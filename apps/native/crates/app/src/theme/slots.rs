@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui::{
-    AbsoluteLength, AlignItems, AnyElement, App, DefiniteLength, Display, Fill, FlexDirection,
-    FontWeight, Global, InteractiveElement, IntoElement, JustifyContent, Length, ObjectFit,
-    ParentElement, RenderImage, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage,
-    div, img, linear_color_stop, linear_gradient, point, px, relative, rems, solid_background,
+    AbsoluteLength, AlignItems, AnyElement, App, BorderStyle, Bounds, BoxShadow, Corners,
+    DefiniteLength, Display, Edges, Fill, FlexDirection, FontWeight, Global, InteractiveElement,
+    IntoElement, JustifyContent, Length, ObjectFit, ParentElement, Pixels, RenderImage, Size,
+    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage, Window, canvas, div, img,
+    linear_color_stop, linear_gradient, point, px, quad, relative, rems, size, solid_background,
     transparent_black,
 };
 use t3_core::client_settings::typography::{FontDefaults, resolve_font_stack};
@@ -32,15 +33,19 @@ pub(super) struct ActiveSlotStylesheet(pub(super) Arc<SlotStylesheet>);
 impl Global for ActiveSlotStylesheet {}
 
 const GRADIENT_TEX_SIZE: u32 = 128;
-const MAX_CACHED_GRADIENTS: usize = 64;
+const GRADIENT_MAX_DIM: u32 = 128;
+const GRADIENT_MIN_DIM: u32 = 16;
+const MAX_CACHED_GRADIENTS: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GradientCacheKey {
     Linear {
+        aspect_bucket: i16,
         angle_bits: u32,
         stops: Vec<(u32, u32)>,
     },
     Radial {
+        aspect_bucket: i16,
         cx_bits: u32,
         cy_bits: u32,
         rx_bits: u32,
@@ -113,10 +118,32 @@ fn sample_gradient_stops(stops: &[GradientStop], t: f32) -> [u8; 4] {
     to_bgra(unpack(last.color))
 }
 
-fn gradient_cache_key(bg: &SlotBackground) -> Option<GradientCacheKey> {
+fn aspect_bucket_and_dims(width_px: f32, height_px: f32) -> (i16, f32, u32, u32) {
+    let ratio = (width_px.max(1.0) / height_px.max(1.0)).clamp(0.05, 20.0);
+    let bucket = (ratio.ln() * 12.0).round() as i16;
+    if bucket == 0 {
+        return (0, 1.0, GRADIENT_TEX_SIZE, GRADIENT_TEX_SIZE);
+    }
+    let q_ratio = (bucket as f32 / 12.0).exp();
+    let (tex_w, tex_h) = if q_ratio >= 1.0 {
+        let h = (GRADIENT_MAX_DIM as f32 / q_ratio)
+            .round()
+            .clamp(GRADIENT_MIN_DIM as f32, GRADIENT_MAX_DIM as f32) as u32;
+        (GRADIENT_MAX_DIM, h)
+    } else {
+        let w = (GRADIENT_MAX_DIM as f32 * q_ratio)
+            .round()
+            .clamp(GRADIENT_MIN_DIM as f32, GRADIENT_MAX_DIM as f32) as u32;
+        (w, GRADIENT_MAX_DIM)
+    };
+    (bucket, q_ratio, tex_w, tex_h)
+}
+
+fn gradient_cache_key(bg: &SlotBackground, aspect_bucket: i16) -> Option<GradientCacheKey> {
     match bg {
         SlotBackground::LinearGradient { angle_deg, stops } if stops.len() >= 2 => {
             Some(GradientCacheKey::Linear {
+                aspect_bucket,
                 angle_bits: angle_deg.to_bits(),
                 stops: stops
                     .iter()
@@ -128,6 +155,7 @@ fn gradient_cache_key(bg: &SlotBackground) -> Option<GradientCacheKey> {
             if stops.len() >= 2 =>
         {
             Some(GradientCacheKey::Radial {
+                aspect_bucket,
                 cx_bits: cx_frac.to_bits(),
                 cy_bits: cy_frac.to_bits(),
                 rx_bits: rx_frac.to_bits(),
@@ -142,29 +170,36 @@ fn gradient_cache_key(bg: &SlotBackground) -> Option<GradientCacheKey> {
     }
 }
 
-fn rasterize_gradient(bg: &SlotBackground) -> Option<Arc<RenderImage>> {
-    let key = gradient_cache_key(bg)?;
+fn rasterize_gradient_for_size(
+    bg: &SlotBackground,
+    width_px: f32,
+    height_px: f32,
+) -> Option<Arc<RenderImage>> {
+    let (bucket, q_ratio, tex_w, tex_h) = aspect_bucket_and_dims(width_px, height_px);
+    let key = gradient_cache_key(bg, bucket)?;
     if let Ok(cache) = GRADIENT_CACHE.lock()
         && let Some(hit) = cache.get(&key)
     {
         return Some(Arc::clone(hit));
     }
 
-    let size = GRADIENT_TEX_SIZE;
-    let inv = 1.0 / size as f32;
-    let mut pixels = image::RgbaImage::new(size, size);
+    let inv_w = 1.0 / tex_w as f32;
+    let inv_h = 1.0 / tex_h as f32;
+    let mut pixels = image::RgbaImage::new(tex_w, tex_h);
 
     match bg {
         SlotBackground::LinearGradient { angle_deg, stops } => {
             let rad = angle_deg.to_radians();
             let dx = rad.sin();
             let dy = -rad.cos();
-            let line_len = (dx.abs() + dy.abs()).max(1e-6);
-            for y in 0..size {
-                let v = (y as f32 + 0.5) * inv - 0.5;
-                for x in 0..size {
-                    let u = (x as f32 + 0.5) * inv - 0.5;
-                    let t = ((u * dx + v * dy) / line_len + 0.5).clamp(0.0, 1.0);
+            let w = q_ratio;
+            let h = 1.0f32;
+            let line_len = (w * dx.abs() + h * dy.abs()).max(1e-6);
+            for y in 0..tex_h {
+                let py = ((y as f32 + 0.5) * inv_h - 0.5) * h;
+                for x in 0..tex_w {
+                    let px_x = ((x as f32 + 0.5) * inv_w - 0.5) * w;
+                    let t = ((px_x * dx + py * dy) / line_len + 0.5).clamp(0.0, 1.0);
                     pixels.put_pixel(x, y, image::Rgba(sample_gradient_stops(stops, t)));
                 }
             }
@@ -172,10 +207,10 @@ fn rasterize_gradient(bg: &SlotBackground) -> Option<Arc<RenderImage>> {
         SlotBackground::RadialGradient { cx_frac, cy_frac, rx_frac, ry_frac, stops } => {
             let rx = rx_frac.max(1e-4);
             let ry = ry_frac.max(1e-4);
-            for y in 0..size {
-                let ny = ((y as f32 + 0.5) * inv - *cy_frac) / ry;
-                for x in 0..size {
-                    let nx = ((x as f32 + 0.5) * inv - *cx_frac) / rx;
+            for y in 0..tex_h {
+                let ny = ((y as f32 + 0.5) * inv_h - *cy_frac) / ry;
+                for x in 0..tex_w {
+                    let nx = ((x as f32 + 0.5) * inv_w - *cx_frac) / rx;
                     let t = (nx * nx + ny * ny).sqrt();
                     pixels.put_pixel(x, y, image::Rgba(sample_gradient_stops(stops, t)));
                 }
@@ -194,7 +229,16 @@ fn rasterize_gradient(bg: &SlotBackground) -> Option<Arc<RenderImage>> {
     Some(rendered)
 }
 
-fn override_uses_raster_or_rim(ov: &SlotStyleOverride) -> bool {
+fn rasterize_gradient(bg: &SlotBackground) -> Option<Arc<RenderImage>> {
+    rasterize_gradient_for_size(bg, GRADIENT_TEX_SIZE as f32, GRADIENT_TEX_SIZE as f32)
+}
+
+fn override_uses_background_layer(ov: &SlotStyleOverride, base: Option<&SlotStyleOverride>) -> bool {
+    let blur = ov
+        .backdrop_blur
+        .or_else(|| base.and_then(|b| b.backdrop_blur))
+        .is_some_and(|b| b > 0.0);
+    let has_fill = ov.background.is_some() || ov.background_color.is_some();
     ov.border_gradient.is_some()
         || matches!(ov.background, Some(SlotBackground::RadialGradient { .. }))
         || matches!(
@@ -203,6 +247,11 @@ fn override_uses_raster_or_rim(ov: &SlotStyleOverride) -> bool {
                 if ov.background_color.is_some()
                     || (stops.len() >= 3 && all_stops_equal(stops).is_none())
         )
+        || (blur && has_fill)
+}
+
+fn override_uses_raster_or_rim(ov: &SlotStyleOverride) -> bool {
+    override_uses_background_layer(ov, None)
 }
 
 fn override_has_live_background(ov: &SlotStyleOverride, has_wallpaper: bool) -> bool {
@@ -306,6 +355,15 @@ pub fn slot_border_color(slot: ThemeSlot, cx: &App) -> Option<gpui::Hsla> {
 
 /// Applies a compiled [`SlotStyleOverride`] directly onto a GPUI [`StyleRefinement`].
 pub fn apply_slot_override(style: &mut StyleRefinement, ov: &SlotStyleOverride, cx: &App) {
+    apply_slot_override_with_base(style, ov, None, cx);
+}
+
+fn apply_slot_override_with_base(
+    style: &mut StyleRefinement,
+    ov: &SlotStyleOverride,
+    base: Option<&SlotStyleOverride>,
+    cx: &App,
+) {
     if ov.is_empty() {
         return;
     }
@@ -316,9 +374,10 @@ pub fn apply_slot_override(style: &mut StyleRefinement, ov: &SlotStyleOverride, 
             style.display = Some(Display::Flex);
         }
     }
-    if override_uses_raster_or_rim(ov) {
-        // Let the rendered gradient / prismatic border-gradient background layer paint cleanly
-        // without the host element's own background washing it out.
+    let uses_bg_layer = override_uses_background_layer(ov, base);
+    if uses_bg_layer {
+        // Let the rendered gradient / backdrop-blur / border-gradient canvas layer paint cleanly
+        // without the host element's own background washing it out or double-tinting blurs.
         style.background = Some(Fill::Color(solid_background(transparent_black())));
     } else if let Some(bg) = &ov.background {
         match bg {
@@ -430,7 +489,9 @@ pub fn apply_slot_override(style: &mut StyleRefinement, ov: &SlotStyleOverride, 
         style.box_shadow = Some(
             shadows
                 .iter()
-                .map(|s| gpui::BoxShadow {
+                // Inset shadows must paint above the canvas fill layer rather than behind it.
+                .filter(|s| !uses_bg_layer || !s.inset)
+                .map(|s| BoxShadow {
                     color: hsla(s.color),
                     offset: point(px(s.offset_x), px(s.offset_y)),
                     blur_radius: px(s.blur_radius),
@@ -439,6 +500,8 @@ pub fn apply_slot_override(style: &mut StyleRefinement, ov: &SlotStyleOverride, 
                 })
                 .collect(),
         );
+    } else if uses_bg_layer && let Some(existing) = &mut style.box_shadow {
+        existing.retain(|s| !s.inset);
     }
     if let Some(opacity) = ov.opacity {
         style.opacity = Some(opacity);
@@ -562,7 +625,7 @@ pub trait ThemeSlotExt: Styled + Sized {
         if let Some(set) = sheet.get(slot) {
             let ov = set.state(state);
             if !ov.is_empty() {
-                apply_slot_override(self.style(), ov, cx);
+                apply_slot_override_with_base(self.style(), ov, Some(&set.base), cx);
             }
         }
         self
@@ -721,198 +784,352 @@ fn resolve_border_inset_px(ov: &SlotStyleOverride, base: &SlotStyleOverride) -> 
         .max(1.0)
 }
 
-fn render_slot_fill(
+fn resolve_border_edges(ov: &SlotStyleOverride, base: &SlotStyleOverride) -> [Option<f32>; 4] {
+    [
+        ov.border_widths.top.or(base.border_widths.top),
+        ov.border_widths.right.or(base.border_widths.right),
+        ov.border_widths.bottom.or(base.border_widths.bottom),
+        ov.border_widths.left.or(base.border_widths.left),
+    ]
+}
+
+fn expand_bounds(bounds: Bounds<Pixels>, edges: [f32; 4]) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.origin.x - px(edges[3]), bounds.origin.y - px(edges[0])),
+        size(
+            (bounds.size.width + px(edges[1] + edges[3])).max(px(0.0)),
+            (bounds.size.height + px(edges[0] + edges[2])).max(px(0.0)),
+        ),
+    )
+}
+
+fn inset_bounds(bounds: Bounds<Pixels>, edges: [f32; 4]) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.origin.x + px(edges[3]), bounds.origin.y + px(edges[0])),
+        size(
+            (bounds.size.width - px(edges[1] + edges[3])).max(px(0.0)),
+            (bounds.size.height - px(edges[0] + edges[2])).max(px(0.0)),
+        ),
+    )
+}
+
+fn to_corners_px(radii: [f32; 4], inset: [f32; 4], box_size: Size<Pixels>) -> Corners<Pixels> {
+    Corners {
+        top_left: px((radii[0] - inset[0].max(inset[3])).max(0.0)),
+        top_right: px((radii[1] - inset[0].max(inset[1])).max(0.0)),
+        bottom_right: px((radii[2] - inset[2].max(inset[1])).max(0.0)),
+        bottom_left: px((radii[3] - inset[2].max(inset[3])).max(0.0)),
+    }
+    .clamp_radii_for_quad_size(box_size)
+}
+
+fn round_div_corners(div_el: gpui::Div, radii: [f32; 4]) -> gpui::Div {
+    div_el
+        .rounded_tl(px(radii[0]))
+        .rounded_tr(px(radii[1]))
+        .rounded_br(px(radii[2]))
+        .rounded_bl(px(radii[3]))
+}
+
+fn paint_slot_fill(
+    bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
     bg: &SlotBackground,
     underlay_color: Option<u32>,
-    cx: &App,
-) -> Option<AnyElement> {
-    let fill_el: Option<AnyElement> = match bg {
-        SlotBackground::Solid(c) => Some(
-            div()
-                .absolute()
-                .inset_0()
-                .size_full()
-                .bg(hsla(*c))
-                .into_any_element(),
-        ),
-        SlotBackground::Transparent => None,
+    window: &mut Window,
+) {
+    if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        return;
+    }
+    if let Some(col) = underlay_color {
+        window.paint_quad(quad(
+            bounds,
+            corner_radii,
+            solid_background(hsla(col)),
+            Edges::default(),
+            transparent_black(),
+            BorderStyle::Solid,
+        ));
+    }
+    match bg {
+        SlotBackground::Solid(c) => {
+            window.paint_quad(quad(
+                bounds,
+                corner_radii,
+                solid_background(hsla(*c)),
+                Edges::default(),
+                transparent_black(),
+                BorderStyle::Solid,
+            ));
+        }
+        SlotBackground::Transparent | SlotBackground::ThemeBackgroundImage { .. } => {}
         SlotBackground::LinearGradient { angle_deg, stops } => {
             if let Some(uniform) = all_stops_equal(stops) {
-                Some(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .bg(hsla(uniform))
-                        .into_any_element(),
-                )
+                window.paint_quad(quad(
+                    bounds,
+                    corner_radii,
+                    solid_background(hsla(uniform)),
+                    Edges::default(),
+                    transparent_black(),
+                    BorderStyle::Solid,
+                ));
             } else if stops.len() == 2 {
                 let from = linear_color_stop(hsla(stops[0].color), stops[0].position.unwrap_or(0.0));
                 let to = linear_color_stop(hsla(stops[1].color), stops[1].position.unwrap_or(1.0));
-                Some(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .bg(linear_gradient(*angle_deg, from, to))
-                        .into_any_element(),
-                )
-            } else {
-                let tex = rasterize_gradient(bg)?;
-                Some(
-                    img(tex)
-                        .object_fit(ObjectFit::Fill)
-                        .size_full()
-                        .absolute()
-                        .inset_0()
-                        .into_any_element(),
-                )
+                window.paint_quad(quad(
+                    bounds,
+                    corner_radii,
+                    linear_gradient(*angle_deg, from, to),
+                    Edges::default(),
+                    transparent_black(),
+                    BorderStyle::Solid,
+                ));
+            } else if let Some(tex) = rasterize_gradient_for_size(
+                bg,
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ) {
+                let _ = window.paint_image(bounds, corner_radii, tex, 0, false);
             }
         }
         SlotBackground::RadialGradient { .. } => {
-            let tex = rasterize_gradient(bg)?;
-            Some(
-                img(tex)
-                    .object_fit(ObjectFit::Fill)
-                    .size_full()
-                    .absolute()
-                    .inset_0()
-                    .into_any_element(),
-            )
-        }
-        SlotBackground::ThemeBackgroundImage { size, overlay_color } => {
-            let image = background_image(cx)?;
-            let fit = match size {
-                BackgroundImageSize::Cover => ObjectFit::Cover,
-                BackgroundImageSize::Contain => ObjectFit::Contain,
-                BackgroundImageSize::Auto => ObjectFit::None,
-            };
-            let img_layer = img(image).object_fit(fit).size_full().absolute().inset_0();
-            match overlay_color {
-                Some(scrim) => Some(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .child(img_layer)
-                        .child(div().absolute().inset_0().size_full().bg(hsla(*scrim)))
-                        .into_any_element(),
-                ),
-                None => Some(img_layer.into_any_element()),
+            if let Some(tex) = rasterize_gradient_for_size(
+                bg,
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ) {
+                let _ = window.paint_image(bounds, corner_radii, tex, 0, false);
             }
         }
-    };
-
-    match (underlay_color, fill_el) {
-        (Some(col), Some(layer)) => Some(
-            div()
-                .absolute()
-                .inset_0()
-                .size_full()
-                .bg(hsla(col))
-                .child(layer)
-                .into_any_element(),
-        ),
-        (Some(col), None) => Some(
-            div()
-                .absolute()
-                .inset_0()
-                .size_full()
-                .bg(hsla(col))
-                .into_any_element(),
-        ),
-        (None, layer) => layer,
     }
+}
+
+fn render_theme_wallpaper_layer(
+    size: &BackgroundImageSize,
+    overlay_color: Option<u32>,
+    underlay_color: Option<u32>,
+    radii: [f32; 4],
+    backdrop_blur: Option<f32>,
+    inset_shadows: Vec<BoxShadow>,
+    cx: &App,
+) -> Option<AnyElement> {
+    let image = background_image(cx)?;
+    let fit = match size {
+        BackgroundImageSize::Cover => ObjectFit::Cover,
+        BackgroundImageSize::Contain => ObjectFit::Contain,
+        BackgroundImageSize::Auto => ObjectFit::None,
+    };
+    let img_layer = img(image)
+        .object_fit(fit)
+        .size_full()
+        .absolute()
+        .inset_0()
+        .rounded_tl(px(radii[0]))
+        .rounded_tr(px(radii[1]))
+        .rounded_br(px(radii[2]))
+        .rounded_bl(px(radii[3]));
+
+    let mut wrap = round_div_corners(div().absolute().inset_0().size_full().overflow_hidden(), radii);
+    if let Some(blur) = backdrop_blur {
+        wrap = wrap.child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let corners = to_corners_px(radii, [0.0; 4], bounds.size);
+                    window.paint_backdrop_blur(bounds, corners, px(blur));
+                },
+            )
+            .absolute()
+            .inset_0()
+            .size_full(),
+        );
+    }
+    if let Some(col) = underlay_color {
+        wrap = wrap.child(round_div_corners(
+            div().absolute().inset_0().size_full().bg(hsla(col)),
+            radii,
+        ));
+    }
+    wrap = wrap.child(img_layer);
+    if let Some(scrim) = overlay_color {
+        wrap = wrap.child(round_div_corners(
+            div().absolute().inset_0().size_full().bg(hsla(scrim)),
+            radii,
+        ));
+    }
+    if !inset_shadows.is_empty() {
+        wrap = wrap.child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let corners = to_corners_px(radii, [0.0; 4], bounds.size);
+                    window.paint_inset_shadows(bounds, corners, &inset_shadows);
+                },
+            )
+            .absolute()
+            .inset_0()
+            .size_full(),
+        );
+    }
+    Some(wrap.into_any_element())
 }
 
 fn render_override_background_layer(
     ov: &SlotStyleOverride,
     base: &SlotStyleOverride,
     default_radius: AbsoluteLength,
-    force_clip: bool,
     cx: &App,
 ) -> Option<AnyElement> {
-    let [tl, tr, br, bl] = resolve_radii_px(ov, base, default_radius, cx);
+    let radii = resolve_radii_px(ov, base, default_radius, cx);
+    let backdrop_blur = ov
+        .backdrop_blur
+        .or(base.backdrop_blur)
+        .filter(|b| *b > 0.0);
+    let inset_shadows: Vec<BoxShadow> = ov
+        .box_shadows
+        .as_deref()
+        .or(base.box_shadows.as_deref())
+        .into_iter()
+        .flatten()
+        .filter(|s| s.inset)
+        .map(|s| BoxShadow {
+            color: hsla(s.color),
+            offset: point(px(s.offset_x), px(s.offset_y)),
+            blur_radius: px(s.blur_radius),
+            spread_radius: px(s.spread_radius),
+            inset: true,
+        })
+        .collect();
 
-    if let Some(rim) = &ov.border_gradient {
-        let bw = resolve_border_inset_px(ov, base);
-        let rim_layer = render_slot_fill(rim, None, cx)?;
-        let inner_bg = ov
-            .background
-            .as_ref()
-            .and_then(|bg| render_slot_fill(bg, ov.background_color, cx))
-            .or_else(|| {
-                ov.background_color.map(|c| {
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .bg(hsla(c))
-                        .into_any_element()
-                })
-            });
-        let inner = div()
-            .absolute()
-            .inset(px(bw))
-            .rounded_tl(px((tl - bw).max(0.0)))
-            .rounded_tr(px((tr - bw).max(0.0)))
-            .rounded_br(px((br - bw).max(0.0)))
-            .rounded_bl(px((bl - bw).max(0.0)))
-            .overflow_hidden()
-            .children(inner_bg);
-        return Some(
-            div()
-                .absolute()
-                .inset_0()
-                .rounded_tl(px(tl))
-                .rounded_tr(px(tr))
-                .rounded_br(px(br))
-                .rounded_bl(px(bl))
-                .overflow_hidden()
-                .child(rim_layer)
-                .child(inner)
-                .into_any_element(),
+    if ov.border_gradient.is_none()
+        && let Some(SlotBackground::ThemeBackgroundImage { size, overlay_color }) = &ov.background
+    {
+        return render_theme_wallpaper_layer(
+            size,
+            *overlay_color,
+            ov.background_color,
+            radii,
+            backdrop_blur,
+            inset_shadows,
+            cx,
         );
     }
 
-    let bg = ov.background.as_ref()?;
-    let needs_layer = match bg {
-        SlotBackground::ThemeBackgroundImage { .. } => background_image(cx).is_some(),
-        SlotBackground::RadialGradient { .. } => true,
-        SlotBackground::LinearGradient { stops, .. } => {
-            ov.background_color.is_some()
-                || (stops.len() >= 3 && all_stops_equal(stops).is_none())
-        }
-        SlotBackground::Solid(_) | SlotBackground::Transparent => false,
-    };
+    let needs_layer = ov.border_gradient.is_some()
+        || (backdrop_blur.is_some() && (ov.background.is_some() || ov.background_color.is_some()))
+        || match ov.background.as_ref() {
+            Some(SlotBackground::RadialGradient { .. }) => true,
+            Some(SlotBackground::LinearGradient { stops, .. }) => {
+                ov.background_color.is_some()
+                    || (stops.len() >= 3 && all_stops_equal(stops).is_none())
+            }
+            Some(
+                SlotBackground::ThemeBackgroundImage { .. }
+                | SlotBackground::Solid(_)
+                | SlotBackground::Transparent,
+            )
+            | None => false,
+        };
     if !needs_layer {
         return None;
     }
 
-    let layer = render_slot_fill(bg, ov.background_color, cx)?;
-    if force_clip || tl > 0.0 || tr > 0.0 || br > 0.0 || bl > 0.0 {
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .rounded_tl(px(tl))
-                .rounded_tr(px(tr))
-                .rounded_br(px(br))
-                .rounded_bl(px(bl))
-                .overflow_hidden()
-                .child(layer)
-                .into_any_element(),
-        )
+    let edge_opts = resolve_border_edges(ov, base);
+    let edges = [
+        edge_opts[0].unwrap_or(0.0),
+        edge_opts[1].unwrap_or(0.0),
+        edge_opts[2].unwrap_or(0.0),
+        edge_opts[3].unwrap_or(0.0),
+    ];
+    let has_explicit_border_widths = edges.iter().any(|&w| w > 0.0);
+    let effective_border_color = ov.border_color.or(base.border_color);
+    let transparent_border = effective_border_color.is_some_and(|c| (c & 0xff) == 0);
+
+    let (expand_outer, inset_inner, radius_inset) = if ov.border_gradient.is_some() {
+        if has_explicit_border_widths && transparent_border {
+            // Host already reserved transparent border widths in Taffy, placing our canvas at the
+            // padding box while its clip mask stays on the outer border box.
+            (edges, [0.0; 4], edges)
+        } else {
+            let bw = resolve_border_inset_px(ov, base);
+            ([0.0; 4], [bw; 4], [bw; 4])
+        }
+    } else if has_explicit_border_widths && !transparent_border {
+        ([0.0; 4], [0.0; 4], edges)
     } else {
-        Some(layer)
-    }
+        ([0.0; 4], [0.0; 4], [0.0; 4])
+    };
+
+    let rim = ov.border_gradient.clone();
+    let fill_bg = ov.background.clone();
+    let underlay_color = ov.background_color;
+
+    Some(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+                    return;
+                }
+                let outer_bounds = expand_bounds(bounds, expand_outer);
+                let inner_bounds = inset_bounds(bounds, inset_inner);
+                let outer_radii = to_corners_px(radii, [0.0; 4], outer_bounds.size);
+                let inner_radii = to_corners_px(radii, radius_inset, inner_bounds.size);
+
+                if let Some(blur) = backdrop_blur {
+                    let (blur_bounds, blur_radii) = if rim.is_some() {
+                        (outer_bounds, outer_radii)
+                    } else {
+                        (inner_bounds, inner_radii)
+                    };
+                    window.paint_backdrop_blur(blur_bounds, blur_radii, px(blur));
+                }
+
+                if let Some(rim_bg) = &rim {
+                    paint_slot_fill(outer_bounds, outer_radii, rim_bg, None, window);
+                    if let Some(bg) = &fill_bg {
+                        paint_slot_fill(inner_bounds, inner_radii, bg, underlay_color, window);
+                    } else if let Some(col) = underlay_color {
+                        paint_slot_fill(
+                            inner_bounds,
+                            inner_radii,
+                            &SlotBackground::Solid(col),
+                            None,
+                            window,
+                        );
+                    }
+                } else if let Some(bg) = &fill_bg {
+                    paint_slot_fill(inner_bounds, inner_radii, bg, underlay_color, window);
+                } else if let Some(col) = underlay_color {
+                    paint_slot_fill(
+                        inner_bounds,
+                        inner_radii,
+                        &SlotBackground::Solid(col),
+                        None,
+                        window,
+                    );
+                }
+
+                if !inset_shadows.is_empty()
+                    && inner_bounds.size.width > px(0.0)
+                    && inner_bounds.size.height > px(0.0)
+                {
+                    window.paint_inset_shadows(inner_bounds, inner_radii, &inset_shadows);
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+        .size_full()
+        .into_any_element(),
+    )
 }
 
 /// Renders an absolutely-positioned background layer for `slot` in `state` when the compiled
 /// stylesheet uses a prismatic `border_gradient` (`background-clip: padding-box, border-box`),
-/// a `radial-gradient(...)`, a multi-stop (`>= 3`) `linear-gradient(...)`, or a scoped
-/// `var(--theme-background-image)`. Falls back to `SlotState::Base` when `state` has no background
-/// layer of its own.
+/// `backdrop-filter: blur(...)`, a `radial-gradient(...)`, a multi-stop (`>= 3`)
+/// `linear-gradient(...)`, or a scoped `var(--theme-background-image)`. Falls back to
+/// `SlotState::Base` when `state` has no background layer of its own.
 pub fn theme_slot_state_background_layer(
     slot: ThemeSlot,
     state: SlotState,
@@ -927,23 +1144,27 @@ pub fn theme_slot_state_background_layer(
     let default_radius = default_radius.into();
     if state != SlotState::Base {
         let state_ov = set.state(state);
-        if state_ov.border_gradient.is_some() || state_ov.background.is_some() {
-            return render_override_background_layer(state_ov, &set.base, default_radius, false, cx);
+        if state_ov.border_gradient.is_some()
+            || state_ov.background.is_some()
+            || state_ov.background_color.is_some()
+            || state_ov.backdrop_blur.is_some()
+        {
+            return render_override_background_layer(state_ov, &set.base, default_radius, cx);
         }
     }
-    render_override_background_layer(&set.base, &set.base, default_radius, false, cx)
+    render_override_background_layer(&set.base, &set.base, default_radius, cx)
 }
 
 /// Renders an absolutely-positioned background layer for `slot` in `SlotState::Base` (multi-stop
-/// linear gradients, radial gradients, prismatic `border_gradient` rims, or scoped wallpapers).
+/// linear gradients, radial gradients, prismatic `border_gradient` rims, `backdrop-filter`, or
+/// scoped wallpapers).
 pub fn theme_slot_background_layer(slot: ThemeSlot, cx: &App) -> Option<AnyElement> {
     theme_slot_state_background_layer(slot, SlotState::Base, px(0.), cx)
 }
 
-/// Like [`theme_slot_background_layer`], guaranteed to be wrapped in an absolutely-positioned
-/// rounded clip container matching `default_radius` (or `slot`'s overridden `border-radius`).
-/// Safe for containers that cannot set `.overflow_hidden()` directly (such as menus with
-/// overflowing submenus or scrollable dropdown lists).
+/// Like [`theme_slot_background_layer`], rounding and clipping all painted layers to `default_radius`
+/// (or `slot`'s overridden `border-radius`). Safe for containers that cannot set
+/// `.overflow_hidden()` directly (such as menus with overflowing submenus or scrollable dropdown lists).
 pub fn theme_slot_clipped_background_layer(
     slot: ThemeSlot,
     default_radius: impl Into<AbsoluteLength>,
@@ -954,7 +1175,7 @@ pub fn theme_slot_clipped_background_layer(
         return None;
     }
     let set = global.0.get(slot)?;
-    render_override_background_layer(&set.base, &set.base, default_radius.into(), true, cx)
+    render_override_background_layer(&set.base, &set.base, default_radius.into(), cx)
 }
 
 /// Renders a compiled `::before` pseudo-element bar (e.g. an active thread row's 3px left accent
@@ -994,6 +1215,11 @@ pub fn theme_slot_pseudo_before(
     if let Some(v) = bar.height.map(to_length) {
         el.style().size.height = Some(v);
     }
+    let rem_px = super::preferences(cx).interface_font_size.max(8.0);
+    let radius_px = bar
+        .border_radius
+        .map(|len| slot_radius_px(Some(len), 0.0, rem_px))
+        .unwrap_or(0.0);
     if let Some(r) = bar.border_radius.and_then(to_radius_length) {
         el.style().corner_radii.top_left = Some(r);
         el.style().corner_radii.top_right = Some(r);
@@ -1015,13 +1241,50 @@ pub fn theme_slot_pseudo_before(
                     let from = linear_color_stop(hsla(stops[0].color), stops[0].position.unwrap_or(0.0));
                     let to = linear_color_stop(hsla(stops[1].color), stops[1].position.unwrap_or(1.0));
                     el.style().background = Some(Fill::Color(linear_gradient(*angle_deg, from, to)));
-                } else if let Some(layer) = render_slot_fill(bg, None, cx) {
-                    el = el.overflow_hidden().child(layer);
+                } else {
+                    let bg_clone = bg.clone();
+                    el = el.child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let corners =
+                                    Corners::all(px(radius_px)).clamp_radii_for_quad_size(bounds.size);
+                                paint_slot_fill(bounds, corners, &bg_clone, None, window);
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    );
                 }
             }
-            SlotBackground::RadialGradient { .. } | SlotBackground::ThemeBackgroundImage { .. } => {
-                if let Some(layer) = render_slot_fill(bg, None, cx) {
-                    el = el.overflow_hidden().child(layer);
+            SlotBackground::RadialGradient { .. } => {
+                let bg_clone = bg.clone();
+                el = el.child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let corners =
+                                Corners::all(px(radius_px)).clamp_radii_for_quad_size(bounds.size);
+                            paint_slot_fill(bounds, corners, &bg_clone, None, window);
+                        },
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                );
+            }
+            SlotBackground::ThemeBackgroundImage { size, overlay_color } => {
+                if let Some(layer) = render_theme_wallpaper_layer(
+                    size,
+                    *overlay_color,
+                    None,
+                    [radius_px; 4],
+                    None,
+                    Vec::new(),
+                    cx,
+                ) {
+                    el = el.child(layer);
                 }
             }
         }
@@ -1641,6 +1904,25 @@ mod tests {
                     ))
                     .child("Composer");
 
+                let header = crate::chat_header::container(false, cx).child("Chat header");
+
+                let details_slot = slot_style(ThemeSlot::ThreadDetailsCard, cx);
+                let details_card = div()
+                    .id("kraken-details-card")
+                    .relative()
+                    .overflow_hidden()
+                    .w(px(260.))
+                    .h(px(140.))
+                    .rounded(px(16.))
+                    .theme_slot_interactive(ThemeSlot::ThreadDetailsCard, cx)
+                    .children(theme_slot_state_background_layer(
+                        ThemeSlot::ThreadDetailsCard,
+                        SlotState::Base,
+                        px(16.),
+                        cx,
+                    ))
+                    .when(details_slot.is_some(), |this| this.child("Details"));
+
                 let group = crate::settings::controls::group(
                     vec![
                         div().child("Row 1").into_any_element(),
@@ -1654,9 +1936,11 @@ mod tests {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
+                    .child(header)
                     .child(div().w(px(240.)).h(px(120.)).flex().flex_col().child(sb_inner))
                     .child(active_row)
                     .child(focused_composer)
+                    .child(details_card)
                     .child(group)
                     .child(crate::settings::controls::Switch::new("kraken-sw-on", true))
                     .child(crate::settings::controls::Switch::new("kraken-sw-off", false))
@@ -1698,9 +1982,16 @@ mod tests {
                 border-radius: 14px !important;
                 border: 1px solid transparent !important;
                 background-clip: padding-box, border-box !important;
+                backdrop-filter: blur(32px) saturate(160%) !important;
             }
             .dark [data-slot="sidebar-inner"] {
                 background-image: linear-gradient(180deg, rgb(21 23 30 / 0.94) 0%, rgb(15 16 22 / 0.97) 100%), var(--kraken-halo-soft) !important;
+                box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.07), 0 18px 40px -14px rgb(0 0 0 / 0.82) !important;
+            }
+            .dark [data-chat-header] {
+                background: color-mix(in srgb, #0A0B0E 82%, transparent) !important;
+                backdrop-filter: blur(24px) saturate(160%);
+                border-bottom: 1px solid rgb(255 255 255 / 0.06) !important;
             }
             [data-thread-item] {
                 border-radius: 11px !important;
@@ -1714,6 +2005,14 @@ mod tests {
                 border: 1px solid transparent !important;
                 background-image: linear-gradient(#262934, #262934), var(--kraken-halo-soft) !important;
                 background-clip: padding-box, border-box !important;
+                box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06) !important;
+            }
+            .dark [data-thread-details-card] {
+                border: 1px solid transparent !important;
+                border-radius: 14px !important;
+                background-image: linear-gradient(#14161D, #14161D), var(--kraken-halo-soft) !important;
+                background-clip: padding-box, border-box !important;
+                box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05), 0 10px 28px -14px rgb(0 0 0 / 0.65);
             }
             [data-slot="composer-host"] {
                 border-radius: 14px !important;
@@ -1730,12 +2029,20 @@ mod tests {
                 box-shadow: 0 0 0 3px rgb(139 116 255 / 0.16) !important;
             }
             [data-slot="switch"] { background: var(--kraken-switch-off) !important; }
-            [data-slot="switch"][data-checked] { background: var(--kraken-switch-on) !important; }
+            [data-slot="switch"][data-checked] {
+                background: var(--kraken-switch-on) !important;
+                box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.28), 0 0 12px -2px rgb(139 116 255 / 0.48) !important;
+            }
             [data-slot="switch-thumb"] { background: #FFFFFF !important; }
             .dark [data-slot="switch-thumb"][data-unchecked] { background: #DCE0EC !important; }
             [data-slot="checkbox"] { border-color: #3a3f50 !important; }
             [data-slot="checkbox-indicator"][data-checked] { background: var(--kraken-switch-on) !important; color: #FFFFFF !important; }
-            [data-slot="settings-group"] { background: rgb(18 20 27 / 0.88) !important; border-color: rgb(255 255 255 / 0.09) !important; border-radius: 14px !important; }
+            [data-slot="settings-group"] {
+                background: rgb(18 20 27 / 0.88) !important;
+                border-color: rgb(255 255 255 / 0.09) !important;
+                border-radius: 14px !important;
+                backdrop-filter: blur(18px) saturate(140%);
+            }
             [data-slot="input-control"][class*="border-input"] { border-color: rgb(255 255 255 / 0.14) !important; border-radius: 10px !important; }
             [data-slot="dialog-popup"], [data-slot="popover-popup"], [data-slot="menu-popup"], [data-slot="select-popup"] > .dropdown-glass {
                 border: 1px solid transparent !important;
@@ -1794,6 +2101,23 @@ mod tests {
                 sb_in.style().background,
                 Some(Fill::Color(solid_background(transparent_black())))
             );
+            // Inset shadow moves onto the background layer canvas so only the outer drop shadow stays on host.
+            let sb_shadows = sb_in.style().box_shadow.as_ref().expect("sidebar drop shadow");
+            assert_eq!(sb_shadows.len(), 1);
+            assert!(!sb_shadows[0].inset);
+
+            // ThreadItem:selected has inset-only box-shadow, so host keeps `Some([])` and canvas paints inset highlight.
+            let mut sel_row = div()
+                .theme_slot(ThemeSlot::ThreadItem, cx)
+                .theme_slot_state(ThemeSlot::ThreadItem, SlotState::Selected, cx);
+            assert_eq!(sel_row.style().box_shadow.as_ref().map(Vec::len), Some(0));
+
+            // Switch:checked uses a native 2-stop gradient without a background layer, keeping both inset + glow shadows.
+            let mut sw_checked = div()
+                .theme_slot(ThemeSlot::Switch, cx)
+                .theme_slot_state(ThemeSlot::Switch, SlotState::Selected, cx);
+            assert_eq!(sw_checked.style().box_shadow.as_ref().map(Vec::len), Some(2));
+
             assert!(slot_has_background(ThemeSlot::SidebarInner, cx));
             assert!(slot_has_background(ThemeSlot::DialogPopup, cx));
             assert!(slot_has_background(ThemeSlot::PopoverPopup, cx));
@@ -1810,6 +2134,47 @@ mod tests {
             assert!(Arc::ptr_eq(&img1, &img2));
             assert_eq!(img1.size(0).width.0, GRADIENT_TEX_SIZE as i32);
             assert_eq!(img1.size(0).height.0, GRADIENT_TEX_SIZE as i32);
+
+            // Aspect-aware gradient rasterization on a wide 600x92 composer sweeps pink -> emerald across top edge.
+            let composer_halo = slot_style(ThemeSlot::ComposerHost, cx)
+                .unwrap()
+                .focus_within
+                .border_gradient
+                .unwrap();
+            let wide1 = rasterize_gradient_for_size(&composer_halo, 600.0, 92.0)
+                .expect("wide composer gradient");
+            let wide2 = rasterize_gradient_for_size(&composer_halo, 604.0, 92.0)
+                .expect("same bucket cache hit");
+            assert!(Arc::ptr_eq(&wide1, &wide2));
+            let tall = rasterize_gradient_for_size(&composer_halo, 260.0, 900.0)
+                .expect("tall sidebar gradient");
+            assert!(wide1.size(0).width > wide1.size(0).height);
+            assert!(tall.size(0).height > tall.size(0).width);
+
+            let w_px = wide1.size(0).width.0 as usize;
+            let h_px = wide1.size(0).height.0 as usize;
+            let bytes = wide1.as_bytes(0).unwrap();
+            let pixel_rgba = |x: usize, y: usize| -> [u8; 4] {
+                let off = (y * w_px + x) * 4;
+                // Stored in straight-alpha BGRA8 byte order.
+                [bytes[off + 2], bytes[off + 1], bytes[off], bytes[off + 3]]
+            };
+            let tl = pixel_rgba(0, 0);
+            let tr = pixel_rgba(w_px - 1, 0);
+            let bl = pixel_rgba(0, h_px - 1);
+            let br = pixel_rgba(w_px - 1, h_px - 1);
+            assert!(tl[0] > 200 && tl[2] > 120, "top-left should be pink: {tl:?}");
+            assert!(tr[1] > 170 && tr[0] < 40, "top-right should be emerald/cyan: {tr:?}");
+            assert!(bl[0] > 180 && bl[2] > 160, "bottom-left should be pink/violet: {bl:?}");
+            assert!(br[0] > 200 && br[2] > 120, "bottom-right should be pink: {br:?}");
+
+            // ChatHeader with `backdrop-filter: blur(24px)` + translucent solid bg clears host bg for canvas blur.
+            let mut ch = div().theme_slot(ThemeSlot::ChatHeader, cx);
+            assert_eq!(
+                ch.style().background,
+                Some(Fill::Color(solid_background(transparent_black())))
+            );
+            assert!(theme_slot_background_layer(ThemeSlot::ChatHeader, cx).is_some());
 
             // Focused composer gets transparent host bg + border_gradient layer + focus shadow.
             let mut comp = div()

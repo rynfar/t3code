@@ -455,8 +455,11 @@ impl Render for DetailsView {
             ))
             .child(crate::webview::occluder("thread-details-cover", crate::webview::Layer::TranscriptChrome))
             .when(popover, |this| {
+                let has_custom_shadow = card_slot.as_ref().is_some_and(|s| s.base.box_shadows.is_some());
                 this.occlude()
-                    .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
+                    .when(!has_custom_shadow, |this| {
+                        this.shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
+                    })
                     .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                         if !super::point_in_find_bar(this.find_open, event.position, this.state.read(cx), window) {
                             this.close_popover(cx);

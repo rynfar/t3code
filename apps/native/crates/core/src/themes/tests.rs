@@ -841,7 +841,7 @@ fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagno
             background: url(https://evil.example/bg.png);
             background-image: image-set(url(https://evil.example/x.png) 1x);
             color: var(--sneaky);
-            backdrop-filter: blur(12px);
+            transform: translateY(-1px);
         }
         [data-slot="input"] {
             font-size: 2px;
@@ -864,7 +864,7 @@ fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagno
     // Supported declarations on Button (border-width, box-shadow, font-size, opacity, color) + Input (font-size, opacity) = 7.
     // Remote `background: url(...)` & `background-image: image-set(...)` are dropped before counting.
     assert_eq!(diag.applied_slot_rules, 7);
-    // Unmapped: `backdrop-filter` on Button + `[data-slot="button"] svg` + `::after` + `svg.lucide` = 4.
+    // Unmapped: `transform` on Button + `[data-slot="button"] svg` + `::after` + `svg.lucide` = 4.
     assert_eq!(diag.unmapped_dom_rules, 4);
 
     let roles = standard(true);
@@ -942,6 +942,13 @@ fn slot_engine_compiles_kraken_glass_rules_faithfully() {
           border: 1px solid transparent !important;
           background-origin: border-box !important;
           background-clip: padding-box, border-box !important;
+          backdrop-filter: blur(32px) saturate(160%) !important;
+          -webkit-backdrop-filter: blur(32px) saturate(160%) !important;
+        }
+        .dark [data-chat-header] {
+          background: color-mix(in srgb, #0A0B0E 82%, transparent) !important;
+          backdrop-filter: blur(24px) saturate(160%);
+          -webkit-backdrop-filter: blur(24px) saturate(160%);
         }
         .dark [data-slot="sidebar-inner"] {
           background-image: linear-gradient(180deg, rgb(21 23 30 / 0.94) 0%, rgb(15 16 22 / 0.97) 100%), var(--kraken-halo-soft) !important;
@@ -1025,15 +1032,27 @@ fn slot_engine_compiles_kraken_glass_rules_faithfully() {
           background: var(--kraken-card-surface) !important;
           border-color: var(--kraken-card-border) !important;
           border-radius: 14px !important;
+          backdrop-filter: blur(18px) saturate(140%);
         }
-        .dark [data-slot="settings-group"] > *:not(:first-child) {
-          border-top-color: rgb(255 255 255 / 0.07) !important;
-        }
-        .dark [data-slot="select-popup"] > .dropdown-glass {
+        [data-slot="dialog-popup"],
+        [data-slot="popover-popup"],
+        [data-slot="menu-popup"],
+        [data-slot="tooltip-popup"] {
           border: 1px solid transparent !important;
           border-radius: 14px !important;
           background-clip: padding-box, border-box !important;
+          backdrop-filter: blur(28px) saturate(160%) !important;
+        }
+        .dark [data-slot="dialog-popup"],
+        .dark [data-slot="popover-popup"],
+        .dark [data-slot="menu-popup"],
+        .dark [data-slot="select-popup"] > .dropdown-glass {
           background-image: linear-gradient(rgb(21 23 30 / 0.96), rgb(15 16 22 / 0.97)), var(--kraken-halo-soft) !important;
+        }
+        .dark [data-slot="tooltip-popup"] {
+          border-radius: 9px !important;
+          background-image: linear-gradient(rgb(24 26 34 / 0.96), rgb(17 19 26 / 0.97)), var(--kraken-halo-soft) !important;
+          backdrop-filter: blur(20px) saturate(160%) !important;
         }
     "#;
 
@@ -1056,12 +1075,13 @@ fn slot_engine_compiles_kraken_glass_rules_faithfully() {
     assert_eq!(sidebar.border_widths.right, Some(0.0));
     assert_eq!(sidebar.border_color, Some(0x0000_0000));
 
-    // Floating SidebarInner card: 6px margin, calc(100% - 12px), 14px radius, 6-stop prismatic border_gradient.
+    // Floating SidebarInner card: 6px margin, calc(100% - 12px), 14px radius, 32px blur, 6-stop prismatic border_gradient.
     let sb_inner = &dark_sheet.get(ThemeSlot::SidebarInner).unwrap().base;
     assert_eq!(sb_inner.margin.top, Some(SlotLength::Px(6.0)));
     assert_eq!(sb_inner.width, Some(SlotLength::FullMinusPx(12.0)));
     assert_eq!(sb_inner.height, Some(SlotLength::FullMinusPx(12.0)));
     assert_eq!(sb_inner.border_radii.top_left, Some(SlotLength::Px(14.0)));
+    assert_eq!(sb_inner.backdrop_blur, Some(32.0));
     assert!(matches!(sb_inner.background, Some(SlotBackground::LinearGradient { .. })));
     match &sb_inner.border_gradient {
         Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
@@ -1132,11 +1152,16 @@ fn slot_engine_compiles_kraken_glass_rules_faithfully() {
     let sg = &dark_sheet.get(ThemeSlot::SettingsGroup).unwrap().base;
     assert_eq!(sg.border_radii.top_left, Some(SlotLength::Px(14.0)));
     assert_eq!(sg.border_color, Some(0xffff_ff17));
+    assert_eq!(sg.backdrop_blur, Some(18.0));
 
-    // `[data-slot="select-popup"] > .dropdown-glass` maps to PopoverPopup with border_gradient.
+    // `[data-slot="select-popup"] > .dropdown-glass` maps to PopoverPopup with border_gradient and backdrop blur.
     let pop = &dark_sheet.get(ThemeSlot::PopoverPopup).unwrap().base;
     assert_eq!(pop.border_radii.top_left, Some(SlotLength::Px(14.0)));
     assert!(pop.border_gradient.is_some());
+    assert_eq!(pop.backdrop_blur, Some(28.0));
+    assert_eq!(dark_sheet.get(ThemeSlot::ChatHeader).unwrap().base.backdrop_blur, Some(24.0));
+    assert_eq!(dark_sheet.get(ThemeSlot::DialogPopup).unwrap().base.backdrop_blur, Some(28.0));
+    assert_eq!(dark_sheet.get(ThemeSlot::TooltipPopup).unwrap().base.backdrop_blur, Some(20.0));
 }
 
 #[test]
@@ -1224,4 +1249,34 @@ fn slot_engine_compiles_kraken_kinetic_radial_gradient_before_bar_and_color_mix(
     // `:root.dark [data-slot="menu-popup"]` matches dark appearance cleanly.
     let menu = &sheet.get(ThemeSlot::MenuPopup).unwrap().base;
     assert_eq!(menu.border_radii.top_left, Some(SlotLength::Px(14.0)));
+}
+
+#[test]
+fn slot_engine_parses_clamps_and_resets_backdrop_blur() {
+    use slots::{MAX_BACKDROP_BLUR_PX, ThemeSlot};
+
+    let css = r#"
+        [data-slot="dialog-popup"] {
+          backdrop-filter: saturate(160%) blur(1.5rem) !important;
+        }
+        [data-slot="popover-popup"] {
+          -webkit-backdrop-filter: blur(80px) saturate(140%);
+        }
+        [data-slot="menu-popup"] {
+          backdrop-filter: blur(20px);
+          backdrop-filter: none;
+        }
+        [data-slot="tooltip-popup"] {
+          backdrop-filter: blur(-4px);
+        }
+    "#;
+    let (_, sheet) = palette_and_slots_for_with_css(None, None, Some(css), true, 100, 80).unwrap();
+
+    assert_eq!(sheet.get(ThemeSlot::DialogPopup).unwrap().base.backdrop_blur, Some(24.0));
+    assert_eq!(
+        sheet.get(ThemeSlot::PopoverPopup).unwrap().base.backdrop_blur,
+        Some(MAX_BACKDROP_BLUR_PX)
+    );
+    assert_eq!(sheet.get(ThemeSlot::MenuPopup).unwrap().base.backdrop_blur, Some(0.0));
+    assert!(sheet.get(ThemeSlot::TooltipPopup).is_none_or(|s| s.base.backdrop_blur.is_none()));
 }

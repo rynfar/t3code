@@ -1201,12 +1201,25 @@ fn render_code_block(
         px(8.),
         cx,
     ) {
-        let mut radius_style = gpui::StyleRefinement::default().rounded(px(8.));
+        let mut card_style = gpui::StyleRefinement::default().rounded(px(8.));
         if let Some(set) = &slot_set {
-            let corners_only = SlotStyleOverride { border_radii: set.base.border_radii, ..SlotStyleOverride::default() };
-            apply_slot_override(&mut radius_style, &corners_only, cx);
+            let card_override = SlotStyleOverride {
+                border_gradient: set.base.border_gradient.clone(),
+                background: set.base.background.clone(),
+                background_color: set.base.background_color,
+                backdrop_blur: set.base.backdrop_blur,
+                border_color: set.base.border_color,
+                border_widths: set.base.border_widths,
+                border_radii: set.base.border_radii,
+                box_shadows: set.base.box_shadows.clone(),
+                ..SlotStyleOverride::default()
+            };
+            apply_slot_override(&mut card_style, &card_override, cx);
         }
-        card.style().corner_radii = radius_style.corner_radii;
+        card.style().corner_radii = card_style.corner_radii;
+        card.style().border_widths = card_style.border_widths;
+        card.style().border_color = card_style.border_color;
+        card.style().box_shadow = card_style.box_shadow;
         card = card.overflow_hidden().child(bg_layer);
     }
     if let Some(set) = slot_set {

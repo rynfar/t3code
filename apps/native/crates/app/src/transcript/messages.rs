@@ -550,7 +550,12 @@ impl RenderOnce for CollapsibleAttributionCard {
                     .border_color(hsla(p.border).opacity(0.6))
                     .bg(self.surface)
                     .theme_slot_hover(ThemeSlot::UserMessageBubble, cx)
-                    .children(theme_slot_background_layer(ThemeSlot::UserMessageBubble, cx))
+                    .children(crate::theme::theme_slot_state_background_layer(
+                        ThemeSlot::UserMessageBubble,
+                        crate::theme::SlotState::Base,
+                        px(12.),
+                        cx,
+                    ))
                     .child(
                         focusable(
                             h_flex()

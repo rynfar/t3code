@@ -10,6 +10,7 @@ use super::{Colors, color, css};
 
 /// Safety limits enforced on compiled CSS slot overrides.
 pub const MAX_BLUR_PX: f32 = 256.0;
+pub const MAX_BACKDROP_BLUR_PX: f32 = 32.0;
 pub const MAX_BORDER_WIDTH_PX: f32 = 64.0;
 pub const MIN_FONT_SIZE_PX: f32 = 8.0;
 pub const MAX_FONT_SIZE_PX: f32 = 96.0;
@@ -370,6 +371,7 @@ pub struct SlotStyleOverride {
     pub min_height: Option<SlotLength>,
     pub max_height: Option<SlotSizeConstraint>,
     pub box_shadows: Option<Vec<SlotBoxShadow>>,
+    pub backdrop_blur: Option<f32>,
     pub opacity: Option<f32>,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
@@ -403,6 +405,7 @@ impl SlotStyleOverride {
             && self.min_height.is_none()
             && self.max_height.is_none()
             && self.box_shadows.is_none()
+            && self.backdrop_blur.is_none()
             && self.opacity.is_none()
             && self.font_family.is_none()
             && self.font_size.is_none()
@@ -585,6 +588,8 @@ pub(crate) fn is_supported_slot_property(prop: &str) -> bool {
             | "min-height"
             | "max-height"
             | "box-shadow"
+            | "backdrop-filter"
+            | "-webkit-backdrop-filter"
             | "opacity"
             | "font-family"
             | "font-size"
@@ -1490,6 +1495,7 @@ struct OverrideBuilder {
     min_height: Option<(CascadeKey, SlotLength)>,
     max_height: Option<(CascadeKey, SlotSizeConstraint)>,
     box_shadows: Option<(CascadeKey, Vec<SlotBoxShadow>)>,
+    backdrop_blur: Option<(CascadeKey, f32)>,
     opacity: Option<(CascadeKey, f32)>,
     font_family: Option<(CascadeKey, String)>,
     font_size: Option<(CascadeKey, f32)>,
@@ -1826,6 +1832,11 @@ impl OverrideBuilder {
                     set_if_wins(&mut self.box_shadows, key, shadows);
                 }
             }
+            "backdrop-filter" | "-webkit-backdrop-filter" => {
+                if let Some(blur) = parse_backdrop_blur(val) {
+                    set_if_wins(&mut self.backdrop_blur, key, blur);
+                }
+            }
             "opacity" => {
                 if let Some(op) = parse_opacity(val) {
                     set_if_wins(&mut self.opacity, key, op);
@@ -1979,6 +1990,7 @@ impl OverrideBuilder {
             min_height: self.min_height.map(|(_, v)| v),
             max_height: self.max_height.map(|(_, v)| v),
             box_shadows: self.box_shadows.map(|(_, v)| v),
+            backdrop_blur: self.backdrop_blur.map(|(_, v)| v),
             opacity: self.opacity.map(|(_, v)| v),
             font_family: self.font_family.map(|(_, v)| v),
             font_size: self.font_size.map(|(_, v)| v),
@@ -2966,6 +2978,32 @@ fn parse_box_shadows(val: &str, roles: &Colors, dark: bool) -> Option<Vec<SlotBo
         });
     }
     if shadows.is_empty() { None } else { Some(shadows) }
+}
+
+fn parse_backdrop_blur(val: &str) -> Option<f32> {
+    let trimmed = val.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    while i + 5 <= bytes.len() {
+        if bytes[i..i + 5].eq_ignore_ascii_case(b"blur(")
+            && (i == 0
+                || (!bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes[i - 1] != b'-'
+                    && bytes[i - 1] != b'_'))
+            && let Some((_, inner)) = css::take_balanced_parens(trimmed, i + 5)
+        {
+            let px = parse_px_or_rem(inner.trim())?;
+            if px < 0.0 {
+                return None;
+            }
+            return Some(px.clamp(0.0, MAX_BACKDROP_BLUR_PX));
+        }
+        i += 1;
+    }
+    None
 }
 
 fn parse_opacity(val: &str) -> Option<f32> {
