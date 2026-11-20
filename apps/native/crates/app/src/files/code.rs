@@ -9,14 +9,18 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, HighlightStyle, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels,
-    ScrollWheelEvent, SharedString, Styled, StyledText, Window, div, list, prelude::*, px,
+    AnyElement, AppContext, Context, Entity, HighlightStyle, IntoElement, ListAlignment,
+    ListOffset, ListState, ParentElement, Pixels, ScrollWheelEvent, SharedString, Styled,
+    StyledText, Subscription, Window, div, list, prelude::*, px,
 };
-use gpui_component::ActiveTheme;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use t3_core::files::expand_tabs;
 
 use super::preview::{Preview, TextFile};
+use crate::icons::Icon;
+use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
 
 const LINE_HEIGHT: f32 = 20.;
@@ -51,6 +55,14 @@ pub struct CodeView {
     pending_reveal: Option<usize>,
     /// A wrapped reveal at the top of the view, centered once its height is known.
     centering: Option<usize>,
+    /// In-file Find bar state for read-only source preview (`pingdotgg/t3code#34360`).
+    pub(super) find_open: bool,
+    pub(super) find_focus_pending: bool,
+    pub(super) find_query: String,
+    pub(super) find_matches: Vec<usize>,
+    pub(super) find_active: usize,
+    pub(super) find_input: Option<Entity<InputState>>,
+    _find_sub: Option<Subscription>,
 }
 
 impl CodeView {
@@ -68,6 +80,65 @@ impl CodeView {
             reveal: None,
             pending_reveal: None,
             centering: None,
+            find_open: false,
+            find_focus_pending: false,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_active: 0,
+            find_input: None,
+            _find_sub: None,
+        }
+    }
+
+    pub fn open_find(&mut self) {
+        self.find_open = true;
+        self.find_focus_pending = true;
+    }
+
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Preview>) {
+        self.find_open = false;
+        self.find_focus_pending = false;
+        self.find_query.clear();
+        self.find_matches.clear();
+        self.find_active = 0;
+        if let Some(input) = self.find_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+    }
+
+    pub fn recompute_find(&mut self) {
+        self.find_matches.clear();
+        self.find_active = 0;
+        let needle = self.find_query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        let Some(file) = self.file.as_ref() else { return };
+        for index in 0..file.lines.len() {
+            if let Some(range) = file.lines.range(index)
+                && file.contents[range].to_ascii_lowercase().contains(&needle)
+            {
+                self.find_matches.push(index);
+            }
+        }
+        if let Some(&first) = self.find_matches.first() {
+            self.reveal(first);
+        }
+    }
+
+    pub fn step_find(&mut self, forward: bool) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        self.find_active = if forward {
+            (self.find_active + 1) % self.find_matches.len()
+        } else if self.find_active == 0 {
+            self.find_matches.len() - 1
+        } else {
+            self.find_active - 1
+        };
+        if let Some(&line) = self.find_matches.get(self.find_active) {
+            self.reveal(line);
         }
     }
 
@@ -94,6 +165,9 @@ impl CodeView {
             }
         }
         self.file = file;
+        if self.find_open && !self.find_query.trim().is_empty() {
+            self.recompute_find();
+        }
     }
 
     pub fn set_wrap(&mut self, wrap: bool) {
@@ -203,16 +277,108 @@ impl Preview {
         if code.scroll_pending_reveal(crate::theme::code_line_height(cx)) {
             window.request_animation_frame();
         }
-        div()
+        if code.find_open && code.find_input.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in file").clean_on_escape());
+            let sub = cx.subscribe(&input, |this: &mut Preview, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.code.find_query = input.read(cx).value().to_string();
+                    this.code.recompute_find();
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    this.code.step_find(!shift);
+                    cx.notify();
+                }
+                _ => {}
+            });
+            self.code.find_input = Some(input);
+            self.code._find_sub = Some(sub);
+        }
+        if std::mem::take(&mut self.code.find_focus_pending)
+            && let Some(input) = self.code.find_input.clone()
+        {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        let find_bar = self.code.find_open.then(|| {
+            let input = self.code.find_input.clone();
+            let count_label = if self.code.find_query.trim().is_empty() {
+                String::new()
+            } else if self.code.find_matches.is_empty() {
+                "0/0".to_owned()
+            } else {
+                format!("{}/{}", self.code.find_active + 1, self.code.find_matches.len())
+            };
+            let has_matches = !self.code.find_matches.is_empty();
+            h_flex()
+                .id("file-code-find-bar")
+                .flex_none()
+                .h(px(34.))
+                .px(px(10.))
+                .gap(px(6.))
+                .items_center()
+                .border_b_1()
+                .border_color(hsla(p.border).opacity(0.6))
+                .bg(hsla(p.background))
+                .text_xs()
+                .when_some(input, |this, input| this.child(div().w(px(200.)).child(Input::new(&input).small())))
+                .when(!count_label.is_empty(), |this| {
+                    this.child(div().text_color(hsla(p.muted_foreground)).child(SharedString::from(count_label)))
+                })
+                .child(
+                    Button::new("file-code-find-prev")
+                        .variant(Variant::Ghost)
+                        .size(Size::IconXs)
+                        .icon(Icon::ChevronUp)
+                        .tooltip("Previous match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.code.step_find(false);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("file-code-find-next")
+                        .variant(Variant::Ghost)
+                        .size(Size::IconXs)
+                        .icon(Icon::ChevronDown)
+                        .tooltip("Next match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.code.step_find(true);
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("file-code-find-close")
+                        .variant(Variant::Ghost)
+                        .size(Size::IconXs)
+                        .icon(Icon::X)
+                        .tooltip("Close find")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.code.close_find(window, cx);
+                            cx.notify();
+                        })),
+                )
+        });
+        v_flex()
             .id("file-code")
             .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .bg(hsla(p.code_background))
-            .on_scroll_wheel(cx.listener(Self::scroll_code_horizontally))
-            .child(list(self.code.list.clone(), cx.processor(|this, index: usize, _, cx| this.render_line(index, cx))).size_full())
-            .vertical_scrollbar(&self.code.list)
+            .children(find_bar)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .on_scroll_wheel(cx.listener(Self::scroll_code_horizontally))
+                    .child(list(self.code.list.clone(), cx.processor(|this, index: usize, _, cx| this.render_line(index, cx))).size_full())
+                    .vertical_scrollbar(&self.code.list),
+            )
             .into_any_element()
     }
 

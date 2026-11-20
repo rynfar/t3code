@@ -165,10 +165,12 @@ pub enum KeyPhase {
     Up,
 }
 
-/// `DeviceHardwareButton`, as far as an iOS rail sends them.
+/// `DeviceHardwareButton`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareButton {
     Home,
+    Back,
+    Recents,
     AppSwitcher,
     Power,
 }
@@ -195,6 +197,8 @@ pub fn touch(phase: TouchPhase, x: f64, y: f64, screen: Option<&Screen>) -> Vec<
 pub fn button(button: HardwareButton) -> Vec<u8> {
     let name = match button {
         HardwareButton::Home => "home",
+        HardwareButton::Back => "back",
+        HardwareButton::Recents => "recents",
         HardwareButton::AppSwitcher => "app_switcher",
         HardwareButton::Power => "lock",
     };

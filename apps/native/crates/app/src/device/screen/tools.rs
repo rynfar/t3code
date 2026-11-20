@@ -1,17 +1,16 @@
 //! The device tools panel beside the screen, as `DeviceToolsPanel.tsx` lays it out: the host's
-//! discovery diagnostics, the foreground app (Terminate, Relaunch), Open URL and Launch, the
+//! discovery diagnostics, the live foreground app (Terminate, Relaunch), Open URL and Launch, the
 //! simulator or emulator settings (appearance, text size, Liquid Glass and color filter on iOS,
-//! orientation on Android, and the switches each platform offers), location, permissions, and a
-//! push notification on iOS. Every control is off while an action runs or before the first
-//! detail; forms clear only once their action succeeds.
-//!
-//! Not here yet: the accessibility frame overlay and the event log, which stream from the hub,
-//! and a live foreground app (`deviceForegroundAtom`); the foreground shown is the detail's.
+//! orientation and fold posture on Android, and the switches each platform offers), Accessibility
+//! frame overlay, location, permissions, a push notification on iOS, and the collapsible iOS event
+//! log. Every control is off while an action runs or before the first detail; forms clear only
+//! once their action succeeds.
 
 use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::device::Platform;
+use t3_core::device::hub::{FoldActionPosture, FoldPosture};
 use t3_core::device::tools::{
     Action, Appearance, ColorFilter, Decision, LOCATION_PRESETS, LiquidGlass, ORIENTATIONS, Permission, TextSize, Toggle, parse_location, parse_orientation,
     resolve_app_id, submit_value,
@@ -126,8 +125,8 @@ impl DeviceScreen {
             Submit::Launch => form.launch.clone(),
             Submit::Push => form.push.clone(),
         };
-        let foreground = self.controls.foreground_app().map(|app| app.id.as_str());
-        let Some(action) = submit_action(submit, &value(&input, cx), foreground) else { return };
+        let foreground = self.effective_foreground();
+        let Some(action) = submit_action(submit, &value(&input, cx), foreground.as_deref()) else { return };
         self.act(action, Some(input), window, cx);
     }
 
@@ -146,7 +145,7 @@ impl DeviceScreen {
         let ios = self.device.platform == Platform::Ios;
         let disabled = self.controls.disabled(self.controls_visible(cx));
         let settings = self.controls.settings().cloned().unwrap_or_default();
-        let foreground = self.controls.foreground_app().map(|app| app.id.clone());
+        let foreground = self.effective_foreground();
         let mut body: Vec<AnyElement> = Vec::new();
         if let Some(error) = self.controls.error() {
             body.push(div().px(px(12.)).py(px(8.)).border_b_1().border_color(hsla(p.border)).bg(hsla(p.destructive).opacity(0.1)).text_xs().text_color(hsla(p.destructive)).child(error.to_owned()).into_any_element());
@@ -250,6 +249,40 @@ impl DeviceScreen {
         }
         body.push(section(if ios { "Simulator" } else { "Emulator" }, device, cx));
 
+        // Android foldable posture (`DeviceAndroidFoldControls.tsx`).
+        if !ios
+            && let Some(fold) = &self.android_fold
+            && fold.supported
+        {
+            let posture = fold.posture;
+            let fold_buttons = h_flex().gap(px(2.)).children([
+                (FoldActionPosture::Opened, FoldPosture::Opened, "Opened"),
+                (FoldActionPosture::Closed, FoldPosture::Closed, "Closed"),
+            ].map(|(action_posture, state_posture, label)| {
+                PanelButton::new(SharedString::from(format!("device-fold-{}", action_posture.as_str())))
+                    .variant(Variant::Toggle)
+                    .size(Size::Xs)
+                    .label(label)
+                    .pressed(posture == Some(state_posture))
+                    .disabled(self.fold_pending)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_fold(action_posture, cx)))
+            }));
+            let mut fold_rows = vec![row("Posture", fold_buttons, cx)];
+            if let Some(error) = &self.fold_error {
+                fold_rows.push(div().text_xs().text_color(hsla(p.destructive)).child(error.clone()).into_any_element());
+            }
+            body.push(section("Fold", fold_rows, cx));
+        }
+
+        // Accessibility (`DeviceToolsPanel.tsx`: "Overlay element frames").
+        let ax_view = cx.entity().downgrade();
+        let ax_switch = Switch::new("device-ax-overlay", self.ax_overlay)
+            .disabled(!self.has_hub_access(cx))
+            .on_change(move |value, _, cx| {
+                let _ = ax_view.update(cx, |this, cx| this.set_ax_overlay(value, cx));
+            });
+        body.push(section("Accessibility", vec![row("Overlay element frames", ax_switch, cx)], cx));
+
         // Location.
         let location = parse_location(&value(&form.latitude, cx), &value(&form.longitude, cx));
         let presets = Select::new("device-location-preset", LOCATION_PRESETS.iter().map(|(label, _, _)| SelectOption::new(*label, *label)).collect())
@@ -338,6 +371,62 @@ impl DeviceScreen {
                 push.push(div().text_xs().text_color(hsla(p.muted_foreground)).child("Open an app first.").into_any_element());
             }
             body.push(section("Push notification", push, cx));
+
+            // Collapsible Event log (`EventLogSection` in `DeviceToolsPanel.tsx`).
+            if self.has_hub_access(cx) {
+                let mono = crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx);
+                let mut log_section = v_flex().border_b_1().border_color(hsla(p.border)).child(
+                    h_flex()
+                        .id("device-event-log-toggle")
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .gap(px(6.))
+                        .items_center()
+                        .cursor_pointer()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.muted_foreground))
+                        .hover(|s| s.text_color(hsla(p.foreground)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_event_log(cx)))
+                        .child("Event log")
+                        .child(div().flex_1())
+                        .child(
+                            (if self.event_log_open { Icon::ChevronDown } else { Icon::ChevronRight })
+                                .svg()
+                                .size(px(14.))
+                                .text_color(hsla(p.muted_foreground)),
+                        ),
+                );
+                if self.event_log_open {
+                    let entries: Vec<AnyElement> = if self.event_log.is_empty() {
+                        vec![div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("No events yet.").into_any_element()]
+                    } else {
+                        self.event_log
+                            .iter()
+                            .map(|entry| {
+                                h_flex()
+                                    .gap(px(8.))
+                                    .font_family(mono.clone())
+                                    .text_size(px(11.))
+                                    .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(SharedString::from(entry.short_time().to_owned())))
+                                    .child(div().min_w_0().truncate().text_color(hsla(p.foreground)).child(SharedString::from(entry.summary.clone())))
+                                    .into_any_element()
+                            })
+                            .collect()
+                    };
+                    log_section = log_section.child(
+                        div()
+                            .id("device-event-log-entries")
+                            .max_h(px(256.))
+                            .overflow_y_scroll()
+                            .px(px(12.))
+                            .pb(px(8.))
+                            .child(v_flex().gap(px(3.)).children(entries)),
+                    );
+                }
+                body.push(log_section.into_any_element());
+            }
         }
 
         v_flex()

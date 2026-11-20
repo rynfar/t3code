@@ -556,3 +556,116 @@ fn ssh_simlock_and_tool_versions_decode_validate_and_patch() {
     .unwrap();
     assert_eq!(ident.token_source_label(), "AGENT_DEVICE_DAEMON_AUTH_TOKEN on the server");
 }
+
+#[test]
+fn agent_session_tracker_opens_new_sessions_after_baseline_and_waits_for_device() {
+    let mut tracker = AgentSessionTracker::default();
+    let mut state = ServiceState::empty();
+    let iphone = Device {
+        host_id: "local".into(),
+        id: "sim-1".into(),
+        platform: Platform::Ios,
+        name: "iPhone 16".into(),
+        version: "iOS 18.0".into(),
+        booted: true,
+    };
+    let pixel = Device {
+        host_id: "local".into(),
+        id: "emu-1".into(),
+        platform: Platform::Android,
+        name: "Pixel 9".into(),
+        version: "API 35".into(),
+        booted: true,
+    };
+    state.devices.push(iphone.clone());
+    state.sessions.push(Session {
+        thread_id: "t-1".into(),
+        host_id: "local".into(),
+        device_id: "sim-1".into(),
+        platform: Platform::Ios,
+    });
+    // First snapshot sets baseline only.
+    assert!(tracker.apply(&state).is_empty());
+
+    // Agent opens a session before its Device summary arrives: stays out of baseline.
+    state.sessions.push(Session {
+        thread_id: "t-2".into(),
+        host_id: "local".into(),
+        device_id: "emu-1".into(),
+        platform: Platform::Android,
+    });
+    assert!(tracker.apply(&state).is_empty());
+
+    // Once the Device summary lands, the session opens.
+    state.devices.push(pixel);
+    let opened = tracker.apply(&state);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].thread_id, "t-2");
+    assert_eq!(opened[0].device_id, "emu-1");
+    assert_eq!(opened[0].name, "Pixel 9");
+    // Repeat snapshot does not re-open.
+    assert!(tracker.apply(&state).is_empty());
+}
+
+#[test]
+fn device_hub_parsers_cover_ax_tree_foreground_event_log_sse_and_fold() {
+    use super::hub::*;
+
+    // iOS AX tree skips screen-covering root and normalizes child frames.
+    let ios_ax = parse_ios_ax_tree(&json!([
+        {
+            "type": "Application",
+            "frame": { "x": 0, "y": 0, "width": 400, "height": 800 },
+            "children": [
+                { "type": "Button", "AXUniqueId": "login-btn", "AXLabel": "Sign In", "frame": { "x": 40, "y": 200, "width": 320, "height": 80 } }
+            ]
+        }
+    ]));
+    assert!(ios_ax.errors.is_empty());
+    assert_eq!(ios_ax.elements.len(), 1);
+    assert_eq!(ios_ax.elements[0].id, "login-btn");
+    assert!((ios_ax.elements[0].x - 0.1).abs() < 0.001);
+    assert!((ios_ax.elements[0].height - 0.1).abs() < 0.001);
+
+    // Android AX tree filters screen-sized & unlabeled non-clickable nodes.
+    let android_ax = parse_android_ax_tree(&json!({
+        "nodes": [
+            { "id": 0, "bounds": { "left": 0, "top": 0, "right": 1000, "bottom": 2000 } },
+            { "id": 1, "text": "", "clickable": false, "bounds": { "left": 10, "top": 10, "right": 100, "bottom": 100 } },
+            { "id": 2, "text": "Submit", "className": "android.widget.Button", "clickable": true, "bounds": { "left": 100, "top": 400, "right": 500, "bottom": 600 } }
+        ]
+    }));
+    assert_eq!(android_ax.elements.len(), 1);
+    assert_eq!(android_ax.elements[0].role, "Button");
+    assert_eq!(android_ax.elements[0].label, "Submit");
+
+    // Foreground SSE events.
+    let fg = parse_foreground_event(&json!({ "bundleId": "com.acme.app", "pid": 42, "isReactNative": true })).unwrap().unwrap();
+    assert_eq!(fg.id, "com.acme.app");
+    assert_eq!(fg.pid, Some(42));
+    assert_eq!(parse_foreground_event(&json!({ "bundleId": null })), Some(None));
+
+    // Event log + rolling 100 limit.
+    let (batch, reset) = parse_event_log_message(&json!({
+        "events": [
+            { "id": 1, "timestamp": "2026-11-19T12:34:56.000Z", "kind": "tap", "summary": "Tapped Login" }
+        ]
+    })).unwrap();
+    assert!(reset);
+    assert_eq!(batch[0].short_time(), "12:34:56");
+    let many: Vec<EventLogEntry> = (0..120).map(|id| EventLogEntry { id, timestamp: String::new(), kind: "log".into(), summary: format!("e{id}") }).collect();
+    let trimmed = append_event_log(&[], &many, true);
+    assert_eq!(trimmed.len(), DEVICE_EVENT_LOG_LIMIT);
+    assert_eq!(trimmed[0].id, 20);
+
+    // SSE parser handles chunked and CRLF framing.
+    let mut sse = SseParser::default();
+    assert!(sse.push(b"data: {\"id\":1}\n").is_empty());
+    assert_eq!(sse.push(b"\ndata: second\r\n\r\n"), vec!["{\"id\":1}", "second"]);
+
+    // Android fold parser & angle.
+    let fold = parse_android_fold(&json!({ "ok": true, "fold": { "supported": true, "posture": "closed", "hingeAngle": null } })).unwrap();
+    assert!(fold.supported);
+    assert_eq!(fold.angle(), 0.0);
+    assert_eq!(FoldActionPosture::Opened.body(), json!({ "posture": "opened" }));
+}

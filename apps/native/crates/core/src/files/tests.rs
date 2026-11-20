@@ -686,3 +686,176 @@ fn mermaid_guard_audio_font_and_drag_mention_helpers() {
     assert_eq!(multi.label, "3 files");
     assert_eq!(drag.end_drag(), vec!["docs/index.md", "docs/api.md", "src/app.ts"]);
 }
+
+#[test]
+fn pdf_layout_find_and_progressive_first_hit_jump_match_web() {
+    use super::pdf::*;
+
+    assert!(is_pdf("report.PDF"));
+    assert!(!is_pdf("report.txt"));
+
+    // Fit width and stepped zoom.
+    let (scale, width) = pdf_page_width(600.0, 612.0, None);
+    assert!((width - 568.0).abs() < 0.01);
+    assert!((scale - 568.0 / 612.0).abs() < 0.001);
+    assert_eq!(step_pdf_zoom(PDF_MIN_ZOOM, -1), PDF_MIN_ZOOM);
+    assert_eq!(step_pdf_zoom(PDF_MAX_ZOOM, 1), PDF_MAX_ZOOM);
+    assert!((step_pdf_zoom(1.0, 1) - 1.25).abs() < 0.001);
+
+    let ratios = [1.0_f32, 1.5, 1.0];
+    let offsets = pdf_page_offsets(&ratios, 100.0);
+    assert_eq!(offsets, vec![16.0, 132.0, 298.0, 414.0]);
+    assert_eq!(current_pdf_page(&offsets, 3, 0.0), 0);
+    assert_eq!(current_pdf_page(&offsets, 3, 120.0), 1);
+    assert_eq!(pdf_page_scroll_top(&offsets, 1), 116.0);
+    let visible = visible_pdf_pages(&ratios, &offsets, 0.0, 100.0);
+    assert_eq!(visible.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+    // Quote folding, hyphenated line break joining, and split-run highlighting.
+    assert!(pdf_find_includes("Quarterly\n\u{201c}out-\nlook\u{201d}", "\"outlook\""));
+    let hits = pdf_find_match_runs(&["Quarter", "ly outlook"], "quarterly");
+    assert_eq!(hits, vec![true, true]);
+
+    // Progressive Find (`pingdotgg/t3code#33956`): jumps on first hit while still scanning,
+    // does not jump again on subsequent hits or finish.
+    let mut find = PdfFindState::default();
+    find.start("needle");
+    assert!(find.finding);
+    assert_eq!(find.status_label(), "Searching…");
+    assert_eq!(find.push_page_text(0, "Intro"), PdfFindStep::Continue);
+    assert_eq!(find.push_page_text(1, "Needle one"), PdfFindStep::JumpToFirstMatch(1));
+    assert!(find.finding, "still scanning remaining pages after first jump");
+    assert_eq!(find.status_label(), "Searching…");
+    assert_eq!(find.push_page_text(2, "Needle two"), PdfFindStep::Continue);
+    assert_eq!(find.push_page_text(3, "Closing"), PdfFindStep::Continue);
+    find.finish();
+    assert!(!find.finding);
+    assert_eq!(find.matches, vec![1, 2]);
+    assert_eq!(find.status_label(), "1/2");
+    assert_eq!(find.next_match(), Some(2));
+    assert_eq!(find.status_label(), "2/2");
+    assert_eq!(find.next_match(), Some(1));
+
+    // Basic PDF parser extracts pages, MediaBox/Rotate, and literal text.
+    let minimal = b"%PDF-1.4\n1 0 obj << /Type /Page /MediaBox [0 0 612 792] /Rotate 90 /Contents 2 0 R >> endobj\n2 0 obj << /Length 42 >>\nstream\nBT /F1 24 Tf (Budget and risks) Tj ET\nendstream\nendobj\n";
+    let parsed = parse_basic_pdf(minimal).unwrap();
+    assert_eq!(parsed.pages.len(), 1);
+    assert_eq!((parsed.pages[0].width, parsed.pages[0].height), (792.0, 612.0));
+    assert!(pdf_find_includes(&parsed.pages[0].text, "budget"));
+
+    // LRU position cache bounds at PDF_MAX_POSITIONS.
+    let mut store = PdfPositionStore::default();
+    for i in 0..(PDF_MAX_POSITIONS + 5) {
+        store.save(
+            format!("doc-{i}.pdf"),
+            SavedPdfPosition { view: PdfViewState { page: i, ..Default::default() }, width: 600.0, ratios: vec![1.2] },
+        );
+    }
+    assert_eq!(store.len(), PDF_MAX_POSITIONS);
+    assert!(store.get("doc-0.pdf").is_none());
+    assert_eq!(store.get("doc-54.pdf").unwrap().view.page, 54);
+}
+
+#[test]
+fn office_parsers_and_spreadsheet_row_col_resize_match_web() {
+    use std::io::Write;
+    use super::office::*;
+
+    assert_eq!(office_kind("sheet.xlsx"), Some(OfficeKind::Xlsx));
+    assert_eq!(office_kind("memo.DOCX"), Some(OfficeKind::Docx));
+    assert_eq!(office_kind("deck.pptx"), Some(OfficeKind::Pptx));
+    assert_eq!(office_kind("notes.rtf"), Some(OfficeKind::Rtf));
+    assert_eq!(office_kind("readme.md"), None);
+
+    assert_eq!(column_name(0), "A");
+    assert_eq!(column_name(25), "Z");
+    assert_eq!(column_name(26), "AA");
+    assert_eq!(parse_cell_ref("BC12"), Some((11, 54)));
+
+    let make_zip = |files: &[(&str, &str)]| -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in files {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    };
+
+    // XLSX workbook with sharedStrings, custom col width, row height, and resize clamping (`#35548`).
+    let xlsx = make_zip(&[
+        (
+            "xl/workbook.xml",
+            r#"<workbook><sheets><sheet name="Summary" r:id="rId1"/><sheet name="Hidden" state="hidden" r:id="rId2"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/sharedStrings.xml",
+            r#"<sst><si><t>Region</t></si><si><t>Revenue &amp; Growth</t></si></sst>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<worksheet><sheetViews><sheetView showGridLines="0"><pane ySplit="1" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="20"/></cols><sheetData><row r="1" ht="30"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>NA</t></is></c><c r="B2"><v>420</v></c></row></sheetData></worksheet>"#,
+        ),
+    ]);
+    let OfficePreview::Workbook(mut wb) = parse_office_preview(OfficeKind::Xlsx, &xlsx).unwrap() else {
+        panic!("expected workbook");
+    };
+    assert_eq!(wb.sheets.len(), 1, "hidden sheet must be skipped");
+    assert_eq!(wb.details_label(), "1 sheet");
+    let sheet = &mut wb.sheets[0];
+    assert_eq!(sheet.name, "Summary");
+    assert!(!sheet.show_gridlines);
+    assert_eq!(sheet.frozen_rows, 1);
+    assert_eq!(sheet.rows[0], vec!["Region", "Revenue & Growth"]);
+    assert_eq!(sheet.rows[1], vec!["NA", "420"]);
+    assert!((sheet.col_width(0) - 145.0).abs() < 0.01);
+    assert!((sheet.row_height(0) - 40.0).abs() < 0.01);
+    // Resize column and row with Excel min/max bounds (`pingdotgg/t3code#35548`).
+    assert_eq!(sheet.resize_track(ResizeAxis::Column, 0, 50.0).unwrap(), 195.0);
+    assert_eq!(sheet.resize_track(ResizeAxis::Column, 0, 5000.0).unwrap(), MAXIMUM_COL_WIDTH);
+    assert_eq!(sheet.resize_track(ResizeAxis::Column, 0, -5000.0).unwrap(), MINIMUM_TRACK_SIZE);
+    assert_eq!(sheet.resize_track(ResizeAxis::Row, 0, 1000.0).unwrap(), MAXIMUM_ROW_HEIGHT);
+    assert_eq!(sheet.resize_track(ResizeAxis::Row, 0, -1000.0).unwrap(), MINIMUM_TRACK_SIZE);
+    assert!(sheet.resize_track(ResizeAxis::Column, 99, 10.0).is_err());
+    assert!(sheet.resize_track(ResizeAxis::Row, 0, f32::NAN).is_err());
+
+    // DOCX with heading, paragraph, and table.
+    let docx = make_zip(&[(
+        "word/document.xml",
+        r#"<w:document><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Spec</w:t></w:r></w:p><w:p><w:r><w:t>Hello world</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>K</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>V</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#,
+    )]);
+    let OfficePreview::Document(doc) = parse_office_preview(OfficeKind::Docx, &docx).unwrap() else {
+        panic!("expected docx document");
+    };
+    assert_eq!(doc.chapters[0].blocks.len(), 3);
+    assert_eq!(doc.chapters[0].blocks[0], DocumentBlock::Heading { level: 1, text: "Spec".into() });
+    assert_eq!(doc.chapters[0].blocks[1], DocumentBlock::Paragraph("Hello world".into()));
+    assert_eq!(doc.chapters[0].blocks[2], DocumentBlock::Table(vec![vec!["K".into(), "V".into()]]));
+
+    // PPTX slide ordering (slide2 before slide10).
+    let pptx = make_zip(&[
+        ("ppt/slides/slide10.xml", r#"<p:sld><a:p><a:t>Tenth</a:t></a:p></p:sld>"#),
+        ("ppt/slides/slide2.xml", r#"<p:sld><a:p><a:t>Second</a:t></a:p><a:p><a:t>Point</a:t></a:p></p:sld>"#),
+    ]);
+    let OfficePreview::Presentation(pres) = parse_office_preview(OfficeKind::Pptx, &pptx).unwrap() else {
+        panic!("expected presentation");
+    };
+    assert_eq!(pres.slides.len(), 2);
+    assert_eq!(pres.slides[0].title.as_deref(), Some("Second"));
+    assert_eq!(pres.slides[0].paragraphs, vec!["Point"]);
+    assert_eq!(pres.slides[1].title.as_deref(), Some("Tenth"));
+
+    // RTF plain-text extraction.
+    let OfficePreview::Document(rtf) = parse_office_preview(OfficeKind::Rtf, br"{\rtf1\ansi {\fonttbl Arial;}Hello\par World}").unwrap() else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(rtf.chapters[0].blocks, vec![DocumentBlock::Paragraph("Hello".into()), DocumentBlock::Paragraph("World".into())]);
+}

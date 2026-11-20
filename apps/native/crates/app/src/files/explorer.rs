@@ -82,6 +82,8 @@ pub struct Explorer {
 
 pub(super) enum ExplorerEvent {
     Refresh,
+    /// User opened a file from the tree without modifier keys (`pingdotgg/t3code#34360`).
+    FileOpened,
 }
 
 impl EventEmitter<ExplorerEvent> for Explorer {}
@@ -378,8 +380,22 @@ impl Explorer {
         self.rows.iter().position(|row| row.path == path)
     }
 
+    /// Focuses and selects the explorer's file search input (`pingdotgg/t3code#34346`).
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+    }
+
+    pub(super) fn on_focus_search(&mut self, _: &crate::preview::Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_search(window, cx);
+    }
+
     /// A click on a row: folders open and close, files open in the panel.
-    pub(super) fn activate_row(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// When `focus_content` is true (unmodified click/Enter on a file), notifies `FilesPanel` to
+    /// move focus into the opened file's editor/preview (`pingdotgg/t3code#34360`).
+    pub(super) fn activate_row(&mut self, index: usize, focus_content: bool, cx: &mut Context<Self>) {
         let Some(row) = self.rows.get(index).cloned() else { return };
         self.cursor = Some(row.path.clone());
         match row.kind {
@@ -399,6 +415,9 @@ impl Explorer {
                 self.selected = Some(row.path.clone());
                 cx.notify();
                 self.state.update(cx, |state, cx| state.open_file(&row.path, None, cx));
+                if focus_content {
+                    cx.emit(ExplorerEvent::FileOpened);
+                }
             }
         }
     }
@@ -436,7 +455,7 @@ impl Explorer {
         if row.expanded {
             self.move_cursor(1, cx);
         } else {
-            self.activate_row(index, cx);
+            self.activate_row(index, false, cx);
         }
     }
 
@@ -459,7 +478,7 @@ impl Explorer {
 
     pub(super) fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.row_index(self.cursor.as_deref()) {
-            self.activate_row(index, cx);
+            self.activate_row(index, true, cx);
         }
     }
 

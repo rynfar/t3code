@@ -23,7 +23,8 @@ pub(super) fn file_icon(path: &str) -> Icon {
         Some("json" | "jsonc" | "json5" | "jsonl" | "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "toml" | "yaml" | "yml" | "lock") => Icon::FileBraces,
         Some("rs" | "py" | "pyi" | "go" | "html" | "htm" | "xml" | "svg" | "css" | "scss" | "sh" | "bash" | "zsh" | "sql") => Icon::CodeXml,
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif" | "tiff" | "avif") => Icon::Image,
-        Some("md" | "mdx" | "markdown" | "mdown" | "mkd" | "txt" | "log" | "diff" | "patch") => Icon::FileText,
+        Some("md" | "mdx" | "markdown" | "mdown" | "mkd" | "txt" | "log" | "diff" | "patch" | "pdf" | "docx" | "odt" | "rtf" | "epub" | "pptx" | "odp") => Icon::FileText,
+        Some("xlsx" | "ods" | "csv" | "tsv") => Icon::Rows3,
         _ => Icon::File,
     }
 }
