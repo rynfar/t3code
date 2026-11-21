@@ -206,6 +206,7 @@ impl UsageView {
                     cx.notify();
                 })
             },
+            window,
             cx,
         );
         let summary = self.render_summary(&merged, metric, &loading, &active, cx);

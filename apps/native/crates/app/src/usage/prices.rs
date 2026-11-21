@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*};
 use gpui_component::Sizable;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
 use t3_core::commands::method::SERVER_UPDATE_SETTINGS;
@@ -21,7 +22,9 @@ use t3_core::usage::price_overrides::{
 
 use super::UsageView;
 use super::controls::{ActionButton, ButtonSize, ButtonVariant, r};
-use crate::app_state::AppState;
+use crate::app_state::{AppState, uuid_v4};
+use crate::i18n::{t, t_fmt};
+use t3_core::i18n::IcuArg;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
@@ -60,6 +63,7 @@ struct PriceRowInputs {
     keep_field_if_blank: [bool; 4],
     /// True when the alias cell started as `"Mixed"` or `"Unavailable"`.
     keep_alias_if_blank: bool,
+    initial_alias: String,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,6 +97,8 @@ pub(super) struct PriceOverridesDialog {
     rows: Vec<PriceRowInputs>,
     next_row_id: usize,
     seed_model: Option<String>,
+    selected_ids: Option<BTreeSet<String>>,
+    read_id: String,
 }
 
 fn decode_target_settings(config: &Value) -> UsagePriceSettings {
@@ -180,7 +186,7 @@ impl PriceOverridesDialog {
         self.results.values().any(|status| matches!(status, TargetSaveStatus::Failed(_)))
     }
 
-    fn new(seed_model: Option<String>, targets: Vec<PriceTarget>) -> Self {
+    fn new(seed_model: Option<String>, targets: Vec<PriceTarget>, selected_ids: Option<BTreeSet<String>>) -> Self {
         Self {
             loading: true,
             saving: false,
@@ -191,7 +197,23 @@ impl PriceOverridesDialog {
             rows: Vec::new(),
             next_row_id: 1,
             seed_model,
+            selected_ids,
+            read_id: uuid_v4(),
         }
+    }
+
+    fn has_edits(&self, cx: &gpui::App) -> bool {
+        self.rows.iter().any(|row| {
+            row.removed
+                || row.model.as_ref().is_some_and(|model| {
+                    let model = model.read(cx).value();
+                    !model.trim().is_empty() && self.seed_model.as_deref() != Some(model.as_ref())
+                })
+                || row.alias.read(cx).value().as_ref() != row.initial_alias
+                || UsagePriceField::ALL.iter().any(|field| {
+                    row.field_input(*field).read(cx).value().as_ref() != row.initial_fields[PriceRowInputs::field_index(*field)]
+                })
+        })
     }
 
     fn push_existing_row(&mut self, model: &str, window: &mut Window, cx: &mut Context<UsageView>) {
@@ -244,6 +266,7 @@ impl PriceOverridesDialog {
             initial_fields: [in_val, out_val, cr_val, cw_val],
             keep_field_if_blank: [in_keep, out_keep, cr_keep, cw_keep],
             keep_alias_if_blank: alias_keep,
+            initial_alias: alias_val,
             _subscriptions: subscriptions,
         });
     }
@@ -294,6 +317,7 @@ impl PriceOverridesDialog {
             initial_fields: Default::default(),
             keep_field_if_blank: [false; 4],
             keep_alias_if_blank: false,
+            initial_alias: String::new(),
             _subscriptions: subscriptions,
         });
     }
@@ -390,12 +414,21 @@ impl PriceOverridesDialog {
 impl UsageView {
     pub(super) fn open_price_overrides(&mut self, seed_model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        let selected_envs = self.data.selected_envs();
-        let initial_targets: Vec<(String, String, bool)> = if selected_envs.is_empty() {
+        self.load_price_overrides(seed_model, self.data.selected_ids.clone(), window, cx);
+    }
+
+    fn load_price_overrides(
+        &mut self,
+        seed_model: Option<String>,
+        selected_ids: Option<BTreeSet<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial_targets: Vec<(String, String, bool)> = if self.data.envs.is_empty() {
             vec![(String::new(), self.data.primary_label(), true)]
         } else {
-            selected_envs
-                .into_iter()
+            self.data.envs.iter()
+                .filter(|env| selected_ids.as_ref().is_none_or(|ids| ids.contains(&env.saved_id)))
                 .map(|env| (env.saved_id.clone(), env.label.clone(), env.phase == ConnectionPhase::Connected))
                 .collect()
         };
@@ -410,7 +443,9 @@ impl UsageView {
                 unavailable: (!connected).then(|| "Offline".to_owned()),
             })
             .collect();
-        self.prices = Some(PriceOverridesDialog::new(seed_model, dialog_targets));
+        let dialog = PriceOverridesDialog::new(seed_model, dialog_targets, selected_ids);
+        let read_id = dialog.read_id.clone();
+        self.prices = Some(dialog);
 
         let active_session = self.data.active_session.as_ref();
         let jobs: Vec<_> = initial_targets
@@ -465,6 +500,9 @@ impl UsageView {
             .await;
 
             let _ = this.update_in(cx, |view, window, cx| {
+                if view.prices.as_ref().is_none_or(|dialog| dialog.read_id != read_id) {
+                    return;
+                }
                 let Some(mut dialog) = view.prices.take() else { return };
                 dialog.loading = false;
                 dialog.targets = loaded;
@@ -674,8 +712,60 @@ impl UsageView {
         cx.notify();
     }
 
+    fn price_scope_picker(&self, dialog: &PriceOverridesDialog, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.data.envs.len() < 2 {
+            return None;
+        }
+        let selected = dialog.selected_ids.clone();
+        let summary = if selected.is_none() {
+            t(cx, "All environments").to_owned()
+        } else if let [target] = dialog.targets.as_slice() {
+            target.label.clone()
+        } else {
+            t_fmt(cx, "{count, plural, one {{count} environment} other {{count} environments}}",
+                &[("count", IcuArg::Int(dialog.targets.len() as i64))])
+        };
+        let environments: Vec<_> = self.data.envs.iter().map(|env| (env.saved_id.clone(), env.label.clone())).collect();
+        let view = cx.weak_entity();
+        let seed = dialog.seed_model.clone();
+        let disabled = dialog.loading || dialog.saving || dialog.has_failed_destinations() || dialog.has_edits(cx);
+        use crate::pull_requests::controls::{Button as ScopeButton, Size as ScopeSize, Variant as ScopeVariant};
+        let trigger = ScopeButton::new("usage-price-scope", ScopeVariant::Outline, ScopeSize::Sm)
+            .label(summary).icon(Icon::ChevronDown).disabled(disabled)
+            .dropdown_menu(move |menu, _, cx| {
+                let all_view = view.clone();
+                let all_seed = seed.clone();
+                let mut menu = menu.item(PopupMenuItem::new(t(cx, "All environments"))
+                    .checked(selected.is_none())
+                    .on_click(move |_, window, cx| {
+                        let _ = all_view.update(cx, |view, cx| view.load_price_overrides(all_seed.clone(), None, window, cx));
+                    })).separator();
+                let picked: BTreeSet<_> = selected.clone().unwrap_or_else(|| environments.iter().map(|(id, _)| id.clone()).collect());
+                for (id, label) in &environments {
+                    let chosen = picked.contains(id);
+                    let mut next = picked.clone();
+                    if chosen {
+                        next.remove(id);
+                    } else {
+                        next.insert(id.clone());
+                    }
+                    let count = environments.len();
+                    let view = view.clone();
+                    let seed = seed.clone();
+                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(chosen).disabled(next.is_empty())
+                        .on_click(move |_, window, cx| {
+                            let scope = (next.len() != count).then(|| next.clone());
+                            let _ = view.update(cx, |view, cx| view.load_price_overrides(seed.clone(), scope, window, cx));
+                        }));
+                }
+                menu
+            });
+        Some(h_flex().gap(r(8.)).child(div().text_size(r(12.)).child(t(cx, "Apply to"))).child(trigger).into_any_element())
+    }
+
     pub(super) fn render_price_overrides_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.prices.as_ref()?;
+        let scope = self.price_scope_picker(dialog, cx);
         let p = palette(cx);
         let loading = dialog.loading;
         let saving = dialog.saving;
@@ -698,9 +788,27 @@ impl UsageView {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| !row.removed)
             .map(|(index, row)| {
                 let row_err = dialog.row_errors.get(&row.id).cloned();
+                if row.removed {
+                    let model = row.model.as_ref().map_or_else(|| row.fixed_model.clone(), |input| input.read(cx).value().to_string());
+                    return h_flex().gap(r(6.)).min_h(r(28.)).text_size(r(12.)).text_color(hsla(p.muted_foreground))
+                        .child(div().flex_1().truncate().child(model))
+                        .child(ActionButton::new("usage-price-undo", crate::i18n::t(cx, "Undo"), ButtonVariant::Outline, ButtonSize::Xs)
+                            .disabled(saving)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if let Some(dialog) = view.prices.as_mut()
+                                    && !dialog.saving
+                                    && let Some(row) = dialog.rows.get_mut(index)
+                                {
+                                    row.removed = false;
+                                    dialog.results.clear();
+                                    cx.notify();
+                                }
+                            })))
+                        .into_any_element();
+                }
+                let mapped = !row.alias.read(cx).value().trim().is_empty();
                 v_flex()
                     .gap(r(4.))
                     .child(
@@ -725,11 +833,12 @@ impl UsageView {
                                     .child(row.fixed_model.clone())
                                     .into_any_element(),
                             })
-                            .child(div().w(r(76.)).child(Input::new(&row.input).small()))
-                            .child(div().w(r(76.)).child(Input::new(&row.output).small()))
-                            .child(div().w(r(84.)).child(Input::new(&row.cache_read).small()))
-                            .child(div().w(r(84.)).child(Input::new(&row.cache_write).small()))
-                            .child(div().w(r(116.)).child(Input::new(&row.alias).small()))
+                            .when(!mapped, |this| this
+                                .child(div().w(r(76.)).child(Input::new(&row.input).small()))
+                                .child(div().w(r(76.)).child(Input::new(&row.output).small()))
+                                .child(div().w(r(84.)).child(Input::new(&row.cache_read).small()))
+                                .child(div().w(r(84.)).child(Input::new(&row.cache_write).small())))
+                            .child(div().w(r(if mapped { 460. } else { 116. })).child(Input::new(&row.alias).small()))
                             .child(
                                 Button::new(SharedString::from(format!("usage-price-remove-{index}")))
                                     .variant(Variant::Ghost)
@@ -816,6 +925,7 @@ impl UsageView {
                     .overflow_y_scroll()
                     .gap(r(10.))
                     .p(r(20.))
+                    .children(scope)
                     .when_some(error, |this, msg| {
                         this.child(div().text_size(r(12.)).text_color(hsla(p.destructive)).child(msg))
                     })

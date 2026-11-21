@@ -41,6 +41,8 @@ pub struct Row {
     id: ElementId,
     base: Stateful<Div>,
     icon: Option<Icon>,
+    leading: Option<AnyElement>,
+    multiline: bool,
     label: SharedString,
     trailing: Option<AnyElement>,
     chevron: bool,
@@ -54,11 +56,21 @@ pub struct Row {
 impl Row {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         let id = id.into();
-        Row { base: div().id(id.clone()), id, icon: None, label: label.into(), trailing: None, chevron: false, opens_menu: false, open: false, disabled: false, tooltip: None, on_click: None }
+        Row { base: div().id(id.clone()), id, icon: None, leading: None, multiline: false, label: label.into(), trailing: None, chevron: false, opens_menu: false, open: false, disabled: false, tooltip: None, on_click: None }
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn leading(mut self, element: impl IntoElement) -> Self {
+        self.leading = Some(element.into_any_element());
+        self
+    }
+
+    pub fn multiline(mut self) -> Self {
+        self.multiline = true;
         self
     }
 
@@ -104,8 +116,11 @@ fn row_icon(icon: Icon, cx: &App) -> impl IntoElement {
     icon.sized(px(16.)).text_color(hsla(palette(cx).muted_foreground))
 }
 
-fn row_label(label: SharedString) -> impl IntoElement {
-    div().flex_1().min_w_0().truncate().child(label)
+fn row_label(label: SharedString, multiline: bool) -> impl IntoElement {
+    div().flex_1().min_w_0()
+        .when(multiline, |el| el.line_height(px(18.)).line_clamp(2))
+        .when(!multiline, |el| el.truncate())
+        .child(label)
 }
 
 impl Styled for Row {
@@ -152,7 +167,8 @@ impl RenderOnce for Row {
             .items_center()
             .w_full()
             .min_w_0()
-            .h(px(ROW_HEIGHT))
+            .min_h(px(ROW_HEIGHT))
+            .when(self.multiline, |this| this.py(px(4.)))
             .pl(px(10.))
             .pr(px(if self.chevron { 8. } else { 10. }))
             .gap(px(10.))
@@ -171,7 +187,8 @@ impl RenderOnce for Row {
                     })
             })
             .children(self.icon.map(|icon| row_icon(icon, cx)))
-            .child(row_label(self.label))
+            .children(self.leading)
+            .child(row_label(self.label, self.multiline))
             .children(self.trailing)
             .when(self.chevron, |this| this.child(Icon::ChevronDown.sized(px(16.)).text_color(hsla(p.muted_foreground))))
             .when_some(self.tooltip, |this, text| this.tooltip(move |window, cx| tooltip_view(text.clone(), window, cx)))

@@ -1312,7 +1312,8 @@ impl PullRequestsPage {
     }
 
     pub(super) fn select(&mut self, reference: PrRef, cx: &mut Context<Self>) {
-        if self.selected.as_ref() == Some(&reference) {
+        let shared = self.state.read(cx).uses_shared_utility_panel();
+        if !shared && self.selected.as_ref() == Some(&reference) {
             return;
         }
         self.cancel_intent();
@@ -1320,8 +1321,23 @@ impl PullRequestsPage {
         let entry = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| PrRef::of(entry) == reference)).cloned();
         let env_id = self.entry_environment(&reference).map(str::to_owned);
         let state = self.state.clone();
-        let page = cx.entity().downgrade();
-        self.detail = Some(cx.new(|cx| DetailView::new_in_environment(state, page, env_id, reference.clone(), entry, cx)));
+        if shared {
+            let target = t3_core::right_panel::PullRequestTarget {
+                environment_id: env_id,
+                project_id: reference.project_id.clone(),
+                host: reference.host.clone(),
+                repository: reference.repository.clone(),
+                number: reference.number,
+                url: entry.as_ref().map(|entry| entry.url.clone()),
+                reveal_url: None,
+                detail_tab: None,
+            };
+            state.update(cx, |state, cx| state.open_utility_pull_request(target, cx));
+            self.detail = None;
+        } else {
+            let page = cx.entity().downgrade();
+            self.detail = Some(cx.new(|cx| DetailView::new_in_environment(state, page, env_id, reference.clone(), entry, cx)));
+        }
         self.selected = Some(reference);
         cx.notify();
     }
@@ -1332,14 +1348,30 @@ impl PullRequestsPage {
         let Some(reference) = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| entry.number == number)).map(PrRef::of) else { return };
         cx.remove_global::<super::SnapshotSelection>();
         self.select(reference, cx);
-        if code && let Some(detail) = &self.detail {
-            detail.update(cx, |detail, cx| detail.set_tab(super::detail::Tab::Code, cx));
+        if code {
+            if let Some(detail) = &self.detail {
+                detail.update(cx, |detail, cx| detail.set_tab(super::detail::Tab::Code, cx));
+            } else if self.state.read(cx).uses_shared_utility_panel() {
+                self.state.update(cx, |state, cx| {
+                    let key = super::PULL_REQUESTS_UTILITY_PANEL_KEY;
+                    if let Some(id) = state.panels.panels.panel(key).active_surface_id.clone() {
+                        state.set_pull_request_surface_detail_tab(key, &id, t3_core::right_panel::PullRequestDetailTab::Code, cx);
+                    }
+                });
+            }
         }
     }
 
     pub(super) fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.selected = None;
         self.detail = None;
+        if self.state.read(cx).uses_shared_utility_panel() {
+            self.state.update(cx, |state, cx| {
+                if state.panels.panels.hide(super::PULL_REQUESTS_UTILITY_PANEL_KEY) {
+                    state.save_panels(cx);
+                }
+            });
+        }
         cx.notify();
     }
 
@@ -1817,7 +1849,7 @@ impl PullRequestsPage {
             .window_control_area(WindowControlArea::Drag)
             .h(px(crate::workspace::TITLEBAR_HEIGHT))
             .flex_none()
-            .pl(px(if collapsed { 130. } else { 20. }))
+            .pl(crate::workspace::traffic_light_inset(window, collapsed))
             .pr(px(12.))
             .gap(px(12.))
             .border_b_1()

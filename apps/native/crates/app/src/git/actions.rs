@@ -13,7 +13,12 @@ use t3_core::vcs::format_diff_count;
 use super::dialogs::ActionRequest;
 use super::{GitDialogs, GitStore};
 use crate::app_state::AppState;
+use crate::components::motion::Spinner;
+use crate::i18n::{t, t_fmt};
 use crate::icons::Icon;
+use crate::thread_details::changes::Comparison;
+use t3_core::diff::{ChangedFileKind, classify_changed_file};
+use t3_core::i18n::IcuArg;
 use crate::right_panel::tooltip_view;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
@@ -105,7 +110,7 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
     if let Some(progress) = store.progress.as_ref() {
         let presentation = progress.presentation();
         let elapsed = format_elapsed(presentation.started_at_ms, now_ms());
-        let spinner = Icon::LoaderCircle.sized(px(16.)).text_color(hsla(p.muted_foreground)).into_any_element();
+        let spinner = Spinner::new("git-action-progress", px(16.), hsla(p.muted_foreground)).into_any_element();
         let fill = hsla(p.foreground).opacity(if cx.theme().is_dark() { 0.055 } else { 0.035 });
         return Some(
             h_flex()
@@ -228,7 +233,7 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
 
 /// The Changes row: line totals for the branch (or the dirty tree) beside what they compare
 /// against (`vs main` or `Uncommitted`); opens the diff panel.
-pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet: bool, cx: &App) -> Option<AnyElement> {
+pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet: bool, comparison: &Comparison, cx: &App) -> Option<AnyElement> {
     let store = git.read(cx);
     let status = store.status.as_ref();
     if status.is_some_and(|status| !status.local.is_repo) {
@@ -241,19 +246,35 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
         return None;
     }
     let p = palette(cx);
-    let resolved = resolve_changes_totals(status, None);
-    let base_label: Option<SharedString> = resolved.as_ref().map(|totals| totals.base_label().into());
+    let resolved = resolve_changes_totals(status, comparison.preview.as_ref());
+    let breakdown = comparison.preview.as_ref().map(|preview| {
+        change_breakdown(preview.files.iter().map(|file| (file.path.as_str(), file.additions, file.deletions)), cx)
+    }).or_else(|| {
+        (resolved.as_ref().is_some_and(|totals| totals.base_ref.is_none()) && status.is_some()).then(|| {
+            change_breakdown(status.into_iter().flat_map(|status| &status.local.working_tree.files)
+                .map(|file| (file.path.as_str(), file.insertions, file.deletions)), cx)
+        })
+    }).filter(|text| !text.is_empty());
+    let base_label: Option<SharedString> = resolved.as_ref().map(|totals| match &totals.base_ref {
+        Some(reference) => t_fmt(cx, "vs {ref}", &[("ref", IcuArg::Text(reference.as_str().into()))]).into(),
+        None => t(cx, "Uncommitted").into(),
+    });
     let (insertions, deletions) = resolved.map(|totals| (totals.insertions, totals.deletions)).unwrap_or((0, 0));
     let count = |sign: &str, value: u64, color: u32| {
         div().text_color(hsla(if value > 0 { color } else { p.muted_foreground })).child(format!("{sign}{}", format_diff_count(value)))
     };
     let counts = h_flex()
+        .id("git-changes-counts")
         .flex_none()
         .gap(px(6.))
         .font_family(gpui_component::ActiveTheme::theme(cx).mono_font_family.clone())
         .text_xs()
         .child(count("+", insertions, p.diff_addition_foreground))
-        .child(count("-", deletions, p.diff_deletion_foreground));
+        .child(count("-", deletions, p.diff_deletion_foreground))
+        .when_some(breakdown, |el, tip| {
+            let tooltip: SharedString = tip.into();
+            el.tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
+        });
     // "Changes" keeps its width and the base label after it truncates first, so the row draws
     // its own label: `Row`'s empty one takes no room and its gap is taken back.
     let mut content = h_flex()
@@ -261,7 +282,7 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
         .min_w_0()
         .ml(px(-10.))
         .gap(px(6.))
-        .child(div().flex_none().child("Changes"))
+        .child(div().flex_none().child(t(cx, "Changes")))
         .children(base_label.map(|label| {
             let tooltip = label.clone();
             div()
@@ -275,7 +296,11 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
                 .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
         }))
         .child(div().flex_1().min_w(px(8.)))
-        .child(counts);
+        .child(if comparison.pending && comparison.preview.is_none() {
+            Spinner::new("git-changes-loading", px(14.), hsla(p.muted_foreground)).into_any_element()
+        } else {
+            counts.into_any_element()
+        });
     content.style().flex_grow = Some(1_000_000.);
     let state = state.clone();
     let can_open = state.read(cx).selected_thread.is_some();
@@ -287,4 +312,26 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
             .on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx)))
             .into_any_element(),
     )
+}
+
+
+fn change_breakdown<'a>(files: impl Iterator<Item = (&'a str, u64, u64)>, cx: &App) -> String {
+    let mut counts = [(0, 0); 5];
+    for (path, added, removed) in files {
+        let index = match classify_changed_file(path) {
+            ChangedFileKind::Code => 0,
+            ChangedFileKind::Tests => 1,
+            ChangedFileKind::Mocks => 2,
+            ChangedFileKind::Docs => 3,
+            ChangedFileKind::Generated => 4,
+        };
+        let (additions, deletions) = &mut counts[index];
+        *additions += added;
+        *deletions += removed;
+    }
+    ["Code", "Tests", "Mocks", "Docs", "Generated"].into_iter().zip(counts)
+        .filter(|(_, (added, removed))| *added > 0 || *removed > 0)
+        .map(|(label, (added, removed))| format!("{}  +{}  −{}", t(cx, label), format_diff_count(added), format_diff_count(removed)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

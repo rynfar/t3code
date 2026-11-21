@@ -250,11 +250,18 @@ impl FrameView {
     }
 
     pub fn capture_full_png(&self) -> Option<Vec<u8>> {
-        let jpeg = self.latest_jpeg.as_ref()?;
-        let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
+        Self::encode_screenshot(self.latest_jpeg.as_deref()?).ok()
+    }
+
+    pub(super) fn screenshot_frame(&self) -> Option<Frame> {
+        self.latest_jpeg.clone()
+    }
+
+    pub(super) fn encode_screenshot(jpeg: &[u8]) -> image::ImageResult<Vec<u8>> {
+        let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?;
         let mut png = Vec::new();
-        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-        Some(png)
+        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        Ok(png)
     }
 
     /// A state the page cannot show through (host setup, refused): drawn over the empty state.

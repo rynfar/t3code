@@ -22,7 +22,9 @@ use super::detail::DetailView;
 use super::interactions;
 use crate::icons::Icon;
 use crate::right_panel::tooltip_view;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette};
+use crate::components::motion::Spinner;
+use super::controls::{anchored_picker, markdown_mode_buttons, markdown_preview};
 use crate::transcript::markdown::prose;
 
 /// The indent of one level of list nesting in a split description.
@@ -113,9 +115,26 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
     if view.description_editing {
         let input = view.ensure_description_input(window, cx);
         let saving = view.description_saves > 0;
+        let preview = view.description_preview;
+        let editor = if preview {
+            let text = input.read(cx).value().to_string();
+            markdown_preview(&text, &mut view.markdown, "pr-description-preview", cx)
+        } else {
+            Textarea::new(&input).disabled(saving).theme_slot(ThemeSlot::Input, cx).into_any_element()
+        };
+        let focus = input.clone();
         return v_flex()
             .gap(px(8.))
-            .child(Textarea::new(&input).disabled(saving))
+            .child(markdown_mode_buttons(preview, saving,
+                cx.listener(move |view, _, window, cx| {
+                    view.description_preview = false;
+                    focus.update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                }),
+                cx.listener(|view, _, _, cx| { view.description_preview = true; cx.notify(); }),
+                cx,
+            ))
+            .child(editor)
             .child(
                 h_flex()
                     .justify_end()
@@ -266,7 +285,9 @@ fn label_picker(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>
     let p = palette(cx);
     let pending = view.label_pending;
     let body: AnyElement = match &view.label_candidates {
-        None => div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("Loading labels…").into_any_element(),
+        None => h_flex().px(px(10.)).py(px(8.)).gap(px(6.)).text_xs().text_color(hsla(p.muted_foreground))
+            .child(Spinner::new("pr-labels-loading", px(12.), hsla(p.muted_foreground)))
+            .child(crate::i18n::t(cx, "Loading labels…")).into_any_element(),
         Some(Err(_)) => h_flex()
             .justify_between()
             .px(px(10.))
@@ -320,33 +341,19 @@ fn label_picker(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>
                 .into_any_element()
         }
     };
-    v_flex()
-        .gap(px(6.))
-        .child(trigger)
-        .child(
-            v_flex()
-                .w(px(260.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(hsla(p.border))
-                .bg(hsla(p.popover))
-                .p(px(6.))
-                .gap(px(4.))
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .px(px(6.))
-                        .py(px(2.))
-                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Labels"))
-                        .child(
-                            Button::new("pr-labels-done", Variant::Ghost, Size::Xs)
-                                .label("Done")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_label_picker(cx))),
-                        ),
-                )
-                .child(body),
-        )
-        .into_any_element()
+    let content = v_flex().gap(px(4.)).child(
+        h_flex().justify_between().px(px(6.)).py(px(2.))
+            .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Labels")))
+            .child(Button::new("pr-labels-done", Variant::Ghost, Size::Xs)
+                .label(crate::i18n::t(cx, "Done"))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_label_picker(cx)))),
+    ).child(body);
+    let view = cx.weak_entity();
+    anchored_picker("pr-labels-popup", trigger, content, 260., move |_, cx| {
+        let _ = view.update(cx, |view, cx| {
+            if view.label_picker_open { view.toggle_label_picker(cx); }
+        });
+    }, cx)
 }
 
 fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {

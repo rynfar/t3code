@@ -211,6 +211,7 @@ pub struct DetailView {
     _title_sub: Option<Subscription>,
     /// Inline description editor & task-checkbox draft.
     pub(super) description_editing: bool,
+    pub(super) description_preview: bool,
     description_input: Option<Entity<TextareaState>>,
     description_draft: Option<DescriptionDraft>,
     pub(super) description_saves: u32,
@@ -242,6 +243,7 @@ pub struct DetailView {
     /// Top-level comment composer (`PullRequestCommentForm`).
     comment_input: Option<Entity<TextareaState>>,
     pub(super) comment_submitting: bool,
+    pub(super) comment_preview: bool,
     pub(super) comment_close_armed: bool,
     _comment_disarm: Option<Task<()>>,
     /// Inline comment editing (`PullRequestCommentBody`).
@@ -322,6 +324,17 @@ impl DetailView {
         Self::new_with_hooks(state, WeakEntity::new_invalid(), Some(on_close), Some(on_select_pr), None, reference, entry, cx)
     }
 
+    pub(crate) fn new_embedded_in_environment(
+        state: Entity<AppState>,
+        environment: Option<String>,
+        reference: PrRef,
+        on_close: CloseHandler,
+        on_select_pr: SelectPrHandler,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_hooks(state, WeakEntity::new_invalid(), Some(on_close), Some(on_select_pr), environment, reference, None, cx)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_hooks(
         state: Entity<AppState>,
@@ -375,6 +388,7 @@ impl DetailView {
             title_input: None,
             _title_sub: None,
             description_editing: false,
+            description_preview: false,
             description_input: None,
             description_draft: None,
             description_saves: 0,
@@ -402,6 +416,7 @@ impl DetailView {
             review_summary_input: None,
             comment_input: None,
             comment_submitting: false,
+            comment_preview: false,
             comment_close_armed: false,
             _comment_disarm: None,
             editing_comment: None,
@@ -1088,6 +1103,10 @@ impl DetailView {
     /// `PullRequestLabelPicker` (`pingdotgg/t3code#37733`): toggles labels in a local draft and
     /// commits additions/removals in batches when the picker closes.
     pub(super) fn toggle_label_picker(&mut self, cx: &mut Context<Self>) {
+        if self.reviewer_picker_open && !self.label_picker_open {
+            self.reviewer_picker_open = false;
+            self.commit_reviewer_draft(cx);
+        }
         if self.label_picker_open {
             self.label_picker_open = false;
             self.commit_label_draft(cx);
@@ -1428,6 +1447,7 @@ impl DetailView {
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 14).default_value(body).placeholder("Describe this change..."));
         self.description_input = Some(input);
         self.description_editing = true;
+        self.description_preview = false;
         cx.notify();
     }
 
@@ -1488,6 +1508,10 @@ impl DetailView {
     }
 
     pub(super) fn toggle_reviewer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.label_picker_open && !self.reviewer_picker_open {
+            self.label_picker_open = false;
+            self.commit_label_draft(cx);
+        }
         if self.reviewer_picker_open {
             self.reviewer_picker_open = false;
             self.commit_reviewer_draft(cx);
@@ -2584,6 +2608,16 @@ impl Render for DetailView {
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
+            .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" { return; }
+                if view.label_picker_open {
+                    view.toggle_label_picker(cx);
+                    cx.stop_propagation();
+                } else if view.reviewer_picker_open {
+                    view.toggle_reviewer_picker(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .child(self.render_header(window, cx))
             .children(review_panel)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))

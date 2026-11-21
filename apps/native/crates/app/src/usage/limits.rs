@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, anchored, deferred, div, prelude::*, px, relative, rgba};
+use gpui::{AnyElement, App, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgba};
 use gpui_component::{h_flex, v_flex};
 use t3_core::providers::driver_label;
 use t3_core::server_config::UsageWindow;
@@ -19,7 +19,8 @@ use super::controls::{ActionButton, ButtonSize, ButtonVariant, brand_mark, drive
 use super::{SegmentKey, UsageView};
 use crate::icons::Icon;
 use crate::right_panel::{focusable, tooltip_view};
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
+use crate::i18n::t;
 
 fn pace_icon(pace: LimitPace, id: SharedString, cx: &App) -> impl IntoElement {
     let p = palette(cx);
@@ -84,6 +85,33 @@ fn account_name(account: &LimitAccount) -> AnyElement {
 
 fn segment_color(account: &LimitAccount, fallback: Hsla) -> Hsla {
     accent_rgba(account.accent_color.as_deref()).map_or(fallback, |accent| rgba(accent).into())
+}
+
+fn refill_stripes(color: Hsla) -> impl IntoElement {
+    canvas(|_, _, _| {}, move |bounds, _, window, _| {
+        let left = bounds.origin.x;
+        let right = bounds.right() - px(2.);
+        let top = bounds.origin.y + px(3.);
+        let bottom = bounds.bottom() - px(3.);
+        let height = bottom - top;
+        if right <= left || height <= px(0.) {
+            return;
+        }
+        let mut path = gpui::PathBuilder::stroke(px(1.));
+        let mut x = left;
+        while x <= right + height {
+            let y0 = top + (x - right).max(px(0.));
+            let y1 = bottom.min(top + x - left);
+            if y0 < y1 {
+                path.move_to(point(x - (y0 - top), y0));
+                path.line_to(point(x - (y1 - top), y1));
+            }
+            x += px(5.);
+        }
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color.opacity(0.2));
+        }
+    }).size_full()
 }
 
 impl UsageView {
@@ -296,6 +324,7 @@ impl UsageView {
                 .when(credits > 0, |this| this.child(h_flex().gap(r(2.)).font_weight(FontWeight::SEMIBOLD).child(icon(Icon::Ticket, 12., hsla(p.foreground))).child(credits.to_string())))
         });
         let toggle_key = key.clone();
+        let hover_key = key.clone();
         let segment = focusable(div().id(id.clone()), id.into(), true, window, cx)
             .relative()
             .flex_1()
@@ -305,8 +334,17 @@ impl UsageView {
             .bg(hsla(p.muted))
             .cursor_pointer()
             .when(open, |this| this.border_1().border_color(hsla(p.border)))
-            .tooltip(move |window, cx| tooltip_view(summary.clone(), window, cx))
+            .aria_label(summary)
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && this.segment.as_ref() != Some(&hover_key) && this.confirm_reset.is_none() {
+                    this.revealed_account_email = None;
+                    this.segment = Some(hover_key.clone());
+                    this.menu = None;
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
+                this.revealed_account_email = None;
                 this.segment = if this.segment.as_ref() == Some(&toggle_key) { None } else { Some(toggle_key.clone()) };
                 this.menu = None;
                 cx.notify();
@@ -318,7 +356,7 @@ impl UsageView {
                     .rounded(r(6.))
                     .overflow_hidden()
                     .child(div().absolute().top_0().bottom_0().left_0().w(relative(remaining as f32 / 100.)).rounded(r(6.)).bg(color.opacity(0.35)))
-                    .children(refill.map(|refill| div().absolute().top_0().bottom_0().right_0().w(relative(refill as f32 / 100.)).bg(color.opacity(0.2)))),
+                    .children(refill.map(|refill| div().absolute().top_0().bottom_0().right_0().w(relative(refill as f32 / 100.)).child(refill_stripes(color)))),
             )
             .children(time_left.map(|left| {
                 div()
@@ -440,8 +478,21 @@ impl UsageView {
         let busy = self.reset_status.as_ref().is_some_and(|(key, status)| *key == account.key && status.is_none());
         let status = self.reset_status.as_ref().filter(|(key, _)| *key == account.key).and_then(|(_, status)| status.clone());
         let can_manage = redeem.as_ref().is_some_and(|r| self.can_manage_providers_for(&r.environment_id));
+        let email = account.email.as_ref().map(|email| {
+            let key = account.key.clone();
+            let revealed = self.revealed_account_email.as_ref() == Some(&key);
+            use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+            Button::new("usage-account-email", ButtonVariant::Ghost, ButtonSize::Xs)
+            .label(if revealed { email.clone() } else { t(cx, "Show email").to_owned() })
+            .tooltip(t(cx, if revealed { "Click to hide email" } else { "Click to reveal email" }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.revealed_account_email = (!revealed).then(|| key.clone());
+                cx.notify();
+            }))
+        });
         let panel = v_flex()
             .id("usage-segment-details")
+            .relative()
             .occlude()
             .w(r(288.))
             .gap(r(10.))
@@ -450,6 +501,8 @@ impl UsageView {
             .border_1()
             .border_color(hsla(p.dropdown_border))
             .bg(hsla(p.popover))
+            .theme_slot(ThemeSlot::MenuPopup, cx)
+            .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
             .text_size(r(12.))
             .shadow(vec![gpui::BoxShadow {
                 color: gpui::black().opacity(0.55),
@@ -471,7 +524,7 @@ impl UsageView {
                             .child(if account.redeem.is_some() || account.email.is_none() { brand_mark(&account.driver, 16., hsla(p.foreground), cx) } else { account_chip(account.email.as_deref().unwrap_or("")).into_any_element() })
                             .child(div().truncate().child(account_title(account))),
                     )
-                    .children(account.email.clone().map(|email| div().text_color(hsla(p.muted_foreground)).child(email))),
+                    .children(email.map(|email| div().child(email))),
             )
             .child(
                 v_flex()

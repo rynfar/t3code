@@ -150,7 +150,9 @@ impl DeviceScreen {
         if let Some(error) = self.controls.error() {
             body.push(div().px(px(12.)).py(px(8.)).border_b_1().border_color(hsla(p.border)).bg(hsla(p.destructive).opacity(0.1)).text_xs().text_color(hsla(p.destructive)).child(error.to_owned()).into_any_element());
         } else if self.controls.detail().is_none() {
-            body.push(div().px(px(12.)).py(px(12.)).text_xs().text_color(hsla(p.muted_foreground)).child("Reading device settings…").into_any_element());
+            body.push(h_flex().px(px(12.)).py(px(12.)).gap(px(8.)).text_xs().text_color(hsla(p.muted_foreground))
+                .child(crate::components::motion::Spinner::new("device-tools-loading", px(12.), hsla(p.muted_foreground)))
+                .child(crate::i18n::t(cx, "Reading device settings…")).into_any_element());
         }
         let diagnostics: Vec<String> = self
             .devices
@@ -431,6 +433,7 @@ impl DeviceScreen {
 
         v_flex()
             .w(px(PANEL_WIDTH))
+            .max_w_full()
             .flex_shrink_0()
             .h_full()
             .min_h_0()
