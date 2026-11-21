@@ -901,3 +901,20 @@ fn remote_close_drops_observed_terminals_while_preserving_reopened_and_new_ones(
     assert!(reopen.get("t1").terminal_open);
     assert_eq!(ids(&reopen.get("t1")), ["term-1"]);
 }
+
+#[test]
+fn legacy_drawer_layout_belongs_to_one_draft_session() {
+    use crate::composer::drafts::{DraftId, DraftRef};
+
+    let first = DraftRef::legacy("project").key();
+    let second = DraftRef::new(DraftId::new("second".into()), "host", "project").key();
+    let mut layouts = TerminalLayouts::default();
+    layouts.ensure("draft:project", "first-terminal", true, Some(true));
+    layouts.ensure(&second, "second-terminal", true, Some(true));
+    let mut restored = TerminalLayouts::from_saved(layouts.saved().clone());
+
+    assert_eq!(restored.get(&first), layouts.get("draft:project"));
+    assert!(restored.get("draft:project").is_default());
+    restored.set_open(&first, false);
+    assert_eq!(restored.get(&second), layouts.get(&second));
+}

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::composer::attachments::{MAX_ATTACHMENTS, MAX_IMAGE_BYTES};
+use crate::composer::drafts::DraftRef;
 use crate::keybindings::{
     KeybindingShortcut, ResolvedKeybindingRule, format_shortcut_key_label, format_shortcut_label,
     parse_keybinding_shortcut, shortcut_conflict_key,
@@ -950,11 +951,11 @@ pub fn snap_shot_description(state: Option<&SnapShotBackendState>) -> &'static s
 // Capture target resolution & image/source helpers (`SnapShotCoordinator.tsx`, `snapShotSource.ts`)
 // ---------------------------------------------------------------------------
 
-/// `CaptureTarget` (`SnapShotCoordinator.tsx`): a draft project id, a scoped thread, or a
+/// `CaptureTarget` (`SnapShotCoordinator.tsx`): a draft session, a scoped thread, or a
 /// question attachment draft pinned to a capture id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CaptureTarget {
-    Draft { project_id: String },
+    Draft(DraftRef),
     Thread { environment_id: String, thread_id: String },
     Question { draft_id: String },
 }
@@ -962,8 +963,8 @@ pub enum CaptureTarget {
 /// Context needed to validate an existing capture target (`resolveExistingSnapShotTarget`).
 pub struct ExistingTargetLookup<'a> {
     pub route_thread: Option<(&'a str, &'a str)>,
-    pub has_draft: &'a dyn Fn(&str) -> bool,
-    pub promoted_draft_thread: &'a dyn Fn(&str) -> Option<(String, String)>,
+    pub has_draft: &'a dyn Fn(&DraftRef) -> bool,
+    pub promoted_draft_thread: &'a dyn Fn(&DraftRef) -> Option<(String, String)>,
     pub has_thread_shell: &'a dyn Fn(&str, &str) -> bool,
 }
 
@@ -976,11 +977,11 @@ pub fn resolve_existing_snapshot_target(
     lookup: &ExistingTargetLookup<'_>,
 ) -> Option<CaptureTarget> {
     match target {
-        CaptureTarget::Draft { project_id } => {
-            if let Some((environment_id, thread_id)) = (lookup.promoted_draft_thread)(project_id) {
+        CaptureTarget::Draft(draft) => {
+            if let Some((environment_id, thread_id)) = (lookup.promoted_draft_thread)(draft) {
                 return Some(CaptureTarget::Thread { environment_id, thread_id });
             }
-            (lookup.has_draft)(project_id).then(|| target.clone())
+            (lookup.has_draft)(draft).then(|| target.clone())
         }
         CaptureTarget::Thread { environment_id, thread_id } => {
             let is_current_route = lookup.route_thread
@@ -1006,7 +1007,7 @@ pub fn resolve_snapshot_attachment_target(
 ) -> CaptureTarget {
     let open_for_target = match &target {
         CaptureTarget::Thread { .. } => open_question_draft_id,
-        CaptureTarget::Draft { .. } | CaptureTarget::Question { .. } => None,
+        CaptureTarget::Draft(_) | CaptureTarget::Question { .. } => None,
     };
     pins.entry(capture_id.to_owned())
         .or_insert_with(|| open_for_target.map(str::to_owned));
@@ -1366,17 +1367,22 @@ mod tests {
 
     #[test]
     fn target_resolution_follows_draft_promotion_and_pins_question_absence() {
+        use crate::composer::drafts::DraftId;
+
+        let open = DraftRef::new(DraftId::new("open".into()), "env-1", "project");
+        let promoted = DraftRef::new(DraftId::new("promoted".into()), "env-1", "project");
+        let missing = DraftRef::new(DraftId::new("missing".into()), "env-1", "project");
         let lookup = ExistingTargetLookup {
             route_thread: Some(("env-1", "t-route")),
-            has_draft: &|project_id| project_id == "p-open",
-            promoted_draft_thread: &|project_id| {
-                (project_id == "p-promoted").then(|| ("env-1".to_owned(), "t-99".to_owned()))
+            has_draft: &|draft| draft == &open,
+            promoted_draft_thread: &|draft| {
+                (draft == &promoted).then(|| ("env-1".to_owned(), "t-99".to_owned()))
             },
             has_thread_shell: &|env, id| env == "env-1" && id == "t-shell",
         };
         assert_eq!(
             resolve_existing_snapshot_target(
-                &CaptureTarget::Draft { project_id: "p-promoted".into() },
+                &CaptureTarget::Draft(promoted.clone()),
                 &lookup
             ),
             Some(CaptureTarget::Thread {
@@ -1386,10 +1392,14 @@ mod tests {
         );
         assert_eq!(
             resolve_existing_snapshot_target(
-                &CaptureTarget::Draft { project_id: "p-missing".into() },
+                &CaptureTarget::Draft(missing),
                 &lookup
             ),
             None
+        );
+        assert_eq!(
+            resolve_existing_snapshot_target(&CaptureTarget::Draft(open.clone()), &lookup),
+            Some(CaptureTarget::Draft(open.clone()))
         );
         assert!(resolve_existing_snapshot_target(
             &CaptureTarget::Thread {

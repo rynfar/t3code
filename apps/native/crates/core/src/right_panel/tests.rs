@@ -973,3 +973,29 @@ fn issue_surface_open_title_persistence_and_reopen() {
     );
     assert_eq!(panels.active_surface("t1").map(Surface::id), Some(gh_id.as_str()));
 }
+
+#[test]
+fn legacy_panel_layout_belongs_to_one_draft_session() {
+    use crate::composer::drafts::{DraftId, DraftRef};
+
+    let legacy_key = "draft:project";
+    let first = DraftRef::legacy("project").key();
+    let second = DraftRef::new(DraftId::new("second".into()), "host", "project").key();
+    let mut saved = RightPanels::default();
+    saved.open_file(legacy_key, Some("first.rs"), None);
+    saved.set_width(legacy_key, 420.);
+    saved.open(ISSUES_PANEL_THREAD_KEY, Surface::diff());
+    saved.open_file(&second, Some("second.rs"), None);
+    saved.set_width(&second, 600.);
+
+    let mut restored = RightPanels::from_value(&serde_json::to_value(&saved).unwrap());
+    assert_eq!(restored.panel(&first), saved.panel(legacy_key));
+    assert_eq!(restored.width(&first), Some(420.));
+    assert_eq!(restored.width(legacy_key), None);
+    assert_eq!(restored.panel(ISSUES_PANEL_THREAD_KEY), saved.panel(ISSUES_PANEL_THREAD_KEY));
+
+    restored.hide(&first);
+    assert!(restored.is_open(&second));
+    assert_eq!(restored.panel(&second), saved.panel(&second));
+    assert_eq!(restored.width(&second), Some(600.));
+}

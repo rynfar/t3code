@@ -22,6 +22,21 @@ use t3_core::usage::{UsageMetric, UsagePeriod};
 
 use crate::app_state::AppState;
 
+#[cfg(test)]
+pub(crate) fn test_context() -> gpui::HeadlessAppContext {
+    static PLATFORM_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let text_system = {
+        // macOS aborts if parallel test threads initialize the platform's keyboard layout concurrently.
+        let _guard = PLATFORM_INIT.lock().unwrap();
+        gpui_platform::current_platform(true).text_system()
+    };
+    gpui::HeadlessAppContext::with_platform(
+        text_system,
+        Arc::new(crate::icons::Assets),
+        gpui_platform::current_headless_renderer,
+    )
+}
+
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
@@ -1870,7 +1885,7 @@ fn apply_sidebar_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{HeadlessAppContext, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
     use serde_json::json;
     use t3_client::environments::{EnvironmentView, FleetView};
     use t3_client::store::{SavedEnvironment, SavedEnvironments};
@@ -1880,7 +1895,7 @@ mod tests {
     use t3_core::sidebar::fleet::EnvironmentSummary;
     use t3_core::sidebar::grouping::EnvironmentOwner;
 
-    fn seed_populated_workspace(state: &Entity<AppState>, cx: &mut HeadlessAppContext) {
+    fn seed_populated_workspace(state: &Entity<AppState>, cx: &mut gpui::HeadlessAppContext) {
         let mut turn_items = Vec::new();
         for i in 0..16u64 {
             let is_user = i % 2 == 0;
@@ -2204,7 +2219,7 @@ mod tests {
     use gpui::{InteractiveElement, SharedString, StatefulInteractiveElement};
 
     fn settle_headless_and_capture(
-        cx: &mut HeadlessAppContext,
+        cx: &mut gpui::HeadlessAppContext,
         window: AnyWindowHandle,
     ) -> image::RgbaImage {
         for _ in 0..4 {
@@ -2280,11 +2295,7 @@ mod tests {
     fn offscreen_capture_retains_static_and_cached_text_after_scroll_and_refresh() {
         crate::webview::set_offscreen();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(),
-            Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         cx.allow_parking();
         let state = cx.update(|cx| crate::boot(runtime.handle().clone(), cx));
         let mut body = String::from("# Long Markdown Preview\n\n");

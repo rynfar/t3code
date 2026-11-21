@@ -44,8 +44,9 @@ impl AppState {
         let project_id = self.draft_project.as_deref()?;
         let project = self.shell.project(project_id)?;
         let cwd = project.workspace_root.clone();
+        let draft_key = self.draft_route_key()?;
         (!self.is_scratch_project(project_id) && !cwd.is_empty()).then(|| FileWorkspace {
-            thread_id: t3_core::composer::drafts::new_thread_key(project_id),
+            thread_id: draft_key,
             cwd,
             project_name: project.title.clone(),
         })
@@ -56,13 +57,17 @@ impl AppState {
     pub fn open_file(&mut self, path: &str, line: Option<u64>, cx: &mut Context<Self>) {
         let Some(workspace) = self.file_workspace() else { return };
         let target = file_surface_path(path, Some(&workspace.cwd));
-        self.mutate_panels(cx, |state, thread| state.panels.open_file(thread, target.as_deref(), line));
+        self.mutate_panels(cx, |state, thread| {
+            !Self::is_utility_panel_key(thread) && state.panels.open_file(thread, target.as_deref(), line)
+        });
     }
 
     /// The "Files" launcher entry and add-menu item.
     pub fn add_files_surface(&mut self, cx: &mut Context<Self>) {
         if self.file_workspace().is_some() {
-            self.mutate_panels(cx, |state, thread| state.panels.open_file(thread, None, None));
+            self.mutate_panels(cx, |state, thread| {
+                !Self::is_utility_panel_key(thread) && state.panels.open_file(thread, None, None)
+            });
         }
     }
 

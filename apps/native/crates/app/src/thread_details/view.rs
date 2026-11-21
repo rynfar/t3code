@@ -68,7 +68,7 @@ fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option
     let project_id = state.draft_project.as_deref()?;
     let project = state.shell.project(project_id)?;
     Some(Inputs {
-        panel_key: format!("draft:{project_id}"),
+        panel_key: state.draft_route_key()?,
         thread_id: None,
         branch: None,
         worktree_path: None,

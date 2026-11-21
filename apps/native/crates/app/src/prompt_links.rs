@@ -9,6 +9,7 @@ use crate::{
 };
 use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
+use t3_core::composer::drafts::DraftRef;
 use t3_core::prompt_links::{self as rules, NewThreadLink};
 
 impl AppState {
@@ -62,7 +63,7 @@ enum PendingTarget {
     },
     Draft {
         saved_id: String,
-        project_id: String,
+        draft: DraftRef,
         link: NewThreadLink,
     },
     PrCheckout(PendingPrCheckout),
@@ -139,8 +140,12 @@ impl PromptLinks {
                 PendingTarget::Thread { environment_id, thread_id, prompt, .. } => {
                     self.open_thread(&environment_id, &thread_id, prompt.as_ref(), window, cx);
                 }
-                PendingTarget::Draft { project_id, link, .. } => {
-                    self.open_draft(&project_id, link, window, cx);
+                PendingTarget::Draft { draft, link, .. } => {
+                    self.state.update(cx, |state, cx| {
+                        state.remember_draft(&draft, cx);
+                        state.open_saved_draft(draft, cx);
+                    });
+                    self.stage_draft_link(link, window, cx);
                 }
                 PendingTarget::PrCheckout(checkout) => {
                     self.run_pr_checkout(checkout, window, cx);
@@ -334,7 +339,8 @@ impl PromptLinks {
             if let Some(project) = active_best {
                 self.open_draft(&project, link, window, cx);
             } else if let Some((saved_id, project_id)) = fleet_best {
-                self.pending_target = Some(PendingTarget::Draft { saved_id, project_id, link });
+                let draft = self.state.update(cx, |state, cx| state.prepare_draft(&project_id, Some(&saved_id), cx));
+                self.pending_target = Some(PendingTarget::Draft { saved_id, draft, link });
                 self.process(window, cx);
                 return;
             } else {
@@ -760,6 +766,10 @@ impl PromptLinks {
     }
     fn open_draft(&mut self, project: &str, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |s, cx| s.start_draft(project, cx));
+        self.stage_draft_link(link, window, cx);
+    }
+
+    fn stage_draft_link(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
         self.fallback = None;
         let mut notes = vec![];

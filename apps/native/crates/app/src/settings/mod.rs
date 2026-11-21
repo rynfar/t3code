@@ -6,6 +6,7 @@
 
 mod about;
 mod access;
+pub(crate) use access::link_access_relay;
 mod appearance;
 pub(crate) mod theme_import;
 mod archive;

@@ -409,6 +409,10 @@ impl ClientHandle {
         crate::preview_stream::open(runtime, Arc::new(self.credentials()), target)
     }
 
+    pub fn preview_stream_read_only(&self, runtime: &tokio::runtime::Handle, target: crate::preview_stream::StreamTarget) -> crate::preview_stream::PreviewStream {
+        crate::preview_stream::open_read_only(runtime, Arc::new(self.credentials()), target)
+    }
+
     /// Opens one device's screen and input through the device hub on `runtime`. Dropping its
     /// input handle stops it.
     pub fn device_stream(&self, runtime: &tokio::runtime::Handle, target: crate::device_stream::DeviceTarget) -> crate::device_stream::DeviceStream {

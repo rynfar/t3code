@@ -1306,7 +1306,7 @@ mod calendar_tests {
 #[cfg(all(test, feature = "snapshot"))]
 mod lifecycle {
     use super::*;
-    use gpui::{AppContext, HeadlessAppContext, Keystroke, PlatformInput, size};
+    use gpui::{AppContext, Keystroke, PlatformInput, size};
     use std::sync::Arc;
     use crate::context_menu::project_filter_tests::{install_state, session};
 
@@ -1364,7 +1364,7 @@ mod lifecycle {
         let out = std::path::PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer);
+        let mut cx = crate::snapshot::test_context();
         let (state, mut fixture) = cx.update(|cx| {
             let (state, fixture) = install_state(cx, runtime.handle().clone());
             crate::composer::init(cx);
@@ -1393,17 +1393,17 @@ mod lifecycle {
         let flow = flow.unwrap();
         let (menu, dialog, outside) = handles.unwrap();
         let mut records = Vec::new();
-        let draw = |cx: &mut HeadlessAppContext| {
+        let draw = |cx: &mut gpui::HeadlessAppContext| {
             cx.update_window(window.into(), |_, window, cx| accommodate(&dialog, window, cx)).unwrap();
             flow.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
             cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
         };
-        let frame = |cx: &mut HeadlessAppContext, name: &str| {
+        let frame = |cx: &mut gpui::HeadlessAppContext, name: &str| {
             draw(cx);
             cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();
         };
-        let edit = |cx: &mut HeadlessAppContext, f: &mut dyn FnMut(&mut Window, &mut App)| {
+        let edit = |cx: &mut gpui::HeadlessAppContext, f: &mut dyn FnMut(&mut Window, &mut App)| {
             let was_pending = dialog.read_with(cx, |d, _| d.pending.is_some());
             let dialog = dialog.clone();
             cx.update_window(window.into(), |_, win, cx| {

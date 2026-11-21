@@ -1005,8 +1005,7 @@ mod tests {
 
     #[test]
     fn production_working_shelf_control() {
-        use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
-        use std::sync::Arc;
+        use gpui::{AppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
         use t3_core::sidebar::{Section, Shelf, fleet::ScopedSidebarRow, tag_filter::ThreadKey};
 
         let Some(out) = std::env::var_os("T3_WORKING_CAPTURE") else { return };
@@ -1032,10 +1031,7 @@ mod tests {
             }
         }
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         cx.allow_parking();
         let (state, mut active_fixture) = cx.update(|cx| {
             let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
@@ -1095,7 +1091,7 @@ mod tests {
             state.rebuild_sidebar(cx);
         });
         let route = state.read_with(&cx, |state, _| (state.environments.active.clone(), state.selected_thread.clone(), state.draft_project.clone()));
-        let assert_sidebar = |cx: &HeadlessAppContext, enabled: bool| {
+        let assert_sidebar = |cx: &gpui::HeadlessAppContext, enabled: bool| {
             state.read_with(cx, |state, cx| {
                 assert_eq!(client(cx).working_shelf(), enabled);
                 assert!(error(cx).is_none());
@@ -1118,7 +1114,7 @@ mod tests {
             let pane = cx.new(|cx| crate::sidebar::SidebarPane::new(state.clone(), composer, menu.clone(), dialog.clone(), snooze.clone(), window, cx));
             cx.new(|_| WorkingFrame { pane, menu, dialog, snooze })
         }).unwrap();
-        let capture = |cx:&mut HeadlessAppContext, name:&str| {
+        let capture = |cx:&mut gpui::HeadlessAppContext, name:&str| {
             cx.run_until_parked();
             cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
             cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();

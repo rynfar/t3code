@@ -835,7 +835,7 @@ impl Composer {
         state
             .selected_thread
             .clone()
-            .or_else(|| state.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))
+            .or_else(|| state.draft_route_key())
     }
 
     fn record_composer_focus(&self, cx: &mut App) {

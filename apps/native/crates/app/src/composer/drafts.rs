@@ -27,6 +27,15 @@ struct SharedDraftStore {
 
 impl gpui::Global for SharedDraftStore {}
 
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn install_test_drafts(value: &serde_json::Value, cx: &mut gpui::App) {
+    cx.set_global(SharedDraftStore {
+        loaded: true,
+        store: DraftStore::from_value(Some(value)),
+        save: None,
+    });
+}
+
 fn load_shared_store(cx: &mut gpui::App) -> DraftStore {
     let loaded = cx.default_global::<SharedDraftStore>().loaded;
     if !loaded {

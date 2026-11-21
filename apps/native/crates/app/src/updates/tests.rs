@@ -1,5 +1,5 @@
 use super::*;
-use gpui::{FocusHandle, HeadlessAppContext, TestAppContext};
+use gpui::{FocusHandle, TestAppContext};
 use serde_json::json;
 use std::sync::Arc;
 use t3_client::store::{SavedEnvironment, SavedEnvironments};
@@ -78,11 +78,7 @@ async fn install_env(
 #[test]
 fn disconnected_saved_environment_uses_saved_label() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_platform::current_platform(true).text_system(),
-        Arc::new(crate::icons::Assets),
-        gpui_platform::current_headless_renderer,
-    );
+    let mut cx = crate::snapshot::test_context();
     cx.allow_parking();
     let (state, _fixture) = cx.update(|cx| {
         crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
@@ -1170,11 +1166,7 @@ fn production_update_dialog_checking_frame() {
     let out = std::path::PathBuf::from(out);
     std::fs::create_dir_all(&out).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_platform::current_platform(true).text_system(),
-        Arc::new(crate::icons::Assets),
-        gpui_platform::current_headless_renderer,
-    );
+    let mut cx = crate::snapshot::test_context();
     let state = cx.update(|cx| {
         cx.set_global(
             serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({

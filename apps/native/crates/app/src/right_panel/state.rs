@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use gpui::{App, Context, PromptLevel, Window};
 use serde_json::json;
 use t3_client::store;
+use t3_core::composer::drafts::migrate_legacy_owner_keys;
 use t3_core::diff::{DiffSelection, TurnDiffSummary};
 use t3_core::preview::{self, SessionSnapshot};
 use t3_core::right_panel::{
@@ -48,10 +49,14 @@ impl PanelState {
     pub fn load(environment: Option<&str>) -> PanelState {
         let shared = store::load_ui_state(STORE);
         let scoped = environment.and_then(|environment| store::load_ui_state(&environment_store(environment)));
+        let mut diff_selections = decode_lenient_map(scoped.as_ref().and_then(|value| value.get("diffSelections")));
+        let mut branch_base_refs = decode_lenient_map(scoped.as_ref().and_then(|value| value.get("branchBaseRefs")));
+        migrate_legacy_owner_keys(&mut diff_selections);
+        migrate_legacy_owner_keys(&mut branch_base_refs);
         PanelState {
             panels: scoped.as_ref().and_then(|value| value.get("panels")).map(RightPanels::from_value).unwrap_or_default(),
-            diff_selections: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("diffSelections"))),
-            branch_base_refs: decode_lenient_map(scoped.as_ref().and_then(|value| value.get("branchBaseRefs"))),
+            diff_selections,
+            branch_base_refs,
             diff_file_tree_open: shared.as_ref().and_then(|value| value.get("diffFileTreeOpen")).and_then(serde_json::Value::as_bool).unwrap_or(false),
             explicit_diff_open: None,
             environment: environment.map(str::to_owned),
@@ -90,7 +95,7 @@ impl AppState {
         }
         self.selected_thread
             .clone()
-            .or_else(|| self.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))
+            .or_else(|| self.draft_route_key())
     }
 
     /// Emits and persists after a change. When the diff became visible without an explicit

@@ -217,7 +217,7 @@ impl Render for MenuFrame {
 
 #[test]
 fn production_menu_frames() {
-    use gpui::{AppContext, HeadlessAppContext, Keystroke, PlatformInput, size};
+    use gpui::{AppContext, Keystroke, PlatformInput, size};
     use serde_json::json;
     let Some(out) = std::env::var_os("T3_MENU_CAPTURE") else {
         return;
@@ -225,11 +225,7 @@ fn production_menu_frames() {
     let out = std::path::PathBuf::from(out);
     std::fs::create_dir_all(&out).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_platform::current_platform(true).text_system(),
-        std::sync::Arc::new(crate::icons::Assets),
-        gpui_platform::current_headless_renderer,
-    );
+    let mut cx = crate::snapshot::test_context();
     cx.allow_parking();
     let (state, mut fixture) = cx.update(|cx| {
         let installed = project_filter_tests::install_state(cx, runtime.handle().clone());
@@ -277,7 +273,7 @@ fn production_menu_frames() {
         })
         .unwrap();
     let (menu, outside) = handles.unwrap();
-    let capture = |cx: &mut HeadlessAppContext, name: &str| {
+    let capture = |cx: &mut gpui::HeadlessAppContext, name: &str| {
         cx.run_until_parked();
         cx.update_window(window.into(), |_, window, cx| {
             window.refresh();
@@ -436,15 +432,11 @@ fn production_menu_frames() {
 }
 
 #[test]
-fn branch_menu_preserves_an_open_draft_and_its_restored_workspace() {
-    use gpui::{HeadlessAppContext, size};
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_platform::current_platform(true).text_system(),
-        std::sync::Arc::new(crate::icons::Assets),
-        gpui_platform::current_headless_renderer,
-    );
+fn branch_menu_opens_a_fresh_draft_and_preserves_the_original_prompt() {
+    use gpui::size;
+    let mut cx = gpui::TestAppContext::single();
     use gpui::AppContext;
-    cx.allow_parking();
+    cx.executor().allow_parking();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (state, mut fixture) = cx.update(|cx| {
         let installed = project_filter_tests::install_state(cx, runtime.handle().clone());
@@ -452,22 +444,25 @@ fn branch_menu_preserves_an_open_draft_and_its_restored_workspace() {
         crate::keymap::init(cx);
         installed
     });
-    cx.update(|_cx| t3_client::store::save_ui_state(t3_core::composer::drafts::STORE_NAME, &serde_json::json!({"version":1, "drafts":{"draft:checkout-b":{"prompt":"Keep this draft", "updatedAt":1}}})));
     state.update(&mut cx, |state, cx| state.start_draft("checkout-b", cx));
+    let original = state.read_with(&cx, |state, _| state.active_draft().expect("original draft"));
     let mut handles = None;
     let window = cx
         .open_window(size(px(720.), px(760.)), |window, cx| {
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
             handles = Some((composer, menu.clone()));
-            cx.new(|cx| MenuFrame {
+            MenuFrame {
                 menu,
                 outside: cx.focus_handle(),
                 guest: None,
-            })
-        })
-        .unwrap();
+            }
+        });
     let (composer, menu) = handles.unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        composer.update(cx, |composer, cx| composer.set_test_prompt("Keep this draft", window, cx));
+    })
+    .unwrap();
     for path in [None, Some("/fixture/worktree")] {
         state.update(&mut cx, |state, cx| {
             let thread = state
@@ -491,7 +486,10 @@ fn branch_menu_preserves_an_open_draft_and_its_restored_workspace() {
         })
         .unwrap();
         let audit = composer.read_with(&cx, |composer, cx| composer.snapshot_audit(0, cx));
-        assert_eq!(audit["prompt"], "Keep this draft");
+        assert_eq!(audit["prompt"], "");
+        let current = state.read_with(&cx, |state, _| state.active_draft().expect("branch draft"));
+        assert_eq!(current.project_id, original.project_id);
+        assert_ne!(current, original);
         let choice: t3_core::workspace::DraftWorkspace =
             serde_json::from_value(audit["workspace"].clone()).unwrap();
         assert_eq!(choice.branch.as_deref(), Some("feature/captured"));
@@ -519,6 +517,8 @@ fn branch_menu_preserves_an_open_draft_and_its_restored_workspace() {
             assert!(state.selected_thread.is_none());
         });
     }
+    state.update(&mut cx, |state, cx| state.open_saved_draft(original, cx));
+    assert_eq!(composer.read_with(&cx, |composer, cx| composer.test_prompt(cx)), "Keep this draft");
     assert!(
         !fixture.take_commands().iter().any(|method| matches!(
             *method,
@@ -527,12 +527,18 @@ fn branch_menu_preserves_an_open_draft_and_its_restored_workspace() {
         "opening a branch draft never launches a turn"
     );
     state.update(&mut cx, |state, _| state.stop_pump());
+    drop(composer);
+    drop(menu);
+    drop(state);
+    cx.quit();
+    cx.update(|cx| cx.clear_globals());
+    cx.run_until_parked();
 }
 
 #[test]
 fn restored_menu_seed_never_falls_through_launch_defaults() {
     use futures::{FutureExt, select};
-    use gpui::{AppContext, HeadlessAppContext, size};
+    use gpui::{AppContext, size};
     use serde_json::json;
     for mode in [
         "entry-environment",
@@ -549,12 +555,8 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
             continue;
         }
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(),
-            std::sync::Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
-        cx.allow_parking();
+        let mut cx = gpui::TestAppContext::single();
+        cx.executor().allow_parking();
         let executor = cx.update(|cx| cx.foreground_executor().clone());
         let (state, mut fixture) = cx.update(|cx| {
             let installed = project_filter_tests::install_state(cx, runtime.handle().clone());
@@ -569,12 +571,10 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
         } else {
             workspace
         };
-        t3_client::store::save_ui_state(
-            t3_core::composer::drafts::STORE_NAME,
+        cx.update(|cx| crate::composer::drafts::install_test_drafts(
             &json!({"version":1,"drafts":{"draft:checkout-b":{"prompt":"Keep restored draft", "workspace":workspace, "updatedAt":1}}}),
-        );
-        runtime.block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
-            .expect("fixture writer barrier task").expect("fixture drafts committed before Composer reads them");
+            cx,
+        ));
         state.update(&mut cx, |state, cx| {
             let config = state.server_config.config.as_mut().unwrap();
             config.providers = vec![serde_json::from_value(json!({"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready","models":[{"slug":"replay","name":"Replay","isDefault":true}]})).unwrap()];
@@ -584,7 +584,7 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
                 if mode.ends_with("environment") { config.environment.environment_id = "replacement".into(); }
                 else { state.shell.snapshot.as_mut().unwrap().projects.iter_mut().find(|project| project.id == "checkout-b").unwrap().created_at = "replacement".into(); }
             }
-            state.start_draft("checkout-b", cx);
+            state.open_saved_draft(t3_core::composer::drafts::DraftRef::legacy("checkout-b"), cx);
         });
         let mut composer = None;
         let window = cx
@@ -592,13 +592,12 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
                 composer =
                     Some(cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx)));
                 let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
-                cx.new(|cx| MenuFrame {
+                MenuFrame {
                     menu,
                     outside: cx.focus_handle(),
                     guest: None,
-                })
-            })
-            .unwrap();
+                }
+            });
         let composer = composer.unwrap();
         let (send, done) = tokio::sync::oneshot::channel();
         let mut send = Some(send);
@@ -692,6 +691,12 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
                 .contains(&t3_core::commands::method::LAUNCH_THREAD)
         );
         state.update(&mut cx, |state, _| state.stop_pump());
+        drop(_observer);
+        drop(composer);
+        drop(state);
+        cx.quit();
+        cx.update(|cx| cx.clear_globals());
+        cx.run_until_parked();
     }
 }
 
@@ -750,6 +755,7 @@ async fn archive_completion_preserves_undo_after_the_shell_removes_its_row(
 
 #[gpui::test]
 fn scoped_menu_keeps_background_owner_and_rejects_same_id_replacement(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
     use std::sync::Arc;
     use t3_core::sidebar::fleet::EnvironmentSummary;
     use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer};

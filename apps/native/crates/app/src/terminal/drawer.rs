@@ -124,17 +124,23 @@ pub(crate) fn terminal_location(state: &AppState, thread_id: &str, terminal_id: 
     if let Some(drawer) = cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade()) {
         return drawer.read(cx).location_with_state(state, thread_id, terminal_id);
     }
-    let (root, thread_worktree) = if let Some(thread) = state.thread_shell(thread_id) {
-        (&state.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref())
-    } else {
-        let project_id = thread_id.strip_prefix("draft:")?;
-        let project = state.shell.project(project_id)?;
-        if project.workspace_root.is_empty() {
-            return None;
-        }
-        (&project.workspace_root, None)
-    };
-    Some(LaunchLocation::new(root, thread_worktree))
+    let (root, worktree) = terminal_workspace(state, thread_id)?;
+    Some(LaunchLocation::new(root, worktree))
+}
+
+fn terminal_workspace<'a>(state: &'a AppState, owner: &str) -> Option<(&'a str, Option<&'a str>)> {
+    if AppState::is_utility_panel_key(owner) {
+        return None;
+    }
+    if let Some(thread) = state.thread_shell(owner) {
+        return Some((&state.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref()));
+    }
+    let draft = t3_core::composer::drafts::DraftRef::from_key(owner)?;
+    if draft.environment_id.as_deref().is_some_and(|environment| state.environments.active.as_deref() != Some(environment)) {
+        return None;
+    }
+    let root = &state.shell.project(&draft.project_id)?.workspace_root;
+    (!root.is_empty()).then_some((root, None))
 }
 
 pub(crate) fn allocate_panel_terminal_id(state: &AppState, thread_id: &str, cx: &App) -> String {
@@ -266,6 +272,12 @@ impl TerminalDrawer {
         drawer
     }
 
+    pub(crate) fn has_saved_layout(key: &str, cx: &App) -> bool {
+        cx.try_global::<ActiveDrawer>()
+            .and_then(|active| active.0.upgrade())
+            .is_some_and(|drawer| drawer.read(cx).layouts.saved().contains_key(key))
+    }
+
     pub(crate) fn is_active(cx: &App) -> bool {
         active_drawer(cx).is_some()
     }
@@ -287,7 +299,7 @@ impl TerminalDrawer {
         state
             .selected_thread
             .clone()
-            .or_else(|| state.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))
+            .or_else(|| state.draft_route_key())
     }
 
     pub(super) fn layout(&self, cx: &App) -> Option<(String, ThreadTerminalLayout)> {
@@ -551,16 +563,7 @@ impl TerminalDrawer {
     }
 
     fn location_with_state(&self, app: &AppState, thread_id: &str, terminal_id: Option<&str>) -> Option<LaunchLocation> {
-        let (root, thread_worktree) = if let Some(thread) = app.thread_shell(thread_id) {
-            (&app.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref())
-        } else {
-            let project_id = thread_id.strip_prefix("draft:")?;
-            let project = app.shell.project(project_id)?;
-            if project.workspace_root.is_empty() {
-                return None;
-            }
-            (&project.workspace_root, None)
-        };
+        let (root, thread_worktree) = terminal_workspace(app, thread_id)?;
         let known = terminal_id.and_then(|id| self.summary(thread_id, id)).filter(|summary| !summary.cwd.is_empty());
         Some(match known {
             Some(summary) => LaunchLocation {
@@ -955,12 +958,13 @@ mod focus_tests {
             assert_eq!(TerminalDrawer::last_focus_for_test("sibling", cx), Some(LastThreadFocus::Composer));
         });
 
-        // 5. Draft thread entry focuses composer and tracks focus under `draft:checkout-a`.
+        // 5. Draft entry focuses the composer and records focus for that draft session.
         state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             assert!(composer.read(cx).has_focus(window, cx));
-            assert_eq!(TerminalDrawer::last_focus_for_test("draft:checkout-a", cx), Some(LastThreadFocus::Composer));
+            let draft = state.read(cx).draft_route_key().expect("active draft");
+            assert_eq!(TerminalDrawer::last_focus_for_test(&draft, cx), Some(LastThreadFocus::Composer));
         });
 
         // 6. Optional `confirmTerminalClose = false` (`pingdotgg/t3code#35305`) closes immediately

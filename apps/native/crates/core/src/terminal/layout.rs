@@ -454,7 +454,8 @@ pub struct TerminalLayouts {
 
 impl TerminalLayouts {
     /// Restores saved layouts, normalizing each and dropping threads left at the defaults.
-    pub fn from_saved(by_thread: HashMap<String, ThreadTerminalLayout>) -> Self {
+    pub fn from_saved(mut by_thread: HashMap<String, ThreadTerminalLayout>) -> Self {
+        crate::composer::drafts::migrate_legacy_owner_keys(&mut by_thread);
         let by_thread = by_thread
             .into_iter()
             .filter(|(thread_id, _)| !thread_id.is_empty())

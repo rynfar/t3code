@@ -382,13 +382,8 @@ impl Details {
     }
 }
 
-pub(crate) fn panel_key_for(selected_thread: Option<&str>, draft_project: Option<&str>) -> Option<String> {
-    selected_thread.map(str::to_owned).or_else(|| draft_project.map(|id| format!("draft:{id}")))
-}
-
-/// The active card target key: the selected thread id, or `draft:<project_id>` for a project draft.
 pub fn panel_key(state: &AppState) -> Option<String> {
-    panel_key_for(state.selected_thread.as_deref(), state.draft_project.as_deref())
+    state.selected_thread.clone().or_else(|| state.draft_route_key())
 }
 
 /// The open thread or draft's effective project scripts: the shell's, as server settings override
@@ -583,12 +578,5 @@ mod tests {
         assert_eq!(available_height_for(900., 280., 0.), 520.);
         assert_eq!(available_height_for(900., 0., 48.), 752.);
         assert_eq!(available_height_for(200., 280., 0.), 0.);
-    }
-
-    #[test]
-    fn panel_key_covers_selected_threads_and_project_drafts() {
-        assert_eq!(panel_key_for(Some("thread-1"), Some("proj-1")), Some("thread-1".to_owned()));
-        assert_eq!(panel_key_for(None, Some("proj-1")), Some("draft:proj-1".to_owned()));
-        assert_eq!(panel_key_for(None, None), None);
     }
 }

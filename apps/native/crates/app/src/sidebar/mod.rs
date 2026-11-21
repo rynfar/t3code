@@ -2178,9 +2178,8 @@ mod snooze_grant_tests {
 #[cfg(all(test, feature = "snapshot"))]
 mod grouping_frames {
     use super::*;
-    use gpui::{AppContext, HeadlessAppContext, Render, size};
+    use gpui::{AppContext, Render, size};
     use serde_json::json;
-    use std::sync::Arc;
     use t3_client::supervisor::{ClientFixture, ConnectionStatus};
     use t3_core::sidebar::fleet::ScopedSidebarRow;
     use t3_core::sidebar::grouping::GroupConsumer;
@@ -2208,10 +2207,7 @@ mod grouping_frames {
         let out = std::path::PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         cx.allow_parking();
         let (state, mut active_fixture) = cx.update(|cx| {
             let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
@@ -2311,7 +2307,7 @@ mod grouping_frames {
         reply.send(Ok(json!({"isRepo":false,"refs":[]}))).unwrap();
         let setup_commands = vec![method, refs_method];
         cx.run_until_parked();
-        let click = |cx:&mut HeadlessAppContext, x:f32, y:f32| {
+        let click = |cx:&mut gpui::HeadlessAppContext, x:f32, y:f32| {
             cx.update_window(window.into(), |_, window, cx| {
                 let position = gpui::point(px(x), px(y));
                 window.simulate_mouse_move(position, cx);
@@ -2319,14 +2315,14 @@ mod grouping_frames {
                 window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button:gpui::MouseButton::Left, position, modifiers:Default::default(), click_count:1 }), cx);
             }).unwrap();
         };
-        let press_key = |cx:&mut HeadlessAppContext, key:&str| {
+        let press_key = |cx:&mut gpui::HeadlessAppContext, key:&str| {
             let keystroke = gpui::Keystroke::parse(key).unwrap();
             cx.update_window(window.into(), |_, window, cx| {
                 window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke:keystroke.clone(), is_held:false, prefer_character_input:false }), cx);
                 window.dispatch_event(gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
             }).unwrap();
         };
-        let capture = |cx:&mut HeadlessAppContext, name:&str| {
+        let capture = |cx:&mut gpui::HeadlessAppContext, name:&str| {
             cx.run_until_parked();
             cx.update_window(window.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(); }).unwrap();
             cx.capture_screenshot(window.into()).unwrap().save(out.join(format!("{name}.png"))).unwrap();
@@ -3188,6 +3184,7 @@ mod sb_sections_pane_tests {
         state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
         vcx.run_until_parked();
         let first = state.read_with(vcx, |state, _| state.active_draft().unwrap());
+        state.update(vcx, |state, cx| state.open_file("first.rs", None, cx));
         vcx.update(|window, cx| {
             composer.update(cx, |composer, cx| composer.set_test_prompt("First draft", window, cx));
             window.draw(cx).clear();
@@ -3203,6 +3200,12 @@ mod sb_sections_pane_tests {
         assert_ne!(first.id, second.id);
         state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
         assert_eq!(state.read_with(vcx, |state, _| state.active_draft()), Some(second.clone()));
+        state.update(vcx, |state, cx| {
+            let key = state.panel_thread().expect("second draft's panel key");
+            assert_eq!(key, second.key());
+            assert!(!state.panels.panels.is_open(&key));
+            state.open_file("second.rs", None, cx);
+        });
         vcx.update(|window, cx| {
             assert_eq!(composer.read(cx).test_prompt(cx), "");
             composer.update(cx, |composer, cx| composer.set_test_prompt("Second draft", window, cx));
@@ -3218,6 +3221,13 @@ mod sb_sections_pane_tests {
         vcx.run_until_parked();
         assert_eq!(state.read_with(vcx, |state, _| state.active_draft()), Some(first.clone()));
         assert_eq!(composer.read_with(vcx, |composer, cx| composer.test_prompt(cx)), "First draft");
+        state.read_with(vcx, |state, _| {
+            let key = state.panel_thread().expect("first draft's panel key");
+            assert_eq!(key, first.key());
+            let panel = state.panels.panels.panel(&key);
+            assert_eq!(panel.surfaces.len(), 1);
+            assert_eq!(panel.active(), Some(&t3_core::right_panel::Surface::file("first.rs", None, 1)));
+        });
 
         vcx.update(|window, cx| pane.update(cx, |pane, cx| pane.discard_draft(&first, window, cx)));
         vcx.run_until_parked();
