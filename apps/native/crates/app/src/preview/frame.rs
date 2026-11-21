@@ -13,7 +13,7 @@ use std::time::Duration;
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Corners, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement,
-    PathPromptOptions, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Task, Window, canvas, div, point, prelude::*, px, size,
+    PathPromptOptions, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Task, WeakEntity, Window, canvas, div, point, prelude::*, px, size,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -52,21 +52,84 @@ pub enum FrameEvent {
     CancelPick,
 }
 
-struct Decoded {
+// Metal packs adjacent sprites with zero padding.
+const FRAME_GUTTER: u32 = 2;
+
+pub(super) struct Decoded {
     image: Arc<RenderImage>,
     size: (u32, u32),
     jpeg: Frame,
 }
 
+fn pad_frame(image: &image::RgbaImage) -> image::RgbaImage {
+    let (width, height) = image.dimensions();
+    image::RgbaImage::from_fn(width + 2 * FRAME_GUTTER, height + 2 * FRAME_GUTTER, |x, y| {
+        let [r, g, b, a] = image.get_pixel(
+            x.saturating_sub(FRAME_GUTTER).min(width - 1),
+            y.saturating_sub(FRAME_GUTTER).min(height - 1),
+        ).0;
+        image::Rgba([b, g, r, a])
+    })
+}
+
 fn decode(bytes: Frame) -> Option<Decoded> {
-    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?;
-    let size = (image.width(), image.height());
-    let mut pixels = image.into_rgba8();
-    // GPUI's atlas takes BGRA.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?.into_rgba8();
+    let size = image.dimensions();
+    let pixels = pad_frame(&image);
     Some(Decoded { image: Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])), size, jpeg: bytes })
+}
+
+pub(super) fn decode_frames(
+    runtime: &tokio::runtime::Handle,
+    mut frames: tokio::sync::watch::Receiver<Option<Frame>>,
+) -> (Abort, tokio::sync::watch::Receiver<Option<Arc<Decoded>>>) {
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    let decoder = runtime.spawn(async move {
+        while frames.changed().await.is_ok() {
+            let Some(bytes) = frames.borrow_and_update().clone() else { continue };
+            let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(bytes)).await else { continue };
+            if tx.send(Some(Arc::new(image))).is_err() {
+                return;
+            }
+        }
+    });
+    (Abort(decoder), rx)
+}
+
+#[derive(Default)]
+pub(super) struct FrameImages {
+    current: Option<Arc<Decoded>>,
+    // Keep the previous atlas tile until its replacement has had a chance to paint.
+    retired: Option<Arc<RenderImage>>,
+}
+
+impl FrameImages {
+    pub(super) fn replace(&mut self, frame: Arc<Decoded>, cx: &mut App) {
+        if let Some(stale) = self.retired.take() {
+            cx.drop_image(stale, None);
+        }
+        self.retired = self.current.replace(frame).map(|old| old.image.clone());
+    }
+
+    pub(super) fn clear(&mut self, cx: &mut App) {
+        for image in [self.current.take().map(|old| old.image.clone()), self.retired.take()].into_iter().flatten() {
+            cx.drop_image(image, None);
+        }
+    }
+
+    pub(super) fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let Some(frame) = &self.current else { return };
+        let box_size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
+        let Some(fit) = fit(box_size, frame.size) else { return };
+        let visible = Bounds::new(bounds.origin + point(px(fit.left as f32), px(fit.top as f32)), size(px(fit.width as f32), px(fit.height as f32)));
+        let pad_x = visible.size.width * (FRAME_GUTTER as f32 / frame.size.0 as f32);
+        let pad_y = visible.size.height * (FRAME_GUTTER as f32 / frame.size.1 as f32);
+        let padded = Bounds::new(
+            visible.origin - point(pad_x, pad_y),
+            size(visible.size.width + 2. * pad_x, visible.size.height + 2. * pad_y),
+        );
+        let _ = window.paint_image_fitted(visible, padded, Corners::default(), frame.image.clone(), 0, false);
+    }
 }
 
 /// The open connection; dropping it closes the socket and stops decoding.
@@ -79,18 +142,17 @@ struct Live {
 
 pub struct FrameView {
     state: Entity<AppState>,
-    previews: Entity<Previews>,
+    previews: WeakEntity<Previews>,
     thread_id: String,
     tab_id: String,
     focus: FocusHandle,
     visible: bool,
     follow_size: bool,
+    floating: bool,
+    relocated: bool,
     live: Option<Live>,
-    image: Option<Arc<RenderImage>>,
+    images: FrameImages,
     latest_jpeg: Option<Frame>,
-    /// The frame before `image`, freed once the next one replaces it so the atlas never drops a
-    /// tile the last drawn scene still uses.
-    retired: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
     viewport: Option<Viewport>,
     control: Option<Control>,
@@ -160,23 +222,22 @@ fn modifier_bits(held: &gpui::Modifiers) -> u8 {
 impl FrameView {
     pub fn new(state: Entity<AppState>, previews: Entity<Previews>, thread_id: String, tab_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.on_release(|this: &mut FrameView, cx| {
-            for image in [this.image.take(), this.retired.take()].into_iter().flatten() {
-                cx.drop_image(image, None);
-            }
+            this.images.clear(cx);
         })
         .detach();
         FrameView {
             state,
-            previews,
+            previews: previews.downgrade(),
             thread_id,
             tab_id,
             focus: cx.focus_handle(),
             visible: false,
             follow_size: true,
+            floating: false,
+            relocated: false,
             live: None,
-            image: None,
+            images: FrameImages::default(),
             latest_jpeg: None,
-            retired: None,
             frame_size: (0, 0),
             viewport: None,
             control: None,
@@ -209,7 +270,7 @@ impl FrameView {
     }
 
     pub fn has_frame(&self) -> bool {
-        self.image.is_some()
+        self.images.current.is_some()
     }
 
     pub fn frames_stalled(&self) -> bool {
@@ -229,6 +290,23 @@ impl FrameView {
                 self.send_resize();
             }
         }
+    }
+
+    pub(super) fn relocate(&mut self, floating: bool, follow_size: bool) {
+        self.floating = floating;
+        self.relocated = true;
+        self.bounds = None;
+        self.resize_task = None;
+        self.cap_task = None;
+        self.sent_size = None;
+        self.set_follow_size(follow_size);
+    }
+
+    pub(super) fn aspect_ratio(&self) -> f32 {
+        self.viewport
+            .filter(|viewport| viewport.width > 0. && viewport.height > 0.)
+            .map(|viewport| (viewport.width / viewport.height) as f32)
+            .unwrap_or(1.6)
     }
 
     pub fn set_pick_mode(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -293,7 +371,9 @@ impl FrameView {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
-        if !self.visible || self.gone || self.refused || self.host_setup.is_some() || self.live.is_some() {
+        if !self.visible || self.gone || self.refused || self.host_setup.is_some() || self.live.is_some()
+            || AppState::is_utility_panel_key(&self.thread_id)
+        {
             return;
         }
         let Some((max_width, max_height)) = self.cap else { return };
@@ -301,21 +381,12 @@ impl FrameView {
         let Some(client) = state.client_handle() else { return };
         let runtime = state.runtime().clone();
         let target = StreamTarget { thread_id: self.thread_id.clone(), tab_id: self.tab_id.clone(), max_width, max_height };
-        let PreviewStream { input, mut frames, mut events } = client.preview_stream(&runtime, target);
-        let (decoded_tx, mut decoded) = tokio::sync::watch::channel::<Option<Arc<Decoded>>>(None);
-        let decoder = runtime.spawn(async move {
-            while frames.changed().await.is_ok() {
-                let Some(bytes): Option<Frame> = frames.borrow_and_update().clone() else { continue };
-                let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(bytes)).await else { continue };
-                if decoded_tx.send(Some(Arc::new(image))).is_err() {
-                    return;
-                }
-            }
-        });
+        let PreviewStream { input, frames, mut events } = client.preview_stream(&runtime, target);
+        let (decoder, mut decoded) = decode_frames(&runtime, frames);
         let frames = cx.spawn(async move |this, cx| {
             while decoded.changed().await.is_ok() {
                 let Some(frame) = decoded.borrow_and_update().clone() else { continue };
-                if this.update(cx, |this, cx| this.show_frame(&frame, cx)).is_err() {
+                if this.update(cx, |this, cx| this.show_frame(frame, cx)).is_err() {
                     return;
                 }
             }
@@ -336,7 +407,7 @@ impl FrameView {
                 }
             }
         });
-        self.live = Some(Live { input, _decoder: Abort(decoder), _frames: frames, _events: events });
+        self.live = Some(Live { input, _decoder: decoder, _frames: frames, _events: events });
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
@@ -359,16 +430,13 @@ impl FrameView {
         self.connect(cx);
     }
 
-    fn show_frame(&mut self, frame: &Decoded, cx: &mut Context<Self>) {
-        let first = self.image.is_none();
+    fn show_frame(&mut self, frame: Arc<Decoded>, cx: &mut Context<Self>) {
+        let first = !self.has_frame();
         self.no_frame_task = None;
         let cleared_stall = std::mem::take(&mut self.frames_stalled);
-        if let Some(stale) = self.retired.take() {
-            cx.drop_image(stale, None);
-        }
-        self.retired = self.image.replace(frame.image.clone());
         self.latest_jpeg = Some(frame.jpeg.clone());
         self.frame_size = frame.size;
+        self.images.replace(frame, cx);
         if first || cleared_stall {
             cx.emit(FrameEvent::Changed);
         }
@@ -380,12 +448,12 @@ impl FrameView {
             StreamEvent::Connected(connected) => {
                 self.no_frame_task = None;
                 if connected {
-                    if self.image.is_none() {
+                    if !self.has_frame() {
                         self.no_frame_task = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(Duration::from_millis(NO_FRAME_TIMEOUT_MS)).await;
                             let _ = this.update(cx, |this, cx| {
                                 this.no_frame_task = None;
-                                if this.image.is_none() {
+                                if !this.has_frame() {
                                     this.frames_stalled = true;
                                     cx.emit(FrameEvent::Changed);
                                     cx.notify();
@@ -411,6 +479,14 @@ impl FrameView {
             StreamEvent::Message(message) => self.on_message(message, cx),
             StreamEvent::Gone => {
                 self.gone = true;
+                if self.floating {
+                    let thread = self.thread_id.clone();
+                    let tab = self.tab_id.clone();
+                    let previews = self.previews.clone();
+                    cx.defer(move |cx| {
+                        let _ = previews.update(cx, |previews, cx| previews.dismiss_float(&thread, &tab, cx));
+                    });
+                }
                 self.no_frame_task = None;
                 self.frames_stalled = false;
                 self.file_chooser = None;
@@ -441,7 +517,11 @@ impl FrameView {
     fn on_message(&mut self, message: StreamMessage, cx: &mut Context<Self>) {
         match message {
             StreamMessage::Viewport(viewport) => {
+                let before = self.aspect_ratio();
                 self.viewport = Some(viewport);
+                if self.floating && self.aspect_ratio() != before {
+                    cx.emit(FrameEvent::Changed);
+                }
             }
             StreamMessage::Control(next) => {
                 let gained = next.is_yours() && !self.controlled();
@@ -473,7 +553,15 @@ impl FrameView {
             StreamMessage::Clipboard { text } => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             StreamMessage::Popup { tab_id } => {
                 let thread = self.thread_id.clone();
-                self.previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
+                if self.floating {
+                    let source = self.tab_id.clone();
+                    let previews = self.previews.clone();
+                    cx.defer(move |cx| {
+                        let _ = previews.update(cx, |previews, cx| previews.popup_from_float(&thread, &source, tab_id, cx));
+                    });
+                } else {
+                    let _ = self.previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
+                }
             }
             StreamMessage::Download { id, file_name, .. } => {
                 self.save_download(id, file_name, cx);
@@ -619,7 +707,10 @@ impl FrameView {
             let _ = this.update(cx, |this, _| this.send_resize());
         }));
         let size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
-        if let Some(cap) = grow_cap(size, f64::from(scale), self.cap) {
+        let relocated = std::mem::take(&mut self.relocated);
+        if (self.cap.is_none() || (!self.floating && !relocated))
+            && let Some(cap) = grow_cap(size, f64::from(scale), self.cap)
+        {
             let delay = if self.cap.is_none() { 0 } else { RESIZE_THROTTLE_MS * 2 };
             self.cap_task = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis(delay)).await;
@@ -658,7 +749,7 @@ impl FrameView {
     /// annotation selection even when watching an agent's tab).
     fn frame_point(&self, position: gpui::Point<Pixels>, clamp: bool) -> Option<t3_core::preview::stream::PagePoint> {
         let (bounds, viewport) = (self.bounds?, self.viewport?);
-        self.image.as_ref()?;
+        self.images.current.as_ref()?;
         let box_size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
         let at = (f64::from(f32::from(position.x - bounds.origin.x)), f64::from(f32::from(position.y - bounds.origin.y)));
         page_point(box_size, self.frame_size, viewport, at, clamp)
@@ -881,7 +972,7 @@ impl FrameView {
     fn render_cursor(&self, cx: &App) -> Option<impl IntoElement> {
         let (pointer, active) = self.pointer.as_ref()?;
         let control = self.control.as_ref()?;
-        if control.is_yours() || self.image.is_none() {
+        if control.is_yours() || !self.has_frame() {
             return None;
         }
         let bounds = self.bounds?;
@@ -1154,13 +1245,7 @@ impl Render for FrameView {
                 },
                 move |bounds, (), window, cx| {
                     let this = paint_view.read(cx);
-                    if let Some(image) = this.image.clone() {
-                        let box_size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
-                        if let Some(fit) = fit(box_size, this.frame_size) {
-                            let drawn = Bounds::new(bounds.origin + point(px(fit.left as f32), px(fit.top as f32)), size(px(fit.width as f32), px(fit.height as f32)));
-                            let _ = window.paint_image(drawn, Corners::default(), image, 0, false);
-                        }
-                    }
+                    this.images.paint(bounds, window);
                     // Drags keep going outside the page; window-wide listeners see them.
                     let moves = paint_view.clone();
                     window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
@@ -1208,5 +1293,20 @@ impl Render for FrameView {
                     .children(self.render_dialog(cx))
                     .children(self.render_blocker(cx)),
             )
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn frame_gutter_clamps_edges_and_preserves_bgra() {
+        let source = image::RgbaImage::from_fn(2, 2, |x, y| image::Rgba([x as u8, y as u8, 33, 255]));
+        let padded = pad_frame(&source);
+        assert_eq!(padded.dimensions(), (6, 6));
+        for (x, y, pixel) in padded.enumerate_pixels() {
+            assert_eq!(pixel.0, [33, u8::from(y >= 3), u8::from(x >= 3), 255]);
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! The preview browser: a right panel tab showing a page the server's headless Chromium renders,
 //! streamed as frames. This controller follows the selected thread's preview sessions as
 //! `components/preview/usePreviewSession.ts` and `agentOpenedPreviews.ts` do
-//! (`followPreviewSessions`, forced `revealServerTabs`; there is no floating player here), opens
+//! (`followPreviewSessions`, `revealServerTabs`), opens
 //! and closes sessions (`addBrowserSurface.ts`, `openPreviewSession.ts`, `closePreviewSession.ts`,
 //! the browser part of `hooks/useRightPanelSurfaceClose.ts`) with default zoom and appearance
 //! (`pingdotgg/t3code#34943`, `pingdotgg/t3code#25874`), keeps the per-project recently used list
@@ -14,6 +14,7 @@ mod annotation;
 mod device_toolbar;
 mod frame;
 mod pane;
+mod windows;
 #[cfg(all(test, feature = "snapshot"))]
 mod tests;
 
@@ -29,6 +30,8 @@ use t3_core::preview::viewport::{BrowserDefaults, OpenPreviewOverrides, Viewport
 use t3_core::preview::{ListResult, PREVIEW_OPERATE_SCOPE, PreviewEvent, PreviewThreads, SessionSnapshot, TabsEdit, method};
 
 pub use pane::PreviewPane;
+#[allow(unused_imports, reason = "entry points used by the Stage 3 workspace and transport integration")]
+pub(crate) use windows::{floating_preview, install_read_only_stream_opener};
 
 use crate::app_state::{AppEvent, AppState};
 use crate::toast::{Toast, ToastKind};
@@ -93,6 +96,9 @@ pub struct Previews {
     threads: PreviewThreads,
     /// Browser tabs each thread's panel last showed, to tell a user's close from the server's.
     panel_tabs: HashMap<String, Vec<String>>,
+    floating_tabs: HashMap<String, String>,
+    floating_frame: Option<windows::FloatingFrame>,
+    separate_window: Option<windows::SeparateWindow>,
     history: BrowserHistory,
     history_store: Option<String>,
     /// `None` until the session state answers; unknown counts as granted.
@@ -162,6 +168,7 @@ pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
                 return;
             }
             match previews.threads.thread(&thread_id).and_then(|thread| thread.active_tab_id.clone()) {
+                Some(tab) if previews.is_floating(&thread_id, &tab) => previews.restore_float(&thread_id, &tab, cx),
                 Some(tab) => previews.state.update(cx, |state, cx| {
                     state.mutate_panels(cx, |panels, thread| {
                         thread == thread_id && panels.panels.open_browser(thread, Some(&tab))
@@ -184,7 +191,11 @@ impl Previews {
             AppEvent::ServerConfig => this.sync_server_browser(cx),
             AppEvent::Selection => {
                 this.panel_changed(cx);
-                let selected = this.state.read(cx).panel_thread();
+                let selected = this.state.read(cx).panel_thread().filter(|key| !AppState::is_utility_panel_key(key));
+                if this.floating_frame.as_ref().is_some_and(|slot| Some(slot.thread.as_str()) != selected.as_deref()) {
+                    this.stop_floating_frame(cx);
+                }
+                cx.notify();
                 let edit = this.threads.show(selected.as_deref());
                 this.apply_edit(selected.as_deref(), edit, cx);
                 this.list_selected(cx);
@@ -196,6 +207,9 @@ impl Previews {
             state,
             threads: PreviewThreads::default(),
             panel_tabs: HashMap::new(),
+            floating_tabs: HashMap::new(),
+            floating_frame: None,
+            separate_window: None,
             history: BrowserHistory::default(),
             history_store: None,
             can_operate: None,
@@ -241,8 +255,13 @@ impl Previews {
             return;
         }
         self.connection = current;
+        self.stop_floating_frame(cx);
+        self.floating_tabs.clear();
+        self.close_separate_window(cx);
+        let state = self.state.read(cx);
         self.threads.clear();
-        self.threads.show(state.panel_thread().as_deref());
+        let selected = state.panel_thread().filter(|key| !AppState::is_utility_panel_key(key));
+        self.threads.show(selected.as_deref());
         self.panel_tabs.clear();
         self.events = None;
         self.grants = None;
@@ -261,6 +280,7 @@ impl Previews {
             self.watch_grants(&client, cx);
         }
         self.sync_server_browser(cx);
+        cx.notify();
     }
 
     fn watch_grants(&mut self, client: &t3_client::supervisor::ClientHandle, cx: &mut Context<Self>) {
@@ -410,12 +430,25 @@ impl Previews {
                 }
             })
             .collect();
+        let mut before = HashMap::new();
+        for event in &events {
+            if let Some(thread) = self.threads.thread(&event.thread_id).filter(|thread| thread.list_loaded) {
+                before.entry(event.thread_id.clone()).or_insert_with(|| thread.clone());
+            }
+        }
         let applied = self.threads.apply(events);
+        let shown = self.state.read(cx).panel_thread();
+        let mut edit = applied.edit;
         for thread in &applied.changed {
+            if let Some(before) = before.get(thread) {
+                let floated = self.reveal_floating(thread, before, cx);
+                if shown.as_ref() == Some(thread) && let Some(edit) = &mut edit {
+                    edit.fronted.retain(|tab| !floated.contains(tab));
+                }
+            }
             self.changed(thread, cx);
         }
-        let shown = self.state.read(cx).panel_thread();
-        self.apply_edit(shown.as_deref(), applied.edit, cx);
+        self.apply_edit(shown.as_deref(), edit, cx);
         if resubscribed || applied.relist {
             self.list_selected(cx);
         }
@@ -441,8 +474,15 @@ impl Previews {
                 }
                 match result {
                     Ok(list) => {
-                        let (changed, relist, edit) = this.threads.listed(&thread_id, &list);
+                        let before = this.threads.thread(&thread_id).filter(|thread| thread.list_loaded).cloned();
+                        let (changed, relist, mut edit) = this.threads.listed(&thread_id, &list);
                         if changed {
+                            if let Some(before) = before {
+                                let floated = this.reveal_floating(&thread_id, &before, cx);
+                                if let Some(edit) = &mut edit {
+                                    edit.fronted.retain(|tab| !floated.contains(tab));
+                                }
+                            }
                             this.changed(&thread_id, cx);
                         }
                         this.apply_edit(Some(&thread_id), edit, cx);
@@ -460,6 +500,13 @@ impl Previews {
     /// A thread's sessions changed: views follow, and non-Incognito loaded pages name their
     /// history entries (`pingdotgg/t3code#34859`).
     fn changed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.follow_floating_popup(thread_id, cx);
+        if let Some(tab) = self.floating_tabs.get(thread_id).filter(|tab| self.session(thread_id, tab).is_none()).cloned() {
+            self.dismiss_float(thread_id, &tab, cx);
+        }
+        if self.separate_window.as_ref().is_some_and(|window| window.thread == thread_id && self.session(thread_id, &window.tab).is_none()) {
+            self.close_separate_window(cx);
+        }
         cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
         let project = self.project_of(thread_id, cx);
         let (Some(project), Some(thread)) = (project, self.threads.thread(thread_id)) else { return };
@@ -471,7 +518,7 @@ impl Previews {
     /// Applies the shown thread's tab edit to its panel.
     fn apply_edit(&mut self, thread_id: Option<&str>, edit: Option<TabsEdit>, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(edit)) = (thread_id, edit) else { return };
-        if self.state.read(cx).panel_thread().as_deref() != Some(thread_id) {
+        if AppState::is_utility_panel_key(thread_id) || self.state.read(cx).panel_thread().as_deref() != Some(thread_id) {
             return;
         }
         self.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| edit.apply(&mut panels.panels, thread)));
@@ -580,6 +627,10 @@ impl Previews {
         let connection = self.connection;
         let snapshot = self.session(thread_id, tab_id).cloned();
         self.threads.thread_mut(thread_id).begin_close(tab_id);
+        self.dismiss_float(thread_id, tab_id, cx);
+        if self.separate_window_open(thread_id, tab_id) {
+            self.close_separate_window(cx);
+        }
         cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
         let task = self.state.read(cx).rpc(method::CLOSE, json!({ "threadId": thread_id, "tabId": tab_id }));
         let (thread_id, tab_id) = (thread_id.to_owned(), tab_id.to_owned());

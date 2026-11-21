@@ -60,6 +60,7 @@ pub struct PreviewPane {
     url_focused: bool,
     frame: Option<Entity<FrameView>>,
     frame_sub: Option<Subscription>,
+    floating: bool,
     device_toolbar: Option<Entity<DeviceToolbar>>,
     device_toolbar_sub: Option<Subscription>,
     annotation: Option<Entity<AnnotationEditor>>,
@@ -124,6 +125,7 @@ impl PreviewPane {
             url_focused: false,
             frame: None,
             frame_sub: None,
+            floating: false,
             device_toolbar: None,
             device_toolbar_sub: None,
             annotation: None,
@@ -183,37 +185,47 @@ impl PreviewPane {
     /// Follows the session: its frame view exists while the server knows the tab.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let snapshot = self.snapshot(cx).cloned();
-        let has_session = snapshot.is_some();
-        match (&self.frame, has_session, self.tab_id.clone()) {
-            (None, true, Some(tab_id)) => {
-                let frame = cx.new(|cx| FrameView::new(self.state.clone(), self.previews.clone(), self.thread_id.clone(), tab_id, window, cx));
-                self.frame_sub = Some(cx.subscribe_in(&frame, window, |this, _, event: &FrameEvent, window, cx| match event {
-                    FrameEvent::Changed => cx.notify(),
-                    FrameEvent::Picked(target) => {
-                        this.pick_active = false;
-                        this.open_annotation_editor(target.clone(), window, cx);
-                    }
-                    FrameEvent::CancelPick => {
-                        this.pick_active = false;
-                        cx.notify();
-                    }
-                }));
-                self.frame = Some(frame);
+        let floating = self.tab_id.as_ref().is_some_and(|tab| self.previews.read(cx).is_floating(&self.thread_id, tab));
+        let was_floating = std::mem::replace(&mut self.floating, floating);
+        let fills_panel = snapshot.as_ref().is_none_or(SessionSnapshot::fills_panel);
+        if let Some(snapshot) = &snapshot {
+            if !floating {
+                let docked = self.previews.update(cx, |previews, _| previews.take_docked_frame(&self.thread_id, &snapshot.tab_id));
+                let handed_off = docked.is_some();
+                if docked.is_some() || self.frame.is_none() {
+                    let frame = docked.unwrap_or_else(|| cx.new(|cx| {
+                        FrameView::new(self.state.clone(), self.previews.clone(), self.thread_id.clone(), snapshot.tab_id.clone(), window, cx)
+                    }));
+                    self.frame_sub = Some(cx.subscribe_in(&frame, window, |this, _, event: &FrameEvent, window, cx| match event {
+                        FrameEvent::Changed => cx.notify(),
+                        FrameEvent::Picked(target) => {
+                            this.pick_active = false;
+                            this.open_annotation_editor(target.clone(), window, cx);
+                        }
+                        FrameEvent::CancelPick => {
+                            this.pick_active = false;
+                            cx.notify();
+                        }
+                    }));
+                    self.frame = Some(frame);
+                }
+                if let Some(frame) = &self.frame {
+                    let active = self.visible || (handed_off && self.state.read(cx).panels.panels.active_surface(&self.thread_id)
+                        .is_some_and(|surface| surface.id == self.surface_id));
+                    frame.update(cx, |frame, cx| {
+                        if was_floating || handed_off {
+                            frame.relocate(false, fills_panel);
+                        } else {
+                            frame.set_follow_size(fills_panel);
+                        }
+                        frame.set_visible(active, cx);
+                    });
+                }
             }
-            (Some(_), false, _) => {
-                self.cancel_annotation(window, cx);
-                self.frame = None;
-                self.frame_sub = None;
-            }
-            _ => {}
-        }
-        if let Some(frame) = &self.frame {
-            let visible = self.visible;
-            let fills_panel = snapshot.as_ref().is_none_or(SessionSnapshot::fills_panel);
-            frame.update(cx, |frame, cx| {
-                frame.set_follow_size(fills_panel);
-                frame.set_visible(visible, cx);
-            });
+        } else if self.frame.is_some() {
+            self.cancel_annotation(window, cx);
+            self.frame = None;
+            self.frame_sub = None;
         }
         if let Some(snapshot) = &snapshot {
             let zoom = snapshot.zoom();
@@ -701,6 +713,25 @@ impl PreviewPane {
             })
     }
 
+    fn toggle_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_id.clone() else { return };
+        self.more_menu_open = false;
+        if self.floating {
+            self.previews.update(cx, |previews, cx| previews.restore_float(&self.thread_id, &tab, cx));
+        } else if let Some(frame) = self.frame.clone() {
+            self.cancel_annotation(window, cx);
+            self.previews.update(cx, |previews, cx| previews.float_from_panel(&self.thread_id, &tab, frame, cx));
+        }
+        cx.notify();
+    }
+
+    fn toggle_separate_window(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = &self.tab_id else { return };
+        self.more_menu_open = false;
+        self.previews.update(cx, |previews, cx| previews.toggle_separate_window(&self.thread_id, tab, cx));
+        cx.notify();
+    }
+
     fn render_more_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.more_menu_open {
             return None;
@@ -717,6 +748,9 @@ impl PreviewPane {
         let has_closed = !self.state.read(cx).panels.panels.closed_views().is_empty();
         let p = palette(cx);
 
+        let previews = self.previews.read(cx);
+        let can_popout = previews.can_open_separate(cx);
+        let separate = self.tab_id.as_ref().is_some_and(|tab| previews.separate_window_open(&self.thread_id, tab));
         let can_save = self.frame.as_ref().is_some_and(|frame| frame.read(cx).has_frame());
         let unavailable = |id, icon, label, reason: &'static str| {
             div().id(id).tooltip(move |window, cx| crate::right_panel::tooltip_view(t(cx, reason).into(), window, cx))
@@ -740,10 +774,16 @@ impl PreviewPane {
                         .w(px(236.))
                         .p(px(4.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(unavailable("preview-menu-find", Icon::Search, "Find on page", "Find on page isn't available for this page"))
-                        .child(unavailable("preview-menu-devtools", Icon::CodeXml, "Open DevTools", "DevTools are unavailable for streamed browser tabs"))
-                        .child(unavailable("preview-menu-pip", Icon::Monitor, "Picture in picture", "Picture in picture is unavailable for streamed browser tabs"))
-                        .child(unavailable("preview-menu-popout", Icon::ExternalLink, "Open separate preview window", "Separate preview windows are unavailable for streamed browser tabs"))
+                        .child(unavailable("preview-menu-find", Icon::Search, "Find on page", "Find on page requires an Electron browser tab"))
+                        .child(unavailable("preview-menu-devtools", Icon::CodeXml, "Open DevTools", "DevTools require an Electron browser tab"))
+                        .child(MenuItem::new("preview-menu-pip", t(cx, if self.floating { "Open in right panel" } else { "Picture in picture" }))
+                            .icon(Icon::Monitor, hsla(p.muted_foreground))
+                            .disabled(!enabled || (!self.floating && self.frame.is_none()))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_floating(window, cx))))
+                        .child(MenuItem::new("preview-menu-popout", t(cx, if separate { "Close separate preview window" } else { "Open separate preview window" }))
+                            .icon(Icon::ExternalLink, hsla(p.muted_foreground))
+                            .disabled(!enabled || (!separate && !can_popout))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_separate_window(cx))))
                         .child(MenuItem::new("preview-menu-save-screenshot", t(cx, "Save screenshot"))
                             .icon(Icon::Camera, hsla(p.muted_foreground))
                             .disabled(!can_save)
@@ -1223,6 +1263,17 @@ impl Render for PreviewPane {
                         .text_center()
                         .child(div().max_w(px(384.)).text_sm().text_color(hsla(p.muted_foreground)).child(message)),
                 )
+                .into_any_element();
+        }
+        if self.floating {
+            return root
+                .child(self.render_chrome(cx))
+                .child(v_flex().flex_1().items_center().justify_center().child(
+                    ActionButton::new("restore-floating-preview", ButtonVariant::Outline, ButtonSize::Sm)
+                        .label(t(cx, "Open in right panel"))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_floating(window, cx))),
+                ))
+                .children(self.render_more_menu(cx))
                 .into_any_element();
         }
         let snapshot = self.snapshot(cx).cloned();

@@ -857,3 +857,107 @@ async fn report_profiles_if_needed_sends_and_deduplicates_preview_report_profile
     state.update(cx, |state, _| state.stop_pump());
     cx.run_until_parked();
 }
+
+#[gpui::test]
+async fn floating_preview_restores_the_same_frame_and_leaves_the_tab_open_on_dismiss(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let (state, previews, _fixture, _runtime) = setup(cx);
+    state.update(cx, |state, _| state.stop_pump());
+    let (thread, tab) = ("menu-thread", "float");
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(snapshot(tab, "https://example.com/", None), cx);
+    });
+    state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some(tab))));
+
+    let (pane, window_cx) = cx.add_window_view(|window, cx| {
+        PreviewPane::new(state.clone(), previews.clone(), thread.into(), "browser:float".into(), Some(tab.into()), window, cx)
+    });
+    let frame = pane.read_with(window_cx, |pane, _| pane.frame_for_test().unwrap());
+    frame.update(window_cx, |frame, cx| {
+        frame.inject_stream_event_for_test(
+            StreamEvent::Message(t3_core::preview::stream::StreamMessage::Control(Control {
+                can_operate: true,
+                controller: Controller::You,
+                generation: 1,
+                dialog: None,
+            })),
+            cx,
+        );
+    });
+    previews.update(window_cx, |previews, cx| {
+        previews.float_from_panel(thread, tab, frame.clone(), cx);
+        assert!(previews.is_floating(thread, tab));
+        assert!(!state.read(cx).panels.panels.is_open(thread));
+        assert!(previews.take_docked_frame(thread, tab).is_none());
+    });
+    assert!(frame.read_with(window_cx, |frame, _| frame.controlled()));
+
+    previews.update(window_cx, |previews, cx| {
+        previews.restore_float(thread, tab, cx);
+        assert!(!previews.is_floating(thread, tab));
+        assert_eq!(state.read(cx).panels.panels.active_surface(thread).and_then(|surface| surface.preview_tab()), Some(tab));
+    });
+    assert_eq!(pane.read_with(window_cx, |pane, _| pane.frame_for_test().unwrap()).entity_id(), frame.entity_id());
+    assert!(frame.read_with(window_cx, |frame, _| frame.controlled()));
+
+    previews.update(window_cx, |previews, cx| {
+        previews.float_from_panel(thread, tab, frame, cx);
+        previews.dismiss_float(thread, tab, cx);
+        assert!(!previews.is_floating(thread, tab));
+        assert!(previews.session(thread, tab).is_some());
+        assert!(!state.read(cx).panels.panels.is_open(thread));
+    });
+}
+
+#[gpui::test]
+async fn agent_reveals_follow_the_floating_setting_and_force_docks_existing_tabs(cx: &mut gpui::TestAppContext) {
+    use t3_core::preview::{EventKind, ListResult, PreviewEvent, RevealRequest};
+
+    cx.executor().allow_parking();
+    let (state, previews, _fixture, _runtime) = setup(cx);
+    state.update(cx, |state, _| state.stop_pump());
+    let thread = "menu-thread";
+    let mut revision = 1;
+    previews.update(cx, |previews, _| {
+        previews.threads.listed(thread, &ListResult { sessions: vec![], server_epoch: "epoch-1".into(), revision });
+    });
+    let mut reveal = |tab: &str, force| {
+        revision += 1;
+        let mut session = snapshot(tab, "https://example.com/", None);
+        session.reveal = Some(true);
+        session.reveal_request = Some(RevealRequest { id: revision.to_string(), force });
+        super::Feed::Event(Box::new(PreviewEvent {
+            thread_id: thread.into(),
+            tab_id: tab.into(),
+            created_at: String::new(),
+            server_epoch: "epoch-1".into(),
+            revision,
+            kind: EventKind::Opened(session),
+        }))
+    };
+
+    previews.update(cx, |previews, cx| {
+        previews.apply_feed(vec![reveal("default-float", false)], cx);
+        assert!(previews.is_floating(thread, "default-float"));
+        previews.dismiss_float(thread, "default-float", cx);
+    });
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(
+            &state,
+            serde_json::from_value(json!({ "browserAutoShowFloatingPreview": false })).unwrap(),
+            cx,
+        );
+    });
+    previews.update(cx, |previews, cx| {
+        previews.apply_feed(vec![reveal("stay-docked", false)], cx);
+        assert!(!previews.is_floating(thread, "stay-docked"));
+
+        previews.apply_feed(vec![reveal("force-float", true)], cx);
+        assert!(previews.is_floating(thread, "force-float"));
+        assert!(!state.read(cx).panels.panels.is_open(thread));
+
+        previews.apply_feed(vec![reveal("stay-docked", true)], cx);
+        let active = state.read(cx).panels.panels.active_surface(thread).and_then(|surface| surface.preview_tab());
+        assert_eq!(active, Some("stay-docked"));
+    });
+}
