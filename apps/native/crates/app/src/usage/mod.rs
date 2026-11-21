@@ -161,7 +161,7 @@ pub struct UsageView {
     prices: Option<prices::PriceOverridesDialog>,
     segment: Option<SegmentKey>,
     revealed_account_email: Option<String>,
-    confirm_reset: Option<Redeem>,
+    confirm_reset: Option<(Redeem, String)>,
     /// The account a reset credit is being used for, and what came of it.
     reset_status: Option<(String, Option<String>)>,
     /// Opens the top model's breakdown once a summary arrives (snapshot tool).

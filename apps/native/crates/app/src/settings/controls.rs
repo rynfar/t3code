@@ -340,7 +340,6 @@ impl Switch {
     }
 
     /// Centers and dims the thumb for an indeterminate value; activation sets every value on.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn mixed(mut self, mixed: bool) -> Self {
         self.mixed = mixed;
         self
@@ -911,14 +910,11 @@ pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
 
 /// The settings sources in precedence order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
 pub enum SettingSource {
     /// A saved project override.
     Project,
     /// The environment's saved value.
     Environment,
-    /// The repository's t3.json value.
-    ProjectFile,
     /// The built-in default.
     Default,
 }
@@ -928,7 +924,6 @@ impl SettingSource {
         match self {
             Self::Project => "Project",
             Self::Environment => "Environment",
-            Self::ProjectFile => "t3.json",
             Self::Default => "Default",
         }
     }
@@ -943,7 +938,6 @@ pub struct SettingInheritanceLayer {
 
 impl SettingInheritanceLayer {
     /// Uses “Inherits” when a layer has no value of its own.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn new(source: SettingSource, value: Option<SharedString>, effective: bool) -> Self {
         Self { source, value, effective }
     }
@@ -953,35 +947,24 @@ impl SettingInheritanceLayer {
 pub struct SettingInheritance {
     summary: SharedString,
     layers: Vec<SettingInheritanceLayer>,
-    overrides: Vec<SharedString>,
     on_reset: Option<ClickHandler>,
     mixed: bool,
 }
 
 impl SettingInheritance {
     /// Builds the source indicator from a caller-resolved chain of layers.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn new(summary: impl Into<SharedString>, mut layers: Vec<SettingInheritanceLayer>) -> Self {
         layers.sort_by_key(|layer| layer.source);
-        Self { summary: summary.into(), layers, overrides: Vec::new(), on_reset: None, mixed: false }
+        Self { summary: summary.into(), layers, on_reset: None, mixed: false }
     }
 
     /// Marks the indicator as mixed across the selected targets.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn mixed(mut self, mixed: bool) -> Self {
         self.mixed = mixed;
         self
     }
 
-    /// Lists the projects that override this value.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
-    pub fn overridden_by(mut self, projects: impl IntoIterator<Item = SharedString>) -> Self {
-        self.overrides = projects.into_iter().collect();
-        self
-    }
-
-    /// Supplies a reset action for the listed project overrides.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
+    /// Supplies a reset action for the displayed project setting.
     pub fn on_reset_overrides(mut self, reset: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_reset = Some(Rc::new(reset));
         self
@@ -994,7 +977,7 @@ impl SettingInheritance {
         let focus = focus_handle(&id, window, cx);
         let tint = if self.mixed {
             p.warning_foreground
-        } else if !self.overrides.is_empty() || self.layers.iter().any(|layer| layer.source == SettingSource::Project && layer.effective) {
+        } else if self.layers.iter().any(|layer| layer.source == SettingSource::Project && layer.effective) {
             p.primary
         } else {
             p.muted_foreground
@@ -1033,21 +1016,16 @@ impl SettingInheritance {
                 .child(div().max_w(r(128.)).truncate().child(layer.value.unwrap_or_else(|| crate::i18n::t(cx, "Inherits").into())))
                 .child(div().size(r(14.)).flex_none().children(layer.effective.then(|| icon(Icon::Check, 14., hsla(p.primary)))))
         });
-        let overrides = (!self.overrides.is_empty()).then(|| {
-            let reset = self.on_reset.map(|reset| {
-                let close = close.clone();
-                let focus = focus.clone();
-                InlineButton::new((id.clone(), "reset"), if self.overrides.len() == 1 { "Reset it" } else { "Reset all" }, InlineTone::Muted)
+        let reset = self.on_reset.map(|reset| {
+            let close = close.clone();
+            let focus = focus.clone();
+            h_flex().mt(r(6.)).pt(r(6.)).border_t_1().border_color(hsla(p.border)).px(r(8.))
+                .child(InlineButton::new((id.clone(), "reset"), crate::i18n::t(cx, "Reset it"), InlineTone::Muted)
                     .on_click(move |event, window, cx| {
                         close(cx);
                         focus.focus(window, cx);
                         reset(event, window, cx);
-                    })
-            });
-            v_flex().mt(r(6.)).pt(r(6.)).border_t_1().border_color(hsla(p.border)).gap(r(4.)).px(r(8.))
-                .child(h_flex().justify_between().text_xs().text_color(hsla(p.muted_foreground))
-                    .child(crate::i18n::t(cx, "Overridden by").to_owned()).children(reset))
-                .children(self.overrides.into_iter().map(|name| div().text_xs().truncate().child(name)))
+                    }))
         });
         let popup = div()
             .id((id.clone(), "popup"))
@@ -1069,7 +1047,7 @@ impl SettingInheritance {
             })
             .children(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, r(8.), cx))
             .child(div().id((id, "scroll")).relative().max_h(r(286.)).overflow_y_scroll().p(r(8.))
-                .text_sm().children(layers).children(overrides));
+                .text_sm().children(layers).children(reset));
         wrapper = wrapper.key_context("SettingsInheritance").on_action(move |_: &CloseInheritance, window, cx| {
             close(cx);
             focus.focus(window, cx);
@@ -1145,7 +1123,6 @@ impl Row {
     }
 
     /// Shows a source indicator and its inheritance popover next to the title.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn inheritance(mut self, inheritance: SettingInheritance) -> Self {
         self.inheritance = Some(inheritance);
         self
@@ -1540,7 +1517,6 @@ pub struct NumberField {
     disabled: bool,
 }
 
-#[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
 impl NumberField {
     /// Uses the input state's value, step and bounds, and emits its normal input events.
     pub fn new(state: &gpui::Entity<gpui_component::input::InputState>) -> Self {

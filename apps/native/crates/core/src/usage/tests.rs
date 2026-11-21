@@ -363,6 +363,48 @@ fn provider(instance: &str, driver: &str, auth: Value, windows: Vec<Value>, chec
 }
 
 #[test]
+fn usage_limits_keep_zero_spend_caps_and_valid_reset_options() {
+    let report: crate::server_config::UsageLimits = serde_json::from_value(json!({
+        "checkedAt": NOW,
+        "windows": [window(json!({})), window(json!({"kind": "future"}))],
+        "zeroSpendCap": true,
+        "resetCredits": {
+            "availableCount": 2,
+            "options": [
+                {"creditId": "weekly", "label": " Weekly ", "description": "Clears weekly limits.", "availableCount": 2, "expiresAt": NOW, "futureField": true},
+                {"creditId": "invalid"},
+                {"creditId": "blank", "label": " ", "description": "Clears a limit.", "availableCount": 2},
+                {"creditId": "fable", "label": "Fable", "description": "Clears Fable limits.", "availableCount": 0}
+            ]
+        }
+    })).unwrap();
+    assert_eq!(report.windows.len(), 1);
+    assert_eq!(report.zero_spend_cap, Some(true));
+    let options = report.reset_credits.unwrap().options.unwrap();
+    assert_eq!(options.iter().map(|option| option.credit_id.as_str()).collect::<Vec<_>>(), ["weekly", "fable"]);
+    assert_eq!(options[0].label, "Weekly");
+    assert_eq!(options[0].expires_at.as_deref(), Some(NOW));
+    assert_eq!(options[1].available_count, 0);
+    let instance = limits::Redeem {
+        environment_id: "env".into(),
+        input: limits::ResetCreditInput::Instance { instance_id: "claude".into() },
+    };
+    assert_eq!(instance.input.payload(), json!({"instanceId": "claude"}));
+    let redeem = instance.with_instance_credit(&options[1].credit_id).unwrap();
+    assert_eq!(redeem.environment_id, "env");
+    assert_eq!(redeem.input.payload(), json!({"instanceId": "claude", "creditId": "fable"}));
+    let hub = limits::Redeem {
+        environment_id: "env".into(),
+        input: limits::ResetCreditInput::Source {
+            source_id: "hub".into(),
+            account_id: "account".into(),
+            credit_id: "next".into(),
+        },
+    };
+    assert!(hub.with_instance_credit("fable").is_none());
+}
+
+#[test]
 fn pace_reads_the_window_clock() {
     let now = parse_iso(NOW).unwrap();
     let session: UsageWindow = serde_json::from_value(window(json!({}))).unwrap();

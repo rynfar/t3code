@@ -771,8 +771,17 @@ impl SettingsView {
         let Some(client) = client else {
             return done(self, Err("Reconnect to this environment first.".to_owned()), cx);
         };
-        let runtime = self.state.read(cx).runtime().clone();
-        let task = runtime.spawn(async move { client.post_access(path, body).await });
+        self.access_request_on(target_id, async move { client.post_access(path, body).await }, cx, done);
+    }
+
+    fn access_request_on<T: Send + 'static>(
+        &mut self,
+        target_id: String,
+        request: impl Future<Output = Result<T, String>> + Send + 'static,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut SettingsView, Result<T, String>, &mut Context<SettingsView>) + 'static,
+    ) {
+        let task = self.state.read(cx).runtime().spawn(request);
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
             let _ = this.update(cx, |this, cx| {
@@ -1082,12 +1091,16 @@ impl SettingsView {
         };
         let current_hold = self.access.cloud_details.hold_webhooks_while_offline;
         let (client, id) = (target.client.clone(), target.saved_id.clone());
+        let environment_id = target.config.as_ref().map(|config| config.environment.environment_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| self.state.read(cx).environments.get(&id).and_then(|saved| saved.environment_id.clone()));
         let unlink = {
             let entity = cx.entity().downgrade();
             let (client, id) = (client.clone(), id.clone());
+            let environment_id = environment_id.clone();
             Box::new(move |_, _: &mut Window, cx: &mut App| {
                 let _ = entity.update(cx, |this, cx| {
-                    this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/unlink", None, cx);
+                    this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/unlink", None, environment_id.clone(), cx);
                 });
             })
         };
@@ -1099,7 +1112,7 @@ impl SettingsView {
                 let path = if !enabled && !tunnel { "/api/connect/unlink" } else { "/api/connect/preferences" };
                 let body = (path == "/api/connect/preferences").then(|| json!({"publishAgentActivity": enabled}));
                 let _ = entity.update(cx, |this, cx| {
-                    this.mutate_access_relay(client.clone(), id.clone(), path, body, cx);
+                    this.mutate_access_relay(client.clone(), id.clone(), path, body, environment_id.clone(), cx);
                 });
             })
         };
@@ -1111,7 +1124,7 @@ impl SettingsView {
                 let _ = entity.update(cx, |this, cx| {
                     this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/preferences", Some(json!({
                         "publishAgentActivity": publish, "holdWebhooksWhileOffline": enabled,
-                    })), cx);
+                    })), None, cx);
                 });
             })
         };
@@ -1136,7 +1149,7 @@ impl SettingsView {
                     .child(div().child(Button::new("access-check-reachability", ButtonVariant::Outline, ButtonSize::Xs)
                         .label(t(cx, "Check reachability")).disabled(!can_check || self.access.relay_saving)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mutate_access_relay(check_client.clone(), check_id.clone(), "/api/connect/reachability", None, cx);
+                            this.mutate_access_relay(check_client.clone(), check_id.clone(), "/api/connect/reachability", None, None, cx);
                         }))))
             }));
         let mut rows = vec![connect.into_any_element(), Row::new("access-publish-activity", t(cx, "Publish agent activity"))
@@ -1156,20 +1169,35 @@ impl SettingsView {
     }
 
     fn mutate_access_relay(
-        &mut self, client: Option<ClientHandle>, id: String, path: &'static str, body: Option<Value>, cx: &mut Context<Self>,
+        &mut self, client: Option<ClientHandle>, id: String, path: &'static str, body: Option<Value>,
+        environment_id: Option<String>, cx: &mut Context<Self>,
     ) {
-        if self.access.relay_saving || client.is_none() { return; }
+        let Some(client) = client.filter(|_| !self.access.relay_saving) else { return };
         self.access.relay_saving = true;
-        self.access_post_on(client, id, path, body, cx, move |this, result, cx| {
+        let unlinking = path == "/api/connect/unlink";
+        let cloud = self.state.read(cx).cloud.service.clone();
+        let relay_error = t(cx, "Disconnected locally, but T3 Connect did not confirm it removed this environment").to_owned();
+        self.access_request_on(id, async move {
+            let value = client.post_access(path, body).await?;
+            let relay_failure = if unlinking && let Some(environment_id) = environment_id {
+                cloud.unlink_environment(&environment_id).await.err()
+            } else {
+                None
+            };
+            Ok((value, relay_failure))
+        }, cx, move |this, result, cx| {
             this.access.relay_saving = false;
             match result {
-                Ok(value) if path == "/api/connect/reachability" => {
+                Ok((value, _)) if path == "/api/connect/reachability" => {
                     this.access.cloud_details.reachability = serde_json::from_value(value).ok();
                 }
-                Ok(_) => {
+                Ok((_, relay_failure)) => {
                     this.access.link_state_task = None;
-                    if path == "/api/connect/unlink" {
+                    if unlinking {
                         this.state.update(cx, |state, cx| state.refresh_cloud(cx));
+                        if let Some(detail) = relay_failure {
+                            store::show_error(format!("{relay_error}: {detail}"), cx);
+                        }
                     }
                 }
                 Err(error) => {

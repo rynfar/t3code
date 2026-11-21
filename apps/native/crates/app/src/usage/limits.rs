@@ -8,11 +8,13 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, anchored, canvas, deferred, div, point, prelude::*, px, relative, rgba};
 use gpui_component::{h_flex, v_flex};
 use t3_core::providers::driver_label;
-use t3_core::server_config::UsageWindow;
+use t3_core::i18n::IcuArg;
+use t3_core::server_config::{UsageWindow, UsageWindowKind};
+use t3_core::sidebar::time::parse_iso;
 use t3_core::timeline;
 use t3_core::usage::limits::{
-    self, CHATGPT_USAGE_URL, LimitAccount, LimitPace, LimitPool, LimitPoolMember, LimitPoolWindow, account_hue, account_initials, account_title, accent_rgba,
-    format_resets_in, pace_remaining_percent, remaining_percent, reset_credits_summary,
+    self, CHATGPT_USAGE_URL, LimitAccount, LimitPace, LimitPool, LimitPoolMember, LimitPoolWindow, ResetCreditInput, account_hue, account_initials, account_title, accent_rgba,
+    format_resets_in, pace_remaining_percent, remaining_percent,
 };
 
 use super::controls::{ActionButton, ButtonSize, ButtonVariant, brand_mark, driver_color, heading, icon, r};
@@ -20,7 +22,7 @@ use super::{SegmentKey, UsageView};
 use crate::icons::Icon;
 use crate::right_panel::{focusable, tooltip_view};
 use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
-use crate::i18n::t;
+use crate::i18n::{t, t_fmt};
 
 fn pace_icon(pace: LimitPace, id: SharedString, cx: &App) -> impl IntoElement {
     let p = palette(cx);
@@ -248,6 +250,18 @@ impl UsageView {
             .enumerate()
             .map(|(index, (account, member))| match member {
                 Some(member) => self.render_segment(driver, pool, account, member, color, index + 1, multiple, roomy, window, cx),
+                None if pool.kind == UsageWindowKind::Monthly && account.limits.zero_spend_cap == Some(true) => {
+                    h_flex()
+                        .flex_1().min_w_0().h(r(if roomy { 32. } else { 20. })).gap(r(6.))
+                        .rounded(r(6.)).border_1().border_dashed().border_color(hsla(palette(cx).border))
+                        .overflow_hidden().whitespace_nowrap()
+                        .text_size(r(if roomy { 12. } else { 10. }))
+                        .text_color(hsla(palette(cx).muted_foreground))
+                        .when(roomy, |cell| cell.px(r(8.)).child(account_name(account)))
+                        .when(!roomy, |cell| cell.justify_center())
+                        .child(div().flex_none().child(t(cx, "$0 cap")))
+                        .into_any_element()
+                }
                 None => div().flex_1().min_w_0().into_any_element(),
             })
             .collect();
@@ -472,7 +486,7 @@ impl UsageView {
         let resets_at = window_data.resets_at.as_deref().map(|at| {
             timeline::format_upcoming(at, now, &crate::timestamp::viewer_zone(), crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale)
         });
-        let credits = account.limits.reset_credits.clone().filter(|credits| credits.available_count > 0 && account.redeem.is_some());
+        let credits = account.limits.reset_credits.as_ref().filter(|credits| credits.available_count > 0 && account.redeem.is_some());
         let redeem = account.redeem.clone();
         let account_key = account.key.clone();
         let busy = self.reset_status.as_ref().is_some_and(|(key, status)| *key == account.key && status.is_none());
@@ -547,28 +561,75 @@ impl UsageView {
                     .children(restore.map(|reset| row(crate::i18n::t(cx, "Restores"), format!("+{}% of pool", reset.restores_percent)))),
             )
             .when_some(credits.zip(redeem), |this, (credits, redeem)| {
-                let summary = reset_credits_summary(credits.available_count, credits.next_expires_at.as_deref(), now, true);
-                this.child(
-                    h_flex()
-                        .gap(r(12.))
-                        .pt(r(10.))
-                        .border_t_1()
-                        .border_color(hsla(p.border).opacity(0.6))
-                        .text_color(hsla(p.muted_foreground))
-                        .child(summary)
-                        .child(
-                            div().ml_auto().child(
-                                ActionButton::new("usage-use-reset", if busy { "Using…" } else { "Use reset" }, ButtonVariant::Outline, ButtonSize::Xs)
-                                    .disabled(busy || !can_manage)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.segment = None;
-                                        this.confirm_reset = Some(redeem.clone());
-                                        this.reset_status = Some((account_key.clone(), Some(String::new())));
-                                        cx.notify();
-                                    })),
-                            ),
-                        ),
-                )
+                let duration = |at: Option<&str>| {
+                    at.and_then(parse_iso).map(|at| limits::format_duration(at - now))
+                };
+                let options = match redeem.input {
+                    ResetCreditInput::Instance { .. } => credits.options.as_ref(),
+                    _ => None,
+                };
+                let choices: Vec<_> = if let Some(options) = options {
+                    options.iter().filter_map(|option| {
+                        let expires = duration(option.expires_at.as_deref());
+                        let mut args = vec![
+                            ("label", IcuArg::from(&option.label)),
+                            ("count", IcuArg::Int(option.available_count as i64)),
+                        ];
+                        if let Some(expires) = &expires {
+                            args.push(("expires", IcuArg::from(expires)));
+                        }
+                        Some((
+                            option.credit_id.as_str(),
+                            t_fmt(cx, if expires.is_some() { "{label} · {count} left · expires in {expires}" } else { "{label} · {count} left" }, &args),
+                            t(cx, "Use"),
+                            option.available_count,
+                            redeem.with_instance_credit(&option.credit_id)?,
+                            t_fmt(cx, "{label}: {description} This cannot be undone.", &[
+                                ("label", IcuArg::from(&option.label)),
+                                ("description", IcuArg::from(&option.description)),
+                            ]),
+                        ))
+                    }).collect()
+                } else {
+                    let expires = duration(credits.next_expires_at.as_deref());
+                    let mut args = vec![("count", IcuArg::Int(credits.available_count as i64))];
+                    if let Some(expires) = &expires {
+                        args.push(("expires", IcuArg::from(expires)));
+                    }
+                    vec![(
+                        "next",
+                        t_fmt(cx, if expires.is_some() { "{count} banked · expires in {expires}" } else { "{count} banked" }, &args),
+                        t(cx, "Use reset"),
+                        credits.available_count,
+                        redeem,
+                        t(cx, "This redeems one credit on your account and clears the current rate-limit windows. It cannot be undone.").to_owned(),
+                    )]
+                };
+                this.when(!choices.is_empty(), |this| this.child(
+                    v_flex().gap(r(6.)).pt(r(10.)).border_t_1()
+                        .border_color(hsla(p.border).opacity(0.6)).text_color(hsla(p.muted_foreground))
+                        .children(choices.into_iter().map(|(key, summary, action, count, redeem, description)| {
+                            let account_key = account_key.clone();
+                            h_flex().gap(r(12.)).child(div().min_w_0().child(summary))
+                                .when(count > 0, |row| row.child(
+                                    div().ml_auto().flex_none().child(
+                                        ActionButton::new(
+                                            SharedString::from(format!("usage-use-reset-{key}")),
+                                            if busy { t(cx, "Using…") } else { action },
+                                            ButtonVariant::Outline,
+                                            ButtonSize::Xs,
+                                        )
+                                        .disabled(busy || !can_manage)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.segment = None;
+                                            this.confirm_reset = Some((redeem.clone(), description.clone()));
+                                            this.reset_status = Some((account_key.clone(), Some(String::new())));
+                                            cx.notify();
+                                        })),
+                                    ),
+                                ))
+                        })),
+                ))
             })
             .children(status.filter(|status| !status.is_empty()).map(|status| div().text_color(hsla(p.foreground)).child(status)));
         div().absolute().top_0().left_0().child(deferred(anchored().anchor(gpui::Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(div().mb(r(6.)).child(panel))).with_priority(3))
@@ -576,7 +637,7 @@ impl UsageView {
 
     /// The confirm a reset credit asks for (`ResetCreditDialog`): redemption spends a credit.
     pub(super) fn render_reset_confirm(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let redeem = self.confirm_reset.clone()?;
+        let (redeem, description) = self.confirm_reset.clone()?;
         let p = palette(cx);
         let account = self.reset_status.as_ref().map(|(key, _)| key.clone()).unwrap_or_default();
         Some(
@@ -609,10 +670,8 @@ impl UsageView {
                                 .relative()
                                 .gap(r(8.))
                                 .p(r(24.))
-                                .child(div().text_size(r(20.)).line_height(r(20.)).font_weight(FontWeight::SEMIBOLD).child("Use a reset credit?"))
-                                .child(div().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(
-                                    "This redeems one credit on your account and clears the current rate-limit windows. It cannot be undone.",
-                                )),
+                                .child(div().text_size(r(20.)).line_height(r(20.)).font_weight(FontWeight::SEMIBOLD).child(t(cx, "Use a reset credit?")))
+                                .child(div().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(description)),
                         )
                         .child(
                             h_flex()
