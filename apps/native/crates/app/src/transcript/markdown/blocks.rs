@@ -203,13 +203,19 @@ impl MermaidPreview {
         self.extent.layout(gpui::canvas(
             |_, _, _| (),
             move |visible, (), window, _| {
+                if !window.content_mask().bounds.intersects(&visible) {
+                    return;
+                }
                 let pad_x = visible.size.width * (Self::GUTTER as f32 / self.pixel_width as f32);
                 let pad_y = visible.size.height * (Self::GUTTER as f32 / self.pixel_height as f32);
                 let fitted = gpui::Bounds::new(
                     gpui::point(visible.origin.x - pad_x, visible.origin.y - pad_y),
                     gpui::size(visible.size.width + 2. * pad_x, visible.size.height + 2. * pad_y),
                 );
-                let _ = window.paint_image_fitted(visible, fitted, gpui::Corners::default(), self.image, 0, false);
+                if window.paint_image_fitted(visible, fitted, gpui::Corners::default(), self.image.clone(), 0, false).is_ok() {
+                    // GPUI carries presentation callbacks forward with cached paint.
+                    window.on_present(move || { let _ = &self.image; });
+                }
             },
         ))
     }
@@ -225,7 +231,9 @@ enum MermaidSlot {
 
 #[derive(Default)]
 struct MermaidStore {
-    entries: VecDeque<(MermaidKey, MermaidSlot)>,
+    entries: VecDeque<(MermaidKey, MermaidSlot, u64)>,
+    frame: u64,
+    drawing: bool,
     // Keep geometry across theme changes and raster eviction.
     extents: VecDeque<(Arc<str>, MermaidExtent)>,
     bytes: usize,
@@ -249,6 +257,18 @@ impl MermaidStore {
         if source.len() > 64 * 1024 {
             return (None, None, true);
         }
+        if !self.drawing {
+            self.drawing = true;
+            self.frame = self.frame.wrapping_add(1);
+            let cache = cx.entity().downgrade();
+            // Wait until every block in this draw has had a chance to touch its slot.
+            cx.defer(move |cx| {
+                let _ = cache.update(cx, |store, cx| {
+                    store.drawing = false;
+                    store.trim(None, cx);
+                });
+            });
+        }
         let extent = self.extents.iter().position(|(code, _)| code == source)
             .and_then(|index| self.extents.remove(index))
             .map(|entry| {
@@ -256,7 +276,7 @@ impl MermaidStore {
                 self.extents.push_back(entry);
                 extent
             });
-        let mut slot = self.entries.iter().position(|(candidate, _)| candidate == &key)
+        let mut slot = self.entries.iter().position(|(candidate, _, _)| candidate == &key)
             .and_then(|index| self.entries.remove(index))
             .map_or_else(|| {
                 let renderer = cx.svg_renderer();
@@ -270,7 +290,7 @@ impl MermaidStore {
                     let _ = cache.update(cx, |cache, cx| cache.finish(completed, preview, cx));
                 });
                 MermaidSlot::Pending(Vec::new(), task)
-            }, |(_, slot)| slot);
+            }, |(_, slot, _)| slot);
         let result = match &mut slot {
             MermaidSlot::Ready(preview) => (Some(preview.clone()), Some(preview.extent), false),
             MermaidSlot::Failed => (None, None, true),
@@ -281,8 +301,7 @@ impl MermaidStore {
                 (None, extent, false)
             }
         };
-        self.entries.push_back((key, slot));
-        self.trim(cx);
+        self.entries.push_back((key, slot, self.frame));
         result
     }
 
@@ -292,10 +311,12 @@ impl MermaidStore {
         preview: Result<MermaidPreview, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.entries.iter().position(|(candidate, _)| candidate == &key) else {
+        let Some(index) = self.entries.iter().position(|(candidate, slot, _)| {
+            candidate == &key && matches!(slot, MermaidSlot::Pending(..))
+        }) else {
             return;
         };
-        let Some((_, MermaidSlot::Pending(waiters, task))) = self.entries.remove(index) else {
+        let Some((_, MermaidSlot::Pending(waiters, task), touched)) = self.entries.remove(index) else {
             return;
         };
         task.detach();
@@ -307,8 +328,8 @@ impl MermaidStore {
             }
             Err(_) => MermaidSlot::Failed,
         };
-        self.entries.push_back((key, slot));
-        self.trim(cx);
+        self.entries.push_back((key.clone(), slot, touched));
+        self.trim(Some(&key), cx);
         let app: &mut App = cx;
         for waiter in waiters {
             app.notify(waiter);
@@ -329,10 +350,23 @@ impl MermaidStore {
             + preview.svg.len()
     }
 
-    fn trim(&mut self, cx: &mut Context<Self>) {
+    fn trim(&mut self, completed: Option<&MermaidKey>, cx: &mut Context<Self>) {
         while self.entries.len() > Self::ENTRY_LIMIT || self.bytes > Self::BYTE_LIMIT {
-            let index = self.entries.iter().position(|(_, slot)| !matches!(slot, MermaidSlot::Pending(..))).unwrap_or(0);
-            if let Some((_, MermaidSlot::Ready(preview))) = self.entries.remove(index) {
+            let over_entry_limit = self.entries.len() > Self::ENTRY_LIMIT;
+            let index = self.entries.iter().enumerate()
+                .filter(|(_, (key, slot, touched))| {
+                    completed != Some(key)
+                        && *touched != self.frame
+                        && match slot {
+                            MermaidSlot::Pending(..) => over_entry_limit,
+                            MermaidSlot::Ready(preview) => Arc::strong_count(&preview.image) == 1,
+                            MermaidSlot::Failed => true,
+                        }
+                })
+                .min_by_key(|(_, (_, slot, _))| matches!(slot, MermaidSlot::Pending(..)))
+                .map(|(index, _)| index);
+            let Some(index) = index else { break };
+            if let Some((_, MermaidSlot::Ready(preview), _)) = self.entries.remove(index) {
                 self.bytes -= Self::preview_bytes(&preview);
                 cx.defer(move |cx| cx.drop_image(preview.image, None));
             }
@@ -1687,6 +1721,46 @@ mod mermaid_tests {
     use super::*;
 
     #[gpui::test]
+    fn three_visible_large_diagrams_each_keep_their_first_raster(cx: &mut gpui::TestAppContext) {
+        let keys = ["A", "B", "C"].map(|label| (Arc::from(format!("graph TD\n {label} --> Z")), false));
+        let (store, renderer) = cx.update(|cx| (mermaid_cache(cx), cx.svg_renderer()));
+        store.update(cx, |store, cx| {
+            store.entries.extend(keys.iter().cloned().map(|key| {
+                (key, MermaidSlot::Pending(Vec::new(), gpui::Task::ready(())), 0)
+            }));
+            for key in &keys {
+                let (preview, _, failed) = store.get(key.clone(), cx.entity_id(), cx);
+                assert!(preview.is_none() && !failed);
+            }
+        });
+        let images = store.update(cx, |store, cx| keys.each_ref().map(|key| {
+            let mut preview = MermaidPreview::render(&key.0, key.1, renderer.clone()).unwrap();
+            preview.pixel_width = 2048;
+            preview.pixel_height = 2048;
+            let image = Arc::downgrade(&preview.image);
+            store.finish(key.clone(), Ok(preview), cx);
+            image
+        }));
+        store.update(cx, |store, cx| {
+            for (key, image) in keys.iter().zip(&images) {
+                let (preview, _, _) = store.get(key.clone(), cx.entity_id(), cx);
+                let preview = preview.expect("visible diagram must reuse its first raster");
+                assert!(image.ptr_eq(&Arc::downgrade(&preview.image)));
+            }
+        });
+        let painted = images[0].upgrade().unwrap();
+        store.update(cx, |store, cx| {
+            assert!(store.get(keys[2].clone(), cx.entity_id(), cx).0.is_some());
+        });
+        assert!(images[1].upgrade().is_none());
+        drop(painted);
+        store.update(cx, |store, cx| {
+            assert!(store.get(keys[2].clone(), cx.entity_id(), cx).0.is_some());
+        });
+        assert!(images[0].upgrade().is_none());
+    }
+
+    #[gpui::test]
     fn revisiting_diagram_reuses_raster_and_other_theme_reserves_its_extent(cx: &mut gpui::TestAppContext) {
         let source: Arc<str> = Arc::from("graph TD\n A --> B");
         let store = cx.update(|cx| {
@@ -1695,7 +1769,7 @@ mod mermaid_tests {
             store.update(cx, |store, _| {
                 store.remember_extent(source.clone(), preview.extent);
                 store.bytes = MermaidStore::preview_bytes(&preview);
-                store.entries.push_back(((source.clone(), false), MermaidSlot::Ready(preview)));
+                store.entries.push_back(((source.clone(), false), MermaidSlot::Ready(preview), 0));
             });
             store
         });

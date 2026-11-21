@@ -766,10 +766,10 @@ impl Cloud {
         .map_err(|_| "Could not refresh the T3 Connect credential.".to_owned())?
     }
 
-    async fn bearer_token(&self, force_refresh: bool) -> Result<(String, u64, bool), String> {
+    async fn bearer_token(&self, force_refresh: bool, require_clerk: bool) -> Result<(String, u64, bool), String> {
         self.ensure_loaded().await?;
         let has_clerk = self.account.lock().await.clerk.is_some();
-        if has_clerk {
+        if require_clerk || has_clerk {
             let (jwt, generation) = self.mint_clerk_jwt(force_refresh).await?;
             Ok((jwt, generation, true))
         } else {
@@ -881,8 +881,9 @@ impl Cloud {
         network_error: &str,
         body: Option<&Value>,
     ) -> Result<Value, String> {
+        let require_clerk = method == reqwest::Method::DELETE;
         for attempt in 0..2 {
-            let (token, generation, is_clerk) = self.bearer_token(attempt > 0).await?;
+            let (token, generation, is_clerk) = self.bearer_token(attempt > 0, require_clerk).await?;
             let mut request = http()
                 .request(method.clone(), url.clone())
                 .bearer_auth(token);
@@ -931,7 +932,7 @@ impl Cloud {
 
     /// Removes the canonical environment link from the relay after the host confirms unlink.
     pub async fn unlink_environment(&self, environment_id: &str) -> Result<(), String> {
-        if self.config.is_err() || self.identity().await?.is_none() {
+        if self.config.is_err() || !self.has_clerk_session().await? {
             return Ok(());
         }
         let mut url = url::Url::parse(&self.config()?.relay)
@@ -952,12 +953,13 @@ impl Cloud {
     pub async fn link_environment(
         &self,
         credentials: &crate::auth::Credentials,
+        primary_http_base: &str,
         environment_id: &str,
         managed_tunnel: bool,
         publish: bool,
     ) -> Result<(), String> {
         let relay_url = &self.config()?.relay;
-        let endpoint = url::Url::parse(&credentials.http_base)
+        let endpoint = url::Url::parse(primary_http_base)
             .map_err(|_| "Invalid environment URL.".to_owned())?;
         let port = endpoint.port_or_known_default().ok_or("Invalid environment port.")?;
         let mut socket = endpoint.clone();
@@ -981,7 +983,7 @@ impl Cloud {
             "challenge": challenge,
             "relayIssuer": relay_url,
             "endpoint": {
-                "httpBaseUrl": credentials.http_base,
+                "httpBaseUrl": primary_http_base,
                 "wsBaseUrl": socket.as_str().trim_end_matches('/'),
                 "providerKind": provider,
             },
@@ -1414,7 +1416,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_only_link_sends_host_proof_and_applies_relay_credentials_before_preferences() {
+    async fn publish_only_link_advertises_primary_over_an_alternate_route() {
+        const PRIMARY: &str = "https://studio.example:3773";
         let mut relay = Fixture::new().await;
         let mut host = Fixture::new().await;
         let cloud = cloud(&relay);
@@ -1429,7 +1432,7 @@ mod tests {
         relay.reply(200, json!({
             "ok": true, "environmentId": "env-studio", "cloudUserId": "user_alice",
             "endpoint": {
-                "httpBaseUrl": host.base, "wsBaseUrl": host.base.replacen("http", "ws", 1),
+                "httpBaseUrl": PRIMARY, "wsBaseUrl": "wss://studio.example:3773",
                 "providerKind": "manual"
             },
             "endpointRuntime": null, "relayIssuer": relay.base,
@@ -1440,6 +1443,7 @@ mod tests {
         host.reply(200, json!({"publishAgentActivity": true}));
         cloud.link_environment(
             &crate::auth::Credentials { http_base: host.base.clone(), access_token: "host-token".into() },
+            PRIMARY,
             "env-studio",
             false,
             true,
@@ -1461,9 +1465,9 @@ mod tests {
         assert_eq!(body(&proof), json!({
             "challenge": "challenge", "relayIssuer": relay.base,
             "endpoint": {
-                "httpBaseUrl": host.base, "wsBaseUrl": host.base.replacen("http", "ws", 1), "providerKind": "manual"
+                "httpBaseUrl": PRIMARY, "wsBaseUrl": "wss://studio.example:3773", "providerKind": "manual"
             },
-            "origin": {"localHttpHost": "127.0.0.1", "localHttpPort": url::Url::parse(&host.base).unwrap().port()}
+            "origin": {"localHttpHost": "127.0.0.1", "localHttpPort": 3773}
         }));
         let link = relay.request().await;
         assert!(link.starts_with("POST /v1/client/environment-links "));
@@ -1580,7 +1584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_uses_signed_in_bearer_and_canonical_environment_id() {
+    async fn unlink_requires_clerk_and_uses_the_canonical_environment_id() {
         let mut fixture = Fixture::new().await;
         let cloud = cloud(&fixture);
         cloud.unlink_environment("test/id").await.unwrap();
@@ -1606,11 +1610,10 @@ mod tests {
             account.clerk = None;
             account.token = Some(token(now_ms() + 3_600_000));
         }
-        fixture.reply_with(MockReply::json(200, json!({"ok": false})));
+        // apps/web/src/cloud/linkEnvironment.ts only deletes the relay link with a Clerk token.
+        fixture.reply_with(MockReply::json(401, json!({})));
         cloud.unlink_environment("test/id").await.unwrap();
-        let unlink = fixture.request().await;
-        assert!(unlink.starts_with("DELETE /v1/client/environment-links/test%2Fid HTTP"), "{unlink}");
-        assert_eq!(header_value(&unlink, "authorization"), Some("Bearer fixture-access"));
+        assert!(fixture.requests.try_recv().is_err());
         let _ = std::fs::remove_dir_all(cloud.home().unwrap());
     }
 

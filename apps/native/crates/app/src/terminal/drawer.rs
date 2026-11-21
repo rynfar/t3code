@@ -15,6 +15,7 @@ use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::composer::context::TerminalSelection;
+use t3_core::composer::drafts::DraftRef;
 use t3_core::files::metadata::MetadataCache;
 use t3_core::terminal::{
     self, LaunchLocation, MetadataEvent, SnapshotId, SplitDirection, TerminalAccess, TerminalFocusQueue, TerminalLayouts, TerminalSummary,
@@ -135,12 +136,23 @@ fn terminal_workspace<'a>(state: &'a AppState, owner: &str) -> Option<(&'a str, 
     if let Some(thread) = state.thread_shell(owner) {
         return Some((&state.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref()));
     }
-    let draft = t3_core::composer::drafts::DraftRef::from_key(owner)?;
+    let draft = DraftRef::from_key(owner)?;
     if draft.environment_id.as_deref().is_some_and(|environment| state.environments.active.as_deref() != Some(environment)) {
         return None;
     }
     let root = &state.shell.project(&draft.project_id)?.workspace_root;
     (!root.is_empty()).then_some((root, None))
+}
+
+fn legacy_terminal_owner(draft: &DraftRef, summaries: &[TerminalSummary]) -> Option<String> {
+    if draft.id != DraftRef::legacy(&draft.project_id).id {
+        return None;
+    }
+    let legacy = format!("draft:{}", draft.project_id);
+    summaries.iter().any(|terminal| {
+        terminal.thread_id == legacy
+            && matches!(terminal.status, terminal::SessionStatus::Starting | terminal::SessionStatus::Running)
+    }).then_some(legacy)
 }
 
 pub(crate) fn allocate_panel_terminal_id(state: &AppState, thread_id: &str, cx: &App) -> String {
@@ -206,6 +218,7 @@ pub struct TerminalDrawer {
     pub(super) app: Entity<AppState>,
     pub(super) layouts: TerminalLayouts,
     summaries: Option<Vec<TerminalSummary>>,
+    legacy_closes: HashMap<String, u64>,
     metadata_snapshot_id: Option<SnapshotId>,
     ephemeral_snapshot_seq: u64,
     panes: HashMap<String, Entity<TerminalPane>>,
@@ -248,6 +261,7 @@ impl TerminalDrawer {
             app,
             layouts,
             summaries: None,
+            legacy_closes: HashMap::new(),
             metadata_snapshot_id: None,
             ephemeral_snapshot_seq: 0,
             panes: HashMap::new(),
@@ -331,6 +345,7 @@ impl TerminalDrawer {
             self.grants = None;
             self.access = TerminalAccess::default();
             self.summaries = None;
+            self.legacy_closes.clear();
             self.metadata_snapshot_id = None;
             self.panes.clear();
             self.panes_thread = None;
@@ -367,6 +382,7 @@ impl TerminalDrawer {
                         let gained_operate = !drawer.access.operate && access.operate;
                         drawer.access = access;
                         if gained_operate {
+                            drawer.close_legacy_draft_terminals(cx);
                             drawer.ensure_panes(window, cx);
                         }
                         cx.notify();
@@ -489,8 +505,31 @@ impl TerminalDrawer {
             }
         }
         self.reconcile(cx);
+        self.close_legacy_draft_terminals(cx);
         self.ensure_panes(window, cx);
         cx.notify();
+    }
+
+    fn close_legacy_draft_terminals(&mut self, cx: &App) {
+        if !self.access.operate {
+            return;
+        }
+        let app = self.app.read(cx);
+        let Some(draft) = app.active_draft() else { return };
+        if terminal_workspace(app, &draft.key()).is_none() {
+            return;
+        }
+        let Some(legacy) = self.summaries.as_deref().and_then(|summaries| legacy_terminal_owner(&draft, summaries)) else { return };
+        let Some(client) = app.client_handle() else { return };
+        let generation = *client.connection_generation().borrow();
+        if self.legacy_closes.insert(legacy.clone(), generation) == Some(generation) {
+            return;
+        }
+        app.runtime().spawn(async move {
+            if let Err(error) = client.request(method::CLOSE, json!({ "threadId": legacy })).await {
+                tracing::warn!(%error, "could not close legacy draft terminals");
+            }
+        });
     }
 
     fn ensure_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -843,6 +882,29 @@ impl TerminalDrawer {
 fn load_layouts() -> HashMap<String, ThreadTerminalLayout> {
     let Some(serde_json::Value::Object(entries)) = store::load_ui_state(STATE_NAME) else { return HashMap::new() };
     entries.into_iter().filter_map(|(thread_id, value)| Some((thread_id, serde_json::from_value(value).ok()?))).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_terminal_cleanup_only_targets_live_sessions_of_the_migrated_project() {
+    let draft = DraftRef::legacy("project:1");
+    let other_draft = DraftRef::legacy("project:2");
+    let fresh = DraftRef::new(t3_core::composer::drafts::DraftId::new("fresh".into()), "", "project:1");
+    let summary = |thread_id: &str, status: &str| {
+        serde_json::from_value::<TerminalSummary>(json!({
+            "threadId": thread_id, "terminalId": "default", "status": status,
+        })).unwrap()
+    };
+    let mut summaries = vec![
+        summary(&draft.key(), "running"),
+        summary("normal-thread", "running"),
+        summary("draft:project:1", "exited"),
+    ];
+    assert!(legacy_terminal_owner(&draft, &summaries).is_none());
+    summaries.push(summary("draft:project:1", "running"));
+    assert!(legacy_terminal_owner(&fresh, &summaries).is_none());
+    assert!(legacy_terminal_owner(&other_draft, &summaries).is_none());
+    assert_eq!(legacy_terminal_owner(&draft, &summaries).as_deref(), Some("draft:project:1"));
 }
 
 #[cfg(all(test, feature = "snapshot"))]

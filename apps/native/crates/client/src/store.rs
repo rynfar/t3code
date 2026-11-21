@@ -7,7 +7,7 @@
 //! `connection.json` of earlier builds is still read when no `environments.json` exists.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
@@ -453,6 +453,10 @@ fn write_environments(base: &Path, saved: &SavedEnvironments) -> std::io::Result
 
 /// An owner-only file written to a temporary and renamed over the target.
 fn write_private(base: &Path, name: &str, text: &str) -> std::io::Result<()> {
+    write_private_file(base, name, text, true)
+}
+
+fn write_private_file(base: &Path, name: &str, text: &str, replace: bool) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(base)?;
     let temporary = base.join(format!(".{name}.{}.tmp", std::process::id()));
@@ -460,8 +464,18 @@ fn write_private(base: &Path, name: &str, text: &str) -> std::io::Result<()> {
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options.open(&temporary).and_then(|mut file| file.write_all(text.as_bytes())).and_then(|()| std::fs::rename(&temporary, base.join(name)));
-    if written.is_err() {
+    let written = options.open(&temporary).and_then(|mut file| file.write_all(text.as_bytes())).and_then(|()| {
+        let destination = base.join(name);
+        if replace {
+            std::fs::rename(&temporary, destination)
+        } else {
+            match std::fs::hard_link(&temporary, destination) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                result => result,
+            }
+        }
+    });
+    if !replace || written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     written
@@ -853,8 +867,36 @@ fn write_patch_result(base: &Path, name: &str, patch: &serde_json::Map<String, s
 /// A uniquely named temporary file renamed over the target: a crash or a second app instance
 /// never leaves half a file or clobbers another writer's temporary.
 fn write_atomically(base: &Path, name: &str, text: &str) {
+    if name == t3_core::composer::drafts::STORE_NAME
+        && let Err(error) = back_up_legacy_drafts(base, text)
+    {
+        tracing::warn!(%error, "drafts not saved: could not back up the pre-migration file");
+        return;
+    }
     let _ = write_atomically_result(base, name, text);
 }
+
+fn back_up_legacy_drafts(base: &Path, next: &str) -> std::io::Result<()> {
+    const BACKUP: &str = "composer-drafts.v6.bak.json";
+    fn version(text: &str) -> Option<u64> {
+        #[derive(Deserialize)]
+        struct Header { version: u64 }
+        serde_json::from_str::<Header>(text).ok().map(|header| header.version)
+    }
+    if base.join(BACKUP).try_exists()? || version(next) != Some(7) {
+        return Ok(());
+    }
+    let previous = match std::fs::read_to_string(base.join("composer-drafts.json")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if matches!(version(&previous), Some(1 | 3..=6)) {
+        write_private_file(base, BACKUP, &previous, false)?;
+    }
+    Ok(())
+}
+
 fn write_atomically_result(base: &Path, name: &str, text: &str) -> std::io::Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     std::fs::create_dir_all(base)?;
@@ -962,30 +1004,39 @@ fn set_relay_managed_environment_in(base: Option<PathBuf>, id: &str, relay_manag
 }
 
 type AlternateRoutes = std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>>;
+type AlternateRoutesCache = std::collections::HashMap<Option<PathBuf>, Arc<AlternateRoutes>>;
 
 /// Settings renders read this on animation frames, and saves are queued; both need memory, not disk.
-fn alternate_routes_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Option<PathBuf>, AlternateRoutes>> {
-    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<Option<PathBuf>, AlternateRoutes>>> = OnceLock::new();
+fn alternate_routes_cache() -> &'static std::sync::Mutex<AlternateRoutesCache> {
+    static CACHE: OnceLock<std::sync::Mutex<AlternateRoutesCache>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
 /// Saved alternate/learned routes keyed by saved environment ID (`CN-SESSION`).
 pub fn load_alternate_routes() -> AlternateRoutes {
+    (*alternate_routes_snapshot()).clone()
+}
+
+pub fn alternate_routes_snapshot() -> Arc<AlternateRoutes> {
+    with_alternate_routes(Arc::clone)
+}
+
+fn with_alternate_routes<T>(read: impl FnOnce(&Arc<AlternateRoutes>) -> T) -> T {
     let mut cache = alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner());
-    cache
+    let routes = cache
         .entry(base())
         .or_insert_with(|| {
-            load_ui_state("environment-routes")
+            Arc::new(load_ui_state("environment-routes")
                 .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default()
-        })
-        .clone()
+                .unwrap_or_default())
+        });
+    read(routes)
 }
 
 pub fn has_saved_relay_route(id: &str) -> bool {
-    load_alternate_routes().get(id).is_some_and(|routes| {
+    with_alternate_routes(|saved| saved.get(id).is_some_and(|routes| {
         routes.iter().any(|route| route.kind() == crate::routes::ConnectionRouteKind::Relay)
-    })
+    }))
 }
 
 /// Persists alternate/learned routes keyed by saved environment ID.
@@ -993,7 +1044,7 @@ pub fn save_alternate_routes(routes: &AlternateRoutes) {
     let home = base();
     let Ok(text) = serde_json::to_string(routes) else { return };
     let mut cache = alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner());
-    cache.insert(home.clone(), routes.clone());
+    cache.insert(home.clone(), Arc::new(routes.clone()));
     if let Some(dir) = home
         && let Some(writer) = writer()
     {
@@ -1159,10 +1210,14 @@ mod tests {
         let _ = load_alternate_routes();
         {
             let mut cache = alternate_routes_cache().lock().unwrap();
-            cache.entry(base()).or_default().insert(id.into(), vec![route]);
+            Arc::make_mut(cache.entry(base()).or_default()).insert(id.into(), vec![route]);
         }
+        let snapshot = alternate_routes_snapshot();
+        assert!(Arc::ptr_eq(&snapshot, &alternate_routes_snapshot()));
         assert!(active.has_connection_route());
-        alternate_routes_cache().lock().unwrap().entry(base()).or_default().remove(id);
+        Arc::make_mut(alternate_routes_cache().lock().unwrap().entry(base()).or_default()).remove(id);
+        assert!(!active.has_connection_route());
+        assert!(snapshot.contains_key(id));
     }
 
     #[test]
@@ -1360,6 +1415,32 @@ mod tests {
         assert!(write_atomically_result(&dir,"blocked","replacement").is_err());
         assert_eq!(std::fs::read_to_string(dir.join("settings.json")).unwrap(),saved);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_v7_draft_save_backs_up_the_pre_migration_file_once() {
+        let dir = std::env::temp_dir().join(format!("t3-drafts-migration-{}", uuid::Uuid::new_v4()));
+        let name = t3_core::composer::drafts::STORE_NAME;
+        let original = "{\n  \"version\": 6, \"drafts\": {\"draft:p\": {\"prompt\": \"keep me\"}}\n}";
+        write_atomically_result(&dir, name, original).unwrap();
+        let save = |text: &str| {
+            write_pending(Some(dir.clone()), vec![(name.into(), Save::Replace(text.into()))]);
+        };
+        let migrated = t3_core::composer::drafts::DraftStore::from_value(
+            serde_json::from_str(original).ok().as_ref(),
+        ).to_value().to_string();
+        save(&migrated);
+        let backup = dir.join("composer-drafts.v6.bak.json");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("composer-drafts.json")).unwrap(), migrated);
+        write_atomically_result(&dir, name, r#"{"version":6,"drafts":{}}"#).unwrap();
+        save(&migrated);
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
     }
 
     #[test]
