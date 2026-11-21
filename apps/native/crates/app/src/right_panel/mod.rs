@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 const REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 use gpui::{
-    AnchoredPositionMode, Animation, AnimationExt, App, Context, DragMoveEvent, ElementId, EmptyView, Entity, FocusHandle, Focusable,
+    AnchoredPositionMode, App, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, StyleRefinement, Styled, Subscription, Task, Window, actions, div,
-    ease_out_quint, point, prelude::*, px,
+    point, prelude::*, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::v_flex;
@@ -28,15 +28,18 @@ use t3_core::right_panel::{
 
 pub use controls::{Button, Size, Variant, focusable, segment, segmented, tooltip_view};
 pub use state::PanelState;
+#[allow(unused_imports, reason = "Integration hook for the file editor")]
+pub(crate) use tabs::publish_file_tab_dirty;
 #[cfg(feature = "snapshot")]
 pub use tabs::open_surface;
 
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::transition;
 use crate::icons::Icon;
 use crate::diff::DiffPanel;
 use crate::files::FilesPanel;
 use crate::theme::{hsla, palette};
-use crate::workspace::sidebar_inline_width;
+use crate::workspace::{panel_animation_duration, panel_width_clip, sidebar_inline_width};
 
 actions!(right_panel, [ToggleRightPanel, ToggleDiff, CloseActiveSurface, ReopenClosedView, ToggleMaximized, NewSurface]);
 
@@ -61,12 +64,28 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
 
 struct ResizeDrag;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PanelAnimation {
-    seq: u64,
-    duration_ms: u32,
-    opening: bool,
-    from_width: f32,
+#[derive(Clone, PartialEq, Eq)]
+struct RetainedFileSurface {
+    state_id: gpui::EntityId,
+    connection: Option<u64>,
+    thread_id: String,
+}
+
+#[derive(Default)]
+struct FileSurfaceExit(Option<RetainedFileSurface>);
+impl gpui::Global for FileSurfaceExit {}
+
+#[allow(dead_code, reason = "Integration hook for FilesPanel's separately owned state reconciliation")]
+pub(crate) fn holding_file_surface(state: &Entity<AppState>, cx: &App) -> bool {
+    if panel_animation_duration(cx).is_zero() {
+        return false;
+    }
+    let app = state.read(cx);
+    let Some(thread_id) = app.panel_thread() else { return false };
+    !app.panels.panels.is_open(&thread_id)
+        && cx.try_global::<FileSurfaceExit>().and_then(|exit| exit.0.as_ref()).is_some_and(|last| {
+            last.state_id == state.entity_id() && last.connection == app.connection_id() && last.thread_id == thread_id
+        })
 }
 
 pub struct RightPanelView {
@@ -95,9 +114,9 @@ pub struct RightPanelView {
     last_open_state: Option<(String, bool)>,
     /// Last rendered inline/sheet panel width, used as the start width for close transitions.
     last_rendered_width: f32,
-    /// Active open or close width transition; `None` when settled or animations are off (`0 ms`).
-    panel_animation: Option<PanelAnimation>,
-    animation_seq: u64,
+    last_open_panel: Option<ThreadPanel>,
+    #[cfg(all(test, feature = "snapshot"))]
+    animation: Option<(bool, u32)>,
     _close_animation_task: Option<Task<()>>,
     /// Whether the panel is currently in narrow-window sheet mode (`ChatView.tsx:2035`).
     in_sheet_mode: bool,
@@ -153,8 +172,13 @@ impl RightPanelView {
                 this.prune_side_chats(cx);
                 this.add_menu_open = false;
                 this.renaming_device = None;
-                this.panel_animation = None;
-                this._close_animation_task = None;
+                if this.last_open_state.as_ref().is_some_and(|(thread, _)| state.read(cx).panel_thread().as_ref() != Some(thread)) {
+                    this.last_open_panel = None;
+                    #[cfg(all(test, feature = "snapshot"))]
+                    { this.animation = None; }
+                    this._close_animation_task = None;
+                    cx.default_global::<FileSurfaceExit>().0 = None;
+                }
                 // A pending width save belongs to the thread that was showing: flush it now.
                 let flush = this._save_width.take().is_some();
                 state.update(cx, |state, cx| {
@@ -192,8 +216,9 @@ impl RightPanelView {
             last_proactive_enabled: None,
             last_open_state: None,
             last_rendered_width: DEFAULT_WIDTH,
-            panel_animation: None,
-            animation_seq: 0,
+            last_open_panel: None,
+            #[cfg(all(test, feature = "snapshot"))]
+            animation: None,
             _close_animation_task: None,
             in_sheet_mode: initial_sheet_mode,
             renaming_device: None,
@@ -214,12 +239,12 @@ impl RightPanelView {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn open_animation_duration_ms(&self) -> Option<u32> {
-        self.panel_animation.filter(|anim| anim.opening).map(|anim| anim.duration_ms)
+        self.animation.filter(|(opening, _)| *opening).map(|(_, duration)| duration)
     }
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn close_animation_duration_ms(&self) -> Option<u32> {
-        self.panel_animation.filter(|anim| !anim.opening).map(|anim| anim.duration_ms)
+        self.animation.filter(|(opening, _)| !*opening).map(|(_, duration)| duration)
     }
 
     fn attach_details_subscription(&mut self, cx: &mut Context<Self>) {
@@ -304,54 +329,13 @@ impl RightPanelView {
             let latest_run_settled = latest_run.is_some_and(|run| run.completed_at.is_some());
             let summaries = projection.map(|p| turn_diff_summaries(&p.checkpoints)).unwrap_or_default();
 
-            let env_id = state.environment().map(str::to_owned);
             let thread_shell = thread_id.as_deref().and_then(|id| state.thread_shell(id));
             let visible_links = thread_shell
                 .map(|thread| visible_thread_pull_requests(&thread.pull_requests))
                 .unwrap_or_default();
             let visible_count = visible_links.len();
-            let current_pr = thread_shell
-                .and_then(|thread| resolve_thread_current_pull_request(&thread.pull_requests))
-                .map(|current| current.link());
-            let project_id = thread_shell.map(|thread| thread.project_id.clone());
-            let link_project = project_id
-                .as_deref()
-                .and_then(|id| state.shell.project(id))
-                .and_then(|project| project.repository_identity.as_ref())
-                .and_then(t3_core::pull_requests::link::LinkProject::from_identity);
-            let persisted_pr = current_pr.zip(project_id.clone()).map(|(link, project_id)| PullRequestTarget {
-                environment_id: env_id.clone(),
-                project_id,
-                host: (!link.host.is_empty()).then(|| link.host.clone()),
-                repository: link.repository.clone(),
-                number: link.number,
-                url: Some(link.url.clone()),
-                reveal_url: None,
-                detail_tab: None,
-            });
-            // Match `useThreadLinkedPullRequest.ts:99-104`: branch PR from live git status
-            // overrides/supplements when resolvable against the project's repository, while
-            // `hasDetail` reflects whether a persisted link exists.
-            let branch_pr_target = branch_pr.and_then(|pr| {
-                let project_id = project_id.clone()?;
-                let parsed = t3_core::pull_requests::link::parse_change_request_url(&pr.url);
-                let (host, repository) = match (parsed, &link_project) {
-                    (Some(link), _) => (Some(link.host), link.repository),
-                    (None, Some(lp)) => (Some(lp.host.clone()), lp.repository.clone()),
-                    (None, None) => return None,
-                };
-                Some(PullRequestTarget {
-                    environment_id: env_id.clone(),
-                    project_id,
-                    host,
-                    repository,
-                    number: pr.number,
-                    url: Some(pr.url),
-                    reveal_url: None,
-                    detail_tab: None,
-                })
-            });
-            let linked_pr = branch_pr_target.or(persisted_pr);
+            let persisted = thread_shell.is_some_and(|thread| resolve_thread_current_pull_request(&thread.pull_requests).is_some());
+            let linked_pr = pull_request_target(state, branch_pr);
             let cap_known = state.server_config.config.is_some();
             // Match `ChatView.tsx:1286-1287,1997-2003,2027-2031`:
             let supports_pull_requests = cap_known;
@@ -380,7 +364,7 @@ impl RightPanelView {
                 latest_run_settled,
                 summaries,
                 linked_pr,
-                current_pr.is_some(),
+                persisted,
                 pr_key,
                 cap_known,
                 supports_pull_requests,
@@ -831,11 +815,12 @@ impl RightPanelView {
         Some(view)
     }
 
-    fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_resize_handle(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let dragging = cx.has_active_drag();
-        div()
-            .id("right-panel-resize")
+        let id = gpui::ElementId::from("right-panel-resize");
+        focusable(div().id(id.clone()), id, true, window, cx)
+            .aria_label(crate::i18n::t(cx, "Resize right panel"))
             .group("resize")
             .absolute()
             .top_0()
@@ -844,6 +829,22 @@ impl RightPanelView {
             .w(px(8.))
             .cursor_col_resize()
             .on_drag(ResizeDrag, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let viewport = f32::from(window.viewport_size().width);
+                let state = this.state.read(cx);
+                let Some(thread) = state.panel_thread() else { return };
+                let width = inline_panel_width(state, &thread, viewport);
+                let proposed = match event.keystroke.key.as_str() {
+                    "left" => width + 16.,
+                    "right" => width - 16.,
+                    "home" => 0.,
+                    "end" => viewport,
+                    _ => return,
+                };
+                let width = clamp_width(proposed, viewport, viewport - sidebar_inline_width(state, viewport));
+                this.state.update(cx, |state, cx| state.set_right_panel_width(width, true, cx));
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .absolute()
@@ -877,97 +878,89 @@ impl Render for RightPanelView {
                 let _ = weak.update(cx, |this, cx| this.evaluate_proactive(cx));
             });
         }
-        self.sync_previews(thread_id.as_deref(), panel.as_ref(), window, cx);
-        self.sync_devices(thread_id.as_deref(), panel.as_ref(), cx);
-        self.sync_terminals(thread_id.as_deref(), panel.as_ref(), window, cx);
-        self.sync_pull_request_tabs(thread_id.as_deref(), panel.as_ref(), cx);
-        self.sync_issue_tabs(thread_id.as_deref(), panel.as_ref());
-        let state = self.state.read(cx);
-        let (Some(thread_id), Some(panel)) = (thread_id, panel) else {
-            self.last_open_state = None;
-            self.panel_animation = None;
+        let duration = panel_animation_duration(cx);
+        let is_open = panel.as_ref().is_some_and(|panel| panel.is_open);
+        let same_thread = self.last_open_state.as_ref().is_some_and(|(previous, _)| Some(previous) == thread_id.as_ref());
+        let was_open = same_thread && self.last_open_state.as_ref().is_some_and(|(_, open)| *open);
+        let was_maximized = self.last_open_panel.as_ref().is_some_and(|panel| panel.maximized);
+        let maximized = panel.as_ref().is_some_and(|panel| panel.maximized);
+        let animate = same_thread && !sheet_mode_changed && !maximized && !was_maximized && !duration.is_zero();
+        self.last_open_state = thread_id.clone().map(|id| (id, is_open));
+        if !animate || is_open {
             self._close_animation_task = None;
+            if !is_open {
+                self.last_open_panel = None;
+            }
+        }
+        if animate && was_open && !is_open {
+            self._close_animation_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration + Duration::from_millis(16)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.last_open_panel = None;
+                    this._close_animation_task = None;
+                    #[cfg(all(test, feature = "snapshot"))]
+                    { this.animation = None; }
+                    cx.notify();
+                });
+            }));
+        }
+        #[cfg(all(test, feature = "snapshot"))]
+        {
+            if !animate {
+                self.animation = None;
+            } else if is_open != was_open {
+                self.animation = Some((is_open, duration.as_millis() as u32));
+            }
+        }
+        let progress = transition(
+            "right-panel-progress",
+            f32::from(is_open),
+            if animate && (is_open || self.last_open_panel.is_some()) { duration } else { Duration::ZERO },
+            window,
+            cx,
+        );
+        let closing = !is_open && progress > 0. && self.last_open_panel.is_some();
+        let rendered = if closing { self.last_open_panel.clone() } else { panel.clone() };
+        self.sync_previews(thread_id.as_deref(), rendered.as_ref(), window, cx);
+        self.sync_devices(thread_id.as_deref(), rendered.as_ref(), cx);
+        self.sync_terminals(thread_id.as_deref(), rendered.as_ref(), window, cx);
+        self.sync_pull_request_tabs(thread_id.as_deref(), rendered.as_ref(), cx);
+        self.sync_issue_tabs(thread_id.as_deref(), rendered.as_ref());
+        if !is_open && !closing {
+            self.last_open_panel = None;
+            self._close_animation_task = None;
+            cx.default_global::<FileSurfaceExit>().0 = None;
+            #[cfg(all(test, feature = "snapshot"))]
+            { self.animation = None; }
+            return div().into_any_element();
+        }
+        let (Some(thread_id), Some(panel)) = (thread_id, rendered) else {
             return div().into_any_element();
         };
-        let animation_duration_ms = crate::settings::store::try_client(cx)
-            .map_or(0, t3_core::client_settings::ClientSettingsDoc::panel_animation_duration_ms);
-        let same_thread_opened = matches!(
-            self.last_open_state.as_ref(),
-            Some((prev_thread, false)) if prev_thread == &thread_id
-        ) && panel.is_open;
-        let same_thread_closed = matches!(
-            self.last_open_state.as_ref(),
-            Some((prev_thread, true)) if prev_thread == &thread_id
-        ) && !panel.is_open;
-        let thread_switched = self.last_open_state.as_ref().is_some_and(|(prev, _)| prev != &thread_id);
-        self.last_open_state = Some((thread_id.clone(), panel.is_open));
-        if animation_duration_ms == 0 || thread_switched {
-            self.panel_animation = None;
-            self._close_animation_task = None;
-        }
-        if !panel.is_open {
-            if same_thread_closed && animation_duration_ms > 0 && !panel.maximized {
-                let from_width = self.last_rendered_width.max(1.);
-                self.animation_seq = self.animation_seq.wrapping_add(1);
-                let seq = self.animation_seq;
-                self.panel_animation = Some(PanelAnimation {
-                    seq,
-                    duration_ms: animation_duration_ms,
-                    opening: false,
-                    from_width,
-                });
-                let wait = Duration::from_millis(u64::from(animation_duration_ms) + 16);
-                self._close_animation_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(wait).await;
-                    let _ = this.update(cx, |this, cx| {
-                        if this.panel_animation.is_some_and(|a| !a.opening && a.seq == seq) {
-                            this.panel_animation = None;
-                            this._close_animation_task = None;
-                            cx.notify();
-                        }
-                    });
-                }));
-            }
-            if let Some(anim) = self.panel_animation.filter(|a| !a.opening) {
-                let p = palette(cx);
-                let closing_el = div()
-                    .id("right-panel-closing")
-                    .debug_selector(|| "right-panel-closing".to_owned())
-                    .h_full()
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(hsla(p.background))
-                    .border_l_1()
-                    .border_color(hsla(p.border))
-                    .with_animation(
-                        ElementId::Name(format!("right-panel-close-{}", anim.seq).into()),
-                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                        move |el, delta| el.w(px(anim.from_width * (1. - delta))),
-                    );
-                return closing_el.into_any_element();
-            }
-            return div().into_any_element();
-        }
-        let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
-        let width = if sheet_mode {
+        let state = self.state.read(cx);
+        let width = if closing {
+            self.last_rendered_width
+        } else if sheet_mode {
             sheet_width(viewport)
         } else {
-            clamp_width(stored, viewport, viewport - sidebar_inline_width(state, viewport))
+            inline_panel_width(state, &thread_id, viewport)
         };
-        self.last_rendered_width = width;
-        if same_thread_opened && animation_duration_ms > 0 && (sheet_mode || !panel.maximized) {
-            self._close_animation_task = None;
-            self.animation_seq = self.animation_seq.wrapping_add(1);
-            self.panel_animation = Some(PanelAnimation {
-                seq: self.animation_seq,
-                duration_ms: animation_duration_ms,
-                opening: true,
-                from_width: 0.,
-            });
-        } else if self.panel_animation.is_some_and(|a| !a.opening) {
-            self.panel_animation = None;
-            self._close_animation_task = None;
+        if is_open {
+            self.last_rendered_width = width;
+            self.last_open_panel = Some(panel.clone());
+            let retained_file = panel.active()
+                .filter(|surface| matches!(surface.kind, SurfaceKind::Files { .. } | SurfaceKind::File { .. }))
+                .map(|_| RetainedFileSurface {
+                    state_id: self.state.entity_id(),
+                    connection: self.state.read(cx).connection_id(),
+                    thread_id: thread_id.clone(),
+                });
+            let exit = cx.default_global::<FileSurfaceExit>();
+            if exit.0 != retained_file {
+                exit.0 = retained_file;
+            }
         }
+        let state = self.state.read(cx);
         // Maximized beside a hidden sidebar, the tab bar clears the traffic lights and the
         // sidebar toggle as the thread header does (design-system §5).
         let titlebar_inset = !sheet_mode && panel.maximized && sidebar_inline_width(state, viewport) == 0.;
@@ -1045,8 +1038,6 @@ impl Render for RightPanelView {
                 this.flex_none().w(px(width)).border_l_1().border_color(hsla(p.border))
             })
             .when(sheet_mode, |this| this.shadow_lg().occlude())
-            .when(!sheet_mode, |this| this.on_drag_move(cx.listener(Self::resize)))
-            .when(!sheet_mode && !panel.maximized, |this| this.child(self.render_resize_handle(cx)))
             .child(tabs::tab_bar(
                 self.state.clone(),
                 &panel,
@@ -1074,16 +1065,20 @@ impl Render for RightPanelView {
         } else {
             panel_el
         };
-        let animated_panel: gpui::AnyElement = match self.panel_animation {
-            Some(anim) if anim.opening && (sheet_mode || !panel.maximized) => panel_el
-                .overflow_hidden()
-                .with_animation(
-                    ElementId::Name(format!("right-panel-open-{}", anim.seq).into()),
-                    Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                    move |el, delta| el.w(px(width * delta)),
-                )
-                .into_any_element(),
-            _ => panel_el.into_any_element(),
+        let animated_panel = if panel.maximized {
+            panel_el.into_any_element()
+        } else {
+            div()
+                .id("right-panel-width")
+                .debug_selector(move || if closing { "right-panel-closing" } else { "right-panel-open" }.to_owned())
+                .relative()
+                .h_full()
+                .when(!sheet_mode && is_open && progress == 1., |this| {
+                    this.on_drag_move(cx.listener(Self::resize)).child(self.render_resize_handle(window, cx))
+                })
+                .child(panel_width_clip(px(width * progress), px(width), false, panel_el))
+                .when(closing, |this| this.child(div().absolute().inset_0().occlude()))
+                .into_any_element()
         };
 
         if sheet_mode {
@@ -1104,12 +1099,12 @@ impl Render for RightPanelView {
                                     .h(size.height)
                                     .flex()
                                     .justify_end()
-                                    .bg(hsla(p.background).opacity(0.45))
+                                    .bg(hsla(p.background).opacity(0.45 * progress))
                                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                        dismiss_state.update(cx, |state, cx| state.toggle_right_panel(cx));
+                                        if is_open { dismiss_state.update(cx, |state, cx| state.toggle_right_panel(cx)); }
                                     })
                                     .on_key_down(move |event, _, cx| {
-                                        if event.keystroke.key == "escape" {
+                                        if is_open && event.keystroke.key == "escape" {
                                             cx.stop_propagation();
                                             esc_state.update(cx, |state, cx| state.toggle_right_panel(cx));
                                         }
@@ -1123,6 +1118,49 @@ impl Render for RightPanelView {
         }
         animated_panel
     }
+}
+
+fn pull_request_target(state: &AppState, branch_pr: Option<t3_core::vcs::ChangeRequest>) -> Option<PullRequestTarget> {
+    let thread = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id))?;
+    let target = |host, repository, number, url| PullRequestTarget {
+        environment_id: state.environment().map(str::to_owned),
+        project_id: thread.project_id.clone(),
+        host,
+        repository,
+        number,
+        url: Some(url),
+        reveal_url: None,
+        detail_tab: None,
+    };
+    if let Some(pr) = branch_pr {
+        if let Some(link) = t3_core::pull_requests::link::parse_change_request_url(&pr.url) {
+            return Some(target(Some(link.host), link.repository, pr.number, pr.url));
+        }
+        let project = state.shell.project(&thread.project_id).and_then(|project| project.repository_identity.as_ref());
+        if let Some(link) = project.and_then(t3_core::pull_requests::link::LinkProject::from_identity) {
+            return Some(target(Some(link.host), link.repository, pr.number, pr.url));
+        }
+    }
+    let current = resolve_thread_current_pull_request(&thread.pull_requests)?;
+    let link = current.link();
+    Some(target((!link.host.is_empty()).then(|| link.host.clone()), link.repository.clone(), link.number, link.url.clone()))
+}
+
+fn launcher_pull_request_target(state: &AppState, cx: &App) -> Option<PullRequestTarget> {
+    let branch_pr = crate::thread_details::details(cx).and_then(|details| {
+        let git = details.read(cx).git.read(cx);
+        let target = git.target.as_ref()?;
+        if Some(target.thread_id.as_str()) != state.selected_thread.as_deref() {
+            return None;
+        }
+        git.status.as_ref()?.remote.pr.clone()
+    });
+    pull_request_target(state, branch_pr)
+}
+
+pub(crate) fn inline_panel_width(state: &AppState, thread_id: &str, viewport: f32) -> f32 {
+    let stored = state.panels.panels.width(thread_id).unwrap_or(DEFAULT_WIDTH);
+    clamp_width(stored, viewport, viewport - sidebar_inline_width(state, viewport))
 }
 
 /// The window's top-right controls (`PanelLayoutControls.tsx` right panel toggle and

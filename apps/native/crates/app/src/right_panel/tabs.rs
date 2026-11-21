@@ -1,15 +1,15 @@
 //! The tab bar (`RightPanelTab`, the add-surface menu, `PanelTabCloseButton`) and the empty
 //! "Open a surface" launcher (`RightPanelEmptyState`) from `components/RightPanelTabs.tsx`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, ElementId, Entity, FontWeight, Hsla, Image, ImageFormat, IntoElement,
-    MouseButton, ParentElement, RenderOnce, SharedString, Styled, Window, WindowControlArea, div,
+    AnyElement, App, ElementId, EmptyView, Entity, FontWeight, Hsla, Image, ImageFormat, IntoElement,
+    MouseButton, ParentElement, RenderOnce, ScrollHandle, SharedString, Styled, Task, Window, WindowControlArea, div,
     img, prelude::*, px,
 };
 use gpui_component::input::{Input, InputState};
@@ -24,8 +24,8 @@ use t3_core::right_panel::{Surface, SurfaceKind, ThreadPanel};
 use super::{Button, Size, Variant, focusable, header_controls_with_options};
 use crate::app_state::AppState;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
-use crate::workspace::TITLEBAR_HEIGHT;
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette};
+use crate::workspace::{TITLEBAR_HEIGHT, traffic_light_inset};
 
 /// What the launcher and the add menu offer. Native ships the diff; other surfaces join here.
 struct SurfaceAction {
@@ -61,12 +61,25 @@ fn terminal_unavailable(state: &AppState, cx: &App) -> Option<&'static str> {
     (!crate::terminal::can_operate_terminals(cx)).then_some("Pair this client again with terminal access to open terminals.")
 }
 
+fn pull_request_unavailable(state: &AppState, cx: &App) -> Option<&'static str> {
+    server_thread_unavailable(state, cx).or_else(|| {
+        super::launcher_pull_request_target(state, cx).is_none().then_some("No pull request on this branch yet.")
+    })
+}
+
+fn open_pull_request(state: &mut AppState, cx: &mut gpui::Context<AppState>) {
+    if let Some(target) = super::launcher_pull_request_target(state, cx) {
+        state.open_pull_request_surface(target, cx);
+    }
+}
+
 const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Browser", icon: Icon::Earth, shortcut: "B", open: crate::preview::add_browser_surface, unavailable: browser_unavailable },
+    SurfaceAction { label: "Terminal", icon: Icon::SquareTerminal, shortcut: "T", open: AppState::add_terminal_surface, unavailable: terminal_unavailable },
     SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: files_unavailable },
     SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: server_thread_unavailable },
-    SurfaceAction { label: "Terminal", icon: Icon::SquareTerminal, shortcut: "T", open: AppState::add_terminal_surface, unavailable: terminal_unavailable },
-    SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: server_thread_unavailable },
+    SurfaceAction { label: "Pull request", icon: Icon::GitPullRequest, shortcut: "P", open: open_pull_request, unavailable: pull_request_unavailable },
+    SurfaceAction { label: "Linked items", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: server_thread_unavailable },
     SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: always },
 ];
 
@@ -104,6 +117,7 @@ pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<Ap
         }
         _ => {}
     }
+    let label = if label.eq_ignore_ascii_case("Linked pull requests") { "Linked items" } else { label };
     let Some(action) = SURFACE_ACTIONS.iter().find(|action| action.label.eq_ignore_ascii_case(label)) else { return false };
     (action.open)(state, cx);
     true
@@ -247,7 +261,75 @@ fn surface_icon(surface: &Surface) -> Icon {
     }
 }
 
-fn render_tab_surface_icon(surface: &Surface, icon_color: Hsla, group: SharedString) -> AnyElement {
+#[derive(Default)]
+struct DirtyTabs(HashMap<(gpui::EntityId, Option<u64>, String, String), bool>);
+impl gpui::Global for DirtyTabs {}
+
+#[allow(dead_code, reason = "The file editor publishes dirty state through this hook at integration")]
+pub(crate) fn publish_file_tab_dirty(state: &Entity<AppState>, path: Option<&str>, dirty: bool, cx: &mut App) {
+    let app = state.read(cx);
+    let Some((thread, path)) = app.panel_thread().zip(path) else { return };
+    let scope = (state.entity_id(), app.connection_id(), thread, path.to_owned());
+    let tabs = &mut cx.default_global::<DirtyTabs>().0;
+    let changed = if dirty { tabs.insert(scope, true).is_none() } else { tabs.remove(&scope).is_some() };
+    if changed {
+        let state = state.clone();
+        cx.defer(move |cx| state.update(cx, |_, cx| cx.emit(crate::app_state::AppEvent::RightPanel)));
+    }
+}
+
+fn browser_favicon_url(raw_url: &str) -> Option<SharedString> {
+    let url = (raw_url.len() <= 4096).then(|| gpui::http_client::Url::parse(raw_url).ok()).flatten()?;
+    let host = url.domain()?.strip_suffix('.').unwrap_or(url.domain()?);
+    let (domain, tld) = host.rsplit_once('.')?;
+    if !matches!(url.scheme(), "https" | "http")
+        || domain.is_empty()
+        || !tld.bytes().all(|byte| byte.is_ascii_alphabetic())
+        || matches!(tld, "alt" | "corp" | "example" | "home" | "internal" | "intranet" | "invalid" | "lan" | "local" | "localhost" | "localdomain" | "onion" | "private" | "test")
+        || host.ends_with(".ts.net")
+        || host.split('.').any(|label| label.is_empty() || matches!(label, "corp" | "internal" | "intranet" | "localhost"))
+    {
+        return None;
+    }
+    Some(format!("https://www.google.com/s2/favicons?domain={host}&sz=32").into())
+}
+
+struct BrowserFavicon {
+    image: Option<Arc<Image>>,
+    _load: Task<()>,
+}
+
+fn load_browser_favicon(
+    url: SharedString,
+    surface: &Surface,
+    state: &Entity<AppState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Arc<Image>> {
+    const PROVIDER: &str = "https://www.google.com";
+    let path = url.strip_prefix(PROVIDER)?.to_owned();
+    let runtime = state.read(cx).runtime().clone();
+    let key = ElementId::Name(format!("browser-tab-favicon:{}:{path}", surface.id).into());
+    window.use_keyed_state::<BrowserFavicon>(key, cx, |_, cx| BrowserFavicon {
+        image: None,
+        _load: cx.spawn(async move |this, cx| {
+            let result = runtime.spawn(async move {
+                let bytes = t3_client::asset::fetch_asset(PROVIDER, &path, 64 * 1024).await.ok()?;
+                let decoder = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+                let (width, height) = decoder.into_dimensions().ok()?;
+                (width <= 128 && height <= 128).then(|| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+            }).await;
+            if let Ok(Some(image)) = result {
+                let _ = this.update(cx, |load, cx| {
+                    load.image = Some(image);
+                    cx.notify();
+                });
+            }
+        }),
+    }).read(cx).image.clone()
+}
+
+fn render_tab_surface_icon(surface: &Surface, favicon: Option<Arc<Image>>, icon_color: Hsla, group: SharedString) -> AnyElement {
     if matches!(surface.kind, SurfaceKind::Device { .. }) {
         match device_tab_icon(surface) {
             DeviceTabIcon::Ios => {
@@ -293,6 +375,13 @@ fn render_tab_surface_icon(surface: &Surface, icon_color: Hsla, group: SharedStr
                     .into_any_element();
             }
         }
+    }
+    if let Some(favicon) = favicon {
+        return div()
+            .absolute().top(px(2.)).left(px(2.)).size(px(12.))
+            .group_hover(group, |style| style.invisible())
+            .child(img(favicon).size(px(12.)))
+            .into_any_element();
     }
     surface_icon(surface)
         .svg()
@@ -346,6 +435,27 @@ pub(super) fn add_menu_entries(state: &AppState, cx: &App) -> Vec<AddMenuEntry> 
     entries
 }
 
+#[derive(Default)]
+struct TabScroll {
+    handle: ScrollHandle,
+    active: RefCell<Option<String>>,
+    edges: Cell<(bool, bool)>,
+}
+
+#[derive(Clone)]
+struct DraggedTab {
+    thread_id: String,
+    surface_id: String,
+}
+
+fn scroll_tabs(handle: &ScrollHandle, direction: f32, window: &mut Window) {
+    let mut offset = handle.offset();
+    offset.x = (offset.x + handle.bounds().size.width * 0.75 * direction)
+        .clamp(-handle.max_offset().x, px(0.));
+    handle.set_offset(offset);
+    window.refresh();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn tab_bar(
     state: Entity<AppState>,
@@ -373,30 +483,80 @@ pub fn tab_bar(
         .collect();
     let add_tooltip = crate::keymap::label("rightPanel.new", cx)
         .map_or_else(|| "Add panel surface".to_owned(), |key| format!("Add panel surface ({key})"));
+    let scroll = window.use_keyed_state("right-panel-tab-scroll", cx, |_, _| TabScroll::default());
+    let strip = scroll.read(cx);
+    let active_index = panel.active_surface_id.as_ref().and_then(|id| panel.surfaces.iter().position(|tab| &tab.id == id));
+    if *strip.active.borrow() != panel.active_surface_id {
+        *strip.active.borrow_mut() = panel.active_surface_id.clone();
+        if let Some(index) = active_index {
+            strip.handle.scroll_to_item(index);
+        }
+    }
+    let handle = strip.handle.clone();
+    let left_handle = handle.clone();
+    let right_handle = handle.clone();
+    let edge_handle = handle.clone();
+    let (can_scroll_left, can_scroll_right) = strip.edges.get();
+    let overflow = can_scroll_left || can_scroll_right;
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
-        .pl(px(if titlebar_inset { 130. } else { 8. }))
+        .pl(if titlebar_inset { traffic_light_inset(window, true) } else { px(8.) })
         .pr(px(12.))
         .gap(px(4.))
         .window_control_area(WindowControlArea::Drag)
         .child(
             h_flex()
-                .flex_1()
+                .on_children_prepainted(move |_, window, cx| {
+                    let offset = edge_handle.offset().x;
+                    let max = edge_handle.max_offset().x;
+                    let next = if max > px(if overflow { 57. } else { 1. }) {
+                        (offset < -px(1.), offset > -max + px(1.))
+                    } else {
+                        (false, false)
+                    };
+                    let strip = scroll.read(cx);
+                    let previous = strip.edges.replace(next);
+                    if previous != next {
+                        if !previous.0 && !previous.1 && let Some(index) = active_index {
+                            edge_handle.scroll_to_item(index);
+                        }
+                        window.request_animation_frame();
+                    }
+                })
+                .id("right-panel-tab-strip")
+                .flex_shrink(1.)
                 .min_w_0()
                 .gap(px(4.))
-                .overflow_hidden()
-                .children(tabs)
-                .child(
-                    Button::new("right-panel-add")
-                        .variant(if add_menu_open { Variant::Toggle } else { Variant::GhostMuted })
-                        .size(Size::IconXs)
-                        .pressed(add_menu_open)
-                        .icon(Icon::Plus)
-                        .tooltip(add_tooltip)
-                        .on_click(move |_, window, cx| on_toggle_add(window, cx)),
-                ),
+                .overflow_x_scroll()
+                .track_scroll(&handle)
+                .children(tabs),
         )
+        .when(overflow, |bar| {
+            bar.child(
+                Button::new("right-panel-tabs-left")
+                    .variant(Variant::GhostMuted).size(Size::IconXs)
+                    .icon(Icon::ChevronLeft).tooltip(crate::i18n::t(cx, "Scroll tabs left"))
+                    .disabled(!can_scroll_left)
+                    .on_click(move |_, window, _| scroll_tabs(&left_handle, 1., window)),
+            ).child(
+                Button::new("right-panel-tabs-right")
+                    .variant(Variant::GhostMuted).size(Size::IconXs)
+                    .icon(Icon::ChevronRight).tooltip(crate::i18n::t(cx, "Scroll tabs right"))
+                    .disabled(!can_scroll_right)
+                    .on_click(move |_, window, _| scroll_tabs(&right_handle, -1., window)),
+            )
+        })
+        .child(
+            Button::new("right-panel-add")
+                .variant(if add_menu_open { Variant::Toggle } else { Variant::GhostMuted })
+                .size(Size::IconXs)
+                .pressed(add_menu_open)
+                .icon(Icon::Plus)
+                .tooltip(add_tooltip)
+                .on_click(move |_, window, cx| on_toggle_add(window, cx)),
+        )
+        .child(div().flex_1().min_w_0())
         .child(header_controls_with_options(&state, !sheet_mode, cx))
         .into_any_element()
 }
@@ -665,12 +825,14 @@ fn tab(
 ) -> AnyElement {
     let p = palette(cx);
     let side_chat = surface.side_chat_thread().and_then(|id| state.read(cx).thread_shell(id));
+    let mut favicon = None;
     let title: SharedString = match &surface.kind {
         SurfaceKind::SideChat { .. } => side_chat.map_or_else(|| surface.title(), |thread| thread.title.clone()).into(),
         SurfaceKind::Preview { resource_id: Some(tab) } => {
             let previews = crate::preview::previews(cx);
             let thread_key = state.read(cx).panel_thread();
             let snapshot = previews.as_ref().zip(thread_key.as_deref()).and_then(|(previews, thread)| previews.read(cx).session(thread, tab));
+            favicon = snapshot.and_then(|snapshot| snapshot.nav_status.url()).and_then(browser_favicon_url);
             t3_core::preview::tab_title(snapshot).into()
         }
         SurfaceKind::Terminal { active_terminal_id, .. } => {
@@ -685,11 +847,20 @@ fn tab(
         t3_core::side_chat::TabState::Running => hsla(p.muted_foreground),
         _ => hsla(p.info),
     });
+    let favicon = favicon.and_then(|url| load_browser_favicon(url, surface, &state, window, cx));
     let id = surface.id.clone();
     let file_path = match &surface.kind {
         SurfaceKind::File { relative_path, attachment: None, .. } => Some(relative_path.clone()),
         _ => None,
     };
+    let dirty = file_path.as_deref().is_some_and(|path| {
+        let app = state.read(cx);
+        app.panel_thread().is_some_and(|thread| {
+            cx.try_global::<DirtyTabs>().is_some_and(|tabs| {
+                tabs.0.contains_key(&(state.entity_id(), app.connection_id(), thread, path.to_owned()))
+            })
+        })
+    });
     let (activate, close, middle) = (state.clone(), state.clone(), state.clone());
     let (activate_id, close_id, middle_id) = (id.clone(), id.clone(), id.clone());
     let rename_id_click = id.clone();
@@ -699,6 +870,9 @@ fn tab(
     let rename_title_menu = title.to_string();
     let on_rename_menu = on_start_rename;
     let group: SharedString = format!("tab-{id}").into();
+    let tip = title.clone();
+    let drag = state.read(cx).panel_thread().map(|thread_id| DraggedTab { thread_id, surface_id: id.clone() });
+    let drop_state = state.clone();
     let icon_color = hsla(if active { p.foreground } else { p.muted_foreground });
     let tab_id = ElementId::from(SharedString::from(format!("right-panel-tab-{id}")));
     let label_el = match rename_input {
@@ -718,13 +892,24 @@ fn tab(
                         cancel_key(cx);
                     }
                 })
-                .child(Input::new(input).xsmall())
+                .child(Input::new(input).xsmall().theme_slot(ThemeSlot::Input, cx))
                 .into_any_element()
         }
         None => div().min_w_0().truncate().child(title.clone()).into_any_element(),
     };
     focusable(div().id(tab_id.clone()), tab_id, true, window, cx)
         .group(group.clone())
+        .tooltip(move |window, cx| super::tooltip_view(tip.clone(), window, cx))
+        .when_some(drag.filter(|_| count > 1 && rename_input.is_none()), |tab, drag| {
+            tab.on_drag(drag, |_, _, _, cx| cx.new(|_| EmptyView))
+        })
+        .on_drop(move |drag: &DraggedTab, _, cx| {
+            drop_state.update(cx, |state, cx| {
+                state.mutate_panels(cx, |panels, thread| {
+                    thread == drag.thread_id && panels.panels.move_surface(thread, &drag.surface_id, index)
+                });
+            });
+        })
         .flex()
         .flex_none()
         .items_center()
@@ -770,7 +955,7 @@ fn tab(
                     cx.stop_propagation();
                     close.update(cx, |state, cx| state.close_surface_with_confirm(&close_id, window, cx));
                 })
-                .child(render_tab_surface_icon(surface, icon_color, group.clone()))
+                .child(render_tab_surface_icon(surface, favicon, icon_color, group.clone()))
                 .child(
                     Icon::X
                         .svg()
@@ -785,6 +970,7 @@ fn tab(
                 .children(dot.map(|dot| div().absolute().top(px(0.)).right(px(0.)).size(px(6.)).rounded_full().bg(dot))),
         )
         .child(label_el)
+        .when(dirty, |tab| tab.child(div().size(px(6.)).flex_none().rounded_full().bg(hsla(p.muted_foreground))))
         .context_menu(move |menu, _, cx| {
             let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut Window, &mut gpui::Context<AppState>)| {
                 let state = state.clone();
@@ -826,6 +1012,16 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
     let profile_menu_state =
         window.use_keyed_state("right-panel-empty-browser-profiles", cx, |_, _| EmptyProfileMenuState::default());
     let is_profile_menu_open = profile_menu_state.read(cx).open;
+    let focus = window.use_keyed_state("right-panel-launcher-focus", cx, |window, cx| {
+        let focus = cx.focus_handle().tab_stop(true);
+        let initial = focus.clone();
+        window.on_next_frame(move |window, cx| window.focus(&initial, cx));
+        focus
+    }).read(cx).clone();
+    let selection = window.use_keyed_state("right-panel-launcher-selection", cx, |_, _| Cell::new(0_usize));
+    let entries = add_menu_entries(state.read(cx), cx);
+    let enabled = entries.iter().enumerate().filter_map(|(index, entry)| entry.unavailable.is_none().then_some(index)).collect::<Vec<_>>();
+    let selected = enabled.get(selection.read(cx).get().min(enabled.len().saturating_sub(1))).copied();
     let mut rows: Vec<AnyElement> = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
         let state_click = state.clone();
         let open = action.open;
@@ -840,6 +1036,7 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             .rounded(px(8.))
             .text_sm()
             .text_color(hsla(p.foreground))
+            .when(selected == Some(index) && focus.is_focused(window), |row| row.bg(hsla(p.accent)))
             .when(reason.is_some(), |this| this.opacity(0.64))
             .when(reason.is_none(), |this| {
                 this.cursor_pointer().hover(|style| style.bg(hsla(p.accent).opacity(0.6))).on_click(move |_, _, cx| state_click.update(cx, open))
@@ -949,6 +1146,7 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
         let open_state = state.clone();
         rows.push(
             focusable(h_flex().id(row_id.clone()), row_id, reason.is_none(), window, cx)
+                .when(selected == Some(SURFACE_ACTIONS.len()) && focus.is_focused(window), |row| row.bg(hsla(p.accent)))
                 .h(px(32.))
                 .w_full()
                 .px(px(10.))
@@ -969,7 +1167,42 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                 .into_any_element(),
         );
     }
+    let key_focus = focus.clone();
     div()
+        .id("right-panel-launcher")
+        .track_focus(&focus)
+        .aria_label(crate::i18n::t(cx, "Open a surface"))
+        .on_key_down(move |event, window, cx| {
+            let key = &event.keystroke;
+            if is_profile_menu_open || enabled.is_empty()
+                || key.modifiers.control || key.modifiers.alt || key.modifiers.platform
+            {
+                return;
+            }
+            let index = selection.read(cx).get().min(enabled.len() - 1);
+            match key.key.as_str() {
+                "down" | "right" | "up" | "left" => {
+                    let next = if key.key == "down" || key.key == "right" {
+                        (index + 1) % enabled.len()
+                    } else {
+                        (index + enabled.len() - 1) % enabled.len()
+                    };
+                    selection.read(cx).set(next);
+                    window.focus(&key_focus, cx);
+                    window.refresh();
+                }
+                "enter" if key_focus.is_focused(window) => {
+                    state.update(cx, entries[enabled[index]].open);
+                }
+                key => {
+                    let Some(entry) = enabled.iter().map(|index| &entries[*index]).find(|entry| entry.shortcut.eq_ignore_ascii_case(key)) else { return };
+                    if !event.is_held {
+                        state.update(cx, entry.open);
+                    }
+                }
+            }
+            cx.stop_propagation();
+        })
         .flex_1()
         .flex()
         .items_center()
@@ -1018,6 +1251,65 @@ fn kbd(text: &'static str, cx: &App) -> impl IntoElement {
 mod unit_tests {
     use super::*;
     use t3_core::right_panel::DeviceTarget;
+
+    #[test]
+    fn browser_favicon_sends_only_public_dns_hosts() {
+        assert_eq!(
+            browser_favicon_url("https://github.com:8443/private?q=secret").unwrap().as_ref(),
+            "https://www.google.com/s2/favicons?domain=github.com&sz=32",
+        );
+        for url in ["http://127.0.0.1:3000/", "http://portal.corp.com/", "https://box.example.ts.net/", "http://[::1]/"] {
+            assert!(browser_favicon_url(url).is_none(), "{url}");
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn panel_chrome_launcher_opens_surfaces_with_shortcuts_and_arrows(cx: &mut gpui::TestAppContext) {
+        use gpui::Render;
+
+        struct Launcher(Entity<AppState>);
+        impl Render for Launcher {
+            fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                empty_state(self.0.clone(), window, cx)
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, cx| {
+            let thread = state.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|thread| thread.id == "menu-thread").unwrap();
+            thread.pull_requests.push(serde_json::from_value(serde_json::json!({
+                "host": "github.com", "repository": "fixture/repo", "number": 17, "url": "https://github.com/fixture/repo/pull/17",
+                "source": "manual", "linkedAt": "2026-01-01T00:00:00Z", "snapshot": null, "stack": null
+            })).unwrap());
+            state.select_thread("menu-thread", cx);
+        });
+        let (_, vcx) = cx.add_window_view(|_, _| Launcher(state.clone()));
+        vcx.refresh().unwrap();
+        vcx.update(|window, cx| { window.simulate_next_frame(cx); });
+        vcx.refresh().unwrap();
+        vcx.simulate_keystrokes("f");
+        state.read_with(vcx, |state, _| {
+            assert!(matches!(state.panels.panels.active_surface("menu-thread").unwrap().kind, SurfaceKind::Files { .. }));
+        });
+
+        vcx.simulate_keystrokes("down down enter");
+        state.read_with(vcx, |state, _| {
+            assert!(matches!(state.panels.panels.active_surface("menu-thread").unwrap().kind, SurfaceKind::Diff));
+        });
+        vcx.simulate_keystrokes("p");
+        state.read_with(vcx, |state, _| {
+            assert!(matches!(state.panels.panels.active_surface("menu-thread").unwrap().kind, SurfaceKind::PullRequest { .. }));
+        });
+        vcx.simulate_keystrokes("l");
+        state.read_with(vcx, |state, _| {
+            assert!(matches!(state.panels.panels.active_surface("menu-thread").unwrap().kind, SurfaceKind::PullRequests));
+        });
+        state.update(vcx, |state, _| state.stop_pump());
+    }
 
     #[test]
     fn device_tab_icon_distinguishes_ios_android_and_generic() {

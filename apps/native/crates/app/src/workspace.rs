@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt as _, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, EmptyView, Entity, FocusHandle, Focusable,
+    ClickEvent, ClipboardItem, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, Pixels,
     FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window,
-    div, ease_out_quint, prelude::*, px,
+    div, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::status::{HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
@@ -22,6 +22,7 @@ use crate::app_state::{AppEvent, AppState, Phase};
 use crate::chat_header::{self, ChatHeader};
 use crate::composer::{Composer, FocusPrompt, OpenPermissions, ToggleModelPicker};
 use crate::connect::ConnectView;
+use crate::components::motion::{prefers_reduced_motion, transition};
 use crate::git::GitDialogs;
 use crate::new_thread::{self, DraftHero};
 use crate::context_menu::ContextMenu;
@@ -41,7 +42,7 @@ use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt as _, ThemeSlotHoverExt as _, hsla, palette,
+    ThemeSlot, ThemeSlotHoverExt as _, hsla, palette,
     theme_slot_background_layer,
 };
 use crate::thread_details::{self, DetailsEvent, DetailsView};
@@ -57,14 +58,106 @@ pub fn sidebar_inline_width(state: &AppState, viewport_width: f32) -> f32 {
     layout::inline_width(state.sidebar_width, state.sidebar.collapsed, viewport_width, BRAND_WIDTH)
 }
 
+fn sidebar_inline_width_when_open(state: &AppState, viewport: f32) -> f32 {
+    layout::inline_width(state.sidebar_width, false, viewport, BRAND_WIDTH)
+}
+
 struct SidebarResize;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SidebarAnimation {
-    seq: u64,
-    duration_ms: u32,
-    opening: bool,
-    from_width: f32,
+const SIDEBAR_TOGGLE_SIZE: f32 = 28.;
+const SIDEBAR_TOGGLE_GAP: f32 = 12.;
+
+fn native_window_controls_width(window: &Window) -> f32 {
+    if cfg!(target_os = "macos") && !window.is_fullscreen() { 90. } else { 0. }
+}
+
+fn sidebar_toggle_left(window: &Window) -> Pixels {
+    px((native_window_controls_width(window) + 1.).max(SIDEBAR_TOGGLE_GAP))
+}
+
+pub(crate) fn traffic_light_inset(window: &Window, collapsed: bool) -> Pixels {
+    if collapsed {
+        px(native_window_controls_width(window).max(SIDEBAR_TOGGLE_GAP) + SIDEBAR_TOGGLE_SIZE + SIDEBAR_TOGGLE_GAP)
+    } else {
+        px(20.)
+    }
+}
+
+pub(crate) fn panel_animation_duration(cx: &gpui::App) -> Duration {
+    if prefers_reduced_motion(cx) {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(u64::from(crate::settings::store::try_client(cx).map_or(
+        t3_core::client_settings::DEFAULT_PANEL_ANIMATION_DURATION_MS,
+        |doc| doc.panel_animation_duration_ms(),
+    )))
+}
+
+pub(crate) fn panel_width_clip(
+    visible: Pixels,
+    full: Pixels,
+    align_right: bool,
+    content: impl IntoElement,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_none()
+        .h_full()
+        .w(visible)
+        .overflow_hidden()
+        .when(align_right, |clip| clip.justify_end())
+        .child(div().flex_none().h_full().w(full).child(content))
+}
+
+fn workspace_for_window(window: &Window, cx: &gpui::App) -> Option<Entity<Workspace>> {
+    window.root::<Workspace>().flatten().or_else(|| {
+        window.root::<gpui_component::Root>().flatten()?.read(cx).view().clone().downcast::<Workspace>().ok()
+    })
+}
+
+#[allow(dead_code, reason = "Integration hook for the independently owned draft composer")]
+pub(crate) fn measure_draft_composer(composer: impl IntoElement, window: &Window, cx: &gpui::App) -> gpui::Div {
+    let measurement = workspace_for_window(window, cx).map(|workspace| {
+        let workspace = workspace.read(cx);
+        (workspace.draft_composer_height.clone(), workspace.terminal.entity_id())
+    });
+    div().relative().w_full().child(composer).when_some(measurement, |container, (height, drawer)| {
+        container.child(
+            gpui::canvas(
+                move |bounds, window, _| {
+                    let next = f32::from(bounds.size.height).ceil();
+                    if height.replace(next) != next {
+                        window.on_next_frame(move |_, cx| cx.notify(drawer));
+                    }
+                },
+                |_, _, _, _| {},
+            ).absolute().inset_0(),
+        )
+    })
+}
+
+pub(crate) fn terminal_drawer_geometry(window: &Window, cx: &gpui::App) -> (Option<Pixels>, f32) {
+    let viewport = window.viewport_size();
+    let workspace = workspace_for_window(window, cx);
+    let Some(workspace) = workspace else {
+        return (None, f32::INFINITY);
+    };
+    let workspace = workspace.read(cx);
+    let state = workspace.state.read(cx);
+    let width = f32::from(viewport.width);
+    let right = if t3_core::right_panel::is_sheet_mode(width) {
+        0.
+    } else {
+        state.panel_thread().filter(|thread| state.panels.panels.is_open(thread))
+            .map_or(0., |thread| crate::right_panel::inline_panel_width(state, &thread, width))
+    };
+    let center = px((width - sidebar_inline_width(state, width) - right).max(0.));
+    let composer = if state.selected_thread.is_some() {
+        workspace.composer_overlay_height.get()
+    } else {
+        workspace.draft_composer_height.get()
+    };
+    (Some(center), (f32::from(viewport.height) - TITLEBAR_HEIGHT - composer).max(0.))
 }
 
 struct WorkspaceAreaFocus {
@@ -90,13 +183,13 @@ pub struct Workspace {
     connection_diagnosis_open: bool,
     inactive_since: Option<Instant>,
     history_swipe: HistorySwipe,
-    _swipe_clear: Option<Task<()>>,
     last_window_title: Option<String>,
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
     lineage: Entity<crate::lineage::ComposerLineage>,
     composer_overlay_height: std::rc::Rc<std::cell::Cell<f32>>,
+    draft_composer_height: std::rc::Rc<std::cell::Cell<f32>>,
     composer_replaced: bool,
     draft: Entity<DraftHero>,
     prompt_links: Entity<crate::prompt_links::PromptLinks>,
@@ -124,12 +217,7 @@ pub struct Workspace {
     snapshot_setup: Entity<crate::snapshot_capture::SnapShotSetupDialog>,
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
-    /// Tracks inline sidebar visibility across frames for `panelAnimationDurationMs` (`ST-APPEARANCE`).
-    last_sidebar_open: Option<bool>,
-    last_sidebar_width: f32,
-    sidebar_animation: Option<SidebarAnimation>,
-    sidebar_animation_seq: u64,
-    _sidebar_close_animation_task: Option<Task<()>>,
+    sidebar_is_sheet: Option<bool>,
     theme_background: t3_core::themes::background::ThemeBackgroundTracker,
     theme_background_task: Option<Task<()>>,
     _save_sidebar_width: Option<Task<()>>,
@@ -335,13 +423,13 @@ impl Workspace {
             connection_diagnosis_open: false,
             inactive_since: None,
             history_swipe: HistorySwipe::default(),
-            _swipe_clear: None,
             last_window_title: None,
             sidebar,
             thread,
             composer,
             lineage,
             composer_overlay_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
+            draft_composer_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
             composer_replaced: false,
             draft,
             prompt_links,
@@ -368,11 +456,7 @@ impl Workspace {
             snapshot_coordinator,
             snapshot_setup,
             rail_dragging: false,
-            last_sidebar_open: None,
-            last_sidebar_width: layout::DEFAULT_WIDTH,
-            sidebar_animation: None,
-            sidebar_animation_seq: 0,
-            _sidebar_close_animation_task: None,
+            sidebar_is_sheet: None,
             theme_background: t3_core::themes::background::ThemeBackgroundTracker::new(),
             theme_background_task: None,
             _save_sidebar_width: None,
@@ -609,17 +693,27 @@ impl Workspace {
         )
     }
 
-    fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, left: Pixels, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.render_connection_status(cx);
         let state = self.state.read(cx);
-        let terminal_toggle = (state.selected_thread.is_some() || state.draft_project.is_some()).then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
-        let collapsed = sidebar_inline_width(state, f32::from(window.viewport_size().width)) == 0.;
-        chat_header::container(collapsed, cx)
+        let has_chat = state.selected_thread.is_some() || state.draft_project.is_some();
+        let no_projects = !has_chat
+            && state.shell.synchronized
+            && state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.iter().all(|project| project.archived_at.is_some()));
+        let terminal_toggle = has_chat.then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
+        chat_header::container_with_layout(left, !no_projects, cx)
             .child(self.header.clone())
             .children(status)
-            .child(new_thread::new_thread_button(cx))
-            .child(chat_header::controls(&self.state, terminal_toggle, window, cx))
+            .when(!has_chat && !no_projects, |bar| bar.child(new_thread::new_thread_button(cx)))
+            .child(
+                div()
+                    .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                        this.header.update(cx, |header, cx| header.cancel_rename(cx));
+                    }))
+                    .child(chat_header::controls(&self.state, terminal_toggle, window, cx)),
+            )
     }
+
 }
 
 impl Render for Workspace {
@@ -654,7 +748,24 @@ impl Render for Workspace {
         if !cx.has_active_drag() {
             self.rail_dragging = false;
         }
-        let swipe_indicator = self.history_swipe.indicator();
+        let tracking_swipe = self.history_swipe.indicator().is_some_and(|indicator| indicator.tracking);
+        let swipe_fade = transition(
+            "history-swipe-fade",
+            f32::from(tracking_swipe),
+            if tracking_swipe { Duration::ZERO } else { Duration::from_millis(200) },
+            window,
+            cx,
+        );
+        if swipe_fade == 0. {
+            self.history_swipe.clear_indicator();
+        }
+        let swipe_indicator = self.history_swipe.indicator().map(|mut indicator| {
+            if !indicator.tracking {
+                indicator.opacity = swipe_fade;
+                indicator.progress *= swipe_fade;
+            }
+            indicator
+        });
         let pane_height = f32::from(window.viewport_size().height);
         self.sync_theme_background(cx);
         self.sync_window_title(window, cx);
@@ -664,9 +775,10 @@ impl Render for Workspace {
         let viewport = f32::from(window.viewport_size().width);
         let sidebar_width = sidebar_inline_width(state, viewport);
         let sidebar_open = sidebar_width > 0.;
-        let sidebar_animation_ms = crate::settings::store::try_client(cx)
-            .map_or(t3_core::client_settings::DEFAULT_PANEL_ANIMATION_DURATION_MS, |doc| doc.panel_animation_duration_ms());
-        let sheet = state.sidebar_sheet.is_open().then(|| layout::sheet_width(viewport));
+        let sidebar_is_sheet = layout::is_sheet(viewport);
+        let sheet_open = sidebar_is_sheet && state.sidebar_sheet.is_open();
+        let panel_duration = panel_animation_duration(cx);
+        let sidebar_mode_changed = self.sidebar_is_sheet.replace(sidebar_is_sheet) != Some(sidebar_is_sheet);
         let running = state.is_selected_thread_running();
         let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
@@ -684,58 +796,43 @@ impl Render for Workspace {
         let on_issues = state.issues_open && !on_pull_requests;
         let on_utility_page = on_pull_requests || on_issues;
         let composer_replaced = self.composer_replaced;
-        self.update_sidebar_animation(sidebar_open, sidebar_width, sidebar_animation_ms, sheet.is_some(), cx);
-        let sidebar_anim = self.sidebar_animation;
+        let inline_progress = transition(
+            "inline-sidebar",
+            f32::from(sidebar_open),
+            if sidebar_is_sheet || sidebar_mode_changed { Duration::ZERO } else { panel_duration },
+            window,
+            cx,
+        );
+        let sheet_progress = transition(
+            "sheet-sidebar",
+            f32::from(sheet_open),
+            if sidebar_is_sheet && !sidebar_mode_changed { panel_duration } else { Duration::ZERO },
+            window,
+            cx,
+        );
+        let titlebar_inset = px(transition(
+            "chat-header-inset",
+            f32::from(traffic_light_inset(window, !sidebar_open)),
+            if sidebar_mode_changed { Duration::ZERO } else { panel_duration },
+            window,
+            cx,
+        ));
         let theme = cx.theme();
-        let sidebar_el: Option<gpui::AnyElement> = if sidebar_open {
-            let base = div()
-                .track_focus(&self.area_focus.sidebar)
-                .relative()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .w(px(sidebar_width))
-                .h_full()
-                .flex_none()
-                .bg(theme.sidebar)
-                .border_r_1()
-                .border_color(hsla(palette(cx).sidebar_edge))
-                .theme_slot_hover(ThemeSlot::Sidebar, cx)
-                .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
-                .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full()));
-            Some(match sidebar_anim {
-                Some(anim) if anim.opening => base
-                    .with_animation(
-                        ElementId::Name(format!("left-sidebar-open-{}", anim.seq).into()),
-                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                        move |el, delta| el.w(px(sidebar_width * delta)),
-                    )
-                    .into_any_element(),
-                _ => base.into_any_element(),
-            })
+        let sidebar_inline_full = if sidebar_open {
+            sidebar_width
         } else {
-            sidebar_anim.filter(|a| !a.opening).map(|anim| {
-                div()
-                    .id("left-sidebar-closing")
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .h_full()
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(theme.sidebar)
-                    .border_r_1()
-                    .border_color(hsla(palette(cx).sidebar_edge))
-                    .theme_slot(ThemeSlot::Sidebar, cx)
-                    .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
-                    .with_animation(
-                        ElementId::Name(format!("left-sidebar-close-{}", anim.seq).into()),
-                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                        move |el, delta| el.w(px(anim.from_width * (1. - delta))),
-                    )
-                    .into_any_element()
-            })
+            sidebar_inline_width_when_open(self.state.read(cx), viewport)
         };
+        let sidebar_el = (inline_progress > 0.).then(|| {
+            panel_width_clip(
+                px(sidebar_inline_full * inline_progress),
+                px(sidebar_inline_full),
+                true,
+                self.sidebar_surface(cx),
+            )
+            .relative()
+            .when(!sidebar_open, |clip| clip.child(div().absolute().inset_0().occlude()))
+        });
         h_flex()
             .track_focus(&focus)
             .relative()
@@ -924,8 +1021,17 @@ impl Render for Workspace {
                 drawer.update(cx, |drawer, cx| drawer.open_terminal(&action.terminal_id, window, cx))
             })
             .children(sidebar_el)
-            .when(on_pull_requests, |this| this.child(div().flex_1().h_full().min_w_0().child(self.pull_requests.clone())))
-            .when(on_issues, |this| this.child(div().flex_1().h_full().min_w_0().child(self.issues.clone())))
+            .when(on_utility_page, |this| {
+                this.child(
+                    div().relative().flex_1().h_full().min_w_0()
+                        .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
+                        .when(on_pull_requests, |page| page.child(self.pull_requests.clone()))
+                        .when(on_issues, |page| page.child(self.issues.clone()))
+                        .when_some(swipe_indicator, |page, indicator| {
+                            page.child(crate::quit_hold::swipe_indicator(indicator, pane_height, cx))
+                        }),
+                )
+            })
             .when(!maximized && !on_utility_page, |this| {
                 this.child(
                 v_flex()
@@ -948,7 +1054,7 @@ impl Render for Workspace {
                         },
                     )
                     .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
-                    .child(self.render_titlebar(window, cx))
+                    .child(self.render_titlebar(titlebar_inset, window, cx))
                     .when(has_thread, |this| {
                         // The inline details card sits over the canvas; the lane moves left to clear it.
                         this.child(
@@ -1018,9 +1124,9 @@ impl Render for Workspace {
                 )
             })
             .when(!on_utility_page, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
-            .when(sidebar_width > 0., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
-            .when_some(sheet, |this, width| this.child(self.render_sidebar_sheet(width, cx)))
-            .child(self.render_sidebar_toggle(cx))
+            .when(sidebar_open && inline_progress == 1., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
+            .when(sheet_progress > 0., |this| this.child(self.render_sidebar_sheet(layout::sheet_width(viewport), sheet_progress, sheet_open, cx)))
+            .when(!sheet_open, |this| this.child(self.render_sidebar_toggle(window, sidebar_open, cx)))
             .children(crate::transcript::html_render::fullscreen(window, cx))
             .children(crate::transcript::mcp_app::fullscreen(window, cx))
             .children(crate::media::fullscreen(window, cx))
@@ -1053,59 +1159,6 @@ impl Render for Workspace {
 }
 
 impl Workspace {
-    fn update_sidebar_animation(
-        &mut self,
-        sidebar_open: bool,
-        sidebar_width: f32,
-        sidebar_animation_ms: u32,
-        is_sheet: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let sidebar_opened = self.last_sidebar_open == Some(false) && sidebar_open;
-        let sidebar_closed = self.last_sidebar_open == Some(true) && !sidebar_open;
-        self.last_sidebar_open = Some(sidebar_open);
-        if sidebar_open {
-            self.last_sidebar_width = sidebar_width;
-        }
-        if sidebar_animation_ms == 0 || is_sheet {
-            self.sidebar_animation = None;
-            self._sidebar_close_animation_task = None;
-        } else if sidebar_opened {
-            self._sidebar_close_animation_task = None;
-            self.sidebar_animation_seq = self.sidebar_animation_seq.wrapping_add(1);
-            self.sidebar_animation = Some(SidebarAnimation {
-                seq: self.sidebar_animation_seq,
-                duration_ms: sidebar_animation_ms,
-                opening: true,
-                from_width: 0.,
-            });
-        } else if sidebar_closed {
-            let from_width = self.last_sidebar_width.max(1.);
-            self.sidebar_animation_seq = self.sidebar_animation_seq.wrapping_add(1);
-            let seq = self.sidebar_animation_seq;
-            self.sidebar_animation = Some(SidebarAnimation {
-                seq,
-                duration_ms: sidebar_animation_ms,
-                opening: false,
-                from_width,
-            });
-            let wait = Duration::from_millis(u64::from(sidebar_animation_ms) + 16);
-            self._sidebar_close_animation_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(wait).await;
-                let _ = this.update(cx, |ws, cx| {
-                    if ws.sidebar_animation.is_some_and(|a| !a.opening && a.seq == seq) {
-                        ws.sidebar_animation = None;
-                        ws._sidebar_close_animation_task = None;
-                        cx.notify();
-                    }
-                });
-            }));
-        } else if sidebar_open && self.sidebar_animation.is_some_and(|a| !a.opening) {
-            self.sidebar_animation = None;
-            self._sidebar_close_animation_task = None;
-        }
-    }
-
     fn resize_sidebar(&mut self, event: &DragMoveEvent<SidebarResize>, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = f32::from(window.viewport_size().width);
         let current = sidebar_inline_width(self.state.read(cx), viewport);
@@ -1159,57 +1212,69 @@ impl Workspace {
             )
     }
 
-    /// Below the breakpoint the sidebar is a sheet over a dimmed backdrop that dismisses it.
-    fn render_sidebar_sheet(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_surface(&self, cx: &Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        div()
+            .track_focus(&self.area_focus.sidebar)
+            .relative()
+            .size_full()
+            .bg(hsla(p.sidebar))
+            .border_r_1()
+            .border_color(hsla(p.sidebar_edge))
+            .theme_slot_hover(ThemeSlot::Sidebar, cx)
+            .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
+            .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full()))
+    }
+
+    fn render_sidebar_sheet(&self, width: f32, progress: f32, open: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         div()
             .id("sidebar-sheet")
             .absolute()
             .inset_0()
-            .occlude()
+            .when(open, |sheet| sheet.occlude())
             .child(
                 div()
                     .id("sidebar-sheet-backdrop")
                     .absolute()
                     .inset_0()
-                    .bg(hsla(p.background).opacity(0.6))
-                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.close_sidebar_sheet(cx)))),
+                    .bg(hsla(p.background).opacity(0.6 * progress))
+                    .when(open, |backdrop| backdrop.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.state.update(cx, |state, cx| state.close_sidebar_sheet(cx));
+                    }))),
             )
             .child(
-                div()
-                    .track_focus(&self.area_focus.sidebar)
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left_0()
-                    .overflow_hidden()
-                    .w(px(width))
-                    .bg(hsla(p.sidebar))
-                    .border_r_1()
-                    .border_color(hsla(p.sidebar_edge))
-                    .theme_slot_hover(ThemeSlot::Sidebar, cx)
-                    .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
-                    .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
+                panel_width_clip(px(width * progress), px(width), true, self.sidebar_surface(cx))
+                    .relative()
+                    .occlude()
+                    .when(!open, |clip| clip.child(div().absolute().inset_0().occlude())),
             )
     }
 
-    /// The workspace control at x = 91 (design-system §5), present whether or not the sidebar shows.
-    fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_toggle(&self, window: &Window, expanded: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let label = keymap::label("sidebar.toggle", cx).map_or_else(|| "Toggle sidebar".to_owned(), |key| format!("Toggle sidebar ({key})"));
+        let label = crate::i18n::t(cx, "Toggle sidebar");
+        let label = keymap::label("sidebar.toggle", cx).map_or_else(|| label.to_owned(), |key| format!("{label} ({key})"));
         div()
             .id("sidebar-toggle")
             .absolute()
-            .left(px(91.))
+            .left(sidebar_toggle_left(window))
             .top(px(12.))
-            .size(px(28.))
+            .size(px(SIDEBAR_TOGGLE_SIZE))
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(8.))
             .cursor_pointer()
             .hover(|this| this.bg(hsla(p.sidebar_accent)))
-            .child(Icon::PanelLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
+            .child(
+                div().relative().size(px(16.))
+                    .child(Icon::PanelLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
+                    .when(expanded, |icon| icon.child(
+                        div().absolute().top(px(4.5)).right(px(1.))
+                            .child(Icon::ChevronLeft.sized(px(7.)).text_color(hsla(p.sidebar_icon))),
+                    )),
+            )
             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
             .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar_or_sheet(cx))))
     }
@@ -1643,7 +1708,7 @@ impl Workspace {
         if !cfg!(target_os = "macos") {
             return;
         }
-        let blocked = self.has_blocking_overlay(window, cx);
+        let blocked = self.has_blocking_overlay(window, cx) || self.state.read(cx).sidebar_sheet.is_open();
         let (is_pixel_delta, delta_x, delta_y) = match event.delta {
             // GPUI's pixel delta has the opposite sign of DOM WheelEvent.deltaX/Y.
             ScrollDelta::Pixels(p) => (true, -f32::from(p.x), -f32::from(p.y)),
@@ -1664,36 +1729,28 @@ impl Workspace {
             blocked,
         };
         let before = self.history_swipe.indicator();
+        let return_to_chat = {
+            let state = self.state.read(cx);
+            (state.issues_open || state.pull_requests_open)
+                && (state.selected_thread.is_some() || state.draft_project.is_some())
+        };
         let action = {
             let state = self.state.read(cx);
-            self.history_swipe.on_wheel(wheel, |dir| state.can_navigate(dir.is_back()))
+            self.history_swipe.on_wheel(wheel, |dir| {
+                (dir.is_back() && return_to_chat) || state.can_navigate(dir.is_back())
+            })
         };
         if let SwipeAction::Navigate(dir) = action {
-            self.state.update(cx, |state, cx| state.navigate_history(dir.is_back(), cx));
+            self.state.update(cx, |state, cx| {
+                if dir.is_back() && return_to_chat {
+                    state.set_issues_open(false, cx);
+                    state.set_pull_requests_open(false, cx);
+                } else {
+                    state.navigate_history(dir.is_back(), cx);
+                }
+            });
         }
         let after = self.history_swipe.indicator();
-        if after.is_some_and(|i| !i.tracking) && self._swipe_clear.is_none() {
-            self._swipe_clear = Some(cx.spawn(async move |this, cx| {
-                for opacity in [0.75_f32, 0.5, 0.25, 0.0] {
-                    cx.background_executor().timer(Duration::from_millis(50)).await;
-                    let keep_going = this.update(cx, |ws, cx| {
-                        ws.history_swipe.set_indicator_opacity(opacity);
-                        cx.notify();
-                        ws.history_swipe.indicator().is_some_and(|i| !i.tracking)
-                    });
-                    if !matches!(keep_going, Ok(true)) {
-                        return;
-                    }
-                }
-                let _ = this.update(cx, |ws, cx| {
-                    ws.history_swipe.clear_indicator();
-                    ws._swipe_clear = None;
-                    cx.notify();
-                });
-            }));
-        } else if after.is_some_and(|i| i.tracking) {
-            self._swipe_clear = None;
-        }
         if before != after {
             cx.notify();
         }
@@ -2498,17 +2555,6 @@ mod tests {
                 let anim_ms = crate::settings::store::try_client(cx)
                     .map_or(0, |doc| doc.panel_animation_duration_ms());
                 assert_eq!(anim_ms, 180);
-                // Establish initial sidebar open state, then close -> closing animation, reopen -> opening animation.
-                ws.update_sidebar_animation(true, 280., anim_ms, false, cx);
-                assert_eq!(ws.last_sidebar_open, Some(true));
-                assert!(ws.sidebar_animation.is_none());
-
-                ws.update_sidebar_animation(false, 0., anim_ms, false, cx);
-                assert!(ws.sidebar_animation.is_some_and(|a| !a.opening && a.duration_ms == 180 && a.from_width == 280.));
-
-                ws.update_sidebar_animation(true, 280., anim_ms, false, cx);
-                assert!(ws.sidebar_animation.is_some_and(|a| a.opening && a.duration_ms == 180));
-
                 // `Shift+F6` from inside right-panel (including side chat) moves focus to main chat.
                 ws.area_focus.right_panel.focus(window, cx);
                 assert!(ws.area_focus.right_panel.contains_focused(window, cx));
@@ -2806,5 +2852,49 @@ mod tests {
         drop(fixture);
         drop(runtime);
         vcx.run_until_parked();
+    }
+}
+
+#[cfg(test)]
+mod panel_clip_tests {
+    use super::*;
+    use crate::components::motion::AnimatedHeight;
+
+    struct Panels {
+        width: Pixels,
+        drawer_open: bool,
+    }
+
+    impl Render for Panels {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full()
+                .child(div().h(px(180.)).child(panel_width_clip(
+                    self.width, px(240.), true,
+                    div().id("test-width-inner").size_full().debug_selector(|| "test-width-inner".into()),
+                )))
+                .child(AnimatedHeight::new(
+                    "test-drawer", px(180.), self.drawer_open, Duration::from_millis(400),
+                    div().id("test-height-inner").size_full().debug_selector(|| "test-height-inner".into()),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn panel_chrome_closing_clip_preserves_mounted_panel_bounds(cx: &mut gpui::TestAppContext) {
+        let (panels, vcx) = cx.add_window_view(|_, _| Panels { width: px(240.), drawer_open: true });
+        vcx.refresh().unwrap();
+        let width = vcx.debug_bounds("test-width-inner").unwrap().size;
+        let height = vcx.debug_bounds("test-height-inner").unwrap().size;
+        assert_eq!(width.width, px(240.));
+        assert_eq!(height.height, px(180.));
+
+        panels.update(vcx, |panels, cx| {
+            panels.width = px(64.);
+            panels.drawer_open = false;
+            cx.notify();
+        });
+        vcx.refresh().unwrap();
+        assert_eq!(vcx.debug_bounds("test-width-inner").unwrap().size, width);
+        assert_eq!(vcx.debug_bounds("test-height-inner").unwrap().size, height);
     }
 }
