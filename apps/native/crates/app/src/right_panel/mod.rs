@@ -75,7 +75,6 @@ struct RetainedFileSurface {
 struct FileSurfaceExit(Option<RetainedFileSurface>);
 impl gpui::Global for FileSurfaceExit {}
 
-#[allow(dead_code, reason = "Integration hook for FilesPanel's separately owned state reconciliation")]
 pub(crate) fn holding_file_surface(state: &Entity<AppState>, cx: &App) -> bool {
     if panel_animation_duration(cx).is_zero() {
         return false;

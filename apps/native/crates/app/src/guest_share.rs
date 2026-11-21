@@ -148,11 +148,6 @@ impl AppState {
             .as_ref()
     }
 
-    // The transcript merge adds the tail row and empty-state checks.
-    #[allow(dead_code)]
-    pub(crate) fn has_pending_guest_messages(&self, id: &str) -> bool {
-        self.guest_share(id).is_some_and(|share| share.pending_messages().next().is_some())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -165,8 +160,6 @@ struct PendingMessageKey {
 struct GuestMessageRequests(HashSet<PendingMessageKey>);
 impl Global for GuestMessageRequests {}
 
-// The transcript merge installs this in the virtualized tail row.
-#[allow(dead_code)]
 pub(crate) fn render_pending_guest_messages(
     thread_id: Option<&str>,
     app: &Entity<AppState>,

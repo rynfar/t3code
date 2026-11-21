@@ -115,7 +115,6 @@ fn workspace_for_window(window: &Window, cx: &gpui::App) -> Option<Entity<Worksp
     })
 }
 
-#[allow(dead_code, reason = "Integration hook for the independently owned draft composer")]
 pub(crate) fn measure_draft_composer(composer: impl IntoElement, window: &Window, cx: &gpui::App) -> gpui::Div {
     let measurement = workspace_for_window(window, cx).map(|workspace| {
         let workspace = workspace.read(cx);
@@ -267,7 +266,7 @@ impl Workspace {
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let issues = cx.new(|cx| IssuesPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
-        let project_dialogs = cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx));
+        let project_dialogs = cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx).with_composer(&composer));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
         let snapshot_coordinator = cx.new(|cx| {

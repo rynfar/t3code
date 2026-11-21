@@ -55,11 +55,9 @@ impl ThreadView {
                 }
                 let Some(row) = this.rows.get(ix - offset).cloned() else {
                     let spacer = (this.bottom_inset > 0.).then(|| div().h(px(this.bottom_inset + 16.)));
-                    let tail = if this.footer_shown() {
-                        gpui_component::v_flex().child(this.render_footer(cx)).children(spacer).into_any_element()
-                    } else {
-                        spacer.map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
-                    };
+                    let footer = this.footer_shown().then(|| this.render_footer(cx));
+                    let guests = crate::guest_share::render_pending_guest_messages(this.thread_id.as_deref(), &this.state, cx);
+                    let tail = gpui_component::v_flex().children(footer).children(guests).children(spacer).into_any_element();
                     return lane(tail, ix == 0 && this.footer_shown(), crate::theme::chat_max_width(cx), this.gutter());
                 };
                 let content = this.with_env(|env, markdown| render_row(&row, env, markdown, window, cx));

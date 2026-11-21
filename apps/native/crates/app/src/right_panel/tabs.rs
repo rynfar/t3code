@@ -265,7 +265,6 @@ fn surface_icon(surface: &Surface) -> Icon {
 struct DirtyTabs(HashMap<(gpui::EntityId, Option<u64>, String, String), bool>);
 impl gpui::Global for DirtyTabs {}
 
-#[allow(dead_code, reason = "The file editor publishes dirty state through this hook at integration")]
 pub(crate) fn publish_file_tab_dirty(state: &Entity<AppState>, path: Option<&str>, dirty: bool, cx: &mut App) {
     let app = state.read(cx);
     let Some((thread, path)) = app.panel_thread().zip(path) else { return };

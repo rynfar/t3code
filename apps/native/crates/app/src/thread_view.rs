@@ -109,6 +109,7 @@ pub struct ThreadView {
     footer: status::ThreadFooter,
     bottom_inset: f32,
     tail_in_list: bool,
+    pending_guest_ids: Vec<String>,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
     fork_support: HashMap<String, bool>,
     forking: std::collections::HashSet<String>,
@@ -256,6 +257,7 @@ impl ThreadView {
             footer: status::ThreadFooter::default(),
             bottom_inset: 0.,
             tail_in_list: false,
+            pending_guest_ids: Vec::new(),
             turn_diffs: HashMap::new(),
             fork_support: HashMap::new(),
             forking: std::collections::HashSet::new(),
@@ -293,7 +295,7 @@ impl ThreadView {
     }
 
     fn wants_tail_item(&self) -> bool {
-        self.footer_shown() || self.bottom_inset > 0.
+        self.footer_shown() || self.bottom_inset > 0. || !self.pending_guest_ids.is_empty()
     }
 
     pub(super) fn sync_tail_item(&mut self, remeasure_existing: bool) {
@@ -506,7 +508,13 @@ impl ThreadView {
         let visible = self.visible_rows(cx);
         self.sync_history(cx);
         let changed = self.rederive_rows(cx);
-        self.sync_tail_item(false);
+        let pending_guest_ids: Vec<String> = self.thread_id.as_deref()
+            .and_then(|id| self.state.read(cx).guest_share(id))
+            .map(|share| share.pending_messages().map(|message| message.id.clone()).collect())
+            .unwrap_or_default();
+        let guests_changed = pending_guest_ids != self.pending_guest_ids;
+        self.pending_guest_ids = pending_guest_ids;
+        self.sync_tail_item(guests_changed);
         if self.find.is_some() {
             self.pending_restore = None;
         }
@@ -2316,7 +2324,7 @@ impl Render for ThreadView {
                 .child(div().relative().child("Loading thread…"))
                 .into_any_element();
         }
-        if self.rows.is_empty() && self.history.is_none() && !self.footer_shown() {
+        if self.rows.is_empty() && self.history.is_none() && !self.footer_shown() && self.pending_guest_ids.is_empty() {
             let banners = self.render_banners(cx);
             return div()
                 .relative()

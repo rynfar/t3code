@@ -526,7 +526,6 @@ impl ProjectDialogs {
         this
     }
 
-    #[allow(dead_code, reason = "Workspace wiring lands during the native parity merge")]
     pub(crate) fn with_composer(mut self, composer: &Entity<crate::composer::Composer>) -> Self {
         self.composer = Some(composer.downgrade());
         self

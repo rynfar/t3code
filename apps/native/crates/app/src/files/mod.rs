@@ -180,6 +180,7 @@ impl FilesPanel {
             {
                 this.explorer.update(cx, |explorer, cx| explorer.expand_folder(&path, cx));
             }
+            crate::right_panel::publish_file_tab_dirty(&this.state, this.shown.as_ref().and_then(|shown| shown.path.as_deref()), preview.read(cx).is_dirty(), cx);
             cx.notify();
         })
         .detach();
@@ -308,6 +309,9 @@ impl FilesPanel {
             self.explorer.update(cx, |explorer, cx| explorer.set_selected(selected, reveal, cx));
         } else if self.shown.as_ref().is_some_and(|shown| shown.attachment.is_some()) {
             self.preview.update(cx, |preview, cx| preview.set_attachment(None, cx));
+        }
+        if !visible && !root_changed && crate::right_panel::holding_file_surface(&self.state, cx) {
+            return;
         }
         if shown != self.shown || root_changed {
             self.shown = shown;

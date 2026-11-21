@@ -1152,7 +1152,7 @@ impl Render for DraftHero {
                 .justify_center()
                 .child(hero_block)
                 .child(div().h(px(16.)))
-                .child(self.composer.clone())
+                .child(crate::workspace::measure_draft_composer(self.composer.clone(), window, cx))
                 .children(self.render_popup(cx));
         }
 
@@ -1273,7 +1273,7 @@ impl Render for DraftHero {
                     .children(below.map(|below| h_flex().mt(px(8.)).h(px(24.)).w_full().justify_center().text_sm().child(below))),
             )
             .child(div().h(px(16.)))
-            .child(self.composer.clone())
+            .child(crate::workspace::measure_draft_composer(self.composer.clone(), window, cx))
             .children(self.render_popup(cx))
     }
 }
