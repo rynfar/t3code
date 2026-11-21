@@ -124,6 +124,7 @@ enum Command {
         alternate_routes: Vec<crate::routes::CandidateRoute>,
         expected_environment_id: Option<String>,
         prepare: Option<Prepare>,
+        relay: Option<Arc<crate::connect::Cloud>>,
     },
     Activate(Option<String>),
     Remove(String),
@@ -177,7 +178,7 @@ impl Environments {
     }
 
     pub fn watch(&mut self, id: &str, credentials: Credentials, prepare: Option<Prepare>) {
-        self.watch_with_routes(id, credentials, Vec::new(), None, prepare);
+        self.watch_with_routes(id, credentials, Vec::new(), None, prepare, None);
     }
 
     /// `watch` with alternate candidate routes and expected canonical `environmentId` (`CN-SESSION`).
@@ -188,6 +189,7 @@ impl Environments {
         alternate_routes: Vec<crate::routes::CandidateRoute>,
         expected_environment_id: Option<String>,
         prepare: Option<Prepare>,
+        relay: Option<Arc<crate::connect::Cloud>>,
     ) {
         if self
             .leases
@@ -206,6 +208,7 @@ impl Environments {
             alternate_routes,
             expected_environment_id,
             prepare,
+            relay,
         });
     }
     #[cfg(test)]
@@ -603,7 +606,7 @@ async fn run(
                     });
                     let _ = reply.send(snapshot);
                 }
-                Some(Command::Watch { id, generation, credentials, alternate_routes, expected_environment_id, prepare }) => {
+                Some(Command::Watch { id, generation, credentials, alternate_routes, expected_environment_id, prepare, relay }) => {
                     if entries.get(&id).is_some_and(|e| e.credentials == credentials) { continue; }
                     let prior = entries.remove(&id);
                     let (client, events) = supervisor::start_with_routes(
@@ -612,6 +615,7 @@ async fn run(
                         alternate_routes,
                         expected_environment_id,
                         prepare,
+                        relay,
                     );
                     let (tx, key, epoch) = (frames.clone(), id.clone(), generation);
                     let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), tx, key, epoch));

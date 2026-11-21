@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
+    PromptLevel, StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
@@ -713,12 +713,7 @@ impl SettingsView {
                 let client = client.clone();
                 let fetch = runtime.spawn(async move { client.get_access("/api/connect/link-state").await });
                 let body = fetch.await.ok().and_then(Result::ok);
-                let link_state = body.as_ref().and_then(|body| serde_json::from_value::<CloudLinkState>(body.clone()).ok()).map(|mut decoded| {
-                    if body.as_ref().is_some_and(|body| body.get("managedTunnelActive").is_none()) {
-                        decoded.managed_tunnel_active = decoded.linked && !decoded.link_revoked;
-                    }
-                    decoded
-                });
+                let link_state = body.as_ref().and_then(CloudLinkState::from_wire);
                 let details = body.and_then(|body| serde_json::from_value(body).ok()).unwrap_or_default();
                 if !this.update(cx, |this, cx| {
                     if this.access.active_target.as_deref() != Some(expected.as_str())
@@ -1070,16 +1065,29 @@ impl SettingsView {
     fn access_relay_rows(&self, target: &ResolvedAccessTarget, link: &CloudLinkState, cx: &Context<Self>) -> Vec<AnyElement> {
         let policy = target.config.as_ref().and_then(|config| config.managed_policy.as_ref());
         let denial = t3_core::managed_policy::capability_denial(policy, t3_core::managed_policy::Capability::Connect);
+        let state = self.state.read(cx);
+        let signed_in = state.cloud.has_clerk_session;
         let can_manage = target.client.is_some() && target.grants.as_ref().is_some_and(|grants| {
             grants.grants(RELAY_READ) && grants.grants(RELAY_WRITE)
         });
+        let can_configure = can_manage && target.grants.as_ref().is_some_and(access::can_configure_relay);
+        let turn_on = access::resolve_t3_connect_turn_on(
+            link.linkable_here.unwrap_or(true), state.cloud.service.configured(), can_manage,
+            can_manage, can_configure, denial.as_deref(),
+        );
+        let on_host = matches!(turn_on, access::T3ConnectTurnOn::OnHost);
         let disabled = |needs_link: bool| -> Option<String> {
             if self.access.relay_saving {
                 Some(t(cx, "A T3 Connect change is in progress.").to_owned())
             } else if !can_manage {
                 Some(t(cx, "This connection cannot manage T3 Connect.").to_owned())
             } else if needs_link {
-                Some(denial.clone().unwrap_or_else(|| t(cx, "Run `t3 connect link` on the server host to configure this connection.").to_owned()))
+                match &turn_on {
+                    access::T3ConnectTurnOn::Policy(reason) => Some(reason.clone()),
+                    access::T3ConnectTurnOn::OnHost => Some(t(cx, "Run `t3 connect link` on the host, then restart T3 Code there.").to_owned()),
+                    access::T3ConnectTurnOn::Here if !signed_in => Some(t(cx, "Sign in to T3 Connect before enabling this.").to_owned()),
+                    access::T3ConnectTurnOn::Here => None,
+                }
             } else {
                 None
             }
@@ -1091,28 +1099,29 @@ impl SettingsView {
         };
         let current_hold = self.access.cloud_details.hold_webhooks_while_offline;
         let (client, id) = (target.client.clone(), target.saved_id.clone());
-        let environment_id = target.config.as_ref().map(|config| config.environment.environment_id.clone())
-            .filter(|id| !id.is_empty())
-            .or_else(|| self.state.read(cx).environments.get(&id).and_then(|saved| saved.environment_id.clone()));
-        let unlink = {
+        let environment_id = self.access_environment_id(target, cx);
+        let managed = link.managed_tunnel_active && environment_id.as_ref().is_none_or(|id| {
+            state.cloud.discovery.environments.iter().find(|env| &env.environment_id == id)
+                .is_none_or(|env| env.endpoint.provider_kind == "cloudflare_tunnel")
+        });
+        let link = CloudLinkState { managed_tunnel_active: managed, ..link.clone() };
+        let tunnel = {
             let entity = cx.entity().downgrade();
-            let (client, id) = (client.clone(), id.clone());
-            let environment_id = environment_id.clone();
-            Box::new(move |_, _: &mut Window, cx: &mut App| {
+            let target = target.clone();
+            let current = link.clone();
+            Box::new(move |enabled, window: &mut Window, cx: &mut App| {
                 let _ = entity.update(cx, |this, cx| {
-                    this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/unlink", None, environment_id.clone(), cx);
+                    this.reconcile_access_relay(&target, &current, enabled, current.publish_agent_activity, window, cx);
                 });
             })
         };
         let publish = {
             let entity = cx.entity().downgrade();
-            let (client, id) = (client.clone(), id.clone());
-            let tunnel = link.managed_tunnel_active;
-            Box::new(move |enabled: bool, _: &mut Window, cx: &mut App| {
-                let path = if !enabled && !tunnel { "/api/connect/unlink" } else { "/api/connect/preferences" };
-                let body = (path == "/api/connect/preferences").then(|| json!({"publishAgentActivity": enabled}));
+            let target = target.clone();
+            let current = link.clone();
+            Box::new(move |enabled: bool, window: &mut Window, cx: &mut App| {
                 let _ = entity.update(cx, |this, cx| {
-                    this.mutate_access_relay(client.clone(), id.clone(), path, body, environment_id.clone(), cx);
+                    this.reconcile_access_relay(&target, &current, current.managed_tunnel_active, enabled, window, cx);
                 });
             })
         };
@@ -1128,9 +1137,9 @@ impl SettingsView {
                 });
             })
         };
-        let tunnel_reason = disabled(!link.managed_tunnel_active || link.publish_agent_activity);
+        let tunnel_reason = disabled(access::cloud_change_replaces_link(&link, !managed, link.publish_agent_activity));
         let publish_reason = if !link.publish_agent_activity { denial.clone() } else { None }
-            .or_else(|| disabled(!link.linked || link.link_revoked));
+            .or_else(|| disabled(access::cloud_change_replaces_link(&link, managed, !link.publish_agent_activity)));
         let check_client = target.client.clone();
         let check_id = target.saved_id.clone();
         let can_check = check_client.is_some() && target.grants.as_ref().is_some_and(|grants| grants.grants(RELAY_READ));
@@ -1141,9 +1150,15 @@ impl SettingsView {
             }).unwrap_or_default(),
             None => vec![t(cx, "No reachability check yet.").to_owned()],
         };
-        let connect = Row::new("access-relay-configure", "T3 Connect")
-            .description(t(cx, if link.managed_tunnel_active { "The environment is linked to T3 Connect." } else { "Run `t3 connect link` on the server host to enable access." }))
-            .control(make_switch("access-relay-switch", link.managed_tunnel_active, tunnel_reason, unlink))
+        let sign_in = || Button::new("access-relay-sign-in", ButtonVariant::Outline, ButtonSize::Xs)
+            .label(t(cx, "Sign in")).disabled(state.cloud.busy)
+            .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx))));
+        let mut connect = Row::new("access-relay-configure", t(cx, "T3 Connect"))
+            .description(if managed { t(cx, "The environment is linked to T3 Connect.").to_owned() }
+                else if on_host { t(cx, if link.link_revoked {
+                    "This environment was removed from T3 Connect. Run `t3 connect link` on the host to link it again."
+                } else { "Run `t3 connect link` on the host, then restart T3 Code there." }).to_owned() }
+                else { denial.clone().unwrap_or_else(|| t(cx, "Make this environment available to your other devices through T3 Connect.").to_owned()) })
             .below(v_flex().gap(r(4.)).when(link.managed_tunnel_active, |el| {
                 el.children(reachability.into_iter().map(|text| muted_text(text, cx)))
                     .child(div().child(Button::new("access-check-reachability", ButtonVariant::Outline, ButtonSize::Xs)
@@ -1152,6 +1167,12 @@ impl SettingsView {
                             this.mutate_access_relay(check_client.clone(), check_id.clone(), "/api/connect/reachability", None, None, cx);
                         }))))
             }));
+        if !on_host || managed {
+            connect = connect.control(
+                if !signed_in && !managed && denial.is_none() { sign_in().into_any_element() }
+                else { make_switch("access-relay-switch", managed, tunnel_reason, tunnel).into_any_element() },
+            );
+        }
         let mut rows = vec![connect.into_any_element(), Row::new("access-publish-activity", t(cx, "Publish agent activity"))
             .description(t(cx, "Send activity to mobile notifications and Live Activities."))
             .control(make_switch("access-publish-activity-switch", link.publish_agent_activity, publish_reason, publish))
@@ -1166,6 +1187,98 @@ impl SettingsView {
                 .control(make_switch("access-hold-webhooks-switch", current_hold.unwrap_or(false), reason, hold)).into_any_element());
         }
         rows
+    }
+
+    fn access_environment_id(&self, target: &ResolvedAccessTarget, cx: &App) -> Option<String> {
+        target.config.as_ref().map(|config| config.environment.environment_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| self.state.read(cx).environments.get(&target.saved_id).and_then(|saved| saved.environment_id.clone()))
+    }
+
+    fn reconcile_access_relay(
+        &mut self, target: &ResolvedAccessTarget, current: &CloudLinkState, managed: bool, publish: bool,
+        window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let Some(client) = target.client.clone().filter(|_| !self.access.relay_saving) else { return };
+        let id = target.saved_id.clone();
+        if self.access.active_target.as_deref() != Some(&id) { return; }
+        let sessions = client.session_state();
+        let can_manage = |session: &AuthSessionState| session.grants(RELAY_READ) && session.grants(RELAY_WRITE);
+        if !sessions.borrow().as_ref().is_some_and(can_manage) { return; }
+        let environment_id = self.access_environment_id(target, cx);
+        if !managed && !publish {
+            self.mutate_access_relay(Some(client), id, "/api/connect/unlink", None, environment_id, cx);
+            return;
+        }
+        if !access::cloud_change_replaces_link(current, managed, publish) {
+            self.mutate_access_relay(Some(client), id, "/api/connect/preferences", Some(json!({
+                "publishAgentActivity": publish,
+            })), None, cx);
+            return;
+        }
+
+        let Some(environment_id) = environment_id else { return };
+        let cloud = &self.state.read(cx).cloud;
+        let policy = target.config.as_ref().and_then(|config| config.managed_policy.as_ref());
+        let denied = t3_core::managed_policy::capability_denial(policy, t3_core::managed_policy::Capability::Connect);
+        if !current.linkable_here.unwrap_or(true) || !cloud.service.configured() || !cloud.has_clerk_session
+            || denied.is_some() || !sessions.borrow().as_ref().is_some_and(access::can_configure_relay)
+        {
+            return;
+        }
+        let service = cloud.service.clone();
+        let runtime = self.state.read(cx).runtime().clone();
+        let generations = client.connection_generation();
+        let generation = *generations.borrow();
+        let credentials = client.credentials();
+        self.access.relay_saving = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let permitted = || *generations.borrow() == generation && sessions.borrow().as_ref().is_some_and(|session| {
+                can_manage(session) && access::can_configure_relay(session)
+            });
+            let result = async {
+                if managed {
+                    let status = client.relay_client_status().await?;
+                    match status["status"].as_str() {
+                        Some("available") => {}
+                        Some("missing") => {
+                            let answer = cx.update(|window, cx| window.prompt(
+                                PromptLevel::Info,
+                                t(cx, "Install relay client?"),
+                                Some(t(cx, "T3 Code needs the relay client to make this environment available through T3 Connect.")),
+                                &[t(cx, "Install"), t(cx, "Cancel")],
+                                cx,
+                            )).map_err(|error| error.to_string())?;
+                            if answer.await.ok() != Some(0) {
+                                return Ok(());
+                            }
+                            if !permitted() {
+                                return Err("This connection cannot manage T3 Connect.".to_owned());
+                            }
+                            client.install_relay_client().await?;
+                        }
+                        _ => return Err("The relay client is unavailable on this environment.".to_owned()),
+                    }
+                }
+                if !permitted() {
+                    return Err("This connection cannot manage T3 Connect.".to_owned());
+                }
+                runtime.spawn(async move { service.link_environment(&credentials, &environment_id, managed, publish).await })
+                    .await.map_err(|error| error.to_string())?
+            }.await;
+            let _ = this.update(cx, |this, cx| {
+                this.state.update(cx, |state, cx| state.refresh_cloud(cx));
+                if this.access.active_target.as_deref() == Some(&id) {
+                    this.access.relay_saving = false;
+                    this.access.link_state_task = None;
+                    cx.notify();
+                }
+                if let Err(error) = result {
+                    store::show_error(t(cx, &error).to_owned(), cx);
+                }
+            });
+        }).detach();
     }
 
     fn mutate_access_relay(
@@ -1292,6 +1405,10 @@ impl SettingsView {
         let mut machine_rows = vec![version, network];
         if let Some(link) = self.access.cloud_link_state.as_ref() {
             machine_rows.extend(self.access_relay_rows(&target, link, cx));
+        } else if target.grants.as_ref().is_some_and(|session| !session.grants(RELAY_READ)) {
+            machine_rows.push(Row::new("access-relay-configure", t(cx, "T3 Connect"))
+                .description(t(cx, "Run `t3 connect link` on the host, then restart T3 Code there."))
+                .into_any_element());
         }
         // `ConnectionsSettings.tsx:1304-1311` + `SavedEnvironmentRows.tsx:746`: render the
         // T3 Connect device-approval switch only when the managed tunnel is active and the server

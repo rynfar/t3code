@@ -162,7 +162,11 @@ impl AppState {
                     }
                     let health = match result {
                         Ok(Ok(resp)) => match resp.status {
-                            EnvironmentStatusValue::Online => EnvironmentHealth::Online,
+                            EnvironmentStatusValue::Online => resp.descriptor
+                                .as_ref()
+                                .and_then(|descriptor| t3_core::compatibility::protocol_mismatch(descriptor)
+                                    .map(|mismatch| mismatch.message(&descriptor.label)))
+                                .map_or(EnvironmentHealth::Online, EnvironmentHealth::Incompatible),
                             EnvironmentStatusValue::Offline => EnvironmentHealth::Offline {
                                 offline_reason: resp.offline_reason,
                                 error: resp.error,
@@ -585,33 +589,67 @@ impl AppState {
         }
     }
 
-    /// Connects a discovered T3 Connect environment via DPoP exchange + `/v1/environments/{id}/connect`,
-    /// registers its DPoP credential, upserts it as a relay-managed saved environment, and activates it.
-    pub fn connect_cloud_environment(&mut self, env: Environment, cx: &mut Context<Self>) {
+    pub(crate) fn cloud_environment_compatibility_error(&self, environment_id: &str) -> Option<String> {
+        if let Some(EnvironmentHealth::Incompatible(error)) = self.cloud.statuses.get(environment_id) {
+            return Some(error.clone());
+        }
+        let saved = self.environments.find_by_environment_id(environment_id)?;
+        let config = self.fleet.environment(&saved.id)?.config.config.as_ref()?;
+        t3_core::compatibility::protocol_mismatch(&config.environment)
+            .map(|mismatch| mismatch.message(&config.environment.label))
+    }
+
+    /// Registers the relay route under the canonical environment.
+    pub fn connect_cloud_environment(&mut self, env: Environment, activate_existing: bool, cx: &mut Context<Self>) {
         if self.cloud.connecting_env_id.is_some() {
+            return;
+        }
+        if let Some(error) = self.cloud_environment_compatibility_error(&env.environment_id) {
+            self.cloud.error = Some(error);
+            cx.emit(AppEvent::Phase);
             return;
         }
         let env_id = env.environment_id.clone();
         let label = env.label.clone();
+        let saved = self.environments.find_by_environment_id(&env_id);
+        let alternate = saved.is_some_and(|saved| !saved.is_relay_managed());
+        if let Some(saved) = saved.filter(|saved| {
+            saved.local || t3_client::store::has_saved_relay_route(&saved.id)
+        }) {
+            if activate_existing {
+                self.connect_environment(&saved.id.clone(), cx);
+            }
+            return;
+        }
         self.cloud.connecting_env_id = Some(env_id.clone());
         self.cloud.error = None;
         let service = self.cloud.service.clone();
         let generation = self.cloud.generation;
         let task = self.runtime().spawn(async move {
-            service.connect_and_register_environment(&env_id, None).await
+            if alternate {
+                service.connect_environment(&env_id).await
+            } else {
+                service.connect_and_register_environment(&env_id, None).await
+            }
         });
         cx.emit(AppEvent::Phase);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |state, cx| {
-                state.cloud.connecting_env_id = None;
                 if state.cloud.generation != generation {
-                    cx.emit(AppEvent::Phase);
                     return;
                 }
+                state.cloud.connecting_env_id = None;
                 match result {
                     Ok(Ok(resp)) => {
+                        let existing = activate_existing.then(|| state.environments
+                            .find_by_environment_id(&resp.environment_id)
+                            .filter(|saved| !saved.is_relay_managed())
+                            .map(|saved| saved.id.clone())).flatten();
                         state.adopt_relay_environment(resp, label, cx);
+                        if let Some(id) = existing {
+                            state.connect_environment(&id, cx);
+                        }
                     }
                     Ok(Err(error)) => {
                         state.cloud.error = Some(error.clone());

@@ -1311,6 +1311,11 @@ impl ConnectView {
                     format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Online")),
                     None,
                 ),
+                Some(EnvironmentHealth::Incompatible(error)) => (
+                    Some(DotTone::Destructive),
+                    crate::i18n::t(cx, "Client not supported").to_owned(),
+                    Some(error.clone()),
+                ),
                 Some(EnvironmentHealth::Offline {
                     offline_reason,
                     error,
@@ -1360,7 +1365,7 @@ impl ConnectView {
         let config = state.environments.find(Some(&environment.environment_id), &environment.endpoint.http_base_url)
             .and_then(|saved| state.fleet.environment(&saved.id))
             .and_then(|view| view.config.config.as_ref());
-        let compatible = config.is_none_or(|config| t3_core::compatibility::protocol_mismatch(&config.environment).is_none());
+        let compatible = state.cloud_environment_compatibility_error(&environment.environment_id).is_none();
         let live = has_clerk_session && matches!(cloud.statuses.get(&environment.environment_id), Some(EnvironmentHealth::Checking) | None);
         let action_button = if !has_clerk_session {
             Button::new(
@@ -1393,7 +1398,7 @@ impl ConnectView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 let env = env_to_connect.clone();
                 this.state
-                    .update(cx, |state, cx| state.connect_cloud_environment(env, cx));
+                    .update(cx, |state, cx| state.connect_cloud_environment(env, true, cx));
             }))
         };
 
@@ -1507,7 +1512,7 @@ impl ConnectView {
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
         let status_opt = state.environment_statuses.get(&environment.id).cloned();
         let (tone, status, error_tone) = match &status_opt {
-            _ if environment.access_token.is_none() => (Some(DotTone::Destructive), crate::i18n::t(cx, "Needs pairing again").to_owned(), true),
+            _ if !environment.has_connection_route() => (Some(DotTone::Destructive), crate::i18n::t(cx, "Needs pairing again").to_owned(), true),
             Some(status) => {
                 let (text, error) = status.summary();
                 (Some(status.dot()), crate::i18n::t(cx, &text).to_owned(), error)
@@ -1547,7 +1552,7 @@ impl ConnectView {
             let (connect, remove, diag_id) = (id.clone(), id.clone(), id.clone());
             let action = if active {
                 None
-            } else if environment.access_token.is_some() || environment.is_relay_managed() {
+            } else if environment.has_connection_route() || environment.is_relay_managed() {
                 Some(crate::i18n::t(cx, "Connect"))
             } else {
                 Some(crate::i18n::t(cx, "Pair again"))

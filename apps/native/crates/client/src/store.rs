@@ -80,6 +80,10 @@ impl SavedEnvironment {
         Some(Credentials { http_base: self.http_base.clone(), access_token })
     }
 
+    pub fn has_connection_route(&self) -> bool {
+        self.access_token.is_some() || has_saved_relay_route(&self.id)
+    }
+
     /// Whether this saved environment is reached through a T3 Connect managed relay tunnel.
     pub fn is_relay_managed(&self) -> bool {
         is_relay_managed_environment(&self.id)
@@ -130,10 +134,14 @@ impl SavedEnvironments {
         self.get(self.active.as_deref()?)
     }
 
+    pub fn find_by_environment_id(&self, id: &str) -> Option<&SavedEnvironment> {
+        self.environments.iter().find(|environment| environment.environment_id.as_deref() == Some(id))
+    }
+
     /// The entry for a server: the same `environmentId`, else the same address.
     pub fn find(&self, environment_id: Option<&str>, http_base: &str) -> Option<&SavedEnvironment> {
         environment_id
-            .and_then(|wanted| self.environments.iter().find(|environment| environment.environment_id.as_deref() == Some(wanted)))
+            .and_then(|wanted| self.find_by_environment_id(wanted))
             .or_else(|| self.environments.iter().find(|environment| environment.http_base == http_base))
     }
 
@@ -163,7 +171,8 @@ impl SavedEnvironments {
         access_token: &str,
     ) -> String {
         let env_id = (!environment_id.trim().is_empty()).then(|| environment_id.trim().to_owned());
-        let existing = self.find(env_id.as_deref(), http_base).map(|environment| environment.id.clone());
+        let existing = env_id.as_deref().and_then(|id| self.find_by_environment_id(id))
+            .map(|environment| environment.id.clone());
         let id = existing.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let previous = existing.and_then(|id| self.get(&id).cloned());
         let resolved_label = (!label.trim().is_empty())
@@ -973,10 +982,27 @@ pub fn load_alternate_routes() -> AlternateRoutes {
         .clone()
 }
 
+pub fn has_saved_relay_route(id: &str) -> bool {
+    load_alternate_routes().get(id).is_some_and(|routes| {
+        routes.iter().any(|route| route.kind() == crate::routes::ConnectionRouteKind::Relay)
+    })
+}
+
 /// Persists alternate/learned routes keyed by saved environment ID.
 pub fn save_alternate_routes(routes: &AlternateRoutes) {
-    alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner()).insert(base(), routes.clone());
-    save_ui_state("environment-routes", routes);
+    let home = base();
+    let Ok(text) = serde_json::to_string(routes) else { return };
+    let mut cache = alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner());
+    cache.insert(home.clone(), routes.clone());
+    if let Some(dir) = home
+        && let Some(writer) = writer()
+    {
+        let _ = writer.send(|_| WriteRequest::Update(Box::new(move |_| {
+            if let Err(error) = write_private(&dir, "environment-routes.json", &text) {
+                tracing::warn!(%error, "could not save environment routes");
+            }
+        })));
+    }
 }
 
 /// Stable 32-hex launcher ID for this T3 Code Native installation so renamed SSH connections keep

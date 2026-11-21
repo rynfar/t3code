@@ -114,6 +114,17 @@ pub struct CloudLinkState {
     pub linkable_here: Option<bool>,
 }
 
+impl CloudLinkState {
+    pub fn from_wire(value: &serde_json::Value) -> Option<Self> {
+        let mut state: Self = serde_json::from_value(value.clone()).ok()?;
+        if value.get("managedTunnelActive").is_none() {
+            state.managed_tunnel_active = state.linked;
+        }
+        state.managed_tunnel_active &= !state.link_revoked;
+        Some(state)
+    }
+}
+
 /// Whether reaching `(desired_managed_tunnel, desired_publish)` links or relinks the environment,
 /// which requires `relay:configure` (`cloudChangeReplacesLink` in `t3ConnectState.ts`, `pingdotgg/t3code#37823`).
 /// Unlinking and preference changes on the current link only require `relay:write`.
