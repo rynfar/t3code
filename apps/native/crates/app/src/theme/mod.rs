@@ -838,6 +838,8 @@ fn config(
         ("link", hex(p.info_foreground)),
         ("link.hover", hex(p.info_foreground)),
         ("link.active", hex(p.info_foreground)),
+        ("slider.background", hex(p.muted)),
+        ("slider.thumb.background", hex(p.background)),
         ("primary.background", hex(p.primary)),
         ("primary.foreground", hex(p.primary_foreground)),
         ("primary.hover.background", hex(p.message_action_hover)),
@@ -922,20 +924,21 @@ pub fn preview_with_css(colors: Option<(&themes::Colors, Option<&str>, bool)>, c
 
 pub fn wireframe(theme: &ThemePreference, dark: bool, cx: &App) -> [u32; 7] {
     let prefs = preferences(cx);
-    let roles = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment_themes(cx)).and_then(|t| t.half(dark));
-    if let Some(roles) = roles {
-        return themes::wireframe(roles);
+    themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment_themes(cx))
+        .map_or_else(|| standard_wireframe(dark), |theme| theme_wireframe(theme, dark))
+}
+
+fn theme_wireframe(theme: &ThemeDefinition, dark: bool) -> [u32; 7] {
+    themes::wireframe(theme.half(dark).unwrap_or(&theme.colors))
+}
+
+fn standard_wireframe(dark: bool) -> [u32; 7] {
+    // ThemePreviewCircles.tsx: canvas, sidebar, surface, accentSurface, messageSurface, messageAction.
+    if dark {
+        [0x0a0a0aff, 0x0f0f10ff, 0x121212ff, 0x27272aff, 0x27272aff, 0x8b9cffff, tokens::DARK.foreground]
+    } else {
+        [0xfcfcfcff, 0xfafafaff, 0xffffffff, 0xf4f4f5ff, 0xe4e4e7ff, 0x4f46e5ff, tokens::LIGHT.foreground]
     }
-    let p = if dark { tokens::DARK } else { tokens::LIGHT };
-    [
-        p.background,
-        p.sidebar,
-        p.card,
-        p.accent,
-        p.message_surface,
-        p.message_action,
-        p.foreground,
-    ]
 }
 
 #[cfg(feature="snapshot")]
@@ -980,6 +983,24 @@ pub(crate) fn syntax_style(capture: &str, dark: bool) -> Option<gpui::HighlightS
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn default_dark_wireframe_matches_web_preview(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            let colors = wireframe(&ThemePreference::Default(AppearanceMode::System), true, cx);
+            assert_eq!(&colors[..6], &[0x0a0a0aff, 0x0f0f10ff, 0x121212ff, 0x27272aff, 0x27272aff, 0x8b9cffff]);
+        });
+    }
+
+    #[test]
+    fn wireframe_falls_back_to_the_single_mode_of_a_named_theme() {
+        let mut theme = themes::builtins()[0].clone();
+        theme.variants.clear();
+        let dark = theme.appearance == "dark";
+        assert_eq!(theme_wireframe(&theme, !dark), theme_wireframe(&theme, dark));
+    }
+
     use super::*;
     use gpui_component::ActiveTheme;
     use t3_core::client_settings::ClientSettingsDoc;
