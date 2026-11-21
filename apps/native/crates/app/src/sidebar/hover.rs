@@ -292,7 +292,7 @@ impl Render for ThreadHoverCard {
                 .min_w_0()
                 .text_color(warning)
                 .child(div().mt(px(2.)).flex_none().child(Icon::CircleAlert.render(px(12.), warning)))
-                .child(div().flex_1().min_w_0().child("You're currently checked out on another branch."))
+                .child(div().flex_1().min_w_0().child(crate::i18n::t(cx, "You're currently checked out on another branch.")))
         });
         let model = self.model.as_ref().map(|model| {
             let icon = div()
@@ -316,7 +316,7 @@ impl Render for ThreadHoverCard {
                 .min_w_0()
                 .text_color(color)
                 .child(Icon::CircleAlert.render(px(12.), color))
-                .child(div().min_w_0().truncate().child(if usage_limit { "Usage limit reached" } else { "Error occurred" }))
+                .child(div().min_w_0().truncate().child(crate::i18n::t(cx, if usage_limit { "Usage limit reached" } else { "Error occurred" })))
         });
         let mono = crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx);
         let pull_requests = (!self.pull_requests.is_empty()).then(|| {
@@ -1076,5 +1076,54 @@ mod tests {
         assert!(vcx.debug_bounds("thread-hover-card").is_none(), "changing search query must dismiss hover card");
 
         state.update(vcx, |state, _| state.stop_pump());
+    }
+}
+
+/// The pull request badge's hover affordance, built only once the badge is hovered.
+pub(super) struct PrMiniList(pub(super) Vec<t3_core::pull_requests::link::ThreadLink>);
+
+impl Render for PrMiniList {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::theme::{ThemeSlot, ThemeSlotExt as _, theme_slot_clipped_background_layer};
+        let p = palette(cx);
+        let muted = hsla(p.muted_foreground);
+        div()
+            .relative()
+            .w(px(MAX_WIDTH))
+            .rounded(px(8.))
+            .shadow(toast_shadow())
+            .theme_slot(ThemeSlot::PopoverPopup, cx)
+            .child(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, px(8.), cx)
+                .unwrap_or_else(|| crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx).into_any_element()))
+            .child(div()
+                .id("sidebar-pr-mini-list")
+                .relative()
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .p(px(4.))
+                .text_xs()
+                .children(model::pull_request_list_lines(&self.0).into_iter().enumerate().map(|(index, line)| {
+                    let badge = line.link.snapshot.as_ref().map(|snapshot| BadgeState::of(snapshot.state, snapshot.is_draft));
+                    let icon = pr_icon(badge.map_or(PrGlyph::PullRequest, BadgeState::glyph));
+                    let tone = badge.map_or(muted, |badge| hsla(pr_tone(badge.tone(), p)));
+                    let title = line.link.snapshot.as_ref().map_or(&line.link.repository, |snapshot| &snapshot.title);
+                    let url = line.link.url.clone();
+                    div()
+                        .id(("linked-pr", index))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .pl(px(6. + 12. * line.depth.min(MAX_PR_DEPTH) as f32))
+                        .pr(px(6.))
+                        .h(px(28.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(hsla(p.accent)))
+                        .child(icon.render(px(12.), tone))
+                        .child(div().flex_none().text_color(muted).child(format!("#{}", line.link.number)))
+                        .child(div().min_w_0().truncate().text_color(hsla(p.popover_foreground)).child(title.clone()))
+                        .children(line.stack_label().map(|label| div().ml_auto().flex_none().text_color(muted).child(label)))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                })))
     }
 }

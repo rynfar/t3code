@@ -3,7 +3,7 @@
 use super::SidebarPane;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
-use gpui::{AnyElement, Context, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
 use t3_core::thread_actions::{UndoAction, UndoKind, UndoStep};
 
 impl SidebarPane {
@@ -40,7 +40,7 @@ impl SidebarPane {
         cx.notify();
     }
 
-    pub(super) fn render_draft_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_draft_row(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let row = &self.drafts.rows[index];
         let p = palette(cx);
         let state = self.state.read(cx);
@@ -49,12 +49,32 @@ impl SidebarPane {
         let open = row.project_id.clone();
         let discard = open.clone();
         let menu = open.clone();
+        let keyboard_menu = open.clone();
+        let id = ElementId::Name(SharedString::from(format!("draft-row-{open}")));
+        let focus = self.tree.focus(&super::tree::TreeRow::Draft(row.project_id.clone()))
+            .unwrap_or_else(|| crate::settings::controls::focus_handle(&id, window, cx));
+        let keyboard_focus = focus.clone();
+        let (bounds, measure) = super::measure_trigger();
         div()
             .px(px(8.))
             .py(px(2.))
             .child(
                 div()
-                    .id(SharedString::from(format!("draft-row-{open}")))
+                    .id(id)
+                    .relative()
+                    .track_focus(&focus)
+                    .role(gpui::Role::Button)
+                    .focus_visible(|this| this.bg(hsla(p.sidebar_row_hover)))
+                    .child(measure)
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                        if keyboard_focus.is_focused(window) && super::tree::context_menu_key(&event.keystroke) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            if !event.is_held && let Some(bounds) = bounds.get() {
+                                this.menu.update(cx, |menu, cx| menu.open_for_draft(&keyboard_menu, bounds.bottom_left(), window, cx));
+                            }
+                        }
+                    }))
                     .group("draft-row")
                     .w_full()
                     .h(px(78.))
@@ -122,6 +142,7 @@ impl SidebarPane {
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            window.focus(&focus, cx);
                             this.menu.update(cx, |menu_view, cx| menu_view.open_for_draft(&menu, event.position, window, cx));
                         }),
                     ),

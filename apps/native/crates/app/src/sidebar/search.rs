@@ -552,7 +552,7 @@ fn desired_specs(app: &AppState, cx: &App) -> Vec<OwnerSpec> {
     }]
 }
 
-fn scoped_thread_shell<'a>(app: &'a AppState, owner: &EnvironmentOwner, id: &str) -> Option<&'a ThreadShell> {
+pub(super) fn scoped_thread_shell<'a>(app: &'a AppState, owner: &EnvironmentOwner, id: &str) -> Option<&'a ThreadShell> {
     if app.environments.active.as_deref() == Some(owner.saved_id.as_str())
         && app.shell.generation == owner.shell_generation
         && let Some(shell) = app.thread_shell(id)
@@ -814,6 +814,11 @@ impl SidebarPane {
         let debug_row_id = row_id.clone();
         let hover_bounds_id = row_id.clone();
         let hover_row_id = row_id.clone();
+        let drag_payload = super::DraggedThread { id: thread.id.clone(), key: hover_key.clone() };
+        let drag_title = thread.title.clone();
+        let drag_project = project.clone();
+        let drag_visual = visual.clone();
+        let pane = cx.entity().downgrade();
         let hover = super::hover::HoverTarget {
             state: self.state.clone(),
             key: hover_key,
@@ -849,6 +854,10 @@ impl SidebarPane {
                         this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);
                     }))
                     .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.hover.dismiss(cx)))
+                    .on_drag(drag_payload, move |_, _, _, cx| {
+                        let _ = pane.update(cx, |this, cx| this.hover.dismiss(cx));
+                        cx.new(|_| super::drag::ThreadDragPreview::new(drag_title.clone(), drag_project.clone(), drag_visual.clone()))
+                    })
                     .drag_over::<gpui::ExternalPaths>(move |style, paths, _, _| {
                         if paths.paths().iter().any(|path| !path.is_dir()) {
                             style.bg(hsla(p.primary).opacity(0.08))

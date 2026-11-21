@@ -12,11 +12,20 @@ use t3_core::home::{PROJECTS_ENSURE_SCRATCH, ensure_scratch_project_id, is_scrat
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
+use crate::i18n::t;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
 impl AppState {
+    pub(crate) fn has_home_projects(&self) -> bool {
+        self.shell.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.projects.iter().any(|project| project.archived_at.is_none())
+        }) || self.fleet.environments.iter().any(|environment| {
+            environment.summary.projects.iter().any(|project| project.project.archived_at.is_none())
+        })
+    }
+
     /// The project the home page drafts in: the most recently active unarchived project.
     pub(crate) fn home_project(&self) -> Option<String> {
         let snapshot = self.shell.snapshot.as_ref()?;
@@ -72,8 +81,8 @@ impl AppState {
             let _ = this.update(cx, |state, cx| match result.as_ref().ok().and_then(ensure_scratch_project_id) {
                 Some(project_id) => state.start_draft(&project_id, cx),
                 None => {
-                    let description = result.err().map_or_else(|| "An error occurred.".to_owned(), |error| error.to_string());
-                    state.show_toast(Toast::new(ToastKind::Error, "Could not start without a project").description(description), cx);
+                    let description = result.err().map_or_else(|| t(cx, "An error occurred.").to_owned(), |error| error.to_string());
+                    state.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not start without a project")).description(description), cx);
                 }
             });
         })
@@ -81,8 +90,7 @@ impl AppState {
     }
 }
 
-/// What the thread area shows with nothing open: the no-projects hero once the shell proves the
-/// workspace is empty, else nothing while home opens a draft.
+/// What the thread area shows with nothing open, once the shell has loaded.
 pub struct HomeView {
     state: Entity<AppState>,
     _subscription: Subscription,
@@ -107,10 +115,31 @@ fn workspace_is_empty(state: &AppState) -> bool {
 impl Render for HomeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let app = self.state.read(cx);
+        let p = palette(cx);
+        if app.has_home_projects() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(crate::theme::rem(512.))
+                        .px(crate::theme::rem(32.))
+                        .py(crate::theme::rem(48.))
+                        .items_center()
+                        .gap(crate::theme::rem(4.))
+                        .text_center()
+                        .child(div().text_lg().font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.foreground)).child(t(cx, "Pick a thread to continue")))
+                        .child(div().text_sm().text_color(hsla(p.muted_foreground))
+                            .child(t(cx, "Select an existing thread or create a new one to get started."))),
+                )
+                .into_any_element();
+        }
         if !workspace_is_empty(app) {
             return div().size_full().into_any_element();
         }
-        let p = palette(cx);
         let scratch = app.scratch_root().is_some();
         let description = crate::i18n::t(cx, if scratch {
             "Add a project, or start without one."

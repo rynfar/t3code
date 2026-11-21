@@ -23,7 +23,7 @@ use t3_core::sidebar::grouping::{
 use super::SidebarPane;
 use crate::app_state::AppState;
 use crate::icons::Icon;
-use crate::theme::{Palette, hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, theme_slot_clipped_background_layer, Palette, hsla, palette};
 
 #[derive(Clone)]
 enum ScopeEntry<G> {
@@ -429,11 +429,7 @@ impl SidebarPane {
                     .collect();
                 trigger_favicons(icons, &p)
             };
-            return Self::header_button("project-filter", content, move |_| label.clone(), true, cx).on_click(
-                cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
-                    this.toggle_project_filter(event.position(), window, cx)
-                }),
-            );
+            return self.project_filter_trigger(content, label, cx);
         }
 
         let scoped: Vec<ProjectGroup> = self
@@ -464,9 +460,19 @@ impl SidebarPane {
                 .collect();
             trigger_favicons(icons, &p)
         };
-        Self::header_button("project-filter", content, move |_| label.clone(), true, cx).on_click(cx.listener(
-            |this, event: &gpui::ClickEvent, window, cx| this.toggle_project_filter(event.position(), window, cx),
-        ))
+        self.project_filter_trigger(content, label, cx)
+    }
+
+    fn project_filter_trigger(&self, content: AnyElement, label: String, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let (bounds, measure) = super::measure_trigger();
+        Self::header_button("project-filter", content, move |_| label.clone(), true, cx)
+            .relative()
+            .child(measure)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(bounds) = bounds.get() {
+                    this.toggle_project_filter(bounds.bottom_left(), window, cx);
+                }
+            }))
     }
 
     fn render_popup_shell(
@@ -517,11 +523,12 @@ impl SidebarPane {
                 )
                 .child(
                     anchored()
-                        .position(position + point(px(-8.), px(16.)))
+                        .position(position + point(px(0.), px(4.)))
                         .snap_to_window_with_margin(px(8.))
                         .child(
                             div()
                                 .id(popup_id)
+                                .theme_slot(ThemeSlot::PopoverPopup, cx)
                                 .track_focus(&self.project_filter_focus)
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -611,7 +618,8 @@ impl SidebarPane {
                                 .text_sm()
                                 .text_color(hsla(p.popover_foreground))
                                 .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
-                                .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+                                .child(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, px(8.), cx)
+                                    .unwrap_or_else(|| crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx).into_any_element()))
                                 .child(
                                     div()
                                         .id("project-filter-search")
@@ -627,6 +635,7 @@ impl SidebarPane {
                                         .child(
                                             div().flex_1().min_w_0().child(
                                                 Input::new(&self.project_filter_search)
+                                                    .theme_slot(ThemeSlot::Input, cx)
                                                     .appearance(false)
                                                     .bordered(false)
                                                     .xsmall()

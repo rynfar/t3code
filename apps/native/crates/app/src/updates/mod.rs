@@ -5,7 +5,9 @@ mod dialog;
 #[cfg(all(test, feature = "snapshot"))]
 mod tests;
 pub(crate) use dialog::UpdateTrackSwitchDialog;
+use crate::components::motion::Spinner;
 use crate::settings::controls::{activates, focus_handle};
+use crate::i18n::t;
 use gpui::{Div, FontWeight, KeyBinding, KeyDownEvent, MouseButton, Stateful, actions, anchored, deferred};
 actions!(updates, [FocusNextUpdate, FocusPreviousUpdate, CloseCapsulePopover]);
 const DIALOG_CONTEXT: &str = "UpdateEverythingDialog";
@@ -1472,19 +1474,17 @@ impl UpdateControl {
     }
 }
 
-fn machine_status_icon(status: UpdateRunMachineStatus, slow: bool, p: &crate::theme::Palette) -> gpui::Svg {
-    match status {
-        UpdateRunMachineStatus::Done => Icon::CircleCheck.sized(px(14.)).text_color(hsla(p.success)),
-        UpdateRunMachineStatus::Failed => Icon::TriangleAlert.sized(px(14.)).text_color(hsla(p.destructive)),
-        UpdateRunMachineStatus::Waiting => Icon::Clock.sized(px(14.)).text_color(hsla(p.muted_foreground)),
-        UpdateRunMachineStatus::Providers
-        | UpdateRunMachineStatus::Downloading
-        | UpdateRunMachineStatus::Restarting => Icon::LoaderCircle.sized(px(14.)).text_color(hsla(if slow {
-            p.warning
-        } else {
-            p.update_foreground
-        })),
-    }
+fn machine_status_icon(id: &str, status: UpdateRunMachineStatus, slow: bool, p: &crate::theme::Palette) -> gpui::AnyElement {
+    let (icon, tone) = match status {
+        UpdateRunMachineStatus::Done => (Icon::CircleCheck, p.success),
+        UpdateRunMachineStatus::Failed => (Icon::TriangleAlert, p.destructive),
+        UpdateRunMachineStatus::Waiting => (Icon::Clock, p.muted_foreground),
+        UpdateRunMachineStatus::Providers | UpdateRunMachineStatus::Downloading | UpdateRunMachineStatus::Restarting => {
+            let color = hsla(if slow { p.warning } else { p.update_foreground });
+            return Spinner::new(gpui::SharedString::from(format!("update-machine-{id}")), px(14.), color).into_any_element();
+        }
+    };
+    icon.render(px(14.), hsla(tone)).into_any_element()
 }
 
 pub(super) fn capsule_popover_actions(
@@ -1534,9 +1534,9 @@ fn render_capsule_popover(
         let elapsed_ms = now - machine.started_at_ms;
         let slow = status.is_working() && elapsed_ms >= updates::UPDATE_SLOW_AFTER_MS;
         let status_text = if status.is_working() {
-            format!("{} · {}", status.label(), updates::format_update_elapsed(elapsed_ms))
+            format!("{} · {}", t(cx, status.label()), updates::format_update_elapsed(elapsed_ms))
         } else {
-            status.label().to_owned()
+            t(cx, status.label()).to_owned()
         };
         let status_color = match status {
             UpdateRunMachineStatus::Failed => p.destructive,
@@ -1555,7 +1555,7 @@ fn render_capsule_popover(
                         .items_center()
                         .gap(rem(6.))
                         .text_xs()
-                        .child(machine_status_icon(status, slow, &p))
+                        .child(machine_status_icon(&machine.environment_id, status, slow, &p))
                         .child(
                             div()
                                 .flex_1()
@@ -1606,7 +1606,7 @@ fn render_capsule_popover(
                     .font_weight(FontWeight::MEDIUM)
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.85))
-                    .child("Retry"),
+                    .child(t(cx, "Retry")),
                 "update-capsule-popover-retry",
                 true,
                 move |_, cx| {
@@ -1628,7 +1628,7 @@ fn render_capsule_popover(
                 .text_xs()
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
-                .child("Dismiss"),
+                .child(t(cx, "Dismiss")),
             "update-capsule-popover-dismiss",
             true,
             move |_, cx| {
@@ -1643,6 +1643,7 @@ fn render_capsule_popover(
     };
 
     let close_this = this.clone();
+    use crate::theme::{ThemeSlot, ThemeSlotExt as _, theme_slot_clipped_background_layer};
     let panel = div()
         .id("update-capsule-popover")
         .debug_selector(|| "update-capsule-popover".to_owned())
@@ -1660,12 +1661,9 @@ fn render_capsule_popover(
             inset: false,
         }])
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(crate::glass::backdrop(
-            8.,
-            hsla(p.dropdown_surface),
-            hsla(p.dropdown_border),
-            cx,
-        ))
+        .theme_slot(ThemeSlot::PopoverPopup, cx)
+        .child(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, rem(8.), cx)
+            .unwrap_or_else(|| crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx).into_any_element()))
         .child(
             div()
                 .relative()
@@ -1683,7 +1681,7 @@ fn render_capsule_popover(
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(hsla(p.muted_foreground))
-                                .child("Updates"),
+                                .child(t(cx, "Updates")),
                         )
                         .child(keyboard_button(
                             div()
@@ -1777,7 +1775,7 @@ impl UpdateControl {
                         ButtonVariant::Outline,
                         ButtonSize::Compact,
                     )
-                    .label("Update T3 Code"),
+                    .label(t(cx, "Update T3 Code")),
                 ))
                 .child(crate::components::managed::notice(reason, cx));
         }
@@ -1800,7 +1798,7 @@ impl UpdateControl {
                     Icon::TriangleAlert,
                 ),
             };
-            let description = view.description.clone();
+            let description = t(cx, &view.description).to_owned();
             let mut row = div()
                 .w_full()
                 .flex()
@@ -1826,8 +1824,12 @@ impl UpdateControl {
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(description.clone()).build(window, cx)
                     })
-                    .child(icon.sized(px(14.)).text_color(hsla(color)))
-                    .child(view.title.clone()),
+                    .child(if view.tone == Tone::Loading {
+                        Spinner::new("provider-update-running", px(14.), hsla(color)).into_any_element()
+                    } else {
+                        icon.render(px(14.), hsla(color)).into_any_element()
+                    })
+                    .child(t(cx, &view.title).to_owned()),
                 "provider-update-main",
                 true,
                 |_, cx| crate::settings::open(Section::Providers, cx),
@@ -1850,7 +1852,7 @@ impl UpdateControl {
                         .hover(|s| s.opacity(1.))
                         .tooltip(|window, cx| {
                             gpui_component::tooltip::Tooltip::new(
-                                "Dismiss until provider status changes",
+                                t(cx, "Dismiss until provider status changes"),
                             )
                             .build(window, cx)
                         })
@@ -1916,6 +1918,9 @@ impl UpdateControl {
             } else {
                 view.label.clone()
             };
+            let busy = run.machines.iter().any(|machine| {
+                updates::resolve_machine_status(machine, run.phase, stage_for(&self.stages, &machine.environment_id)).is_working()
+            });
             let this = cx.weak_entity();
             let mut capsule_row = div()
                 .id("update-capsule")
@@ -1946,7 +1951,11 @@ impl UpdateControl {
                         .px(px(8.))
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.85))
-                        .child(icon.sized(px(14.)).text_color(hsla(text_color)))
+                        .child(if busy && icon == Icon::LoaderCircle {
+                            Spinner::new("update-capsule-running", px(14.), hsla(text_color)).into_any_element()
+                        } else {
+                            icon.render(px(14.), hsla(text_color)).into_any_element()
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -1987,7 +1996,7 @@ impl UpdateControl {
                         .font_weight(FontWeight::MEDIUM)
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.85))
-                        .child(action_label),
+                        .child(t(cx, action_label)),
                     "update-capsule-action",
                     true,
                     move |_, cx| {
@@ -2067,7 +2076,32 @@ impl UpdateControl {
                     .into_any_element(),
             );
         }
-        None
+        let checking = manual_check_status(cx) == ManualCheckStatus::Checking;
+        let label = if checking { "Checking for updates…" } else { "Check for updates" };
+        let state = self.state.clone();
+        let button = keyboard_button(
+            div()
+                .id("check-for-updates")
+                .size(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(rem(8.))
+                .aria_label(t(cx, label))
+                .when(!checking, |button| button.cursor_pointer().hover(|style| style.bg(hsla(p.sidebar_row_hover))))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(t(cx, label)).build(window, cx))
+                .child(if checking {
+                    Spinner::new("checking-for-updates", px(14.), hsla(p.sidebar_icon)).into_any_element()
+                } else {
+                    Icon::RefreshCw.render(px(16.), hsla(p.sidebar_icon)).into_any_element()
+                }),
+            "check-for-updates",
+            !checking,
+            move |window, cx| check_for_updates(&state, window, cx),
+            window,
+            cx,
+        );
+        Some(self.key_boundary(cx).ml_auto().flex_none().child(button).into_any_element())
     }
 }
 

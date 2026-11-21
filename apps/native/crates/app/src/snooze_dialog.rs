@@ -2,7 +2,7 @@
 //! duration, validated by `resolve_custom_snooze`. Requests retain their destination until picked.
 
 use crate::icons::Icon;
-use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant, NumberField, Select, SelectOption};
 use chrono::{Datelike, NaiveDate};
 use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
@@ -21,7 +21,7 @@ use t3_core::sidebar::time::{MINUTE_MS, Zone, to_local};
 
 use crate::app_state::{AppState, Phase};
 use crate::sidebar::controller::{SystemZone, now_ms};
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
 use t3_client::supervisor::ConnectionStatus;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,9 +142,9 @@ impl SnoozeRequest {
             state.show_toast(
                 crate::toast::Toast::new(
                     crate::toast::ToastKind::Warning,
-                    "Could not snooze thread",
+                    crate::i18n::t(cx, "Could not snooze thread"),
                 )
-                .description("That snooze time has passed. Choose another time."),
+                .description(crate::i18n::t(cx, "That snooze time has passed. Choose another time.")),
                 cx,
             );
             return;
@@ -390,7 +390,6 @@ pub struct SnoozeDialog {
     calendar_open: bool,
     calendar_trigger: FocusHandle,
     mode_focus: [FocusHandle; 2],
-    unit_focus: [FocusHandle; 3],
     footer_focus: [FocusHandle; 3],
     clock: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -406,7 +405,7 @@ impl SnoozeDialog {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let date = cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD"));
         let time = cx.new(|cx| InputState::new(window, cx).placeholder("HH:MM"));
-        let amount = cx.new(|cx| InputState::new(window, cx).default_value("2"));
+        let amount = cx.new(|cx| InputState::new(window, cx).default_value("2").min(0.));
         let calendar = cx.new(|cx| {
             CalendarState::new(window, cx).disabled_matcher(|date: &NaiveDate| {
                 calendar_disabled(*date, now_ms(), &SystemZone)
@@ -477,7 +476,6 @@ impl SnoozeDialog {
             calendar_open: false,
             calendar_trigger: cx.focus_handle().tab_stop(true),
             mode_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            unit_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             footer_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             clock: None,
             _subscriptions: subscriptions,
@@ -588,26 +586,15 @@ impl SnoozeDialog {
         } else if key == "tab" {
             self.calendar_open = false;
             cx.notify();
-            let mut stops = self.mode_focus.to_vec();
-            match self.mode {
-                Mode::Date => stops.extend([
-                    self.date.read(cx).focus_handle(cx),
-                    self.calendar_trigger.clone(),
-                    self.time.read(cx).focus_handle(cx),
-                ]),
-                Mode::Duration => {
-                    stops.push(self.amount.read(cx).focus_handle(cx));
-                    stops.extend(self.unit_focus.iter().cloned());
-                }
-            }
-            stops.extend(self.footer_focus.iter().cloned());
-            let index = stops.iter().position(|focus| focus.is_focused(window));
-            let next = if event.keystroke.modifiers.shift {
-                index.unwrap_or(0).checked_sub(1).unwrap_or(stops.len() - 1)
+            let first = &self.mode_focus[0];
+            let last = &self.footer_focus[2];
+            if event.keystroke.modifiers.shift {
+                if first.is_focused(window) { window.focus(last, cx); } else { window.focus_prev(cx); }
+            } else if last.is_focused(window) {
+                window.focus(first, cx);
             } else {
-                index.map_or(0, |i| (i + 1) % stops.len())
-            };
-            window.focus(&stops[next], cx);
+                window.focus_next(cx);
+            }
         } else if self.calendar_open && self.calendar.read(cx).focus_handle.is_focused(window) {
             if !self
                 .calendar
@@ -629,18 +616,6 @@ impl SnoozeDialog {
                     Mode::Duration
                 };
                 self.calendar_open = false;
-                self.error = None;
-                cx.notify();
-            } else if let Some(index) = self
-                .unit_focus
-                .iter()
-                .position(|focus| focus.is_focused(window))
-            {
-                self.unit = [
-                    DurationUnit::Minutes,
-                    DurationUnit::Hours,
-                    DurationUnit::Days,
-                ][index];
                 self.error = None;
                 cx.notify();
             } else if self.footer_focus[0].is_focused(window) {
@@ -729,11 +704,7 @@ impl SnoozeDialog {
             .children(options.iter().enumerate().map(|(index, (option, label))| {
                 let option = *option;
                 let pressed = option == value;
-                let focus = if id == "snooze-mode" {
-                    &self.mode_focus[index]
-                } else {
-                    &self.unit_focus[index]
-                };
+                let focus = &self.mode_focus[index];
                 let keyboard_focus = focus.is_focused(window) && window.last_input_was_keyboard();
                 div()
                     .id(SharedString::from(format!("{id}-{index}")))
@@ -803,7 +774,7 @@ impl SnoozeDialog {
                     .text_color(hsla(p.foreground))
                     .child(label),
             )
-            .child(Input::new(input))
+            .child(Input::new(input).theme_slot(ThemeSlot::Input, cx))
     }
 }
 
@@ -835,7 +806,7 @@ impl Render for SnoozeDialog {
                             div()
                                 .flex()
                                 .gap(px(4.))
-                                .child(div().flex_1().min_w_0().child(Input::new(&self.date)))
+                                .child(div().flex_1().min_w_0().child(Input::new(&self.date).theme_slot(ThemeSlot::Input, cx)))
                                 .child(
                                     Button::new(
                                         "snooze-calendar",
@@ -859,6 +830,8 @@ impl Render for SnoozeDialog {
                                         .left_0()
                                         .occlude()
                                         .bg(hsla(p.popover))
+                                        .theme_slot(ThemeSlot::PopoverPopup, cx)
+                                        .children(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, px(8.), cx))
                                         .child(Calendar::new(&self.calendar).with_size(Size::Small))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
@@ -870,24 +843,36 @@ impl Render for SnoozeDialog {
                 )
                 .child(Self::field(crate::i18n::t(cx, "Time"), &self.time, cx))
                 .into_any_element(),
-            Mode::Duration => div()
-                .flex()
-                .gap(px(12.))
-                .items_end()
-                .child(Self::field(crate::i18n::t(cx, "Snooze for"), &self.amount, cx))
-                .child(div().flex_1().child(self.segmented(
-                    "snooze-unit",
-                    &[
-                        (DurationUnit::Minutes, crate::i18n::t(cx, "Minutes")),
-                        (DurationUnit::Hours, crate::i18n::t(cx, "Hours")),
-                        (DurationUnit::Days, crate::i18n::t(cx, "Days")),
-                    ],
-                    self.unit,
-                    |this, unit| this.unit = unit,
-                    window,
-                    cx,
-                )))
-                .into_any_element(),
+            Mode::Duration => {
+                let units = [
+                    ("minutes", "Minutes", DurationUnit::Minutes),
+                    ("hours", "Hours", DurationUnit::Hours),
+                    ("days", "Days", DurationUnit::Days),
+                ];
+                let selected = units.iter().find(|(_, _, unit)| *unit == self.unit).map_or("hours", |entry| entry.0);
+                let this = cx.weak_entity();
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .items_end()
+                    .child(div().flex_1().min_w_0().flex().flex_col().gap(px(8.))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Snooze for")))
+                        .child(NumberField::new(&self.amount)))
+                    .child(Select::new("snooze-unit", units.iter().map(|(value, label, _)| SelectOption::new(*value, *label)).collect())
+                        .selected(selected)
+                        .width(102.)
+                        .show_check()
+                        .on_change(move |value, _, cx| {
+                            if let Some((_, _, unit)) = units.iter().find(|(key, _, _)| *key == value.as_ref()) {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.unit = *unit;
+                                    this.error = None;
+                                    cx.notify();
+                                });
+                            }
+                        }))
+                    .into_any_element()
+            }
         };
         deferred(
             div()
@@ -923,12 +908,9 @@ impl Render for SnoozeDialog {
                         .max_w(px(384.))
                         .relative()
                         .rounded(px(16.))
-                        .child(crate::glass::backdrop(
-                            16.,
-                            hsla(p.dialog_surface),
-                            hsla(p.dialog_border),
-                            cx,
-                        ))
+                        .theme_slot(ThemeSlot::DialogPopup, cx)
+                        .child(theme_slot_clipped_background_layer(ThemeSlot::DialogPopup, px(16.), cx)
+                            .unwrap_or_else(|| crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx).into_any_element()))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),
                             offset: point(px(0.), px(24.)),
@@ -1504,10 +1486,20 @@ mod lifecycle {
         // The production tab handler wraps through the current mode and footer focus handles.
         edit(&mut cx, &mut |window, cx| {
             dialog.update(cx, |d, cx| window.focus(&d.mode_focus[0], cx));
-            let stops = dialog.read(cx).mode_focus.iter().cloned().chain([dialog.read(cx).amount.read(cx).focus_handle(cx)]).chain(dialog.read(cx).unit_focus.iter().cloned()).chain(dialog.read(cx).footer_focus.iter().cloned()).collect::<Vec<_>>();
-            for expected in stops.iter().cycle().skip(1).take(stops.len()) {
-                key(&dialog, window, cx, "tab"); assert!(expected.is_focused(window));
+            let before_unit = [dialog.read(cx).mode_focus[1].clone(), dialog.read(cx).amount.read(cx).focus_handle(cx)];
+            for expected in before_unit {
+                key(&dialog, window, cx, "tab");
+                assert!(expected.is_focused(window));
             }
+            key(&dialog, window, cx, "tab");
+            let unit = window.focused(cx).expect("duration unit select receives Tab focus");
+            assert!(!dialog.read(cx).footer_focus.contains(&unit));
+            let footer = dialog.read(cx).footer_focus.clone();
+            for expected in &footer {
+                key(&dialog, window, cx, "tab");
+                assert!(expected.is_focused(window));
+            }
+            key(&dialog, window, cx, "tab");
             dialog.update(cx, |d, _| assert!(d.mode_focus[0].is_focused(window)));
             key(&dialog, window, cx, "shift-tab");
             dialog.update(cx, |d, _| assert!(d.footer_focus[2].is_focused(window)));

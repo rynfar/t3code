@@ -1,7 +1,6 @@
 //! Project folders in the default-off boring sidebar.
 
-use std::{cell::Cell, rc::Rc};
-use gpui::{AnyElement, Bounds, Context, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, SharedString, Styled, Window, canvas, div, prelude::*};
+use gpui::{AnyElement, Context, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, prelude::*};
 use t3_core::sidebar::fleet::FolderDot;
 use super::SidebarPane;
 use crate::i18n::{t, t_fmt};
@@ -16,6 +15,17 @@ impl SidebarPane {
         let first = model.rows.iter().find_map(|row| match row { t3_core::sidebar::fleet::ScopedSidebarRow::Folder { key, .. } => Some(key.as_str()), _ => None }) == Some(key);
         let visual = crate::project_icon::ProjectVisual::for_scoped_project(state, &group.representative);
         let p = palette(cx);
+        let environment_badge = t3_core::sidebar::grouping::resolve_project_environment_badge(
+            group,
+            crate::new_thread::primary_environment_id(state),
+        ).map(|badge| {
+            let icon = crate::context_chip::environment_machine_icon(state, &badge.environment_id);
+            let id = SharedString::from(format!("project-environment-{key}"));
+            div().id(id)
+                .flex_none()
+                .child(icon.render(crate::project_icon::size(12., cx), hsla(p.sidebar_icon)))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(badge.description.clone()).build(window, cx))
+        });
         let toggle = group.clone();
         let new_thread = group.clone();
         let context_group = group.clone();
@@ -26,11 +36,11 @@ impl SidebarPane {
         let label = if is_scratch { t(cx, "No project").to_owned() } else { group.label.clone() };
         let id = ElementId::Name(SharedString::from(format!("project-folder-{key}")));
         let new_id = ElementId::Name(SharedString::from(format!("folder-new-{key}")));
-        let focus = crate::settings::controls::focus_handle(&id, window, cx);
+        let focus = self.tree.focus(&super::tree::TreeRow::Folder(key.to_owned()))
+            .unwrap_or_else(|| crate::settings::controls::focus_handle(&id, window, cx));
         let keyboard_focus = focus.clone();
         let new_focus = crate::settings::controls::focus_handle(&new_id, window, cx);
-        let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
-        let measured = bounds.clone();
+        let (bounds, measure) = super::measure_trigger();
         let folder_group = SharedString::from(format!("project-folder-group-{key}"));
         let new_thread_aria = t_fmt(cx, "New thread in {project}", &[("project", label.as_str().into())]);
         let new_thread_tooltip = new_thread_aria.clone();
@@ -77,6 +87,7 @@ impl SidebarPane {
                     .children(drop_line)
                     .child(visual.render(crate::project_icon::size(16., cx), hsla(p.sidebar_icon), cx))
                     .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.sidebar_foreground).opacity(0.9)).child(label))
+                    .children(environment_badge)
                     .children(color.map(|color| div().size(rem(6.)).rounded_full().bg(hsla(color))))
                     .when(!expanded && hidden_count > 0, |row| row.child(div().text_xs().text_color(hsla(p.sidebar_muted_foreground)).group_hover(folder_group.clone(), |style| style.invisible()).child(hidden_count.to_string())))
                     .child(div().id(new_id).track_focus(&new_focus).role(gpui::Role::Button).aria_label(new_thread_aria)
@@ -91,25 +102,19 @@ impl SidebarPane {
                             this.state.update(cx, |state, cx| state.run_scoped_project_action(&new_thread, t3_core::thread_actions::ProjectAction::NewThread, cx));
                         })))
                     .child(if expanded { Icon::ChevronDown } else { Icon::ChevronRight }.render(crate::project_icon::size(12., cx), hsla(p.sidebar_muted_foreground)))
-                    .child(canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
+                    .child(measure)
                     .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
-                        let key = &event.keystroke;
-                        let context_key = (key.key == "menu" && !key.modifiers.modified())
-                            || (key.key == "f10" && key.modifiers.shift && !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform && !key.modifiers.function);
-                        if context_key && keyboard_focus.is_focused(window) && let Some(bounds) = bounds.get() {
+                        if keyboard_focus.is_focused(window) && super::tree::context_menu_key(&event.keystroke) {
                             window.prevent_default();
                             cx.stop_propagation();
-                            this.menu.update(cx, |menu, cx| menu.open_scoped_project(keyboard_group.clone(), bounds.bottom_left(), window, cx));
+                            if !event.is_held && let Some(bounds) = bounds.get() {
+                                this.menu.update(cx, |menu, cx| menu.open_scoped_project(keyboard_group.clone(), bounds.bottom_left(), window, cx));
+                            }
                         }
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.state.update(cx, |state, cx| {
-                            state.project_preferences.set_expanded(&toggle, !expanded);
-                            state.save_project_preferences(cx);
-                            state.rebuild_sidebar(cx);
-                            cx.emit(crate::app_state::AppEvent::Shell);
-                        });
+                        this.toggle_project_folder(&toggle, !expanded, cx);
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
