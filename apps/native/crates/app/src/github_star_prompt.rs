@@ -318,7 +318,7 @@ impl AppState {
     }
 
     fn start_star_confetti(&mut self, cx: &mut Context<Self>) {
-        if !core::should_celebrate(prefers_reduced_motion()) {
+        if !core::should_celebrate(crate::components::motion::prefers_reduced_motion(cx)) {
             return;
         }
         self.github_star.confetti = Some(core::ConfettiBurst::spawn(1200.0, 800.0));
@@ -519,21 +519,6 @@ fn embedded_focused() -> bool {
 }
 #[cfg(not(target_os = "macos"))]
 fn embedded_focused() -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn prefers_reduced_motion() -> bool {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSWorkspace;
-    if MainThreadMarker::new().is_none() {
-        return false;
-    }
-    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn prefers_reduced_motion() -> bool {
     false
 }
 

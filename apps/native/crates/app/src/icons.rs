@@ -9,10 +9,10 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Hsla, Pixels, SharedString, Svg, prelude::*, svg};
 
 macro_rules! icons {
-    ($($variant:ident => $path:literal),* $(,)?) => {
+    ($($(#[$doc:meta])* $variant:ident => $path:literal $(= $inline:literal)?),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Icon {
-            $($variant),*
+            $($(#[$doc])* $variant),*
         }
 
         impl Icon {
@@ -26,12 +26,99 @@ macro_rules! icons {
         }
 
         const FILES: &[(&str, &[u8])] = &[
-            $(($path, include_bytes!(concat!("../assets/", $path)))),*
+            $(($path, icons!(@bytes $path $(= $inline)?))),*
         ];
     };
+    (@bytes $path:literal = $inline:literal) => { $inline.as_bytes() };
+    (@bytes $path:literal) => { include_bytes!(concat!("../assets/", $path)) };
 }
 
 icons! {
+    /// Light appearance.
+    Sun => "icons/lucide/sun.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2"/>
+        <path d="M12 20v2"/>
+        <path d="m4.93 4.93 1.41 1.41"/>
+        <path d="m17.66 17.66 1.41 1.41"/>
+        <path d="M2 12h2"/>
+        <path d="M20 12h2"/>
+        <path d="m6.34 17.66-1.41 1.41"/>
+        <path d="m19.07 4.93-1.41 1.41"/>
+    </svg>"#,
+    /// Dark appearance.
+    Moon => "icons/lucide/moon.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/>
+    </svg>"#,
+    /// Balance scales.
+    Scale => "icons/lucide/scale.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v18"/>
+        <path d="m19 8 3 8a5 5 0 0 1-6 0zV7"/>
+        <path d="M3 7h1a17 17 0 0 0 8-2 17 17 0 0 0 8 2h1"/>
+        <path d="m5 8 3 8a5 5 0 0 1-6 0zV7"/>
+        <path d="M7 21h10"/>
+    </svg>"#,
+    /// Still capture.
+    Camera => "icons/lucide/camera.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/>
+        <circle cx="12" cy="13" r="3"/>
+    </svg>"#,
+    /// Add a package.
+    PackagePlus => "icons/lucide/package-plus.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M16 16h6"/>
+        <path d="M19 13v6"/>
+        <path d="M21 10V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l2-1.14"/>
+        <path d="m7.5 4.27 9 5.15"/>
+        <polyline points="3.29 7 12 12 20.71 7"/>
+        <line x1="12" x2="12" y1="22" y2="12"/>
+    </svg>"#,
+    /// Upload a file.
+    Upload => "icons/lucide/upload.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12"/>
+        <path d="m17 8-5-5-5 5"/>
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+    </svg>"#,
+    /// A directly entered text value.
+    Type => "icons/lucide/type.svg" = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 4v16"/>
+        <path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2"/>
+        <path d="M9 20h6"/>
+    </svg>"#,
+    /// The Apple platform mark.
+    Apple => "icons/platform/apple.svg" = r#"<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+    <path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701" />
+  </svg>"#,
+    /// The Android platform mark.
+    Android => "icons/platform/android.svg" = r#"<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+    <path
+      d="m8 3-1-2m9 2 1-2"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.4"
+      stroke-linecap="round"
+    />
+    <path
+      fill-rule="evenodd"
+      d="M5 10a7 7 0 0 1 14 0H5Zm4-4a.8.8 0 1 0 0 1.6A.8.8 0 0 0 9 6Zm6 0a.8.8 0 1 0 0 1.6A.8.8 0 0 0 15 6Z"
+    />
+    <path d="M5 11h14v7a2 2 0 0 1-2 2v2a1.5 1.5 0 0 1-3 0v-2h-4v2a1.5 1.5 0 0 1-3 0v-2a2 2 0 0 1-2-2v-7Z" />
+    <rect x="1" y="11" width="3" height="8" rx="1.5" />
+    <rect x="20" y="11" width="3" height="8" rx="1.5" />
+  </svg>"#,
+    /// The T3 wordmark, in a 94.3941 × 56.96 viewbox.
+    T3Wordmark => "icons/brand/t3-wordmark.svg" = r#"<svg viewBox="15.5309 37 94.3941 56.96" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M33.4509 93V47.56H15.5309V37H64.3309V47.56H46.4109V93H33.4509ZM86.7253 93.96C82.832 93.96 78.9653 93.4533 75.1253 92.44C71.2853 91.3733 68.032 89.88 65.3653 87.96L70.4053 78.04C72.5386 79.5867 75.0186 80.8133 77.8453 81.72C80.672 82.6267 83.5253 83.08 86.4053 83.08C89.6586 83.08 92.2186 82.44 94.0853 81.16C95.952 79.88 96.8853 78.12 96.8853 75.88C96.8853 73.7467 96.0586 72.0667 94.4053 70.84C92.752 69.6133 90.0853 69 86.4053 69H80.4853V60.44L96.0853 42.76L97.5253 47.4H68.1653V37H107.365V45.4L91.8453 63.08L85.2853 59.32H89.0453C95.9253 59.32 101.125 60.8667 104.645 63.96C108.165 67.0533 109.925 71.0267 109.925 75.88C109.925 79.0267 109.099 81.9867 107.445 84.76C105.792 87.48 103.259 89.6933 99.8453 91.4C96.432 93.1067 92.0586 93.96 86.7253 93.96Z"
+        fill="currentColor"
+      />
+    </svg>"#,
     Rocket => "icons/lucide/rocket.svg",
     Building => "icons/lucide/building.svg",
     AlarmClock => "icons/lucide/alarm-clock.svg",
