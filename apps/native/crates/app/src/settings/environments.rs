@@ -1160,7 +1160,9 @@ impl SettingsView {
     ) -> Button {
         let id: SharedString = id.to_owned().into();
         let button = if key == "actions" {
-            Button::new((gpui::ElementId::from(id.clone()), key), ButtonVariant::Ghost, ButtonSize::IconSm).icon(Icon::Ellipsis).tooltip(t(cx, label))
+            let button = Button::new((gpui::ElementId::from(id.clone()), key), ButtonVariant::Ghost, ButtonSize::IconSm).icon(Icon::Ellipsis);
+            // The tooltip would cover the menu's first item while it is open.
+            if open { button } else { button.tooltip(t(cx, label)) }
         } else {
             catalog_button((gpui::ElementId::from(id.clone()), key), label, cx).icon(if open { Icon::ChevronDown } else { Icon::ChevronRight })
         };
