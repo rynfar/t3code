@@ -3,26 +3,33 @@
 //! Dock-back and Close controls. Guarded off from spawning OS windows during unit tests and
 //! offscreen snapshot runs.
 
-use gpui::{
-    App, AppContext, Context, Entity, FontWeight, IntoElement, MouseButton, ParentElement, Render, Styled, Window, div, prelude::*, px,
-};
+use gpui::{App, Entity};
+#[cfg(any(test, not(feature = "snapshot")))]
+use gpui::{AppContext, Context, FontWeight, IntoElement, MouseButton, ParentElement, Render, Styled, Window, div, prelude::*, px};
 #[cfg(not(any(test, feature = "snapshot")))]
 use gpui::{Bounds, TitlebarOptions, WindowBounds, WindowKind, WindowOptions, point, size};
+#[cfg(any(test, not(feature = "snapshot")))]
 use gpui_component::{h_flex, v_flex};
 use t3_core::device::Device;
 
+#[cfg(any(test, not(feature = "snapshot")))]
 use super::DeviceScreen;
 use crate::app_state::AppState;
 use crate::device::Devices;
+#[cfg(any(test, not(feature = "snapshot")))]
 use crate::icons::Icon;
+#[cfg(any(test, not(feature = "snapshot")))]
 use crate::right_panel::{Button, Size, Variant};
+#[cfg(any(test, not(feature = "snapshot")))]
 use crate::theme::{hsla, palette};
 
 /// Compact header height for the floating device window.
+#[cfg(any(test, not(feature = "snapshot")))]
 const HEADER_HEIGHT: f32 = 34.;
 
 /// Root view of a floating device window: compact draggable header (Dock back + Close) above a
 /// live `DeviceScreen`.
+#[cfg(any(test, not(feature = "snapshot")))]
 pub(crate) struct FloatingDeviceWindow {
     devices: Entity<Devices>,
     thread_id: String,
@@ -30,6 +37,7 @@ pub(crate) struct FloatingDeviceWindow {
     screen: Entity<DeviceScreen>,
 }
 
+#[cfg(any(test, not(feature = "snapshot")))]
 impl FloatingDeviceWindow {
     pub(crate) fn new(
         state: Entity<AppState>,
@@ -61,6 +69,7 @@ impl FloatingDeviceWindow {
     }
 }
 
+#[cfg(any(test, not(feature = "snapshot")))]
 impl Render for FloatingDeviceWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);

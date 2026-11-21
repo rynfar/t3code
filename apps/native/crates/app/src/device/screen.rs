@@ -204,6 +204,7 @@ impl DeviceScreen {
         Self::create(state, devices, thread_id, surface_id, device, false, cx)
     }
 
+    #[cfg(any(test, not(feature = "snapshot")))]
     pub(super) fn new_floating(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, device: Device, cx: &mut Context<Self>) -> Self {
         Self::create(state, devices, thread_id, surface_id, device, true, cx)
     }
