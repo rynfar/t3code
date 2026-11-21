@@ -192,6 +192,11 @@ impl ClientHandle {
         self.active_credentials.borrow().clone().unwrap_or_else(|| (*self.credentials).clone())
     }
 
+    /// The saved primary address, regardless of which route the supervisor dialed.
+    pub fn primary_http_base(&self) -> &str {
+        &self.credentials.http_base
+    }
+
     /// Live extras decoded from `subscribeServerConfig` snapshots and settings updates.
     pub fn server_config_extras(&self) -> watch::Receiver<ServerConfigExtras> {
         extras_sender(&self.credentials.http_base).subscribe()
@@ -2146,6 +2151,8 @@ mod parity_tests {
             }
         }
         assert!(client.server_config_extras().borrow().secret_references);
+        assert_eq!(client.credentials().http_base, live.credentials().http_base);
+        assert_eq!(client.primary_http_base(), "http://127.0.0.1:1");
 
         // Sending a long-resume wakeup while the server ignores Ping closes the stale session and reconnects.
         client.notify_wakeup(ConnectionWakeup::ApplicationActiveLong);

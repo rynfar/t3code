@@ -439,6 +439,7 @@ pub(crate) async fn link_access_relay(
     let generations = client.connection_generation();
     let generation = *generations.borrow();
     let credentials = client.credentials();
+    let primary_http_base = client.primary_http_base().to_owned();
     let permitted = || *generations.borrow() == generation && sessions.borrow().as_ref().is_some_and(|session| {
         session.grants(RELAY_READ) && session.grants(RELAY_WRITE) && access::can_configure_relay(session)
     });
@@ -473,7 +474,9 @@ pub(crate) async fn link_access_relay(
         return Err(denied());
     }
     let environment_id = environment_id.to_owned();
-    runtime.spawn(async move { cloud.link_environment(&credentials, &environment_id, managed, publish).await })
+    runtime.spawn(async move {
+        cloud.link_environment(&credentials, &primary_http_base, &environment_id, managed, publish).await
+    })
         .await.map_err(|error| error.to_string())??;
     Ok(true)
 }

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use t3_client::routes::{CandidateRoute, ConnectionRouteKind, merge_learned_routes};
 use t3_client::status::{self, Diagnosis, DotTone, HopResult};
 use t3_client::updates::{self as update_client, UpdateDestination, UpdateEvent};
-use t3_client::store::{SavedEnvironment, load_alternate_routes, load_ui_state, save_ui_state};
+use t3_client::store::{SavedEnvironment, alternate_routes_snapshot, has_saved_relay_route, load_alternate_routes, load_ui_state, save_ui_state};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::client_settings::ClientSettingChange;
 use t3_core::relay::EnvironmentHealth;
@@ -903,7 +903,7 @@ impl SettingsView {
         let mut ticking = false;
         let saved = state.environments.environments.clone();
         self.environments.catalog.rows.retain(|id, _| saved.iter().any(|entry| &entry.id == id));
-        let alternates = load_alternate_routes();
+        let alternates = alternate_routes_snapshot();
         let rows: Vec<_> = saved.iter().map(|entry| {
             let configured = alternates.get(&entry.id).map(Vec::as_slice).unwrap_or_default();
             let progress = status::route_progress(&entry.http_base);
@@ -1391,7 +1391,6 @@ impl SettingsView {
     fn catalog_cloud_rows(&self, cx: &Context<Self>) -> AnyElement {
         let state = self.state.read(cx);
         let cloud = &state.cloud;
-        let alternate_routes = load_alternate_routes();
         let p = palette(cx);
         let heading = h_flex().gap(r(6.)).justify_between()
             .child(section_title("T3 Connect"))
@@ -1408,8 +1407,7 @@ impl SettingsView {
             .children(cloud.discovery.environments.iter().filter_map(|entry| {
                 let saved = state.environments.find_by_environment_id(&entry.environment_id);
                 if saved.is_some_and(|saved| {
-                    saved.local || saved.is_relay_managed() || alternate_routes.get(&saved.id)
-                        .is_some_and(|routes| routes.iter().any(|route| route.kind() == ConnectionRouteKind::Relay))
+                    saved.local || saved.is_relay_managed() || has_saved_relay_route(&saved.id)
                 }) { return None; }
                 let known = saved.and_then(|saved| state.fleet.environment(&saved.id)).and_then(|view| view.config.config.as_ref());
                 let incompatibility = state.cloud_environment_compatibility_error(&entry.environment_id);

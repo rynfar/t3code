@@ -70,6 +70,27 @@ impl Default for CloudState {
     }
 }
 
+impl CloudState {
+    fn advance_generation(&mut self) -> u64 {
+        self.connecting_env_id = None;
+        self.generation += 1;
+        self.generation
+    }
+
+    fn cancel_sign_in(&mut self) {
+        if let Some(session) = self.active_auth_session.take() {
+            session.cancel();
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.advance_generation();
+        self.busy = false;
+        self.signing_in = false;
+        self.auth_flow = CloudAuthFlow::Idle;
+    }
+}
+
 impl AppState {
     fn abort_cloud_status_tasks(&mut self) {
         for task in self.cloud.status_tasks.drain(..) {
@@ -189,7 +210,7 @@ impl AppState {
         if self.cloud.busy {
             return;
         }
-        self.cancel_cloud_sign_in_internal();
+        self.cloud.cancel_sign_in();
         self.cloud.busy = true;
         self.cloud.signing_in = true;
         self.cloud.auth_flow = CloudAuthFlow::OAuth(provider);
@@ -348,7 +369,7 @@ impl AppState {
         if self.cloud.busy {
             return;
         }
-        self.cancel_cloud_sign_in_internal();
+        self.cloud.cancel_sign_in();
         self.cloud.busy = true;
         self.cloud.error = None;
         let generation = self.cloud.generation;
@@ -550,8 +571,7 @@ impl AppState {
             self.cloud.busy = true;
             self.cloud.signing_in = true;
             self.cloud.error = None;
-            self.cloud.generation += 1;
-            let generation = self.cloud.generation;
+            let generation = self.cloud.advance_generation();
             let service = self.cloud.service.clone();
             let (browser, url) = tokio::sync::oneshot::channel();
             let task = self.runtime().spawn(async move { service.sign_in(browser).await });
@@ -669,33 +689,19 @@ impl AppState {
         .detach();
     }
 
-    fn cancel_cloud_sign_in_internal(&mut self) {
-        if let Some(session) = self.cloud.active_auth_session.take() {
-            session.cancel();
-        }
-        if let Some(task) = self.cloud.task.take() {
-            task.abort();
-        }
-        self.cloud.generation += 1;
-        self.cloud.busy = false;
-        self.cloud.signing_in = false;
-        self.cloud.auth_flow = CloudAuthFlow::Idle;
-    }
-
     pub fn cancel_cloud_sign_in(&mut self, cx: &mut Context<Self>) {
-        self.cancel_cloud_sign_in_internal();
+        self.cloud.cancel_sign_in();
         self.cloud.error = None;
         cx.emit(AppEvent::Phase);
     }
 
     pub fn sign_out_cloud(&mut self, cx: &mut Context<Self>) {
         self.abort_cloud_status_tasks();
-        self.cancel_cloud_sign_in_internal();
+        self.cloud.cancel_sign_in();
         self.cloud.identity = None;
         self.cloud.has_clerk_session = false;
         self.cloud.discovery = Default::default();
         self.cloud.statuses.clear();
-        self.cloud.connecting_env_id = None;
         self.cloud.error = None;
         self.cloud.busy = true;
         let service = self.cloud.service.clone();
@@ -716,5 +722,22 @@ impl AppState {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canceling_sign_in_releases_the_pending_environment_connection() {
+        let mut cloud = CloudState {
+            connecting_env_id: Some("pending-environment".into()),
+            ..CloudState::default()
+        };
+        let generation = cloud.generation;
+        cloud.cancel_sign_in();
+        assert_ne!(cloud.generation, generation);
+        assert!(cloud.connecting_env_id.is_none());
     }
 }
