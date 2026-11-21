@@ -15,31 +15,41 @@ use super::{GitDialogs, GitStore};
 use crate::app_state::AppState;
 use crate::components::motion::Spinner;
 use crate::i18n::{t, t_fmt};
-use crate::icons::Icon;
+use crate::icons::{Icon, ProviderLogo, source_control_logo};
 use crate::thread_details::changes::Comparison;
 use t3_core::diff::{ChangedFileKind, classify_changed_file};
 use t3_core::i18n::IcuArg;
 use crate::right_panel::tooltip_view;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
-use crate::thread_details::controls::{MenuTrigger, ROW_HEIGHT, ROW_WIDTH, Row, menu_icon, split_row};
+use crate::thread_details::controls::{MenuTrigger, ROW_HEIGHT, ROW_WIDTH, Row, split_row};
 
-fn quick_icon(icon: QuickActionIcon) -> Icon {
-    match icon {
-        QuickActionIcon::Commit => Icon::GitCommit,
-        QuickActionIcon::Push => Icon::CloudUpload,
-        QuickActionIcon::Pull => Icon::CloudDownload,
-        QuickActionIcon::ChangeRequest => Icon::GitPullRequest,
-        QuickActionIcon::Info => Icon::Info,
+pub(super) fn change_request_logo(provider_kind: Option<&str>) -> ProviderLogo {
+    source_control_logo(provider_kind.unwrap_or("github"))
+        .unwrap_or(ProviderLogo::Mono(Icon::GitPullRequest.path()))
+}
+
+fn menu_item_logo(id: MenuItemId, provider_kind: Option<&str>) -> ProviderLogo {
+    match id {
+        MenuItemId::Commit => ProviderLogo::Mono(Icon::GitCommit.path()),
+        MenuItemId::Push => ProviderLogo::Mono(Icon::CloudUpload.path()),
+        MenuItemId::Pr => change_request_logo(provider_kind),
     }
 }
 
-fn menu_item_icon(id: MenuItemId) -> Icon {
-    match id {
-        MenuItemId::Commit => Icon::GitCommit,
-        MenuItemId::Push => Icon::CloudUpload,
-        MenuItemId::Pr => Icon::GitPullRequest,
-    }
+fn action_menu_item(label: SharedString, logo: ProviderLogo, reason: Option<SharedString>) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, cx| {
+        h_flex()
+            .id(label.clone())
+            .aria_label(label.clone())
+            .w_full()
+            .gap(px(8.))
+            .child(div().opacity(0.8).child(logo.render(px(16.), hsla(palette(cx).muted_foreground), cx.theme().is_dark())))
+            .child(label.clone())
+            .when_some(reason.clone(), |row, reason| {
+                row.tooltip(move |window, cx| tooltip_view(reason.clone(), window, cx))
+            })
+    })
 }
 
 /// A two-line status cell: the label, and a smaller muted line under it when there is one.
@@ -132,17 +142,27 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
     if compact {
         return None;
     }
-    let icon = quick_icon(quick.icon());
+    let primary = Row::new("git-quick-action", quick.label.clone());
+    let primary = match quick.icon() {
+        QuickActionIcon::Commit => primary.icon(Icon::GitCommit),
+        QuickActionIcon::Push => primary.icon(Icon::CloudUpload),
+        QuickActionIcon::Pull => primary.icon(Icon::CloudDownload),
+        QuickActionIcon::Info => primary.icon(Icon::Info),
+        QuickActionIcon::ChangeRequest => {
+            let logo = change_request_logo(status.and_then(|status| status.provider_kind()));
+            primary.leading(logo.render(px(16.), hsla(p.muted_foreground), cx.theme().is_dark()))
+        }
+    };
     let disabled_reason = if !can_write {
         Some("This connection cannot change source control.".to_owned())
     } else {
         quick.disabled_reason()
     };
     let primary = match disabled_reason {
-        Some(reason) => Row::new("git-quick-action", quick.label.clone()).icon(icon).disabled(true).tooltip(reason),
+        Some(reason) => primary.disabled(true).tooltip(reason),
         None => {
             let (git, dialogs) = (git.clone(), dialogs.clone());
-            Row::new("git-quick-action", quick.label.clone()).icon(icon).tooltip(quick.label.clone()).on_click(move |_, window, cx| run_quick_action(&quick, &git, &dialogs, window, cx))
+            primary.tooltip(quick.label.clone()).on_click(move |_, window, cx| run_quick_action(&quick, &git, &dialogs, window, cx))
         }
     };
     Some(split_row("git-actions", primary, menu, cx).into_any_element())
@@ -179,39 +199,29 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
         let can_write = store.can_write_source_control();
         let has_primary_remote = status.as_ref().is_some_and(|status| status.local.has_primary_remote);
         let can_publish = can_write && status.as_ref().is_some_and(|status| status.local.is_repo && !status.local.has_primary_remote);
-        let terms = terminology(status.as_ref().and_then(|status| status.provider_kind()));
+        let provider_kind = status.as_ref().and_then(|status| status.provider_kind());
+        let terms = terminology(provider_kind);
         let status_error = store.status_error.clone();
         let mut menu = menu.min_w(px(ROW_WIDTH));
         for item in build_menu_items(status.as_ref(), busy, has_primary_remote) {
-            let icon = menu_icon(menu_item_icon(item.id));
-            let entry = match menu_disabled_reason(&item, status.as_ref(), busy, has_primary_remote) {
-                Some(reason) => {
-                    let label: SharedString = item.label.clone().into();
-                    let reason: SharedString = reason.into();
-                    PopupMenuItem::element(move |_, _| {
-                        let reason = reason.clone();
-                        div().id(label.clone()).w_full().child(label.clone()).tooltip(move |window, cx| tooltip_view(reason.clone(), window, cx))
-                    })
-                    .icon(icon)
-                    .disabled(true)
-                }
-                None => {
-                    let (git, dialogs) = (git.clone(), dialogs.clone());
-                    PopupMenuItem::new(item.label.clone()).icon(icon).on_click(move |_, window, cx| match item.id {
+            let reason = menu_disabled_reason(&item, status.as_ref(), busy, has_primary_remote);
+            let disabled = reason.is_some() || !can_write || busy;
+            let logo = menu_item_logo(item.id, provider_kind);
+            let dialogs = dialogs.clone();
+            menu = menu.item(
+                action_menu_item(item.label.into(), logo, reason.map(Into::into))
+                    .disabled(disabled)
+                    .on_click(move |_, window, cx| match item.id {
                         MenuItemId::Commit => dialogs.update(cx, |dialogs, cx| dialogs.open_commit(window, cx)),
                         MenuItemId::Push => dialogs.update(cx, |dialogs, cx| dialogs.request_action(ActionRequest::new(StackedAction::Push), window, cx)),
                         MenuItemId::Pr => dialogs.update(cx, |dialogs, cx| dialogs.request_action(ActionRequest::new(StackedAction::CreatePr), window, cx)),
-                    })
-                    .disabled(!can_write || git.read(cx).is_running())
-                }
-            };
-            menu = menu.item(entry);
+                    }),
+            );
         }
         if can_publish {
             let dialogs = dialogs.clone();
             menu = menu.item(
-                PopupMenuItem::new("Publish repository...")
-                    .icon(menu_icon(Icon::CloudUpload))
+                action_menu_item("Publish repository...".into(), ProviderLogo::Mono(Icon::CloudUpload.path()), None)
                     .disabled(busy)
                     .on_click(move |_, window, cx| dialogs.update(cx, |dialogs, cx| dialogs.open_publish(window, cx))),
             );

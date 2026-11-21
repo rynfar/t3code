@@ -1297,8 +1297,7 @@ impl ProviderLogo {
     }
 }
 
-/// An Open In brand, using the app platform (darwin/win32/linux) for file managers.
-#[allow(dead_code, reason = "Used by the Open In controls when their callers are migrated")]
+/// An Open In brand, using the viewing app's platform for file managers.
 pub fn editor_logo(editor_id: &str, platform: &str) -> Option<ProviderLogo> {
     Some(match editor_id {
         "cursor" => ProviderLogo::Image {
@@ -1308,7 +1307,7 @@ pub fn editor_logo(editor_id: &str, platform: &str) -> Option<ProviderLogo> {
         "antigravity" => provider_logo("antigravity")?,
         "trae" => ProviderLogo::Mono("icons/editors/trae.svg"),
         "zed" => ProviderLogo::Mono("icons/editors/zed.svg"),
-        "file-manager" if platform == "darwin" => ProviderLogo::fixed("icons/editors/finder.svg"),
+        "file-manager" if matches!(platform, "darwin" | "macos") => ProviderLogo::fixed("icons/editors/finder.svg"),
         "file-manager" if matches!(platform, "win32" | "windows") => ProviderLogo::fixed("icons/editors/file-explorer.svg"),
         "kiro" => ProviderLogo::fixed("icons/editors/kiro.svg"),
         "vscode" => ProviderLogo::fixed("icons/editors/vscode.svg"),
@@ -1331,7 +1330,6 @@ pub fn editor_logo(editor_id: &str, platform: &str) -> Option<ProviderLogo> {
 }
 
 /// The mark for the source control provider's wire kind.
-#[allow(dead_code, reason = "Used by the source control controls when their callers are migrated")]
 pub fn source_control_logo(kind: &str) -> Option<ProviderLogo> {
     Some(match kind {
         "azure-devops" => ProviderLogo::fixed("icons/source-control/azure-devops.svg"),
