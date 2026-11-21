@@ -3,12 +3,14 @@
 mod search_impl;
 use super::{
     SettingsView,
-    controls::{Button, ButtonSize, ButtonVariant, DialogFrame, r},
+    controls::{Button, ButtonSize, ButtonVariant, DialogFrame, dialog_footer, r},
     store,
 };
 use crate::{
     app_state::AppState,
-    theme::{hsla, palette},
+    components::motion::Spinner,
+    i18n::{t, t_fmt},
+    theme::{ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer},
 };
 use gpui::Focusable;
 use gpui_base::input::{EditorState, TextDecoration, TextDecorationCollection};
@@ -27,6 +29,7 @@ use gpui_component::{
 };
 use t3_core::{
     client_settings::ClientSettingChange,
+    i18n::IcuArg,
     themes::{
         self, ThemeDefinition,
         importer::{self, ImportSession, Installed},
@@ -565,46 +568,46 @@ impl Render for ThemeImportDialog {
         }
         let p = palette(cx);
         let mut body = v_flex().gap(r(16.));
+        let footer;
         if let Some(extension) = self.search.pending_update().cloned() {
-            body = body
-                .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(
-                    "This replaces its installed variants, including any local edits. Variants no longer in the extension will be removed.",
-                ))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap(r(8.))
-                        .child(
-                            Button::new("theme-update-cancel", ButtonVariant::Outline, ButtonSize::Default)
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.search.dismiss_update();
-                                    this.search.focus(window, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("theme-update-confirm", ButtonVariant::Default, ButtonSize::Default)
-                                .label("Update theme")
-                                .focus_handle(self.conflict_focus.clone())
-                                .on_click(cx.listener(move |this, _, window, cx| this.download_theme(extension.clone(), true, window, cx))),
-                        ),
-                );
+            body = body.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(t(
+                cx, "This replaces its installed variants, including any local edits. Variants no longer in the extension will be removed.",
+            ).to_owned()));
+            footer = vec![
+                Button::new(
+                    "theme-update-cancel",
+                    ButtonVariant::Outline,
+                    ButtonSize::Default,
+                )
+                .label("Cancel")
+                .focus_handle(self.conflict_focus.clone())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.search.dismiss_update();
+                    this.search.focus(window, cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+                Button::new(
+                    "theme-update-confirm",
+                    ButtonVariant::Destructive,
+                    ButtonSize::Default,
+                )
+                .label("Update theme")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.download_theme(extension.clone(), true, window, cx)
+                }))
+                .into_any_element(),
+            ];
         } else if !self.session.conflicts.is_empty() || self.marketplace.is_some() {
+            let marketplace = self.marketplace.is_some();
             body = body
                 .child(
-                    v_flex()
-                        .p(r(12.))
-                        .gap(r(4.))
-                        .rounded(r(12.))
-                        .border_1()
+                    v_flex().p(r(12.)).gap(r(4.)).rounded(r(12.)).border_1()
                         .border_color(hsla(p.border).opacity(0.7))
                         .bg(hsla(p.muted).opacity(0.2))
                         .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(if self.marketplace.is_some() {"Update installed themes?"} else {"Already installed"}),
+                            div().text_sm().font_weight(gpui::FontWeight::MEDIUM)
+                                .child(t(cx, if marketplace { "Update installed themes?" } else { "Already installed" }).to_owned()),
                         )
                         .child(
                             div().text_xs().text_color(hsla(p.muted_foreground)).child(
@@ -613,57 +616,54 @@ impl Render for ThemeImportDialog {
                             ),
                         ),
                 )
-                .when(self.marketplace.is_some(), |body| body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Update existing replaces installed variants, including local edits, and removes retired variants. Keep both adds copies.")))
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap(r(8.))
-                        .child(
-                            Button::new(
-                                "theme-update-existing",
-                                ButtonVariant::Default,
-                                ButtonSize::Sm,
-                            )
-                            .focus_handle(self.conflict_focus.clone())
-                            .disabled(self.saving)
-                            .label("Update existing")
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.resolve(themes::ImportChoice::Update, window, cx)
-                                },
-                            )),
-                        )
-                        .child(
-                            Button::new("theme-keep-both", ButtonVariant::Outline, ButtonSize::Sm)
-                                .disabled(self.saving)
-                                .label("Keep both")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.resolve(themes::ImportChoice::KeepBoth, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("theme-import-back", ButtonVariant::Ghost, ButtonSize::Sm)
-                                .disabled(self.saving)
-                                .label("Back")
-                                .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
-                        )
-                        .child(
-                            Button::new(
-                                "theme-import-cancel",
-                                ButtonVariant::Ghost,
-                                ButtonSize::Sm,
-                            )
-                            .disabled(self.saving)
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                        ),
-                );
+                .when(marketplace, |body| body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
+                    t(cx, "Update existing replaces installed variants, including local edits, and removes retired variants. Keep both adds copies.").to_owned(),
+                )));
+            footer = vec![
+                Button::new("theme-import-back", ButtonVariant::Ghost, ButtonSize::Sm)
+                    .disabled(self.saving)
+                    .label("Back")
+                    .focus_handle(self.conflict_focus.clone())
+                    .on_click(cx.listener(|this, _, window, cx| this.back(window, cx)))
+                    .into_any_element(),
+                Button::new("theme-import-cancel", ButtonVariant::Ghost, ButtonSize::Sm)
+                    .disabled(self.saving)
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))
+                    .into_any_element(),
+                Button::new("theme-keep-both", ButtonVariant::Outline, ButtonSize::Sm)
+                    .disabled(self.saving)
+                    .label("Keep both")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.resolve(themes::ImportChoice::KeepBoth, window, cx)
+                    }))
+                    .into_any_element(),
+                Button::new(
+                    "theme-update-existing",
+                    ButtonVariant::Destructive,
+                    ButtonSize::Sm,
+                )
+                .disabled(self.saving)
+                .label("Update existing")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.resolve(themes::ImportChoice::Update, window, cx)
+                }))
+                .into_any_element(),
+            ];
         } else {
+            let divider = || div().flex_1().h(gpui::px(1.)).bg(hsla(p.border));
             body = body.child(self.search_section(window, cx)).child(
-                div()
-                    .text_xs()
-                    .text_color(hsla(p.muted_foreground))
-                    .child("or import a file"),
+                h_flex()
+                    .gap(r(12.))
+                    .child(divider())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(hsla(p.muted_foreground))
+                            .child(t(cx, "or import a file").to_uppercase()),
+                    )
+                    .child(divider()),
             );
             body = body
                 .child(
@@ -691,7 +691,7 @@ impl Render for ThemeImportDialog {
                                     div()
                                         .text_sm()
                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                        .child("Theme file"),
+                                        .child(t(cx, "Theme file").to_owned()),
                                 )
                                 .child(
                                     div()
@@ -699,28 +699,44 @@ impl Render for ThemeImportDialog {
                                         .text_color(hsla(p.muted_foreground))
                                         .truncate()
                                         .child(self.session.file_name.clone().unwrap_or_else(
-                                            || "Drop T3 Code or VS Code .json files".into(),
+                                            || {
+                                                t(cx, "Drop T3 Code or VS Code .json files")
+                                                    .to_owned()
+                                            },
                                         )),
                                 ),
                         )
                         .child(
-                            Button::new(
-                                "choose-theme-files",
-                                ButtonVariant::Outline,
-                                ButtonSize::Sm,
-                            )
-                            .icon(crate::icons::Icon::Download)
-                            .label(if self.session.reading {
-                                "Reading…"
-                            } else {
-                                "Choose files"
-                            })
-                            .disabled(
-                                self.session.reading
-                                    || self.saving
-                                    || self.search.session_installing(),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| this.pick(window, cx))),
+                            h_flex()
+                                .gap(r(8.))
+                                .when(self.session.reading, |actions| {
+                                    actions.child(Spinner::new(
+                                        "reading-theme-files",
+                                        window.rem_size() * (14. / 16.),
+                                        hsla(p.muted_foreground),
+                                    ))
+                                })
+                                .child(
+                                    Button::new(
+                                        "choose-theme-files",
+                                        ButtonVariant::Outline,
+                                        ButtonSize::Sm,
+                                    )
+                                    .icon(crate::icons::Icon::Upload)
+                                    .label(if self.session.reading {
+                                        "Reading…"
+                                    } else {
+                                        "Choose files"
+                                    })
+                                    .disabled(
+                                        self.session.reading
+                                            || self.saving
+                                            || self.search.session_installing(),
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.pick(window, cx)),
+                                    ),
+                                ),
                         ),
                 )
                 .child(
@@ -730,7 +746,7 @@ impl Render for ThemeImportDialog {
                             div()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .child("Theme JSON"),
+                                .child(t(cx, "Theme JSON").to_owned()),
                         )
                         .child(ThemeJsonField {
                             input: self.input.clone(),
@@ -777,38 +793,43 @@ impl Render for ThemeImportDialog {
                                 )
                                 .into_any_element(),
                         }),
-                )
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap(r(8.))
-                        .child(
-                            Button::new(
-                                "theme-import-cancel",
-                                ButtonVariant::Ghost,
-                                ButtonSize::Default,
-                            )
-                            .disabled(self.saving)
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                        )
-                        .child(
-                            Button::new(
-                                "theme-import-submit",
-                                ButtonVariant::Default,
-                                ButtonSize::Default,
-                            )
-                            .icon(crate::icons::Icon::Plus)
-                            .label("Add theme")
-                            .disabled(
-                                self.session.json.trim().is_empty()
-                                    || self.session.reading
-                                    || self.saving
-                                    || self.search.session_installing(),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                        ),
                 );
+            footer = vec![
+                Button::new("theme-import-cancel", ButtonVariant::Ghost, ButtonSize::Default)
+                .disabled(self.saving)
+                .label("Cancel")
+                .on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))
+                .into_any_element(),
+                Button::new(
+                    "theme-import-submit",
+                    ButtonVariant::Default,
+                    ButtonSize::Default,
+                )
+                .icon(crate::icons::Icon::Plus)
+                .label("Add theme")
+                .disabled(
+                    self.session.json.trim().is_empty()
+                        || self.session.reading
+                        || self.saving
+                        || self.search.session_installing(),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                .into_any_element(),
+            ];
+        }
+        if self.saving {
+            body = body.child(
+                h_flex()
+                    .gap(r(8.))
+                    .text_sm()
+                    .text_color(hsla(p.muted_foreground))
+                    .child(Spinner::new(
+                        "saving-theme-import",
+                        gpui::px(14.),
+                        hsla(p.muted_foreground),
+                    ))
+                    .child(t(cx, "Saving…").to_owned()),
+            );
         }
         let errors = self
             .session
@@ -865,8 +886,14 @@ impl Render for ThemeImportDialog {
             title: self
                 .search
                 .pending_update()
-                .map(|extension| format!("Update “{}”?", extension.name))
-                .unwrap_or_else(|| "Add a theme".into())
+                .map(|extension| {
+                    t_fmt(
+                        cx,
+                        "Update “{name}”?",
+                        &[("name", IcuArg::Text(extension.name.as_str().into()))],
+                    )
+                })
+                .unwrap_or_else(|| t(cx, "Add a theme").to_owned())
                 .into(),
             description: "".into(),
             max_width: if self.search.pending_update().is_some() {
@@ -875,7 +902,9 @@ impl Render for ThemeImportDialog {
                 768.
             },
             body: body.into_any_element(),
-            footer: div().into_any_element(),
+            footer: dialog_footer(false, footer, cx)
+                .flex_wrap()
+                .into_any_element(),
             focus: self.focus.clone(),
         };
         div()
@@ -994,7 +1023,7 @@ impl gpui::RenderOnce for ThemeJsonField {
         div()
             .id("theme-json-field")
             .role(gpui::Role::MultilineTextInput)
-            .aria_label("Theme JSON")
+            .aria_label(t(cx, "Theme JSON").to_owned())
             .when_some(accessible_value, |v, value| v.aria_value(value))
             .when(!self.disabled, |v| {
                 v.on_a11y_action(gpui::AccessibleAction::SetValue, move |data, window, cx| {
@@ -1013,6 +1042,12 @@ impl gpui::RenderOnce for ThemeJsonField {
             .border_1()
             .border_color(hsla(if focused { p.ring } else { p.input }))
             .bg(hsla(p.background))
+            .theme_slot(ThemeSlot::Input, cx)
+            .children(theme_slot_clipped_background_layer(
+                ThemeSlot::Input,
+                r(12.),
+                cx,
+            ))
             .when(focused, |v| {
                 v.shadow(vec![gpui::BoxShadow {
                     color: hsla(p.ring).opacity(0.24),
@@ -1260,7 +1295,7 @@ mod tests {
                 assert!(view.conflict_focus.is_focused(window));
             })
             .unwrap();
-        keys(cx, window.into(), "tab tab enter");
+        keys(cx, window.into(), "enter");
         cx.run_until_parked();
         window
             .update(cx, |view, window, cx| {

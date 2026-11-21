@@ -2,8 +2,8 @@
 
 use gpui::Focusable;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, IntoElement, ParentElement, Styled, StyledText,
-    Subscription, Window, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, FontWeight, IntoElement, ParentElement, Styled,
+    StyledText, Subscription, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Rope, h_flex,
@@ -19,7 +19,9 @@ use t3_core::{
 use super::super::SettingsView;
 use crate::{
     diff::lines::{code_row, gutter_width, line_colors},
-    theme::{self, hsla, palette},
+    i18n::t,
+    icons::Icon,
+    theme::{self, ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer},
 };
 
 #[path = "font_preview_keys.rs"]
@@ -28,14 +30,16 @@ mod keys;
 #[path = "font_preview_terminal.rs"]
 mod terminal;
 
-const PROMPT: &str = "Use $frontend-design to fix the flaky test in [surface.test.ts](apps/web/src/terminal/ghostty/surface.test.ts) and align the header with [SettingsPanels.tsx](apps/web/src/components/settings/SettingsPanels.tsx) before shipping.";
+const PROMPT: &str = "Use frontend-design to fix the flaky test in surface.test.ts and align the header with SettingsPanels.tsx before shipping.";
 const PATCH: &str = "diff --git a/src/formatUser.ts b/src/formatUser.ts\n--- a/src/formatUser.ts\n+++ b/src/formatUser.ts\n@@ -1,3 +1,3 @@\n export function formatUser(user: User) {\n-  return user.name.toUpperCase();\n+  return `${user.name} <${user.email}>`; // 0O 1lI\n }\n";
 
 pub(super) struct FontPreviews {
     prompt: Entity<TextareaState>,
     terminal: Entity<terminal::TerminalPreview>,
     lines: Vec<(DiffLine, SyntaxHighlighter)>,
+    prompt_focused: bool,
     _prompt_change: Subscription,
+    _prompt_focus: [Subscription; 2],
     _keys: Subscription,
 }
 
@@ -60,6 +64,17 @@ impl FontPreviews {
                 cx.notify();
             }
         });
+        let focus = prompt.read(cx).focus_handle(cx);
+        let prompt_focus = [
+            cx.on_focus(&focus, window, |view, _, cx| {
+                view.typography.previews.prompt_focused = true;
+                cx.notify();
+            }),
+            cx.on_blur(&focus, window, |view, _, cx| {
+                view.typography.previews.prompt_focused = false;
+                cx.notify();
+            }),
+        ];
         let terminal = cx.new(|cx| terminal::TerminalPreview::new(window, cx));
         let keys = keys::install(prompt.clone(), terminal.clone(), cx);
         let ParsedPatch::Files(files) = parse_patch(PATCH) else {
@@ -78,7 +93,9 @@ impl FontPreviews {
             prompt,
             terminal,
             lines,
+            prompt_focused: false,
             _prompt_change: repaint,
+            _prompt_focus: prompt_focus,
             _keys: keys,
         }
     }
@@ -92,14 +109,32 @@ impl FontPreviews {
         match role {
             FontRole::Interface | FontRole::Prompt => {
                 let size = theme::font_size(FontRole::Prompt, cx);
+                let family = theme::font_family(FontRole::Prompt, cx);
+                let show_tokens =
+                    !self.prompt_focused && self.prompt.read(cx).value().as_ref() == PROMPT;
+                let input = Textarea::new(&self.prompt)
+                    .appearance(false)
+                    .aria_label(t(cx, "Prompt font preview").to_owned())
+                    .context_menu(|menu, _, _| menu)
+                    .font_family(family.clone())
+                    .text_size(px(size))
+                    .line_height(px(size * 1.625));
                 prompt_surface(
-                    Textarea::new(&self.prompt)
-                        .appearance(false)
-                        .aria_label("Prompt font preview")
-                        .context_menu(|menu, _, _| menu)
-                        .font_family(theme::font_family(FontRole::Prompt, cx))
-                        .text_size(px(size))
-                        .line_height(px(size * 1.625)),
+                    div()
+                        .relative()
+                        .when(show_tokens, |view| {
+                            view.child(
+                                prompt_tokens(cx)
+                                    .font_family(family)
+                                    .text_size(px(size))
+                                    .line_height(px(size * 1.625)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .when(show_tokens, |view| view.absolute().inset_0().opacity(0.))
+                                .child(input),
+                        ),
                     cx,
                 )
                 .into_any_element()
@@ -127,15 +162,14 @@ impl FontPreviews {
             )
             .map_or(px(7.8), |size| size.width);
         let content = v_flex()
-            .mt(theme::rem(4.))
-            .mb(theme::rem(8.))
             .min_w_0()
-            .bg(hsla(p.code_background))
             .text_color(hsla(p.code_foreground))
             .child(
                 h_flex()
                     .h(px(32.))
                     .px(px(12.))
+                    .border_b_1()
+                    .border_color(hsla(p.border))
                     .text_size(px(12.))
                     .child("src/formatUser.ts")
                     .child(div().flex_1())
@@ -144,8 +178,8 @@ impl FontPreviews {
             .children(self.lines.iter().map(|(line, syntax)| {
                 let mut colors = line_colors(line.kind, p);
                 if line.kind == LineKind::Context {
-                    colors.row = hsla(p.code_background);
-                    colors.gutter = hsla(p.code_background);
+                    colors.row = gpui::transparent_black();
+                    colors.gutter = gpui::transparent_black();
                 }
                 let number = if line.kind == LineKind::Deletion {
                     line.old_line
@@ -196,15 +230,58 @@ impl FontPreviews {
             .id("code-font-preview")
             .w_full()
             .min_w_0()
-            .when(!wrap, |this| this.overflow_x_scroll())
-            .child(content.when(!wrap, |this| this.min_w(width)))
+            .mt(theme::rem(4.))
+            .mb(theme::rem(8.))
+            .rounded(theme::rem(8.))
+            .border_1()
+            .border_color(hsla(p.border))
+            .bg(hsla(p.code_background))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("code-font-preview-scroll")
+                    .min_w_0()
+                    .when(!wrap, |this| this.overflow_x_scroll())
+                    .child(content.when(!wrap, |this| this.min_w(width))),
+            )
             .into_any_element()
     }
+}
+
+fn prompt_tokens(cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    let pill = |label: &'static str, glyph: Icon, ink| {
+        h_flex()
+            .flex_none()
+            .gap(theme::rem(4.))
+            .px(theme::rem(6.))
+            .rounded_full()
+            .bg(hsla(p.muted))
+            .font_weight(FontWeight::MEDIUM)
+            .child(glyph.render(px(14.), hsla(ink)))
+            .child(label)
+    };
+    let words = |text: &'static str| text.split_ascii_whitespace().map(|word| div().child(word));
+    h_flex()
+        .flex_wrap()
+        .gap_x(theme::rem(4.))
+        .children(words("Use"))
+        .child(pill(
+            "frontend-design",
+            Icon::Sparkles,
+            p.context_chip_skill,
+        ))
+        .children(words("to fix the flaky test in"))
+        .child(pill("surface.test.ts", Icon::File, p.context_chip_file))
+        .children(words("and align the header with"))
+        .child(pill("SettingsPanels.tsx", Icon::File, p.context_chip_file))
+        .children(words("before shipping."))
 }
 
 pub(super) fn prompt_surface(editor: impl IntoElement, cx: &App) -> gpui::Div {
     let p = palette(cx);
     div()
+        .relative()
         .key_context(keys::CONTEXT)
         .mt(theme::rem(4.))
         .mb(theme::rem(8.))
@@ -212,6 +289,12 @@ pub(super) fn prompt_surface(editor: impl IntoElement, cx: &App) -> gpui::Div {
         .border_1()
         .border_color(hsla(p.border))
         .bg(hsla(p.background))
+        .theme_slot(ThemeSlot::Input, cx)
+        .children(theme_slot_clipped_background_layer(
+            ThemeSlot::Input,
+            theme::rem(8.),
+            cx,
+        ))
         .px(theme::rem(12.))
         .py(theme::rem(8.))
         .capture_action(|_: &Copy, _, cx| cx.stop_propagation())

@@ -343,14 +343,19 @@ impl ThemeImportDialog {
         }
         if self.search.searching && self.search.results.is_none() {
             body = body.child(
-                div()
+                h_flex()
                     .w_full()
-                    .flex()
+                    .gap(r(8.))
                     .justify_center()
                     .py(r(24.))
                     .text_sm()
                     .text_color(hsla(p.muted_foreground))
-                    .child("Searching themes..."),
+                    .child(Spinner::new(
+                        "loading-community-themes",
+                        gpui::px(16.),
+                        hsla(p.muted_foreground),
+                    ))
+                    .child(t(cx, "Searching themes...").to_owned()),
             );
         }
         if let Some(error) = &self.search.error {
@@ -366,10 +371,16 @@ impl ThemeImportDialog {
         }
         if self.search.session.installing {
             body = body.child(
-                div()
+                h_flex()
+                    .gap(r(8.))
                     .text_sm()
                     .text_color(hsla(p.muted_foreground))
-                    .child("Installing..."),
+                    .child(Spinner::new(
+                        "installing-community-theme",
+                        gpui::px(16.),
+                        hsla(p.muted_foreground),
+                    ))
+                    .child(t(cx, "Installing...").to_owned()),
             );
         }
         if let Some(results) = &self.search.results {
@@ -437,6 +448,9 @@ impl ThemeImportDialog {
                     }
                     let icon = e.icon_url.clone();
                     v_flex()
+                        .id(gpui::ElementId::Name(
+                            format!("extension-theme-{}", e.id).into(),
+                        ))
                         .flex_1()
                         .min_w_0()
                         .gap(r(12.))
@@ -445,6 +459,7 @@ impl ThemeImportDialog {
                         .border_1()
                         .border_color(hsla(p.border).opacity(0.7))
                         .bg(hsla(p.card).opacity(0.6))
+                        .hover(|card| card.bg(hsla(p.accent).opacity(0.2)))
                         .child(
                             h_flex()
                                 .gap(r(12.))
@@ -504,13 +519,13 @@ impl ThemeImportDialog {
                         )
                         .child(
                             div()
-                                .h(r(32.))
-                                .overflow_hidden()
+                                .min_h(r(32.))
+                                .line_clamp(2)
                                 .text_xs()
                                 .line_height(r(16.))
                                 .text_color(hsla(p.muted_foreground))
                                 .child(if e.description.is_empty() {
-                                    "A community color theme for your editor.".into()
+                                    t(cx, "A community color theme for your editor.").to_owned()
                                 } else {
                                     e.description.clone()
                                 }),
@@ -522,6 +537,11 @@ impl ThemeImportDialog {
                                     ButtonVariant::Outline,
                                     ButtonSize::Xs,
                                 )
+                                .icon(if update {
+                                    crate::icons::Icon::RefreshCw
+                                } else {
+                                    crate::icons::Icon::Download
+                                })
                                 .label(action)
                                 .disabled(busy)
                                 .on_click(cx.listener(
@@ -627,7 +647,7 @@ impl gpui::RenderOnce for SearchField {
         div()
             .id("theme-search-input")
             .role(gpui::Role::TextInput)
-            .aria_label("Search Open VSX themes")
+            .aria_label(t(cx, "Search Open VSX themes").to_owned())
             .h(r(36.))
             .w_full()
             .flex()
@@ -643,6 +663,13 @@ impl gpui::RenderOnce for SearchField {
                 p.background
             })
             .opacity(if cx.theme().is_dark() { 0.32 } else { 1. }))
+            .relative()
+            .theme_slot(ThemeSlot::Input, cx)
+            .children(theme_slot_clipped_background_layer(
+                ThemeSlot::Input,
+                r(8.),
+                cx,
+            ))
             .when(self.disabled, |v| v.opacity(0.64))
             .when(focused, |v| {
                 v.shadow(vec![gpui::BoxShadow {
@@ -667,13 +694,12 @@ impl gpui::RenderOnce for SearchField {
                     .min_w_0()
                     .child(gpui_base::input::Input::new(&self.input)),
             )
-            .when(self.searching, |v| {
-                v.child(
-                    div()
-                        .text_xs()
-                        .text_color(hsla(p.muted_foreground))
-                        .child("Searching..."),
-                )
+            .when(self.searching, |view| {
+                view.child(Spinner::new(
+                    "theme-search-pending",
+                    gpui::px(14.),
+                    hsla(p.muted_foreground),
+                ))
             })
     }
 }
