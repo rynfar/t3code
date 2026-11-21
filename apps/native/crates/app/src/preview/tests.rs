@@ -815,6 +815,7 @@ async fn report_profiles_if_needed_sends_and_deduplicates_preview_report_profile
         json!({
             "profiles": [{ "id": "work", "name": "Work", "kind": "persistent" }],
             "defaultProfileId": "work",
+            "recordingFrameRate": 30,
         })
     );
     let _ = reply_err.send(Err(t3_client::session::RpcError::Closed));
@@ -835,6 +836,7 @@ async fn report_profiles_if_needed_sends_and_deduplicates_preview_report_profile
         json!({
             "profiles": [{ "id": "work", "name": "Work", "kind": "persistent" }],
             "defaultProfileId": "work",
+            "recordingFrameRate": 30,
         })
     );
     let _ = reply.send(Ok(json!({})));

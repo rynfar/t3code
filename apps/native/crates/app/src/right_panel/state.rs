@@ -77,6 +77,9 @@ impl PanelState {
 
 impl AppState {
     pub(crate) fn panel_thread(&self) -> Option<String> {
+        if let Some(key) = self.details_utility_panel_key() {
+            return Some(key.to_owned());
+        }
         self.selected_thread
             .clone()
             .or_else(|| self.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))

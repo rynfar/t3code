@@ -43,7 +43,6 @@ type InstallThreadDrop = dyn Fn(Card, Entity<Composer>, Hsla, Hsla) -> Card;
 struct ThreadDrop(std::rc::Rc<InstallThreadDrop>);
 impl gpui::Global for ThreadDrop {}
 
-#[allow(unused, reason = "The sidebar registers its private DraggedThread type")]
 pub(crate) fn register_thread_drop<T: 'static>(cx: &mut App, read: for<'a> fn(&'a T) -> (&'a str, Option<&'a ThreadKey>)) {
     if cx.has_global::<ThreadDrop>() {
         return;

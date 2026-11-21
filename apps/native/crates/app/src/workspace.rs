@@ -794,6 +794,7 @@ impl Render for Workspace {
         let on_pull_requests = state.pull_requests_open;
         let on_issues = state.issues_open && !on_pull_requests;
         let on_utility_page = on_pull_requests || on_issues;
+        let show_right_panel = !on_utility_page || state.uses_shared_utility_panel();
         let composer_replaced = self.composer_replaced;
         let inline_progress = transition(
             "inline-sidebar",
@@ -1020,7 +1021,7 @@ impl Render for Workspace {
                 drawer.update(cx, |drawer, cx| drawer.open_terminal(&action.terminal_id, window, cx))
             })
             .children(sidebar_el)
-            .when(on_utility_page, |this| {
+            .when(on_utility_page && !maximized, |this| {
                 this.child(
                     div().relative().flex_1().h_full().min_w_0()
                         .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
@@ -1122,7 +1123,7 @@ impl Render for Workspace {
                     }),
                 )
             })
-            .when(!on_utility_page, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
+            .when(show_right_panel, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
             .when(sidebar_open && inline_progress == 1., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
             .when(sheet_progress > 0., |this| this.child(self.render_sidebar_sheet(layout::sheet_width(viewport), sheet_progress, sheet_open, cx)))
             .when(!sheet_open, |this| this.child(self.render_sidebar_toggle(window, sidebar_open, cx)))
@@ -1817,6 +1818,7 @@ impl Workspace {
         let on_pull_requests = state.pull_requests_open;
         let on_issues = state.issues_open && !on_pull_requests;
         let on_utility_page = on_pull_requests || on_issues;
+        let show_right_panel = !on_utility_page || state.uses_shared_utility_panel();
         let has_thread = state.selected_thread.is_some();
         let has_draft = !has_thread && state.draft_project.is_some();
         let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
@@ -1828,7 +1830,7 @@ impl Workspace {
         if sidebar_visible {
             visible.push(WorkspaceFocusArea::Sidebar);
         }
-        if on_utility_page {
+        if on_utility_page && !maximized {
             visible.push(WorkspaceFocusArea::PullRequests);
         } else if !maximized {
             if has_thread {
@@ -1845,7 +1847,7 @@ impl Workspace {
                 visible.push(WorkspaceFocusArea::Terminal);
             }
         }
-        if !on_utility_page && right_panel_open {
+        if show_right_panel && right_panel_open {
             visible.push(WorkspaceFocusArea::RightPanel);
         }
 

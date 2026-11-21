@@ -1546,9 +1546,7 @@ mod tests {
             assert_eq!(page.sent, "old", "send_query must not fetch after closing page");
         });
 
-        // 4. Opening an issue via ISSUES_PANEL_THREAD_KEY while IssuesPage is active
-        // (e.g. clicking an inline issue link in an issue body/comment) visibly navigates
-        // IssuesPage's split detail pane.
+        // 4. Opening a linked issue updates the shared panel and the page selection.
         let linked_target = IssueTarget {
             environment_id: Some("saved-remote".into()),
             project_id: "p-remote".into(),
@@ -1565,10 +1563,18 @@ mod tests {
             app.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, linked_target, cx);
         });
         cx.run_until_parked();
-        page.read_with(cx, |page, cx| {
+        page.read_with(cx, |page, _| {
             assert_eq!(page.selected.as_ref(), Some(&expected_ref));
-            let detail = page.detail.as_ref().expect("detail pane opened from panel event");
-            assert!(detail.read(cx).matches_target(Some("saved-remote"), &expected_ref));
+            assert!(page.detail.is_none());
+        });
+        state.read_with(cx, |app, _| {
+            assert_eq!(app.panel_thread().as_deref(), Some(ISSUES_PANEL_THREAD_KEY));
+            let active = app.panels.panels.active_surface(ISSUES_PANEL_THREAD_KEY).unwrap();
+            let t3_core::right_panel::SurfaceKind::Issue(target) = &active.kind else {
+                panic!("expected the linked issue in the shared panel");
+            };
+            assert_eq!(target.environment_id.as_deref(), Some("saved-remote"));
+            assert_eq!(target.issue_ref(), expected_ref);
         });
     }
 }

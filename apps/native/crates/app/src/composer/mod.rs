@@ -32,7 +32,6 @@ pub(crate) use send::SendAndNewThreadCompleted;
 mod stash;
 pub(crate) use pending::{banner_surface, banner_surface_card};
 mod view;
-#[allow(unused_imports, reason = "The sidebar registers its private DraggedThread type")]
 pub(crate) use view::register_thread_drop;
 mod workspace;
 

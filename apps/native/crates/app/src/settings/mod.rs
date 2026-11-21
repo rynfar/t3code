@@ -13,7 +13,7 @@ pub(crate) mod controls;
 mod devices;
 pub(crate) mod diagnostics;
 mod diffs_browser;
-pub(crate) use diffs_browser::{browser_auto_show_floating_preview, browser_profile_report_payload, maybe_float_agent_device};
+pub(crate) use diffs_browser::{browser_profile_report_payload, maybe_float_agent_device};
 mod environments;
 mod general;
 mod keybindings;

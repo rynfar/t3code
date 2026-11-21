@@ -265,6 +265,7 @@ fn resolve(preset: &SnoozePreset, now: DateTime<Local>, format: TimestampFormat)
 }
 
 impl SettingsView {
+    #[cfg(all(test, feature = "snapshot"))]
     pub(super) fn thread_settings<'a>(&self, cx: &'a App) -> Option<&'a ServerConfig> {
         self.state.read(cx).server_config.config.as_ref()
     }

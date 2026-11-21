@@ -104,7 +104,7 @@ pub fn show_error(message: impl Into<SharedString>, cx: &mut App) {
 pub fn update_client(state: &Entity<AppState>, change: ClientSettingChange, cx: &mut App) {
     apply_client(state, change, true, cx);
 }
-#[cfg(all(test, feature = "snapshot"))]
+#[cfg(test)]
 pub fn install_committed_client(
     state: &Entity<AppState>,
     patch: serde_json::Map<String, serde_json::Value>,

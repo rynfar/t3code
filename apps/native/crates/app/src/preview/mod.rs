@@ -25,9 +25,7 @@ use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::preview::address::{BrowserHistory, HistoryEntry, is_history_profile};
-use t3_core::preview::viewport::{
-    BrowserDefaults, OpenPreviewOverrides, ViewportSetting, open_session_payload, report_profiles_payload,
-};
+use t3_core::preview::viewport::{BrowserDefaults, OpenPreviewOverrides, ViewportSetting, open_session_payload};
 use t3_core::preview::{ListResult, PREVIEW_OPERATE_SCOPE, PreviewEvent, PreviewThreads, SessionSnapshot, TabsEdit, method};
 
 pub use pane::PreviewPane;
@@ -285,7 +283,7 @@ impl Previews {
         }
     }
 
-    /// Reports the client's `browserProfiles` and `browserDefaultProfileId` to the active
+    /// Reports browser profiles and the recording frame rate to the active
     /// server-browser environment (`BrowserProfileReporter.ts`), deduplicated per connection.
     pub fn report_profiles_if_needed(&mut self, cx: &mut Context<Self>) {
         if self.server_browser != Some(true) || self.can_operate != Some(true) {
@@ -293,7 +291,7 @@ impl Previews {
             return;
         }
         let Some(doc) = crate::settings::store::try_client(cx) else { return };
-        let payload = report_profiles_payload(&doc.browser_user_profiles(), &doc.browser_default_profile_id());
+        let payload = crate::settings::browser_profile_report_payload(doc);
         let key = (self.connection, payload.clone());
         if self.last_reported_profiles.as_ref() == Some(&key) {
             return;
@@ -414,13 +412,14 @@ impl Previews {
     }
 
     fn list_selected(&mut self, cx: &mut Context<Self>) {
-        if self.server_browser != Some(true) {
+        let state = self.state.read(cx);
+        if self.server_browser != Some(true) || state.details_utility_panel_key().is_some() {
             return;
         }
-        let Some(thread_id) = self.state.read(cx).panel_thread() else { return };
+        let Some(thread_id) = state.panel_thread() else { return };
         self.threads.thread_mut(&thread_id);
         let connection = self.connection;
-        let Some(task) = self.state.read(cx).request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
+        let Some(task) = state.request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
         self.listing = Some(cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
             let _ = this.update(cx, |this, cx| {

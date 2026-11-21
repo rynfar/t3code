@@ -194,7 +194,9 @@ impl Render for ChatHeader {
                 let favicon = crate::project_icon::render(app, &project.id, crate::project_icon::size(14., cx), hsla(p.icon_muted), cx);
                 (project.id.clone(), title, scratch, favicon)
             });
-            let draft_label = app.draft_project.is_some().then(|| crate::i18n::t(cx, "New thread"));
+            let draft_label = app.draft_project.is_some()
+                .then(|| crate::i18n::t(cx, "New thread"))
+                .or_else(|| app.has_home_projects().then(|| crate::i18n::t(cx, "No active thread")));
             let state = self.state.clone();
             let settings_project = project.as_ref().filter(|(_, _, scratch, _)| !*scratch).map(|(id, _, _, _)| id.clone());
             return h_flex()
@@ -219,7 +221,7 @@ impl Render for ChatHeader {
                         .child(div().max_w(px(160.)).truncate().child(name))
                         .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx)))
                 }))
-                .when(draft_label.is_some(), |this| this.child(separator()))
+                .when(app.draft_project.is_some(), |this| this.child(separator()))
                 .children(draft_label.map(|label| div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(label)))
                 .map(|this| match settings_project {
                     Some(project_id) => this
