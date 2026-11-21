@@ -429,7 +429,7 @@ pub fn legacy_project_cwd_key(path: &str) -> String {
     format!("legacy-project-cwd:{}", normalize_project_path(path))
 }
 
-fn scoped_logical_key(project: &ScopedProject, settings: &GroupingSettings, scratch: bool) -> String {
+pub fn scoped_logical_key(project: &ScopedProject, settings: &GroupingSettings, scratch: bool) -> String {
     if scratch && project.is_scratch { return SCRATCH_SCOPE_KEY.into(); }
     let identity = project.owner.identity();
     logical_key(&identity, &project.project, resolve_mode(&identity, &project.project, settings))

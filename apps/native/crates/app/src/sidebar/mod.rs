@@ -109,6 +109,7 @@ pub struct SidebarPane {
     updates: Entity<crate::updates::UpdateControl>,
     pub(crate) composer: Entity<crate::composer::Composer>,
     drafts: t3_core::sidebar::drafts::DraftRows,
+    draft_menu_target: Option<t3_core::composer::drafts::DraftRef>,
     discarded: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
     discarded_threads: std::collections::HashMap<String, (t3_core::thread_actions::Claim, crate::composer::drafts::DiscardedDraft)>,
     state: Entity<AppState>,
@@ -402,7 +403,7 @@ impl SidebarPane {
         let subscriptions = vec![
             cx.subscribe(&composer, |this, _, event: &crate::composer::drafts::DraftsChanged, cx| {
                 let state = this.state.read(cx);
-                if this.drafts.update_draft(this.composer.read(cx).sidebar_drafts(), &event.project_id, state.sidebar.project_scope.as_ref()) {
+                if this.drafts.update_draft(this.composer.read(cx).sidebar_drafts(), &event.key, state.sidebar.project_scope.as_ref()) {
                     this.sync_list_rows(cx);
                     cx.notify();
                 }
@@ -423,7 +424,7 @@ impl SidebarPane {
                     });
                     for project in projects {
                         if let Some((_, draft)) = this.discarded.remove(&project) {
-                            this.composer.update(cx, |composer, cx| composer.restore_sidebar_draft(&project, draft, window, cx));
+                            this.composer.update(cx, |composer, cx| composer.restore_sidebar_draft(draft, window, cx));
                         }
                     }
                     for thread_id in threads {
@@ -526,7 +527,11 @@ impl SidebarPane {
                 }
             }),
             cx.subscribe_in(&menu, window, move |this, _, event: &ContextMenuEvent, window, cx| match event {
-                ContextMenuEvent::DiscardDraft(project) => this.discard_draft(project, window, cx),
+                ContextMenuEvent::DiscardDraft(project) => {
+                    if let Some(draft) = this.draft_menu_target.take().filter(|draft| &draft.project_id == project) {
+                        this.discard_draft(&draft, window, cx);
+                    }
+                }
                 ContextMenuEvent::Rename(owner, focus) => { if owner.allows(this.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) {
                     if let Some(key) = owner.key() { this.start_scoped_rename(&key, window, cx); }
                     else { this.start_rename_from_menu(&owner.thread, focus.clone(), window, cx); }
@@ -600,6 +605,7 @@ impl SidebarPane {
             updates,
             composer,
             drafts: Default::default(),
+            draft_menu_target: None,
             discarded: Default::default(),
             discarded_threads: Default::default(),
             state,
@@ -691,7 +697,7 @@ impl SidebarPane {
     /// Splices the list so scroll position and measured heights survive streaming updates.
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        self.drafts.update(self.composer.read(cx).sidebar_drafts(), state.draft_project.as_deref(), state.sidebar.project_scope.as_ref());
+        self.drafts.update(self.composer.read(cx).sidebar_drafts(), state.draft_route_key().as_deref(), state.sidebar.project_scope.as_ref());
         self.sync_list_rows(cx);
     }
 
@@ -703,7 +709,7 @@ impl SidebarPane {
         if self.project_drag.is_some() && crate::settings::store::client(cx).project_sort_order() != t3_core::client_settings::ProjectSortOrder::Manual {
             self.project_drag = None;
         }
-        let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.project_id.clone())).collect();
+        let mut keys: Vec<_> = self.drafts.rows.iter().map(|row| PaneRowKey::Draft(row.key.clone())).collect();
         if !keys.is_empty() { keys.push(PaneRowKey::Divider); }
         if state.fleet.environments.is_empty() { keys.extend(state.sidebar.model.row_keys().into_iter().map(PaneRowKey::Thread)); }
         else { keys.extend(state.sidebar.fleet.row_keys().into_iter().map(PaneRowKey::Scoped)); }
@@ -3155,6 +3161,76 @@ mod sb_sections_pane_tests {
             "itemCount": 0,
             "visibleItemCount": 0
         })
+    }
+
+    #[gpui::test]
+    async fn same_project_drafts_reopen_and_discard_independently(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            let installed = install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        let composer = pane.read_with(vcx, |pane, _| pane.composer.clone());
+        state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
+        vcx.run_until_parked();
+        let first = state.read_with(vcx, |state, _| state.active_draft().unwrap());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| composer.set_test_prompt("First draft", window, cx));
+            window.draw(cx).clear();
+        });
+
+        let new_thread = vcx.debug_bounds("new-thread-sidebar").unwrap().center();
+        let shift = Modifiers { shift: true, ..Default::default() };
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: new_thread, modifiers: shift, click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: new_thread, modifiers: shift, click_count: 1 });
+        vcx.run_until_parked();
+        let second = state.read_with(vcx, |state, _| state.active_draft().unwrap());
+        assert_eq!(first.project_id, second.project_id);
+        assert_ne!(first.id, second.id);
+        state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
+        assert_eq!(state.read_with(vcx, |state, _| state.active_draft()), Some(second.clone()));
+        vcx.update(|window, cx| {
+            assert_eq!(composer.read(cx).test_prompt(cx), "");
+            composer.update(cx, |composer, cx| composer.set_test_prompt("Second draft", window, cx));
+        });
+        state.update(vcx, |state, cx| state.select_thread("menu-thread", cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| { window.draw(cx).clear(); });
+        assert!(vcx.debug_bounds(format!("draft-row-{}", second.key()).leak()).is_some());
+
+        let first_row = vcx.debug_bounds(format!("draft-row-{}", first.key()).leak()).unwrap().center();
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: first_row, modifiers: Default::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: first_row, modifiers: Default::default(), click_count: 1 });
+        vcx.run_until_parked();
+        assert_eq!(state.read_with(vcx, |state, _| state.active_draft()), Some(first.clone()));
+        assert_eq!(composer.read_with(vcx, |composer, cx| composer.test_prompt(cx)), "First draft");
+
+        vcx.update(|window, cx| pane.update(cx, |pane, cx| pane.discard_draft(&first, window, cx)));
+        vcx.run_until_parked();
+        composer.read_with(vcx, |composer, _| {
+            assert!(composer.sidebar_drafts().get(&first.key()).is_none());
+            assert_eq!(composer.sidebar_drafts().get(&second.key()).unwrap().prompt, "Second draft");
+        });
+        assert!(state.update(vcx, |state, cx| state.undo_latest(cx)));
+        vcx.run_until_parked();
+        composer.read_with(vcx, |composer, _| {
+            assert_eq!(composer.sidebar_drafts().get(&first.key()).unwrap().prompt, "First draft");
+        });
+        state.update(vcx, |state, _| state.stop_pump());
     }
 
     #[gpui::test]

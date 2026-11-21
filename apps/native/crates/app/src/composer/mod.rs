@@ -189,7 +189,7 @@ fn compute_reasoning_effort_step(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Target {
     Thread(String),
-    Draft(String),
+    Draft(t3_core::composer::drafts::DraftRef),
     Question(requests::attachments::QuestionDraftKey),
 }
 
@@ -857,11 +857,9 @@ impl Composer {
     fn read_snapshot(&self, cx: &App) -> Snapshot {
         let state = self.state.read(cx);
         let environment = ProviderTarget::environment(state);
-        let target = match (self.fixed.as_ref().or(state.selected_thread.as_ref()), &state.draft_project) {
-            (Some(id), _) => Some(Target::Thread(id.clone())),
-            (None, Some(project)) => Some(Target::Draft(project.clone())),
-            _ => None,
-        };
+        let target = self.fixed.as_ref().or(state.selected_thread.as_ref())
+            .map(|id| Target::Thread(id.clone()))
+            .or_else(|| state.active_draft().map(Target::Draft));
         let last_error = state.last_error.clone();
         let can_operate_thread = state.client_handle().is_none_or(|client| {
             client
@@ -928,6 +926,7 @@ impl Composer {
                 let resolved = self.resolve(cx);
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
             }
+            drafts::sync_saved_session(self, next.target.as_ref(), cx);
             let previous = self.snapshot.target.clone();
             self.close_citation_comment("outside-press", window, cx);
             self.citation_editor = None;
@@ -988,7 +987,7 @@ impl Composer {
         self.snapshot = next;
         let voice_owner = match &self.snapshot.target {
             Some(Target::Thread(id)) => format!("{}:thread:{id}", self.snapshot.environment),
-            Some(Target::Draft(id)) => format!("{}:draft:{id}", self.snapshot.environment),
+            Some(Target::Draft(draft)) => format!("{}:{}", self.snapshot.environment, draft.key()),
             Some(Target::Question(key)) => {
                 format!("{}:question:{}:{}", self.snapshot.environment, key.request, key.question)
             }
@@ -1056,7 +1055,7 @@ impl Composer {
         let choices = self.choices().cloned().unwrap_or_default();
         let draft = match &self.snapshot.target {
             Some(Target::Draft(project)) => {
-                Some(rules::draft_defaults(config, project, self.carry.0.as_ref(), self.carry.1, now_ms()))
+                Some(rules::draft_defaults(config, &project.project_id, self.carry.0.as_ref(), self.carry.1, now_ms()))
             }
             _ => None,
         };
@@ -1535,13 +1534,13 @@ impl Composer {
                     .state
                     .read(cx)
                     .shell
-                    .project(project_id)
+                    .project(&project_id.project_id)
                     .map(|p| p.title.trim().to_owned())
                     .filter(|t| !t.is_empty())
                     .or_else(|| Some("New thread".to_owned()));
                 let pid = project_id.clone();
                 let open = std::rc::Rc::new(move |_: &mut Window, cx: &mut App| {
-                    state_entity.update(cx, |s, cx| s.start_draft(&pid, cx));
+                    state_entity.update(cx, |s, cx| s.open_saved_draft(pid.clone(), cx));
                 });
                 (title, Some(open))
             }
@@ -5051,7 +5050,6 @@ mod stream_error_tests {
                     t3_client::supervisor::ConnectionStatus::Connected,
                     cx,
                 );
-                state.start_draft("proj-remote", cx);
             });
         });
         vcx.run_until_parked();
@@ -5110,7 +5108,6 @@ mod stream_error_tests {
                     t3_client::supervisor::ConnectionStatus::Connected,
                     cx,
                 );
-                state.start_draft("proj-local", cx);
             });
         });
         let launched_payload = loop {
@@ -5482,7 +5479,7 @@ mod stream_error_tests {
                 composer.select_host(local_opt, window, cx);
                 assert_eq!(composer.draft_auto_environment_label(&opts, cx), None);
 
-                let target = Target::Draft("proj-local".into());
+                let target = Target::Draft(state.read(cx).active_draft().expect("open draft"));
                 let attachment = t3_core::composer::attachments::Attachment {
                     id: "img-1".into(),
                     kind: t3_core::composer::attachments::AttachmentKind::Image,

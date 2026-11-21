@@ -4,19 +4,31 @@ use super::SidebarPane;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use gpui::{AnyElement, Context, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
-use t3_core::thread_actions::{UndoAction, UndoKind, UndoStep};
+use t3_core::composer::drafts::DraftRef;
+use t3_core::thread_actions::{UndoAction, UndoStep};
 
 impl SidebarPane {
-    pub(super) fn discard_draft(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.composer.update(cx, |composer, cx| composer.discard_sidebar_draft(project, window, cx));
+    fn open_draft_menu(&mut self, draft: &DraftRef, position: gpui::Point<gpui::Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_menu_target = Some(draft.clone());
+        self.menu.update(cx, |menu, cx| menu.open_for_draft(&draft.project_id, position, window, cx));
+    }
+
+    pub(super) fn discard_draft(&mut self, target: &DraftRef, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.composer.update(cx, |composer, cx| composer.discard_sidebar_draft(target, window, cx));
         if let Some(draft) = draft {
+            let key = target.key();
             let claim = self.state.update(cx, |state, cx| {
-                let claim = state.sidebar.undo.begin(UndoKind::Discard, project);
+                let claim = state.sidebar.undo.begin_draft_session(&key);
                 state.sidebar.undo.show(UndoAction::Discarded, claim.clone(), vec![UndoStep::RestoreDraft], super::controller::now_ms());
+                state.sidebar.history.forget_draft(target);
+                if state.is_active_draft(target) {
+                    state.draft_project = None;
+                    state.clear_selection(cx);
+                }
                 state.after_undo_change(cx);
                 claim
             });
-            if let Some((_, previous)) = self.discarded.insert(project.into(), (claim, draft)) {
+            if let Some((_, previous)) = self.discarded.insert(key, (claim, draft)) {
                 self.composer.update(cx, |composer, cx| composer.commit_sidebar_discard(previous, cx));
             }
         }
@@ -44,14 +56,22 @@ impl SidebarPane {
         let row = &self.drafts.rows[index];
         let p = palette(cx);
         let state = self.state.read(cx);
-        let active = state.draft_project.as_deref() == Some(&row.project_id);
-        let project = state.sidebar.model.project_names.get(&row.project_id).cloned();
-        let open = row.project_id.clone();
+        let active = state.is_active_draft(&row.draft);
+        let project_id = &row.draft.project_id;
+        let project = row.draft.environment_id.as_ref()
+            .and_then(|env| state.sidebar.fleet.project_names.get(&t3_core::sidebar::grouping::ProjectRef {
+                environment_id: env.clone(),
+                project_id: project_id.clone(),
+            }))
+            .or_else(|| state.sidebar.model.project_names.get(project_id))
+            .cloned();
+        let open = row.draft.clone();
         let discard = open.clone();
         let menu = open.clone();
         let keyboard_menu = open.clone();
-        let id = ElementId::Name(SharedString::from(format!("draft-row-{open}")));
-        let focus = self.tree.focus(&super::tree::TreeRow::Draft(row.project_id.clone()))
+        let id = ElementId::Name(SharedString::from(format!("draft-row-{}", row.key)));
+        let discard_id = SharedString::from(format!("discard-draft-{}", row.key));
+        let focus = self.tree.focus(&super::tree::TreeRow::Draft(row.key.clone()))
             .unwrap_or_else(|| crate::settings::controls::focus_handle(&id, window, cx));
         let keyboard_focus = focus.clone();
         let (bounds, measure) = super::measure_trigger();
@@ -61,6 +81,7 @@ impl SidebarPane {
             .child(
                 div()
                     .id(id)
+                    .debug_selector(|| format!("draft-row-{}", row.key))
                     .relative()
                     .track_focus(&focus)
                     .role(gpui::Role::Button)
@@ -71,7 +92,7 @@ impl SidebarPane {
                             window.prevent_default();
                             cx.stop_propagation();
                             if !event.is_held && let Some(bounds) = bounds.get() {
-                                this.menu.update(cx, |menu, cx| menu.open_for_draft(&keyboard_menu, bounds.bottom_left(), window, cx));
+                                this.open_draft_menu(&keyboard_menu, bounds.bottom_left(), window, cx);
                             }
                         }
                     }))
@@ -92,7 +113,7 @@ impl SidebarPane {
                             .items_center()
                             .gap(px(6.))
                             .child(Icon::SquarePen.render(px(12.), hsla(p.warning_foreground)))
-                            .child(self.favicon(&row.project_id, false, cx))
+                            .child(self.favicon(project_id, false, cx))
                             .child(
                                 div()
                                     .flex_1()
@@ -105,7 +126,7 @@ impl SidebarPane {
                             )
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("discard-draft-{discard}")))
+                                    .id(discard_id)
                                     .size(px(20.))
                                     .flex()
                                     .items_center()
@@ -133,17 +154,19 @@ impl SidebarPane {
                             .child(row.preview.clone()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.state.update(cx, |state, cx| {
-                            state.clear_thread_selection(cx);
-                            state.start_draft(&open, cx);
-                        });
+                        if this.composer.read(cx).sidebar_drafts().get(&open.key()).is_some() {
+                            this.state.update(cx, |state, cx| {
+                                state.clear_thread_selection(cx);
+                                state.open_saved_draft(open.clone(), cx);
+                            });
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             window.focus(&focus, cx);
-                            this.menu.update(cx, |menu_view, cx| menu_view.open_for_draft(&menu, event.position, window, cx));
+                            this.open_draft_menu(&menu, event.position, window, cx);
                         }),
                     ),
             )

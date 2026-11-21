@@ -88,6 +88,7 @@ pub fn time_label(time: LocalTime) -> String {
 pub(crate) enum UndoContext {
     Thread(Box<crate::context_menu::ThreadMenuOwner>),
     Draft { environment: Option<String>, canonical: Option<String>, connection: Option<u64>, generation: u64, project: Box<t3_core::shell::ProjectShell> },
+    DraftSession { key: String },
     ThreadDraft { thread_id: String },
     Unavailable { id: String, draft: bool },
 }
@@ -112,6 +113,12 @@ impl UndoContexts {
         self.token(context)
     }
     pub fn begin(&mut self, kind: UndoKind, id: &str) -> actions::Claim { let token = self.active_token(kind,id); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
+    pub(super) fn begin_draft_session(&mut self, key: &str) -> actions::Claim {
+        let token = self.token(UndoContext::DraftSession { key: key.to_owned() });
+        let claim = self.store.begin(UndoKind::Discard, &token);
+        self.pending.push(claim.clone());
+        claim
+    }
     pub(super) fn begin_thread_draft(&mut self, thread_id: &str) -> actions::Claim { let token = self.token(UndoContext::ThreadDraft { thread_id: thread_id.to_owned() }); let claim = self.store.begin(UndoKind::Discard, &token); self.pending.push(claim.clone()); claim }
     fn begin_owned(&mut self, kind: UndoKind, owner: crate::context_menu::ThreadMenuOwner) -> actions::Claim { let token = self.token(UndoContext::Thread(Box::new(owner))); let claim=self.store.begin(kind,&token); self.pending.push(claim.clone()); claim }
     pub fn invalidate(&mut self, kind: UndoKind, id: &str) { let token = self.active_token(kind,id); self.store.invalidate(kind,&token); }
@@ -354,7 +361,7 @@ fn history_entry_exists(shell: &ShellState, mounts: &MountedReads, hidden: &std:
             let loaded = mounts.thread(shell, id).is_some();
             loaded && t3_core::sidebar::tag_filter::route_visible(id, loaded, hidden, hiding)
         }
-        NavEntry::Draft(project_id) => shell.project(project_id).is_some(),
+        NavEntry::Draft(draft) => shell.project(&draft.project_id).is_some(),
     }
 }
 
@@ -1104,7 +1111,7 @@ impl AppState {
         let hidden = &self.sidebar.hidden_thread_ids;
         match self.sidebar.history.go(back, |entry| history_entry_exists(shell, mounts, hidden, hiding, entry)).cloned() {
             Some(NavEntry::Thread(id)) => self.select_thread(&id, cx),
-            Some(NavEntry::Draft(project_id)) => self.start_draft(&project_id, cx),
+            Some(NavEntry::Draft(draft)) => self.open_saved_draft(draft, cx),
             None => {}
         }
     }
@@ -2588,6 +2595,13 @@ impl AppState {
                         && self.shell.project(&project.id).is_some_and(|current| current.created_at == project.created_at && current.workspace_root == project.workspace_root)
                         && plan.contains(&UndoStep::RestoreDraft) {
                         self.sidebar.drafts_to_restore.push(project.id); cx.emit(AppEvent::RestoreDraft);
+                        restored_drafts += 1;
+                    }
+                }
+                UndoContext::DraftSession { key } => {
+                    if plan.contains(&UndoStep::RestoreDraft) {
+                        self.sidebar.drafts_to_restore.push(key);
+                        cx.emit(AppEvent::RestoreDraft);
                         restored_drafts += 1;
                     }
                 }

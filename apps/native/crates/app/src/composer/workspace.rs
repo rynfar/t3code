@@ -42,6 +42,7 @@ const GENERIC_LOCAL_ENVIRONMENT_LABELS: &[&str] = &["this device", "this machine
 struct Scope {
     environment: String,
     project: String,
+    draft: t3_core::composer::drafts::DraftRef,
     root: String,
     connection: u64,
     generation: u64,
@@ -64,6 +65,7 @@ pub(super) struct DraftRouting {
     /// Logical project group key this draft routing state belongs to, so self-initiated
     /// retargeting across machines in the same logical project preserves routing state.
     pub(super) logical_project_key: Option<String>,
+    draft_id: Option<t3_core::composer::drafts::DraftId>,
     pub(super) selection: DraftEnvSelection,
     /// Canonical `environment_id` picked by automatic load balancing (`loadBalancedEnvironmentId`).
     pub(super) resolved_environment_id: Option<String>,
@@ -132,7 +134,7 @@ pub(super) struct HostOptions {
 impl Composer {
     fn workspace_choice(&self) -> Option<&DraftWorkspace> {
         let scope = self.workspace.scope.as_ref()?;
-        self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone())))?.workspace.as_ref().filter(|choice| choice.in_scope(&scope.environment, &scope.root) && choice.destination.as_ref().is_none_or(|destination| destination == &scope.destination))
+        self.drafts.store.get(&drafts::key(&Target::Draft(scope.draft.clone())))?.workspace.as_ref().filter(|choice| choice.in_scope(&scope.environment, &scope.root) && choice.destination.as_ref().is_none_or(|destination| destination == &scope.destination))
     }
 
     pub(super) fn workspace_is_repo(&self) -> bool {
@@ -149,10 +151,12 @@ impl Composer {
             if self.fixed.is_some() {
                 return None;
             }
-            let Target::Draft(project) = self.snapshot.target.as_ref()? else {
+            let Target::Draft(draft) = self.snapshot.target.as_ref()? else {
                 return None;
             };
+            let project = &draft.project_id;
             Some(Scope {
+                draft: draft.clone(),
                 environment: state.environments.active.clone()?,
                 project: project.clone(),
                 root: state.shell.project(project)?.workspace_root.clone(),
@@ -435,7 +439,7 @@ impl Composer {
     fn workspace_visible(&self) -> bool {
         self.workspace.scope.as_ref().is_some_and(|scope| {
             self.workspace.is_repo || self.workspace.error.is_some()
-                || (self.workspace_choice().is_none() && self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone()))).is_some_and(|draft| draft.workspace.is_some()))
+                || (self.workspace_choice().is_none() && self.drafts.store.get(&drafts::key(&Target::Draft(scope.draft.clone()))).is_some_and(|draft| draft.workspace.is_some()))
         })
     }
 
@@ -450,7 +454,7 @@ impl Composer {
         let Some(scope) = self.workspace.scope.clone() else {
             return;
         };
-        let target = Target::Draft(scope.project);
+        let target = Target::Draft(scope.draft);
         self.record_draft(&target, cx);
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.updated_at = crate::sidebar::controller::now_ms();
@@ -729,7 +733,7 @@ impl Composer {
 
     pub(super) fn mutate_draft_workspace(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut DraftWorkspace)) {
         let Some(scope) = self.workspace.scope.clone() else { return };
-        let target = Target::Draft(scope.project);
+        let target = Target::Draft(scope.draft);
         self.record_draft(&target, cx);
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.updated_at = crate::sidebar::controller::now_ms();
@@ -1053,7 +1057,7 @@ impl Composer {
         let Some(Target::Draft(project_id)) = self.snapshot.target.as_ref() else {
             return false;
         };
-        !self.state.read(cx).is_scratch_project(project_id) && self.load_balancing_enabled(cx)
+        !self.state.read(cx).is_scratch_project(&project_id.project_id) && self.load_balancing_enabled(cx)
     }
 
     /// Whether this unsent draft currently runs in automatic load-balancing mode
@@ -1179,21 +1183,23 @@ impl Composer {
             cx.notify();
             return;
         }
-        if let Some(from) = from_project {
-            self.retarget_draft_for_routing(&from, &target.project_id, same_env, window, cx);
-        }
         if let Some(owner) = target.owner
             && self
                 .state
                 .read(cx)
                 .scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
         {
+            let Some(source) = self.state.read(cx).active_draft() else { return };
+            let draft = t3_core::composer::drafts::DraftRef::new(source.id, &target.saved_id, &target.project_id);
+            if !self.retarget_session(&draft, same_env, window, cx) {
+                return;
+            }
             if !same_env {
                 self.workspace.routing.pending_navigation =
                     Some((target.saved_id.clone(), target.project_id.clone()));
             }
             self.state.update(cx, |state, cx| {
-                state.navigate_scoped(owner, ScopedRouteAction::Draft(target.project_id), cx);
+                state.navigate_scoped(owner, ScopedRouteAction::OpenDraft(draft), cx);
             });
         }
         cx.notify();
@@ -1206,7 +1212,7 @@ impl Composer {
         if self.fixed.is_some() {
             return;
         }
-        let Some(Target::Draft(current_project)) = self.snapshot.target.clone() else {
+        let Some(Target::Draft(current_draft)) = self.snapshot.target.clone() else {
             let waiting_on_routed_switch = {
                 let state = self.state.read(cx);
                 state.selected_thread.is_none()
@@ -1219,6 +1225,7 @@ impl Composer {
                 return;
             }
             self.workspace.routing.logical_project_key = None;
+            self.workspace.routing.draft_id = None;
             self.workspace.routing.selection = DraftEnvSelection::Implicit;
             self.workspace.routing.resolved_environment_id = None;
             self.workspace.routing.pending_navigation = None;
@@ -1230,20 +1237,17 @@ impl Composer {
         if self.workspace.routing.pending_navigation.as_ref().is_some_and(
             |(saved_id, project_id)| {
                 self.state.read(cx).environments.active.as_deref() == Some(saved_id.as_str())
-                    && project_id == &current_project
+                    && project_id == &current_draft.project_id
             },
         ) {
             self.workspace.routing.pending_navigation = None;
         }
         let host = self.host_options(cx);
-        let logical_key = host.logical_project_key.clone().or_else(|| {
-            if let Some(Target::Draft(pid)) = self.snapshot.target.as_ref() {
-                Some(pid.clone())
-            } else {
-                None
-            }
-        });
-        if logical_key != self.workspace.routing.logical_project_key {
+        let logical_key = host.logical_project_key.clone().or(Some(current_draft.project_id));
+        if logical_key != self.workspace.routing.logical_project_key
+            || self.workspace.routing.draft_id.as_ref() != Some(&current_draft.id)
+        {
+            self.workspace.routing.draft_id = Some(current_draft.id);
             self.workspace.routing.logical_project_key = logical_key;
             self.workspace.routing.selection = DraftEnvSelection::Implicit;
             self.workspace.routing.resolved_environment_id = None;
@@ -1415,11 +1419,16 @@ impl Composer {
             cx.notify();
             return;
         }
-        if let Some(from) = from_project {
-            self.retarget_draft_for_routing(&from, &option.project_id, same_env, window, cx);
+        let Some(source) = self.state.read(cx).active_draft() else { return };
+        let draft = t3_core::composer::drafts::DraftRef::new(source.id, &option.saved_id, &option.project_id);
+        if !self.retarget_session(&draft, same_env, window, cx) {
+            return;
+        }
+        if !same_env {
+            self.workspace.routing.pending_navigation = Some((option.saved_id, option.project_id));
         }
         self.state.update(cx, |state, cx| {
-            state.navigate_scoped(owner, ScopedRouteAction::Draft(option.project_id), cx);
+            state.navigate_scoped(owner, ScopedRouteAction::OpenDraft(draft), cx);
         });
         self.focus(window, cx);
         cx.notify();
@@ -1867,7 +1876,7 @@ impl Composer {
         let Some((owner, choice)) = pending else { return };
         let state = self.state.read(cx);
         if !owner.current(state) || state.selected_thread.is_some() { return; }
-        let Some(project) = state.draft_project.clone() else { return };
+        let Some(project) = state.active_draft() else { return };
         let target = Target::Draft(project);
         if self.snapshot.target.as_ref() != Some(&target) { return; }
         self.record_draft(&target, cx);

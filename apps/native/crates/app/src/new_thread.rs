@@ -415,6 +415,35 @@ impl DraftHero {
         cx.notify();
     }
 
+    fn open_in_project(
+        &self,
+        project_id: String,
+        owner: Option<EnvironmentOwner>,
+        same_env: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = {
+            let state = self.state.read(cx);
+            let environment = owner.as_ref().map(|owner| owner.saved_id.as_str()).or(state.environments.active.as_deref());
+            state.active_draft().map(|source| t3_core::composer::drafts::DraftRef::new(
+                source.id, environment.unwrap_or_default(), &project_id
+            ))
+        };
+        let moved = target.filter(|target| self.composer.update(cx, |composer, cx| {
+            composer.retarget_non_empty_session(target, same_env, window, cx)
+        }));
+        self.state.update(cx, |state, cx| match (owner, moved) {
+            (Some(owner), Some(draft)) => state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::OpenDraft(draft), cx),
+            (Some(owner), None) => state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(project_id), cx),
+            (None, Some(draft)) => {
+                state.remember_draft(&draft, cx);
+                state.open_draft(draft, cx);
+            }
+            (None, None) => state.start_draft(&project_id, cx),
+        });
+    }
+
     fn select_entry(&mut self, entry: HeroPickerEntry, window: &mut Window, cx: &mut Context<Self>) {
         self.scratch_request = self.scratch_request.wrapping_add(1);
         self.close_picker(Some(window), false, cx);
@@ -432,15 +461,7 @@ impl DraftHero {
                 self.switch_triage_machine(owner, Some(entry.project_id), window, cx);
                 return;
             }
-            if let Some(from) = current {
-                self.composer.update(cx, |composer, cx| {
-                    composer.retarget_draft(&from, &entry.project_id, same_env, window, cx);
-                });
-            }
-            self.state.update(cx, |state, cx| match &entry.owner {
-                Some(owner) => state.navigate_scoped(owner.clone(), crate::app_state::ScopedRouteAction::Draft(entry.project_id), cx),
-                None => state.start_draft(&entry.project_id, cx),
-            });
+            self.open_in_project(entry.project_id, entry.owner, same_env, window, cx);
             self.composer.update(cx, |composer, cx| {
                 composer.prepare_draft_routing_on_project_pick(window, cx);
             });
@@ -452,13 +473,13 @@ impl DraftHero {
     /// session on the destination machine, ensures a project there if needed, and rewrites the
     /// playbook link while preserving any edits typed in the meantime.
     fn switch_triage_machine(&mut self, owner: EnvironmentOwner, known_project_id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let (from_project, active_env, destination) = {
+        let (from_draft, active_env, destination) = {
             let app = self.state.read(cx);
             if !app.scoped_ready(&owner, ORCHESTRATION_OPERATE_SCOPE) {
                 return;
             }
             (
-                app.draft_project.clone(),
+                app.active_draft(),
                 app.environments.active.clone(),
                 app.connections.destination(&owner, ORCHESTRATION_OPERATE_SCOPE),
             )
@@ -501,7 +522,7 @@ impl DraftHero {
                 }
                 let same_draft = {
                     let app = hero.state.read(cx);
-                    app.selected_thread.is_none() && app.draft_project == from_project && app.environments.active == active_env
+                    app.selected_thread.is_none() && app.active_draft() == from_draft && app.environments.active == active_env
                 };
                 if !same_draft {
                     return;
@@ -514,13 +535,8 @@ impl DraftHero {
                             if next != current {
                                 composer.replace_prompt_text(&next, window, cx);
                             }
-                            if let Some(from) = &from_project {
-                                composer.retarget_draft(from, &target_project_id, false, window, cx);
-                            }
                         });
-                        hero.state.update(cx, |state, cx| {
-                            state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(target_project_id), cx);
-                        });
+                        hero.open_in_project(target_project_id, Some(owner), false, window, cx);
                         hero.composer.update(cx, |composer, cx| composer.focus(window, cx));
                     }
                     Err(description) => {
@@ -566,11 +582,11 @@ impl DraftHero {
 
     /// `startScratchThread`: ensures the scratch project, then retargets or opens the draft.
     fn start_without_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (scratch_ready, from_project, active_env, rpc) = {
+        let (scratch_ready, from_draft, active_env, rpc) = {
             let app = self.state.read(cx);
             (
                 app.scratch_root().is_some(),
-                app.draft_project.clone(),
+                app.active_draft(),
                 app.environments.active.clone(),
                 app.rpc(t3_core::home::PROJECTS_ENSURE_SCRATCH, serde_json::json!({})),
             )
@@ -590,17 +606,12 @@ impl DraftHero {
                     Some(scratch_id) => {
                         let app = hero.state.read(cx);
                         let same_draft = app.selected_thread.is_none()
-                            && app.draft_project == from_project
+                            && app.active_draft() == from_draft
                             && app.environments.active == active_env;
                         if !same_draft {
                             return;
                         }
-                        if let Some(from) = from_project {
-                            hero.composer.update(cx, |composer, cx| {
-                                composer.retarget_draft(&from, &scratch_id, true, window, cx);
-                            });
-                        }
-                        hero.state.update(cx, |state, cx| state.start_draft(&scratch_id, cx));
+                        hero.open_in_project(scratch_id, None, true, window, cx);
                         hero.composer.update(cx, |composer, cx| composer.focus(window, cx));
                     }
                     None => {
@@ -1374,7 +1385,9 @@ mod tests {
         cx.run_until_parked();
         let _ = window.update(cx, |_, window, cx| {
             assert_eq!(state.read(cx).draft_project.as_deref(), Some(p2.as_str()));
-            assert_eq!(composer.read(cx).test_prompt(cx), "Keep destination");
+            assert_eq!(composer.read(cx).test_prompt(cx), "");
+            assert!(composer.read(cx).sidebar_drafts().session_drafts()
+                .any(|(session, draft)| session.project_id == p2 && draft.prompt == "Keep destination"));
 
             // Now type in p2 and switch back to p1 -> non-empty draft retargets to p1
             composer.update(cx, |composer, cx| composer.set_test_prompt("Retargeted prompt", window, cx));
@@ -1386,8 +1399,10 @@ mod tests {
             assert_eq!(state.read(cx).draft_project.as_deref(), Some(p1.as_str()));
             assert_eq!(composer.read(cx).test_prompt(cx), "Retargeted prompt");
             assert!(
-                composer.read(cx).sidebar_drafts().get(&t3_core::composer::drafts::new_thread_key(&p2)).is_none(),
-                "source draft is removed after retargeting"
+                composer.read(cx).sidebar_drafts().session_drafts()
+                    .filter(|(session, _)| session.project_id == p2)
+                    .map(|(_, draft)| draft.prompt.as_str()).collect::<Vec<_>>() == ["Keep destination"],
+                "retargeting leaves the other draft in the source project"
             );
         }).unwrap();
 

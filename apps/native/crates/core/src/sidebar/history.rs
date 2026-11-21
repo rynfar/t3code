@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use crate::composer::drafts::DraftRef;
+
 const HISTORY_LIMIT: usize = 100;
 
 /// A page Back and Forward return to: a thread, or a draft in a project (the draft route, which
@@ -12,7 +14,7 @@ const HISTORY_LIMIT: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
     Thread(String),
-    Draft(String),
+    Draft(DraftRef),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,6 +44,37 @@ impl NavHistory {
             self.entries.remove(0);
         }
         self.index = self.entries.len() - 1;
+    }
+
+    pub fn forget_draft(&mut self, draft: &DraftRef) {
+        let current = self.index;
+        let mut position = 0;
+        self.entries.retain(|entry| {
+            let keep = !matches!(entry, NavEntry::Draft(entry_draft) if entry_draft == draft);
+            if !keep && position <= current {
+                self.index = self.index.saturating_sub(1);
+            }
+            position += 1;
+            keep
+        });
+    }
+
+    pub fn promote_draft(&mut self, draft: &DraftRef, thread_id: &str) {
+        for entry in &mut self.entries {
+            if matches!(entry, NavEntry::Draft(entry_draft) if entry_draft == draft) {
+                *entry = NavEntry::Thread(thread_id.to_owned());
+            }
+        }
+    }
+
+    pub fn retarget_draft(&mut self, draft: &DraftRef) {
+        for entry in &mut self.entries {
+            if let NavEntry::Draft(previous) = entry
+                && previous.id == draft.id
+            {
+                *previous = draft.clone();
+            }
+        }
     }
 
     /// A draft that launched its thread gives way to it, as the web replaces the draft route.
@@ -129,13 +162,25 @@ mod tests {
     }
 
     #[test]
+    fn promoting_a_background_draft_replaces_only_its_history_entry() {
+        let first = DraftRef::legacy("project");
+        let second = DraftRef::new(crate::composer::drafts::DraftId::new("second".into()), "", "project");
+        let mut history = NavHistory::default();
+        history.visit(NavEntry::Draft(first.clone()));
+        history.visit(NavEntry::Draft(second.clone()));
+        history.promote_draft(&first, "launched");
+        assert_eq!(history.go(true, |_| true), Some(&thread("launched")));
+        assert_eq!(history.go(false, |_| true), Some(&NavEntry::Draft(second)));
+    }
+
+    #[test]
     fn going_home_is_an_entry_back_returns_from() {
         let all = |_: &NavEntry| true;
         let mut history = NavHistory::default();
         history.visit(thread("a"));
-        history.visit(NavEntry::Draft("p".into()));
+        history.visit(NavEntry::Draft(DraftRef::legacy("p")));
         assert_eq!(history.go(true, all), Some(&thread("a")));
-        assert_eq!(history.go(false, all), Some(&NavEntry::Draft("p".into())));
+        assert_eq!(history.go(false, all), Some(&NavEntry::Draft(DraftRef::legacy("p"))));
 
         // A launched draft is replaced by its thread.
         history.replace_draft();
