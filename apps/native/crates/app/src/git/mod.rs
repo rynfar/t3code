@@ -664,7 +664,7 @@ impl GitStore {
         .detach();
     }
 
-    /// Loads `sourceControl.discovery` for `PublishRepositoryDialog`.
+    /// Loads `server.discoverSourceControl` for `PublishRepositoryDialog`.
     pub fn discover_publish_providers(&self, cx: &App) -> Option<tokio::task::JoinHandle<Result<Vec<git_actions::PublishProviderDiscovery>, String>>> {
         self.state.read(cx).request(
             git_actions::method::SOURCE_CONTROL_DISCOVERY,

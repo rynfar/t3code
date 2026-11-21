@@ -277,6 +277,9 @@ impl FilesPanel {
         self.mutation = mutation;
         self.reconnected |= connected && !self.connected;
         self.connected = connected;
+        if !visible && !root_changed && crate::right_panel::holding_file_surface(&self.state, cx) {
+            return;
+        }
         // Hidden files do no work: they catch up when they show.
         if visible {
             self.explorer.update(cx, |explorer, cx| explorer.set_root(root.clone(), cx));
@@ -309,9 +312,6 @@ impl FilesPanel {
             self.explorer.update(cx, |explorer, cx| explorer.set_selected(selected, reveal, cx));
         } else if self.shown.as_ref().is_some_and(|shown| shown.attachment.is_some()) {
             self.preview.update(cx, |preview, cx| preview.set_attachment(None, cx));
-        }
-        if !visible && !root_changed && crate::right_panel::holding_file_surface(&self.state, cx) {
-            return;
         }
         if shown != self.shown || root_changed {
             self.shown = shown;

@@ -952,17 +952,30 @@ fn set_relay_managed_environment_in(base: Option<PathBuf>, id: &str, relay_manag
     }
 }
 
+type AlternateRoutes = std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>>;
+
+/// Settings renders read this on animation frames, and saves are queued; both need memory, not disk.
+fn alternate_routes_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Option<PathBuf>, AlternateRoutes>> {
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<Option<PathBuf>, AlternateRoutes>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// Saved alternate/learned routes keyed by saved environment ID (`CN-SESSION`).
-pub fn load_alternate_routes() -> std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>> {
-    load_ui_state("environment-routes")
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
+pub fn load_alternate_routes() -> AlternateRoutes {
+    let mut cache = alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner());
+    cache
+        .entry(base())
+        .or_insert_with(|| {
+            load_ui_state("environment-routes")
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default()
+        })
+        .clone()
 }
 
 /// Persists alternate/learned routes keyed by saved environment ID.
-pub fn save_alternate_routes(
-    routes: &std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>>,
-) {
+pub fn save_alternate_routes(routes: &AlternateRoutes) {
+    alternate_routes_cache().lock().unwrap_or_else(|p| p.into_inner()).insert(base(), routes.clone());
     save_ui_state("environment-routes", routes);
 }
 

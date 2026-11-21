@@ -230,7 +230,7 @@ impl GitDialogs {
         cx.notify();
     }
 
-    /// Opens `PublishRepositoryDialog` (`GitActionsControl.tsx`) and loads `sourceControl.discovery`.
+    /// Opens `PublishRepositoryDialog` (`GitActionsControl.tsx`) and loads `server.discoverSourceControl`.
     pub fn open_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit = None;
         self.pending = None;

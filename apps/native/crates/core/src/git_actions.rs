@@ -16,7 +16,7 @@ use crate::diff::DiffPreviewSource;
 use crate::vcs::{VcsStatus, changes_totals};
 
 pub mod method {
-    pub const SOURCE_CONTROL_DISCOVERY: &str = "sourceControl.discovery";
+    pub const SOURCE_CONTROL_DISCOVERY: &str = "server.discoverSourceControl";
     pub const SOURCE_CONTROL_PUBLISH_REPOSITORY: &str = "sourceControl.publishRepository";
 }
 
@@ -708,7 +708,7 @@ fn decode_effect_option_str(value: Option<&Value>) -> Option<String> {
     inner.as_str().map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned)
 }
 
-/// Decodes `sourceControlProviders` from `sourceControl.discovery`.
+/// Decodes `sourceControlProviders` from `server.discoverSourceControl`.
 pub fn decode_publish_discovery(value: &Value) -> Vec<PublishProviderDiscovery> {
     let Some(items) = value.get("sourceControlProviders").and_then(Value::as_array) else {
         return Vec::new();
