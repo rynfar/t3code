@@ -4,17 +4,19 @@
 //! `StorageSettings.tsx` (database notice, artifact and log retention, Delete now and the last
 //! run's report), and the link to Diagnostics. Rules live in `t3_core::settings::maintenance`.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, list, prelude::FluentBuilder,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, NumberInputEvent, StepAction};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::json;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
+use t3_core::sidebar::grouping::EnvironmentOwner;
+use crate::i18n::t;
 use t3_core::server_config::{DEFAULT_USAGE_HISTORY_RETENTION_DAYS, ServerConfig, ServerSettings, UsageHistoryRetentionDays};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::diagnostics::ENVIRONMENT_MAINTAIN_SCOPE;
@@ -24,7 +26,7 @@ use t3_core::settings::maintenance::{
 };
 use t3_core::settings::search::Section;
 
-use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, icon, muted_text, r, section, section_title};
+use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, NumberField, Row, Select, SelectOption, SettingInheritance, SettingInheritanceLayer, SettingSource, Switch, dialog_footer, group, icon, muted_text, r, section, section_title};
 use super::providers::{Stream, failure_text};
 use super::{Block, SettingsView};
 use crate::app_state::Phase;
@@ -100,9 +102,10 @@ pub(crate) struct MaintenanceState {
     retention_seq: u64,
     intervals: [Entity<InputState>; 4],
     last_run: LastRun,
-    report_stream: Option<(u64, Stream)>,
+    stream_target: Option<(Option<EnvironmentOwner>, Option<u64>)>,
+    report_stream: Option<Stream>,
     database: Option<DatabaseStorage>,
-    database_stream: Option<(u64, Stream)>,
+    database_stream: Option<Stream>,
     cleanup_pending: bool,
     reclaim_confirming: Option<FocusHandle>,
     reclaim_requested: bool,
@@ -113,9 +116,13 @@ pub(crate) struct MaintenanceState {
     _subscriptions: Vec<Subscription>,
 }
 
-/// `DatabaseStorageNotice`'s Dismiss lasts for the app session; the web keeps it in browser
-/// storage.
-struct DismissedDatabaseNotice(bool);
+const DATABASE_NOTICE_DISMISSALS: &str = "dismissed-database-storage";
+
+#[derive(Default)]
+struct DismissedDatabaseNotice {
+    environments: HashSet<String>,
+    loaded: bool,
+}
 
 impl gpui::Global for DismissedDatabaseNotice {}
 
@@ -147,6 +154,24 @@ impl MaintenanceState {
                 _ => {}
             }));
         }
+        for field in Field::ALL {
+            let input = match field {
+                Field::Artifacts => &artifacts_days,
+                Field::Logs => &logs_days,
+                Field::UsageHistory => &usage_history_days,
+            };
+            subscriptions.push(cx.subscribe_in(input, window, move |this, input, event: &NumberInputEvent, window, cx| {
+                let current = input.read(cx).value().trim().parse::<u32>().unwrap_or(1);
+                let NumberInputEvent::Step(action) = event;
+                let days = match action {
+                    StepAction::Increment => current.saturating_add(1),
+                    StepAction::Decrement => current.saturating_sub(1).max(1),
+                };
+                input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
+                this.maintenance.retention_drafts[field.index()].mark_edited();
+                this.commit_artifact_retention(field, true, window, cx);
+            }));
+        }
         for (input, field) in intervals.iter().zip(INTERVAL_FIELDS) {
             subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
                 if commit_on(event) {
@@ -163,6 +188,7 @@ impl MaintenanceState {
             retention_seq: 0,
             intervals,
             last_run: LastRun::Loading,
+            stream_target: None,
             report_stream: None,
             database: None,
             database_stream: None,
@@ -193,8 +219,13 @@ impl MaintenanceState {
 
     /// Off the page: its streams and clock stop.
     pub(super) fn leave(&mut self) {
+        self.stream_target = None;
         self.report_stream = None;
         self.database_stream = None;
+        self.last_run = LastRun::Loading;
+        self.database = None;
+        self.last_run_open = false;
+        self.cleanup_pending = false;
         self.ticker = None;
         self.background_dialog = None;
         self.reclaim_confirming = None;
@@ -219,10 +250,47 @@ impl SettingsView {
 
     /// Why a server-backed row cannot change (`SettingsRow`'s inert control), if it cannot.
     pub(super) fn settings_unavailable(&self, cx: &App) -> Option<String> {
-        if !self.connected_now(cx) {
-            return Some("Reconnect the selected environment to change this setting.".to_owned());
+        let owners = self.scoped_environment_owners(cx);
+        let app = self.state.read(cx);
+        let explicit = self.scope.machine.is_some() || self.scope.project.is_some();
+        if (!self.scoped_connected_now(cx) && owners.is_empty()) || (explicit && owners.is_empty()) {
+            return Some(t(cx, "Reconnect the selected environment to change this setting.").to_owned());
         }
-        (!self.may(SETTINGS_WRITE_SCOPE, cx)).then(|| t3_core::settings::diagnostics::telemetry_no_permission(&self.environment_label(cx)))
+        let can_edit = if owners.is_empty() {
+            self.may(SETTINGS_WRITE_SCOPE, cx)
+        } else {
+            owners.iter().all(|owner| app.scoped_ready(owner, SETTINGS_WRITE_SCOPE))
+        };
+        (!can_edit).then(|| t3_core::settings::diagnostics::telemetry_no_permission(&self.environment_label(cx)))
+    }
+
+    pub(super) fn switch_inheritance(
+        &self, key: &'static str, value: bool, default: bool,
+        read: fn(&ServerSettings) -> bool, cx: &Context<Self>,
+    ) -> (SettingInheritance, bool) {
+        let targets = self.scoped_model_targets(cx);
+        let mixed = targets.iter().any(|(_, config, project)| {
+            let effective = project.as_ref().map(|project| t3_core::settings::resolve_project_settings(&config.settings, project));
+            read(effective.as_ref().unwrap_or(&config.settings)) != value
+        });
+        let raw = self.scoped_raw_representative_config(cx).map_or(default, |config| read(&config.settings));
+        let project = self.is_project_scope(cx);
+        if !project {
+            return (environment_switch_inheritance(raw, default, mixed, cx), mixed);
+        }
+        let overridden = self.has_project_override(&[key], cx);
+        let environment_set = raw != default;
+        let flag = |on| t(cx, if on { "On" } else { "Off" }).into();
+        let summary = if mixed { "Mixed values" } else if overridden { "Project" } else if environment_set { "Environment" } else { "Default" };
+        let mut inheritance = SettingInheritance::new(t(cx, summary), vec![
+            SettingInheritanceLayer::new(SettingSource::Project, overridden.then(|| flag(value)), overridden && !mixed),
+            SettingInheritanceLayer::new(SettingSource::Environment, environment_set.then(|| flag(raw)), !overridden && !mixed && environment_set),
+            SettingInheritanceLayer::new(SettingSource::Default, Some(flag(default)), !overridden && !mixed && !environment_set),
+        ]).mixed(mixed);
+        if overridden && self.settings_unavailable(cx).is_none() && self.managed_setting_lock(&[key], cx).is_none() {
+            inheritance = inheritance.on_reset_overrides(cx.listener(move |this, _, _, cx| this.clear_project_overrides(&[key], cx)));
+        }
+        (inheritance, mixed)
     }
 
     pub(super) fn save_retention_setting(
@@ -297,16 +365,53 @@ impl SettingsView {
         super::store::update_server(state, ServerSettingChange::Prepared(payload), cx);
     }
 
+    fn maintenance_storage_target(&self, cx: &App) -> Option<(Option<EnvironmentOwner>, Option<u64>)> {
+        if self.is_project_scope(cx) || self.scoped_environment_owners(cx).len() > 1 || !self.scoped_connected_now(cx) {
+            return None;
+        }
+        let owner = self.scoped_primary_owner(cx);
+        if owner.is_none() && self.scope.machine.is_some() {
+            return None;
+        }
+        Some((owner, self.state.read(cx).connection_id()))
+    }
+
+    fn maintenance_may(&self, scope: &str, cx: &App) -> bool {
+        self.maintenance_storage_target(cx).is_some()
+            && self.scoped_session(cx).is_none_or(|session| session.grants(scope))
+    }
+
+    fn ensure_database_dismissals(&self, cx: &mut Context<Self>) {
+        if cx.try_global::<DismissedDatabaseNotice>().is_some() {
+            return;
+        }
+        cx.set_global(DismissedDatabaseNotice::default());
+        let load = cx.background_executor().spawn(async {
+            t3_client::store::load_ui_state(DATABASE_NOTICE_DISMISSALS)
+                .and_then(|value| serde_json::from_value::<HashSet<String>>(value).ok())
+                .unwrap_or_default()
+        });
+        cx.spawn(async move |this, cx| {
+            let environments = load.await;
+            cx.update(|cx| cx.set_global(DismissedDatabaseNotice { loaded: true, environments }));
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }).detach();
+    }
+
     /// Follows the last cleanup report and the database's reclaimable space while the page shows.
     fn ensure_maintenance_streams(&mut self, config: &ServerConfig, cx: &mut Context<Self>) {
-        let Some(connection) = self.state.read(cx).connection_id() else {
+        let target = self.maintenance_storage_target(cx);
+        if self.maintenance.stream_target != target {
             self.maintenance.leave();
-            return;
-        };
+            self.maintenance.stream_target = target.clone();
+        }
+        let Some(target) = target else { return };
         let capabilities = &config.environment.capabilities;
-        if capabilities.storage_cleanup_run == Some(true) && !self.maintenance.report_stream.as_ref().is_some_and(|(id, _)| *id == connection) {
+        if capabilities.storage_cleanup_run == Some(true) && self.maintenance.report_stream.is_none() {
             self.maintenance.last_run = LastRun::Loading;
-            let stream = self.subscribe(model::GET_STORAGE_CLEANUP_REPORT, json!({}), cx, |this, item, _| {
+            let report_target = target.clone();
+            self.maintenance.report_stream = self.subscribe(model::GET_STORAGE_CLEANUP_REPORT, json!({}), cx, move |this, item, cx| {
+                if this.maintenance_storage_target(cx).as_ref() != Some(&report_target) { return; }
                 this.maintenance.last_run = match item {
                     Ok(serde_json::Value::Null) => LastRun::None,
                     Ok(value) => match model::decode_report(&value) {
@@ -316,18 +421,20 @@ impl SettingsView {
                     Err(_) => LastRun::Failed,
                 };
             });
-            self.maintenance.report_stream = stream.map(|stream| (connection, stream));
         }
-        if capabilities.database_storage == Some(true) && !self.maintenance.database_stream.as_ref().is_some_and(|(id, _)| *id == connection) {
-            let stream = self.subscribe(model::GET_DATABASE_STORAGE, json!({}), cx, |this, item, _| {
-                if let Ok(value) = item {
-                    this.maintenance.database = model::compaction_recommendation(&value);
-                    if this.maintenance.database.as_ref().is_some_and(|d| d.reclaim_failure.is_some()) {
-                        this.maintenance.reclaim_requested = false;
+        if capabilities.database_storage == Some(true) {
+            self.ensure_database_dismissals(cx);
+            if self.maintenance.database_stream.is_none() {
+                self.maintenance.database_stream = self.subscribe(model::GET_DATABASE_STORAGE, json!({}), cx, move |this, item, cx| {
+                    if this.maintenance_storage_target(cx).as_ref() != Some(&target) { return; }
+                    if let Ok(value) = item {
+                        this.maintenance.database = model::compaction_recommendation(&value);
+                        if this.maintenance.database.as_ref().is_some_and(|d| d.reclaim_failure.is_some()) {
+                            this.maintenance.reclaim_requested = false;
+                        }
                     }
-                }
-            });
-            self.maintenance.database_stream = stream.map(|stream| (connection, stream));
+                });
+            }
         }
         if self.maintenance.ticker.is_none() {
             self.maintenance.ticker = Some(cx.spawn(async move |this, cx| {
@@ -432,11 +539,19 @@ impl SettingsView {
             return vec![Block::new(&[], muted_text("Reconnect to change this environment's settings.", cx))];
         };
         self.ensure_maintenance_streams(&config, cx);
+        let scoped_configs = self.scoped_all_configs(cx);
         let settings = &config.settings;
         let unavailable = self.settings_unavailable(cx);
         let env_only = self.env_only_unavailable(cx);
         let connected = self.scoped_connected_now(cx);
         let view = cx.entity().downgrade();
+        let provider_checks = settings.maintenance.enable_provider_update_checks;
+        let provider_checks_mixed = scoped_configs.iter().any(|cfg| cfg.settings.maintenance.enable_provider_update_checks != provider_checks);
+        let continue_threads = settings.maintenance.continue_threads_after_server_update;
+        let keep_awake = settings.maintenance.keep_awake_while_agents_work;
+        let keep_awake_mixed = scoped_configs.iter().any(|cfg| cfg.settings.maintenance.keep_awake_while_agents_work != keep_awake);
+        let (continue_inheritance, continue_mixed) = self.switch_inheritance("continueThreadsAfterServerUpdate", continue_threads, true,
+            |settings| settings.maintenance.continue_threads_after_server_update, cx);
         let updates = section(
             "Updates",
             vec![
@@ -447,7 +562,8 @@ impl SettingsView {
                         .description("Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.")
                         .highlighted(self.is_target("provider-update-checks"))
                         .unavailable(row_unavail.clone())
-                        .reset(lock.is_none() && !settings.maintenance.enable_provider_update_checks, {
+                        .inheritance(environment_switch_inheritance(provider_checks, true, provider_checks_mixed, cx))
+                        .reset(lock.is_none() && (!provider_checks || provider_checks_mixed), {
                             let view = view.clone();
                             move |_, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
@@ -455,7 +571,7 @@ impl SettingsView {
                                 });
                             }
                         })
-                        .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).disabled(row_unavail.is_some()).on_change({
+                        .control(Switch::new("provider-update-checks-switch", provider_checks).mixed(provider_checks_mixed).disabled(row_unavail.is_some()).on_change({
                             let view = view.clone();
                             move |on, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
@@ -472,13 +588,14 @@ impl SettingsView {
                             .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
                             .when(!connected, |row| row.status("All selected connected environments must support restart continuation."))
                             .highlighted(self.is_target("continue-threads-after-server-update"))
+                            .inheritance(continue_inheritance)
                             .unavailable(unavailable.clone()),
                         &["continueThreadsAfterServerUpdate"],
-                        connected && !settings.maintenance.continue_threads_after_server_update,
+                        connected && (!continue_threads || continue_mixed),
                         ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()),
                         cx,
                     )
-                    .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected || continue_locked).on_change({
+                    .control(Switch::new("continue-threads-switch", continue_threads).mixed(continue_mixed).disabled(!connected || continue_locked || unavailable.is_some()).on_change({
                         let view = view.clone();
                         move |on, _, cx| {
                             let _ = view.update(cx, |this, cx| {
@@ -502,7 +619,8 @@ impl SettingsView {
                         .description("Stop the computer from going to sleep while agents are working, and let it sleep once they finish. Closing a laptop lid still puts it to sleep.")
                         .highlighted(self.is_target("keep-awake-while-agents-work"))
                         .unavailable(row_unavail.clone())
-                        .reset(lock.is_none() && !settings.maintenance.keep_awake_while_agents_work, {
+                        .inheritance(environment_switch_inheritance(keep_awake, true, keep_awake_mixed, cx))
+                        .reset(lock.is_none() && (!keep_awake || keep_awake_mixed), {
                             let view = view.clone();
                             move |_, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
@@ -511,7 +629,7 @@ impl SettingsView {
                             }
                         })
                         .control(
-                            Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).disabled(row_unavail.is_some()).on_change({
+                            Switch::new("keep-awake-while-agents-work-switch", keep_awake).mixed(keep_awake_mixed).disabled(row_unavail.is_some()).on_change({
                                 let view = view.clone();
                                 move |on, _, cx| {
                                     let _ = view.update(cx, |this, cx| {
@@ -575,7 +693,9 @@ impl SettingsView {
             Block::new(&["background-activity", "git-fetch-interval", "keep-awake-while-agents-work"], background),
             Block::new(&["usage-history-retention"], usage_history),
         ];
-        blocks.extend(self.storage_blocks(&config, env_only, window, cx));
+        if !self.is_project_scope(cx) {
+            blocks.extend(self.storage_blocks(&config, env_only, window, cx));
+        }
         let diagnostics = section(
             "Diagnostics",
             vec![
@@ -784,7 +904,7 @@ impl SettingsView {
                     this.child(
                         h_flex()
                             .gap(r(6.))
-                            .child(div().w(r(72.)).child(Input::new(self.maintenance.input(field)).small().disabled(disabled)))
+                            .child(div().w(r(116.)).child(NumberField::new(self.maintenance.input(field)).disabled(disabled)))
                             .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
                     )
                 } else {
@@ -828,7 +948,7 @@ impl SettingsView {
         if let Some(notice) = self.database_notice(config, cx) {
             blocks.push(Block::new(&["storage-database"], notice));
         }
-        if capabilities.storage_cleanup != Some(true) {
+        if self.scoped_all_configs(cx).iter().any(|cfg| cfg.environment.capabilities.storage_cleanup != Some(true)) {
             blocks.push(Block::new(
                 &["storage-artifacts"],
                 v_flex()
@@ -882,13 +1002,19 @@ impl SettingsView {
             div().id("storage-artifacts").rounded(r(12.)).when(highlighted, |this| this.bg(hsla(p.accent).opacity(0.3))).child(artifacts),
         ));
         if capabilities.storage_cleanup_run == Some(true) {
-            blocks.push(Block::new(&["storage-delete-now"], self.storage_cleanup_section(config, cx)));
+            let cleanup = if self.maintenance_storage_target(cx).is_some() {
+                self.storage_cleanup_section(config, cx)
+            } else {
+                section(t(cx, "Cleanup"), vec![Row::new("storage-delete-now", t(cx, "Delete now"))
+                    .description(t(cx, "Select one connected environment to run cleanup.")).into_any_element()], cx).into_any_element()
+            };
+            blocks.push(Block::new(&["storage-delete-now"], cleanup));
         }
         blocks
     }
 
     fn open_reclaim_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+        if !self.maintenance_may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
             return;
         }
         let focus = cx.focus_handle();
@@ -917,12 +1043,14 @@ impl SettingsView {
         self.maintenance.reclaim_requested = true;
         self.focus.focus(window, cx);
         let amount = storage.amount();
-        let label = self.environment_label(cx);
+        let label = self.scoped_raw_representative_config(cx).map(|cfg| cfg.environment.label).unwrap_or_default();
         let minutes = storage.reclaim_minutes();
-        let task = self.state.read(cx).rpc(model::RECLAIM_DATABASE_SPACE, json!({}));
+        let target = self.maintenance_storage_target(cx);
+        let task = self.scoped_rpc(ENVIRONMENT_MAINTAIN_SCOPE, model::RECLAIM_DATABASE_SPACE, json!({}), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.maintenance_storage_target(cx) != target { return; }
                 let toast = match result {
                     Ok(_) => Toast::new(ToastKind::Success, format!("Reclaiming {amount} on {label}"))
                         .description(format!("T3 Code there restarts and is back in about {minutes} min.")),
@@ -943,7 +1071,8 @@ impl SettingsView {
     fn reclaim_dialog_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let focus = self.maintenance.reclaim_confirming.clone()?;
         let storage = self.maintenance.database.as_ref()?;
-        let (title, description) = storage.reclaim_confirmation(&self.environment_label(cx));
+        let label = self.scoped_raw_representative_config(cx)?.environment.label;
+        let (title, description) = storage.reclaim_confirmation(&label);
         let footer = dialog_footer(
             false,
             vec![
@@ -979,19 +1108,28 @@ impl SettingsView {
 
     /// `DatabaseStorageNotice`: offers in-app Reclaim when supported & permitted, else `t3 doctor`.
     fn database_notice(&self, config: &ServerConfig, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if config.environment.capabilities.database_storage != Some(true) || cx.try_global::<DismissedDatabaseNotice>().is_some_and(|dismissed| dismissed.0) {
+        let dismissed = cx.try_global::<DismissedDatabaseNotice>()?;
+        let environment = &config.environment;
+        if environment.capabilities.database_storage != Some(true) || !dismissed.loaded
+            || dismissed.environments.contains(&environment.environment_id)
+        {
             return None;
         }
         let storage = self.maintenance.database.clone()?;
-        let reclaimable = storage.can_reclaim && self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx);
+        let reclaimable = storage.can_reclaim && self.maintenance_may(ENVIRONMENT_MAINTAIN_SCOPE, cx);
         let restarting = self.maintenance.reclaim_requested && storage.reclaim_failure.is_none();
         let command = storage.compact_command.clone();
-        let dismiss = Button::new("storage-database-dismiss", ButtonVariant::Ghost, ButtonSize::Xs).label("Dismiss").on_click(cx.listener(|_, _, _, cx| {
-            cx.set_global(DismissedDatabaseNotice(true));
-            cx.notify();
-        }));
+        let env_id = environment.environment_id.clone();
+        let dismiss = Button::new("storage-database-dismiss", ButtonVariant::Ghost, ButtonSize::Xs)
+            .label(t(cx, "Dismiss"))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let dismissed = cx.global_mut::<DismissedDatabaseNotice>();
+                dismissed.environments.insert(env_id.clone());
+                t3_client::store::save_ui_state(DATABASE_NOTICE_DISMISSALS, &dismissed.environments);
+                cx.notify();
+            }));
         let machine_row = if reclaimable {
-            Row::new("storage-database-machine", storage.title(&self.environment_label(cx)))
+            Row::new("storage-database-machine", storage.title(&environment.label))
                 .description(storage.reclaim_description())
                 .control(
                     h_flex()
@@ -1006,7 +1144,7 @@ impl SettingsView {
                 )
                 .into_any_element()
         } else {
-            Row::new("storage-database-machine", storage.title(&self.environment_label(cx)))
+            Row::new("storage-database-machine", storage.title(&environment.label))
                 .description_content(div().font_family(cx.theme().mono_font_family.clone()).child(command.clone()))
                 .control(
                     h_flex()
@@ -1031,7 +1169,7 @@ impl SettingsView {
     fn storage_cleanup_section(&mut self, config: &ServerConfig, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let has_rules = model::has_cleanup_rules(&config.settings);
-        let allowed = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let allowed = self.maintenance_may(SETTINGS_WRITE_SCOPE, cx);
         let pending = self.maintenance.cleanup_pending;
         let description = if has_rules { self.maintenance.last_run.description(now_ms()) } else { model::NO_RULES.to_owned() };
         let delete_now = Row::new("storage-delete-now", "Delete now").description(description).highlighted(self.is_target("storage-delete-now")).control(
@@ -1132,15 +1270,17 @@ impl SettingsView {
 
     /// Delete now: one manual run; failures it reports, or its own failure, show as toasts.
     fn run_storage_cleanup(&mut self, cx: &mut Context<Self>) {
-        if self.maintenance.cleanup_pending {
+        if self.maintenance.cleanup_pending || !self.maintenance_may(SETTINGS_WRITE_SCOPE, cx) {
             return;
         }
         self.maintenance.cleanup_pending = true;
-        let label = self.environment_label(cx);
-        let task = self.state.read(cx).rpc(model::RUN_STORAGE_CLEANUP, json!({}));
+        let label = self.scoped_raw_representative_config(cx).map(|cfg| cfg.environment.label).unwrap_or_default();
+        let target = self.maintenance_storage_target(cx);
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, model::RUN_STORAGE_CLEANUP, json!({}), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.maintenance_storage_target(cx) != target { return; }
                 this.maintenance.cleanup_pending = false;
                 let toast = match result {
                     Ok(reply) => model::decode_report(&reply).and_then(|report| {
@@ -1159,6 +1299,16 @@ impl SettingsView {
         .detach();
         cx.notify();
     }
+}
+
+fn environment_switch_inheritance(value: bool, default: bool, mixed: bool, cx: &App) -> SettingInheritance {
+    let provided = value != default;
+    let flag = |on| t(cx, if on { "On" } else { "Off" }).into();
+    let summary = if mixed { "Mixed across selected machines" } else if provided { "Environment" } else { "Default" };
+    SettingInheritance::new(t(cx, summary), vec![
+        SettingInheritanceLayer::new(SettingSource::Environment, provided.then(|| flag(value)), provided && !mixed),
+        SettingInheritanceLayer::new(SettingSource::Default, Some(flag(default)), !provided && !mixed),
+    ]).mixed(mixed)
 }
 
 #[cfg(all(test, feature = "snapshot"))]

@@ -20,12 +20,15 @@ use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::keybindings::KeybindingWhenNode;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
+use t3_core::server_config::ServerConfigState;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::settings::keybindings::{self as model, BindingRow, SERVER_REMOVE_KEYBINDING, SERVER_UPSERT_KEYBINDING, WhenEdit, WhenOperator};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ModalLayout, Select, SelectOption, focus_ring, group, icon, muted_text, r, section, section_title};
 use super::{Block, SettingsView, store};
 use crate::app_state::{AppEvent, Phase};
 use crate::composer::controls::{floating_shadow, kbd};
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -72,7 +75,15 @@ struct Catalog {
     commands: Rc<Vec<String>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ScopeTarget {
+    owners: Vec<EnvironmentOwner>,
+    primary: Option<EnvironmentOwner>,
+    active_connection: Option<u64>,
+}
+
 pub(crate) struct KeybindingsState {
+    scope: Option<ScopeTarget>,
     pub(crate) filter: Entity<InputState>,
     /// The expression field of the open when builder.
     pub(crate) when_input: Entity<InputState>,
@@ -121,6 +132,7 @@ impl KeybindingsState {
             }),
         ];
         KeybindingsState {
+            scope: None,
             filter,
             when_input,
             focus: HashMap::new(),
@@ -228,16 +240,48 @@ impl SettingsView {
         false
     }
 
+    fn keybinding_scope(&self, cx: &App) -> ScopeTarget {
+        ScopeTarget {
+            owners: self.scoped_environment_owners(cx),
+            primary: self.scoped_primary_owner(cx),
+            active_connection: self.state.read(cx).connection_id(),
+        }
+    }
+
+    fn scoped_keymap<'a>(&self, cx: &'a App) -> Option<&'a ServerConfigState> {
+        let app = self.state.read(cx);
+        if let Some(owner) = self.scoped_primary_owner(cx) {
+            if app.environments.active.as_deref() == Some(owner.saved_id.as_str()) {
+                return Some(&app.server_config);
+            }
+            return app.scoped_environment(&owner.saved_id).map(|entry| &entry.config);
+        }
+        (self.scope.machine.is_none() && self.scope.project.is_none()).then_some(&app.server_config)
+    }
+
     fn connected(&self, cx: &App) -> bool {
-        matches!(self.state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
+        self.scoped_keymap(cx).is_some()
+            && if self.scoped_primary_owner(cx).is_some() {
+                self.scoped_connected_now(cx)
+            } else {
+                matches!(self.state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
+            }
     }
 
     fn can_write_keybindings(&self, cx: &App) -> bool {
-        self.connected(cx) && self.may(SETTINGS_WRITE_SCOPE, cx)
+        if !self.connected(cx) {
+            return false;
+        }
+        let owners = self.scoped_environment_owners(cx);
+        if owners.is_empty() {
+            return self.may(SETTINGS_WRITE_SCOPE, cx);
+        }
+        owners.iter().all(|owner| self.state.read(cx).scoped_ready(owner, SETTINGS_WRITE_SCOPE))
     }
 
     fn can_open_keybindings_file(&self, cx: &App) -> bool {
-        self.connected(cx) && self.may(ORCHESTRATION_OPERATE_SCOPE, cx) && self.keybindings_file_target(cx).is_some()
+        self.connected(cx) && self.scoped_session(cx).is_none_or(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE))
+            && self.keybindings_file_target(cx).is_some()
     }
 
     /// `captureKeybinding`: a focused shortcut field takes every chord; Escape restores the saved
@@ -429,48 +473,111 @@ impl SettingsView {
         self.send_keybinding(SERVER_REMOVE_KEYBINDING, model::remove_payload(row), row.command.clone(), Some(row.id.clone()), "Unable to remove keybinding", cx);
     }
 
-    /// Sends one keymap write; its reply installs the new keymap before the config stream repeats it.
     fn send_keybinding(&mut self, method: &'static str, payload: Value, command: String, done: Option<String>, failure: &'static str, cx: &mut Context<Self>) {
+        let target = self.keybinding_scope(cx);
+        if self.keybindings.scope.as_ref().is_some_and(|scope| *scope != target)
+            || self.keybindings.saving.is_some() || !self.can_write_keybindings(cx)
+        {
+            return;
+        }
         store::clear_error(cx);
         self.keybindings.saving = Some(command);
-        let (sent_at, conn_id, task) = {
-            let state = self.state.read(cx);
-            (state.server_config.keybindings_revision(), state.connection_id(), state.rpc(method, payload))
-        };
         let state = self.state.clone();
+        let app = state.read(cx);
+        let active_revision = app.server_config.keybindings_revision();
+        let fallback = target.owners.is_empty().then(|| app.rpc(method, payload.clone()));
+        let lookups = target.owners.iter().filter_map(|owner| {
+            let entry = app.scoped_environment(&owner.saved_id)?;
+            Some((app.connections.destination(owner, SETTINGS_WRITE_SCOPE), entry.keybindings_revision, entry.summary.owner.saved_id.clone()))
+        }).collect::<Vec<_>>();
+        let runtime = app.runtime().clone();
+        let failure = t(cx, failure).to_owned();
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let mut error = None;
+            let mut primary_reply = None;
+            if let Some(task) = fallback {
+                match task.await {
+                    Ok(reply) => primary_reply = Some(reply),
+                    Err(failed) => error = Some(failed.to_string()),
+                }
+            } else {
+                let mut destinations = Vec::with_capacity(lookups.len());
+                for (lookup, revision, label) in lookups {
+                    match lookup.await {
+                        Ok(destination) => destinations.push((destination, revision, label)),
+                        Err(failed) => {
+                            error = Some(format!("{label}: {failed:?}"));
+                            break;
+                        }
+                    }
+                }
+                if error.is_none() {
+                    for (destination, revision, label) in destinations {
+                        let view = cx.update(|cx| state.read(cx).connections.view());
+                        if !destination.is_current(&view.borrow())
+                            || !destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(SETTINGS_WRITE_SCOPE))
+                        {
+                            error.get_or_insert_with(|| cx.update(|cx| t(cx, "A shortcut destination changed. Try again.").to_owned()));
+                            continue;
+                        }
+                        let client = destination.client.clone();
+                        let payload = payload.clone();
+                        match runtime.spawn(async move { client.request(method, payload).await }).await {
+                            Ok(Ok(reply)) => {
+                                let apply = cx.update(|cx| state.read(cx).connections.apply_keybindings_reply(&destination.owner, reply.clone(), revision));
+                                let _ = apply.await;
+                                cx.update(|cx| state.update(cx, |app, cx| {
+                                    if app.connection_id() == target.active_connection
+                                        && app.environments.active.as_deref() == Some(destination.owner.saved_id.as_str())
+                                        && destination.is_current(&app.connections.view().borrow())
+                                        && app.server_config.apply_keybindings_reply(&reply, active_revision)
+                                    {
+                                        app.sync_server_config(cx);
+                                        cx.emit(AppEvent::ServerConfig);
+                                    }
+                                }));
+                                if target.primary.as_ref() == Some(&destination.owner) {
+                                    primary_reply = Some(reply);
+                                }
+                            }
+                            Ok(Err(failed)) => { error.get_or_insert_with(|| format!("{label}: {failed}")); }
+                            Err(failed) => { error.get_or_insert_with(|| format!("{label}: {failed}")); }
+                        }
+                    }
+                }
+            }
             let _ = this.update(cx, |this, cx| {
+                if this.keybinding_scope(cx) != target {
+                    return;
+                }
                 this.keybindings.saving = None;
-                match result {
-                    Ok(reply) => {
-                        let issue = model::keybinding_issue_message(&reply);
+                if let Some(reply) = primary_reply {
+                    if target.owners.is_empty() {
                         state.update(cx, |state, cx| {
-                            if state.server_config.apply_keybindings_reply(&reply, sent_at) {
+                            if state.server_config.apply_keybindings_reply(&reply, active_revision) {
                                 state.sync_server_config(cx);
                                 cx.emit(AppEvent::ServerConfig);
                             }
                         });
-                        if this.state.read(cx).connection_id() == conn_id {
-                            this.keybindings.config_issue = issue.clone();
-                            this.keybindings.config_issue_connection = issue.as_ref().and(conn_id);
-                            this.keybindings.config_issue_revision =
-                                issue.as_ref().map(|_| this.state.read(cx).server_config.keybindings_revision());
-                        }
-                        if let Some(id) = done {
-                            if id == NEW_ROW {
-                                this.keybindings.adding = false;
-                                this.keybindings.new_command = None;
-                            }
-                            this.keybindings.drafts.remove(&id);
-                        }
                     }
-                    Err(error) => store::show_error(format!("{failure}: {error}"), cx),
+                    let issue = model::keybinding_issue_message(&reply);
+                    let revision = this.scoped_keymap(cx).map(ServerConfigState::keybindings_revision);
+                    this.keybindings.config_issue_connection = issue.as_ref().and(target.active_connection);
+                    this.keybindings.config_issue_revision = issue.as_ref().and(revision);
+                    this.keybindings.config_issue = issue;
+                }
+                if let Some(error) = error {
+                    store::show_error(format!("{failure}: {error}"), cx);
+                } else if let Some(id) = done {
+                    if id == NEW_ROW {
+                        this.keybindings.adding = false;
+                        this.keybindings.new_command = None;
+                    }
+                    this.keybindings.drafts.remove(&id);
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
         cx.notify();
     }
 
@@ -479,7 +586,7 @@ impl SettingsView {
             return;
         }
         let Some((path, editor)) = self.keybindings_file_target(cx) else { return };
-        let task = self.state.read(cx).rpc(OPEN_IN_EDITOR, open_in_editor_request(&path, editor));
+        let task = self.scoped_rpc(ORCHESTRATION_OPERATE_SCOPE, OPEN_IN_EDITOR, open_in_editor_request(&path, editor), cx);
         cx.spawn(async move |this, cx| {
             if let Err(error) = task.await {
                 let _ = this.update(cx, |_, cx| store::show_error(format!("Unable to open keybindings file: {error}"), cx));
@@ -489,7 +596,7 @@ impl SettingsView {
     }
 
     fn keybindings_file_target(&self, cx: &App) -> Option<(String, &'static str)> {
-        let config = self.state.read(cx).server_config.config.as_ref()?;
+        let config = self.scoped_keymap(cx)?.config.as_ref()?;
         let path = config.keybindings_config_path.clone().filter(|path| !path.is_empty())?;
         preferred_editor(&config.available_editors, None).map(|(editor, _)| (path, editor))
     }
@@ -504,9 +611,10 @@ impl SettingsView {
             self.keybindings.config_issue_revision = None;
             return;
         }
-        let rev = state.server_config.keybindings_revision();
-        if let Some(live) = state.server_config.config.as_ref().and_then(|config| config.keybindings_issue_message()) {
-            self.keybindings.config_issue = Some(live.to_owned());
+        let Some(keymap) = self.scoped_keymap(cx) else { return };
+        let rev = keymap.keybindings_revision();
+        if let Some(live) = keymap.config.as_ref().and_then(|config| config.keybindings_issue_message().map(str::to_owned)) {
+            self.keybindings.config_issue = Some(live);
             self.keybindings.config_issue_connection = conn_id;
             self.keybindings.config_issue_revision = Some(rev);
             return;
@@ -519,8 +627,23 @@ impl SettingsView {
     }
 
     pub(super) fn keybindings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        static NONE: Value = Value::Null;
-        let keybindings = self.state.read(cx).server_config.config.as_ref().map_or(&NONE, |config| &config.keybindings);
+        let scope = self.keybinding_scope(cx);
+        if self.keybindings.scope.as_ref() != Some(&scope) {
+            self.keybindings.scope = Some(scope);
+            self.keybindings.drafts.clear();
+            self.keybindings.focus.clear();
+            self.keybindings.adding = false;
+            self.keybindings.new_command = None;
+            self.keybindings.recording = None;
+            self.keybindings.armed = false;
+            self.keybindings.when_open = None;
+            self.keybindings.menu = None;
+            self.keybindings.saving = None;
+            self.keybindings.config_issue = None;
+            self.keybindings.config_issue_connection = None;
+            self.keybindings.config_issue_revision = None;
+        }
+        let keybindings = self.scoped_keymap(cx).and_then(|state| state.config.as_ref()).map_or(&Value::Null, |config| &config.keybindings);
         self.keybindings.refresh(keybindings);
         // A field left by Tab or a click re-arms when focused again.
         if let Some(id) = self.keybindings.recording.clone()

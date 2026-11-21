@@ -11,7 +11,7 @@ pub(super) struct MonitorState {
     history_task: Option<Task<()>>,
     retry: Query<()>,
     stream: Option<Task<()>>,
-    connection: Option<u64>,
+    connection: Option<DiagnosticTarget>,
     collapsed: HashSet<Identity>,
     signaling: HashSet<Identity>,
     fixture: bool,
@@ -52,7 +52,7 @@ impl SettingsView {
             }
             return;
         }
-        let connection = self.state.read(cx).connection_id();
+        let connection = self.diagnostic_target(cx);
         if self.diagnostics.monitor.connection == connection {
             return;
         }
@@ -62,20 +62,21 @@ impl SettingsView {
     }
 
     fn start_resource_subscription(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let connection = state.connection_id();
-        let Some(handle) = state.client_handle() else {
-            return;
-        };
-        let mut stream = client::subscribe(state.runtime(), handle);
-        self.diagnostics.monitor.connection = connection;
+        let target = self.diagnostic_target(cx);
+        let runtime = self.state.read(cx).runtime().clone();
+        let handle = self.diagnostic_client(DIAGNOSTICS_READ, cx);
+        self.diagnostics.monitor.connection = target.clone();
         self.diagnostics.monitor.stream = Some(cx.spawn(async move |this, cx| {
+            let Some(handle) = handle.await else { return };
+            let mut stream = client::subscribe(&runtime, handle);
             while stream.feed.changed().await.is_ok() {
                 let feed = stream.feed.borrow_and_update().clone();
                 if this
                     .update(cx, |this, cx| {
-                        this.diagnostics.monitor.feed = feed;
-                        cx.notify();
+                        if this.diagnostic_target_current(&target, cx) {
+                            this.diagnostics.monitor.feed = feed;
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -96,17 +97,19 @@ impl SettingsView {
             }
             return;
         }
-        let state = self.state.read(cx);
-        let Some(handle) = state.client_handle() else {
-            self.diagnostics.monitor.history.query.finish(request, Err("The connection closed. Try again once it reconnects.".into()));
-            return;
-        };
+        let target = self.diagnostic_target(cx);
+        let runtime = self.state.read(cx).runtime().clone();
+        let handle = self.diagnostic_client(DIAGNOSTICS_READ, cx);
         let window = monitor::HISTORY_WINDOWS[self.diagnostics.monitor.history.selected];
-        let mut request_task = client::start_history(state.runtime(), handle, window);
+        let closed = t(cx, "The connection closed. Try again once it reconnects.").to_owned();
         self.diagnostics.monitor.history_task = Some(cx.spawn(async move |this, cx| {
-            let result = request_task.result().await;
+            let result = if let Some(handle) = handle.await {
+                client::start_history(&runtime, handle, window).result().await
+            } else {
+                Err(closed)
+            };
             let _ = this.update(cx, |this, cx| {
-                if this.diagnostics.monitor.history.query.finish(request, result) {
+                if this.diagnostic_target_current(&target, cx) && this.diagnostics.monitor.history.query.finish(request, result) {
                     cx.notify();
                 }
             });
@@ -124,18 +127,22 @@ impl SettingsView {
     }
 
     fn retry_monitor(&mut self, cx: &mut Context<Self>) {
-        if !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || !self.may("diagnostics:read", cx) || self.diagnostics.monitor.retry.pending || self.diagnostics.monitor.fixture {
+        if !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || !self.diagnostic_may(DIAGNOSTICS_READ, cx) || self.diagnostics.monitor.retry.pending || self.diagnostics.monitor.fixture {
             return;
         }
-        let state = self.state.read(cx);
-        let Some(handle) = state.client_handle() else {
-            return;
-        };
-        let task = state.runtime().spawn(async move { client::retry(&handle).await });
+        let target = self.diagnostic_target(cx);
+        let runtime = self.state.read(cx).runtime().clone();
+        let handle = self.diagnostic_client(DIAGNOSTICS_READ, cx);
         let request = self.diagnostics.monitor.retry.begin();
+        let closed = t(cx, "The connection closed. Try again once it reconnects.").to_owned();
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = if let Some(handle) = handle.await {
+                runtime.spawn(async move { client::retry(&handle).await }).await.unwrap_or_else(|error| Err(error.to_string()))
+            } else {
+                Err(closed)
+            };
             let _ = this.update(cx, |this, cx| {
+                if !this.diagnostic_target_current(&target, cx) { return; }
                 let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
                 if !this.diagnostics.monitor.retry.finish(request, outcome) {
                     return;
@@ -157,10 +164,10 @@ impl SettingsView {
     /// `signalProcess` in `ResourceTelemetryDiagnostics.tsx`: SIGKILL asks first; per-identity
     /// pending guard and connection-epoch check prevent duplicate or cross-environment signals.
     fn request_monitor_signal(&mut self, identity: Identity, signal: Signal, cx: &mut Context<Self>) {
-        if !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || self.diagnostics.monitor.signaling.contains(&identity) {
+        if !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || self.diagnostics.monitor.signaling.contains(&identity) {
             return;
         }
-        let connection = self.diagnostics.monitor.connection;
+        let connection = self.diagnostic_target(cx);
         self.diagnostics.monitor.signaling.insert(identity.clone());
         cx.notify();
         if signal == Signal::Kill {
@@ -177,7 +184,7 @@ impl SettingsView {
                     // Defer so `AppState` is no longer borrowed by `ConfirmDialog::resolve`.
                     cx.defer(move |cx| {
                         let _ = confirm_view.update(cx, |this, cx| {
-                            if this.diagnostics.monitor.connection != connection || !this.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+                            if !this.diagnostic_target_current(&connection, cx) || !this.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
                                 this.diagnostics.monitor.signaling.remove(&confirm_id);
                                 cx.notify();
                                 return;
@@ -205,17 +212,18 @@ impl SettingsView {
         self.send_monitor_signal(identity, signal, connection, cx);
     }
 
-    fn send_monitor_signal(&mut self, identity: Identity, signal: Signal, connection: Option<u64>, cx: &mut Context<Self>) {
-        if self.diagnostics.monitor.connection != connection || !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+    fn send_monitor_signal(&mut self, identity: Identity, signal: Signal, connection: Option<DiagnosticTarget>, cx: &mut Context<Self>) {
+        if !self.diagnostic_target_current(&connection, cx) || !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
             self.diagnostics.monitor.signaling.remove(&identity);
             cx.notify();
             return;
         }
         let payload = monitor::signal_payload(&identity, signal.as_str());
-        let task = self.state.read(cx).rpc(model::SIGNAL_PROCESS, payload);
+        let task = self.scoped_rpc(model::ENVIRONMENT_MAINTAIN_SCOPE, model::SIGNAL_PROCESS, payload, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if !this.diagnostic_target_current(&connection, cx) { return; }
                 this.diagnostics.monitor.signaling.remove(&identity);
                 let toast = match result {
                     Err(error) => Some(
@@ -461,7 +469,7 @@ impl SettingsView {
                         div()
                             .text_size(r(11.))
                             .text_color(hsla(p.muted_foreground))
-                            .child("Power, idle, lock, and thermal state are supplied by the desktop host. Process telemetry remains fully active in this browser session."),
+                            .child(t(cx, "Power, idle, lock, and thermal state are supplied by the desktop host. Process telemetry remains available here.")),
                     )
                     .into_any_element(),
             );
@@ -478,7 +486,7 @@ impl SettingsView {
                         .border_color(hsla(p.border).opacity(0.5))
                         .child(h_flex().justify_between().gap(r(8.)).child(div().text_sm().child(label)).child(Self::monitor_status("", source.status, desktop_only, cx)))
                         .child(div().text_size(r(11.)).text_color(hsla(p.muted_foreground)).child(if desktop_only {
-                            "Available when this page runs inside the desktop app.".into()
+                            t(cx, "Available in the Electron desktop app.").into()
                         } else {
                             source.last_error.clone().unwrap_or_else(|| "No reported errors".into())
                         }))
@@ -506,7 +514,7 @@ impl SettingsView {
         let actions = monitor::should_show_retry(snapshot.map(|s| s.health.native.status), self.diagnostics.monitor.feed.error.as_deref()).then(|| {
             Button::new("retry-resource-monitor", ButtonVariant::Outline, ButtonSize::Xs)
                 .label("Retry monitor")
-                .disabled(self.diagnostics.monitor.retry.pending || !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx))
+                .disabled(self.diagnostics.monitor.retry.pending || !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.retry_monitor(cx)))
                 .into_any_element()
         });
@@ -786,7 +794,7 @@ impl SettingsView {
                 let identity = process.identity.clone();
                 let int_id = identity.clone();
                 let kill_id = identity.clone();
-                let disabled = !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || state.signaling.contains(&identity);
+                let disabled = !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || state.signaling.contains(&identity);
                 Self::cell(kill_width, true).flex_none().pr(r(16.)).child(
                     h_flex()
                         .gap(r(6.))

@@ -13,7 +13,9 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Map, Value, json};
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::device::hosts::SecretValue;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::issues::wire::{
     IssueTrackerBindProjectInput, IssueTrackerConnectInput, IssueTrackerConnection, IssueTrackerConnectionList,
     IssueTrackerKind, IssueTrackerProjectBinding, method as issue_method,
@@ -31,9 +33,11 @@ use super::controls::{
     Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, muted_text, r, section, section_title, tooltip,
 };
 use super::projects::SETTINGS_WRITE_SCOPE;
-use super::threads::{model_options, parse_selection, selection_label, selection_value};
+use super::threads::{model_options, model_trait_controls, parse_selection, selection_label, selection_value};
 use super::worktrees::advanced;
 use super::{Block, SettingsView, store};
+use crate::components::secret_source::SecretSourceInput;
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -85,7 +89,7 @@ pub(super) fn titled(title: impl Into<SharedString>, action: Option<AnyElement>,
 enum SignInState {
     #[default]
     Idle,
-    Starting,
+    Starting { seq: u64 },
     Waiting { seq: u64, prompt: SignInPrompt },
     Failed(String),
 }
@@ -115,17 +119,19 @@ struct IssueTrackerDraft {
     _subscription: Subscription,
 }
 
+type SourceTarget = (Option<EnvironmentOwner>, Option<u64>);
+
 pub(crate) struct SourceControlState {
     pub(crate) custom_instructions: Entity<TextareaState>,
     pub(crate) review_instructions: Entity<TextareaState>,
     /// The last scan, kept across visits; `None` until one answers.
     discovery: Option<Result<Discovery, String>>,
     /// Which connection the scan belongs to, so a reconnect scans again.
-    scanned_for: Option<u64>,
+    scanned_for: Option<SourceTarget>,
     scanning: bool,
     /// Standalone issue trackers (`issueTrackers.list`, `pingdotgg/t3code#19274`).
     trackers: Option<Result<IssueTrackerConnectionList, String>>,
-    trackers_for: Option<(Option<String>, Option<u64>)>,
+    trackers_for: Option<SourceTarget>,
     trackers_loading: bool,
     trackers_expanded: HashSet<String>,
     tracker_drafts: HashMap<String, IssueTrackerDraft>,
@@ -223,12 +229,6 @@ fn stop_slash_shortcut(event: &KeyDownEvent, _: &mut Window, cx: &mut App) {
     }
 }
 
-fn secret_source_options(config: &ServerConfig) -> Vec<SelectOption> {
-    std::iter::once(SelectOption::new(STORED_SECRET, "Stored secret"))
-        .chain(config.settings.secret_providers.0.iter().map(|provider| SelectOption::new(provider.id.clone(), provider.label.clone())))
-        .collect()
-}
-
 fn secret_placeholder(source: &str, configured: bool, fallback: &str) -> String {
     if source != STORED_SECRET {
         "op://Vault/Item/field".to_owned()
@@ -297,12 +297,14 @@ impl SettingsView {
     }
 
     fn save_source_control_and_rescan(&self, change: SourceControlChange, on_settled: impl FnOnce(&mut Self, Option<String>, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        let target = self.issue_tracker_scope_key(cx);
         let view = cx.entity().downgrade();
         self.update_scoped_single_env_then(
             change.into_server(),
             move |error, cx| {
                 cx.defer(move |cx| {
                     let _ = view.update(cx, |this, cx| {
+                        if this.issue_tracker_scope_key(cx) != target { return; }
                         let ok = error.is_none();
                         on_settled(this, error, cx);
                         if ok {
@@ -317,6 +319,7 @@ impl SettingsView {
     }
 
     fn commit_custom_instructions(&mut self, cx: &mut Context<Self>) {
+        if self.source_control.scanned_for != self.issue_tracker_scope_key(cx) { return; }
         let value = self.source_control.custom_instructions.read(cx).value().trim().to_owned();
         let saved = self.scoped_representative_config(cx).map(|config| config.settings.source_control.source_control_writing_style.custom_instructions);
         if saved.is_some_and(|saved| saved != value) {
@@ -325,6 +328,7 @@ impl SettingsView {
     }
 
     fn commit_review_instructions(&mut self, cx: &mut Context<Self>) {
+        if self.source_control.scanned_for != self.issue_tracker_scope_key(cx) { return; }
         let value = self.source_control.review_instructions.read(cx).value().trim().to_owned();
         let saved = self.scoped_representative_config(cx).map(|config| config.settings.source_control.review_guide_instructions);
         if saved.is_some_and(|saved| saved != value) {
@@ -342,11 +346,11 @@ impl SettingsView {
     }
 
     /// `issueTrackerEnvironment.connections` (`issueTrackers.list`, `pingdotgg/t3code#19274`).
-    fn issue_tracker_scope_key(&self, cx: &App) -> Option<(Option<String>, Option<u64>)> {
+    fn issue_tracker_scope_key(&self, cx: &App) -> Option<SourceTarget> {
         let app = self.state.read(cx);
-        let owner = self.scoped_primary_owner(cx).map(|o| o.saved_id);
+        let owner = self.scoped_primary_owner(cx);
         let connection = app.connection_id();
-        if owner.is_none() && connection.is_none() {
+        if owner.is_none() && (connection.is_none() || self.scope.machine.is_some() || self.scope.project.is_some()) {
             return None;
         }
         Some((owner, connection))
@@ -537,7 +541,11 @@ impl SettingsView {
             let app = self.state.read(cx);
             let scoped_owner = self.scoped_primary_owner(cx);
             let active_id = app.environments.active.as_deref();
-            if let Some(owner) = scoped_owner
+            if self.is_project_scope(cx) {
+                self.scoped_project_members(cx).into_iter()
+                    .filter(|project| scoped_owner.as_ref() == Some(&project.owner))
+                    .map(|project| (project.project.id, project.project.title)).collect()
+            } else if let Some(owner) = scoped_owner
                 && active_id != Some(owner.saved_id.as_str())
             {
                 app.fleet
@@ -834,22 +842,31 @@ impl SettingsView {
 
     /// `sourceControlEnvironment.discovery`, run when the page opens on a connection and on Rescan.
     pub(super) fn scan_source_control(&mut self, force: bool, cx: &mut Context<Self>) {
-        let connection = self.state.read(cx).connection_id();
-        if self.source_control.scanning || (!force && connection.is_some() && self.source_control.scanned_for == connection) {
+        let target = self.issue_tracker_scope_key(cx);
+        if self.source_control.scanned_for != target {
+            self.source_control.scanned_for = target.clone();
+            self.source_control.discovery = None;
+            self.source_control.scanning = false;
+            self.source_control.token_editors.clear();
+            self.source_control.generic_editors.clear();
+            self.source_control.revealed_accounts.clear();
+            self.source_control.accounts_revealed.clear();
+            self.source_control.sign_in.clear();
+        }
+        if target.is_none() || self.source_control.scanning || (!force && self.source_control.discovery.is_some()) {
             return;
         }
-        let Some(task) = self.state.read(cx).request(DISCOVER, json!({}), |value| Ok(decode_discovery(&value))) else { return };
+        let task = self.scoped_rpc(ORCHESTRATION_READ_SCOPE, DISCOVER, json!({}), cx);
         self.source_control.scanning = true;
-        self.source_control.scanned_for = connection;
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = task.await.map(|value| decode_discovery(&value)).map_err(|error| error.to_string());
             let _ = this.update(cx, |this, cx| {
+                if this.issue_tracker_scope_key(cx) != target { return; }
                 this.source_control.scanning = false;
                 this.source_control.discovery = Some(result);
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
         cx.notify();
     }
 
@@ -977,40 +994,39 @@ impl SettingsView {
     fn start_app_sign_in(&mut self, kind: String, host: String, cx: &mut Context<Self>) {
         self.source_control.sign_in_seq += 1;
         let seq = self.source_control.sign_in_seq;
-        self.source_control.sign_in.insert(kind.clone(), SignInState::Starting);
+        self.source_control.sign_in.insert(kind.clone(), SignInState::Starting { seq });
         cx.notify();
         let payload = json!({ "provider": kind, "host": host });
-        let Some(start_task) = self.state.read(cx).request(SIGN_IN_START, payload.clone(), |v| decode_sign_in_prompt(&v)) else {
-            self.source_control.sign_in.insert(kind, SignInState::Failed("Not connected to server.".into()));
-            cx.notify();
-            return;
-        };
-        let state = self.state.clone();
+        let target = self.issue_tracker_scope_key(cx);
+        let start_task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, SIGN_IN_START, payload.clone(), cx);
         cx.spawn(async move |this, cx| {
-            let started = start_task.await.unwrap_or_else(|e| Err(e.to_string()));
-            let prompt = match started {
-                Ok(prompt) => prompt,
-                Err(message) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.source_control.sign_in.insert(kind, SignInState::Failed(message));
-                        cx.notify();
-                    });
-                    return;
+            let started = start_task.await.map_err(|error| error.to_string()).and_then(|value| decode_sign_in_prompt(&value));
+            let Ok(Some(wait_task)) = this.update(cx, |this, cx| {
+                if this.issue_tracker_scope_key(cx) != target
+                    || !matches!(this.source_control.sign_in.get(&kind), Some(SignInState::Starting { seq: active }) if *active == seq)
+                {
+                    return None;
                 }
-            };
-            let wait_task = state.read_with(cx, |app, _| app.request(SIGN_IN_WAIT, payload, |_| Ok(())));
-            let _ = this.update(cx, |this, cx| {
-                this.source_control.sign_in.insert(kind.clone(), SignInState::Waiting { seq, prompt: prompt.clone() });
-                cx.notify();
-            });
-            let Some(wait_task) = wait_task else { return };
-            let finished = wait_task.await.unwrap_or_else(|e| Err(e.to_string()));
+                match started {
+                    Ok(prompt) => {
+                        this.source_control.sign_in.insert(kind.clone(), SignInState::Waiting { seq, prompt });
+                        cx.notify();
+                        Some(this.scoped_rpc(SETTINGS_WRITE_SCOPE, SIGN_IN_WAIT, payload, cx))
+                    }
+                    Err(message) => {
+                        this.source_control.sign_in.insert(kind.clone(), SignInState::Failed(message));
+                        cx.notify();
+                        None
+                    }
+                }
+            }) else { return };
+            let finished = wait_task.await.map(|_| ()).map_err(|error| error.to_string());
             let _ = this.update(cx, |this, cx| {
                 let still_waiting = matches!(
                     this.source_control.sign_in.get(&kind),
                     Some(SignInState::Waiting { seq: active_seq, .. }) if *active_seq == seq
                 );
-                if !still_waiting {
+                if this.issue_tracker_scope_key(cx) != target || !still_waiting {
                     return;
                 }
                 match finished {
@@ -1030,17 +1046,17 @@ impl SettingsView {
 
     fn cancel_app_sign_in(&mut self, kind: String, host: String, cx: &mut Context<Self>) {
         self.source_control.sign_in.insert(kind.clone(), SignInState::Idle);
-        if let Some(task) = self.state.read(cx).request(SIGN_IN_CANCEL, json!({ "provider": kind, "host": host }), |_| Ok(())) {
-            cx.spawn(async move |_, _| {
-                let _ = task.await;
-            })
-            .detach();
-        }
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, SIGN_IN_CANCEL, json!({ "provider": kind, "host": host }), cx);
+        cx.spawn(async move |_, _| {
+            let _ = task.await;
+        }).detach();
         cx.notify();
     }
 
     pub(super) fn source_control_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let Some(config) = self.scoped_representative_config(cx) else {
+        let scoped = self.scope.machine.is_some() || self.scope.project.is_some();
+        let target = self.issue_tracker_scope_key(cx);
+        let Some(config) = self.scoped_representative_config(cx).filter(|_| !scoped || target.is_some()) else {
             return vec![Block::new(
                 &["source-control"],
                 section(
@@ -1093,8 +1109,14 @@ impl SettingsView {
         };
         let merge_view = view.clone();
         let method = config.settings.pull_request_merge_method;
-        let auto_pull_locked = self.managed_setting_lock(&["defaultAutoPull"], cx).is_some();
-        let credits_locked = self.managed_setting_lock(&["removeAgentCreditsOnMerge"], cx).is_some();
+        let (auto_pull_inheritance, auto_pull_mixed) = self.switch_inheritance(
+            "defaultAutoPull", settings.default_auto_pull, false, |settings| settings.source_control.default_auto_pull, cx,
+        );
+        let (credits_inheritance, credits_mixed) = self.switch_inheritance(
+            "removeAgentCreditsOnMerge", settings.remove_agent_credits_on_merge, false, |settings| settings.source_control.remove_agent_credits_on_merge, cx,
+        );
+        let auto_pull_locked = self.managed_setting_lock(&["defaultAutoPull"], cx).is_some() || self.settings_unavailable(cx).is_some();
+        let credits_locked = self.managed_setting_lock(&["removeAgentCreditsOnMerge"], cx).is_some() || self.settings_unavailable(cx).is_some();
         let merge_locked = self.managed_setting_lock(&["pullRequestMergeMethod"], cx).is_some();
         section(
             "Repositories",
@@ -1102,24 +1124,24 @@ impl SettingsView {
                 self.apply_scoped_reset(
                     Row::new("automatic-pull", "Automatically pull")
                         .description("Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.")
-                        .highlighted(self.is_target("automatic-pull")),
+                        .highlighted(self.is_target("automatic-pull")).inheritance(auto_pull_inheritance),
                     &["defaultAutoPull"],
                     settings.default_auto_pull,
                     SourceControlChange::AutoPull(false).into_server(),
                     cx,
                 )
-                .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull).disabled(auto_pull_locked))
+                .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull).mixed(auto_pull_mixed).disabled(auto_pull_locked))
                 .into_any_element(),
                 self.apply_scoped_reset(
                     Row::new("remove-agent-credits-on-merge", "Remove agent credits when merging")
                         .description("Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.")
-                        .highlighted(self.is_target("remove-agent-credits-on-merge")),
+                        .highlighted(self.is_target("remove-agent-credits-on-merge")).inheritance(credits_inheritance),
                     &["removeAgentCreditsOnMerge"],
                     settings.remove_agent_credits_on_merge,
                     SourceControlChange::RemoveAgentCredits(false).into_server(),
                     cx,
                 )
-                .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits).disabled(credits_locked))
+                .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits).mixed(credits_mixed).disabled(credits_locked))
                 .into_any_element(),
                 self.apply_scoped_reset(
                     Row::new("pull-request-merge-method", "Default merge method")
@@ -1216,7 +1238,7 @@ impl SettingsView {
     fn discovery_row(&mut self, item: &DiscoveryItem, config: &ServerConfig, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let muted = hsla(p.muted_foreground);
-        let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let can_write = self.scoped_session(cx).is_none_or(|session| session.grants(SETTINGS_WRITE_SCOPE));
         let definition = item.auth.as_ref().and_then(|_| host_definition(&item.kind));
         let has_details = definition.is_some();
         let expanded = has_details
@@ -1479,7 +1501,7 @@ impl SettingsView {
         } else if !matches!(state, SignInState::Waiting { .. }) {
             let kind = def.kind.to_owned();
             let host = app_sign_in.host.to_owned();
-            let starting = matches!(state, SignInState::Starting);
+            let starting = matches!(state, SignInState::Starting { .. });
             actions = actions.child(
                 Button::new(SharedString::from(format!("sc-signin-{}", def.kind)), ButtonVariant::Default, ButtonSize::Sm)
                     .label(if starting { "Starting…" } else { "Sign in with GitHub" })
@@ -1619,30 +1641,26 @@ impl SettingsView {
             normalized_host.clone()
         };
         let token_url = credentials.new_token_url(&new_token_host);
-        let has_secret_providers = !config.settings.secret_providers.0.is_empty();
         let placeholder = secret_placeholder(&source, is_saved && !saved_token.is_some_and(SecretValue::is_reference), "Paste a personal access token");
 
         let kind_for_source = def.kind.to_owned();
         let view_for_source = cx.entity().downgrade();
-        let source_picker = has_secret_providers.then(|| {
-            Select::new(SharedString::from(format!("sc-token-source-{}", def.kind)), secret_source_options(config))
-                .selected(source.clone())
-                .width(156.)
-                .disabled(!can_write || saving)
-                .on_change(move |next, window, cx| {
-                    let next_str = next.to_string();
-                    let _ = view_for_source.update(cx, |this, cx| {
-                        if let Some(ed) = this.source_control.token_editors.get_mut(&kind_for_source) {
-                            let is_stored = next_str == STORED_SECRET;
-                            ed.source = next_str;
-                            ed.value.update(cx, |input, cx| {
-                                input.set_masked(is_stored, window, cx);
-                                input.set_value(String::new(), window, cx);
-                            });
-                            cx.notify();
-                        }
+        let token_input = SecretSourceInput::new(
+            SharedString::from(format!("sc-token-source-{}", def.kind)), t(cx, "Token"), &value_input,
+            &config.settings.secret_providers.0, (source != STORED_SECRET).then_some(source.as_str()),
+        ).disabled(!can_write || saving).on_source_change(move |next, window, cx| {
+            let next = next.map_or_else(|| STORED_SECRET.to_owned(), |source| source.to_string());
+            let _ = view_for_source.update(cx, |this, cx| {
+                if let Some(editor) = this.source_control.token_editors.get_mut(&kind_for_source) {
+                    let direct = next == STORED_SECRET;
+                    editor.source = next;
+                    editor.value.update(cx, |input, cx| {
+                        input.set_masked(direct, window, cx);
+                        input.set_value(String::new(), window, cx);
                     });
-                })
+                    cx.notify();
+                }
+            });
         });
 
         let save_kind = def.kind.to_owned();
@@ -1700,12 +1718,7 @@ impl SettingsView {
                             .gap(r(4.))
                             .on_key_down(stop_slash_shortcut)
                             .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Token"))
-                            .child(
-                                h_flex()
-                                    .gap(r(6.))
-                                    .children(source_picker)
-                                    .child(div().flex_1().min_w_0().child(Input::new(&value_input).small().disabled(!can_write || saving))),
-                            )
+                            .child(token_input)
                             .child(div().text_size(r(11.)).text_color(hsla(p.muted_foreground)).child(placeholder)),
                     ),
             )
@@ -1972,7 +1985,6 @@ impl SettingsView {
         let p = palette(cx);
         let saved = read_host_fields(&config.settings.source_control_hosts, def.kind);
         let has_saved = saved.values().any(|val| !val.is_empty());
-        let has_secret_providers = !config.settings.secret_providers.0.is_empty();
         let Some(editor) = self.source_control.generic_editors.get(def.kind) else {
             return div().into_any_element();
         };
@@ -1992,31 +2004,30 @@ impl SettingsView {
             let kind_for_source = def.kind.to_owned();
             let key_for_source = field.key.to_owned();
             let view_for_source = cx.entity().downgrade();
-            let source_picker = (field.secret && has_secret_providers).then(|| {
-                Select::new(SharedString::from(format!("sc-field-source-{}-{}", def.kind, field.key)), secret_source_options(config))
-                    .selected(source.clone())
-                    .width(156.)
-                    .disabled(!can_write || saving)
-                    .on_change(move |next, window, cx| {
-                        let next_str = next.to_string();
-                        let _ = view_for_source.update(cx, |this, cx| {
-                            if let Some(ed) = this.source_control.generic_editors.get_mut(&kind_for_source) {
-                                let is_stored = next_str == STORED_SECRET;
-                                ed.sources.insert(key_for_source.clone(), next_str);
-                                if !is_stored {
-                                    ed.cleared_fields.remove(&key_for_source);
-                                }
-                                if let Some(input) = ed.inputs.get(&key_for_source) {
-                                    input.update(cx, |input, cx| {
-                                        input.set_masked(is_stored, window, cx);
-                                        input.set_value(String::new(), window, cx);
-                                    });
-                                }
-                                cx.notify();
+            let field_control = if field.secret {
+                SecretSourceInput::new(
+                    SharedString::from(format!("sc-field-source-{}-{}", def.kind, field.key)), t(cx, field.label),
+                    input, &config.settings.secret_providers.0, (source != STORED_SECRET).then_some(source.as_str()),
+                ).disabled(!can_write || saving).on_source_change(move |next, window, cx| {
+                    let source = next.map_or_else(|| STORED_SECRET.to_owned(), |source| source.to_string());
+                    let _ = view_for_source.update(cx, |this, cx| {
+                        if let Some(editor) = this.source_control.generic_editors.get_mut(&kind_for_source) {
+                            let direct = source == STORED_SECRET;
+                            editor.sources.insert(key_for_source.clone(), source);
+                            if !direct { editor.cleared_fields.remove(&key_for_source); }
+                            if let Some(input) = editor.inputs.get(&key_for_source) {
+                                input.update(cx, |input, cx| {
+                                    input.set_masked(direct, window, cx);
+                                    input.set_value(String::new(), window, cx);
+                                });
                             }
-                        });
-                    })
-            });
+                            cx.notify();
+                        }
+                    });
+                }).into_any_element()
+            } else {
+                div().flex_1().min_w_0().child(Input::new(input).small().disabled(!can_write || saving)).into_any_element()
+            };
             let clear_kind = def.kind.to_owned();
             let clear_key = field.key.to_owned();
             let clear_btn = (field_has_saved && !is_cleared).then(|| {
@@ -2054,8 +2065,7 @@ impl SettingsView {
                     .child(
                         h_flex()
                             .gap(r(6.))
-                            .children(source_picker)
-                            .child(div().flex_1().min_w_0().child(Input::new(input).small().disabled(!can_write || saving)))
+                            .child(field_control)
                             .children(clear_btn),
                     )
                     .child(div().text_size(r(11.)).text_color(hsla(p.muted_foreground)).child(hint)),
@@ -2364,6 +2374,10 @@ impl SettingsView {
                 this.update_scoped_server(change(next).into_server(), cx);
             });
         });
+        let traits = selection.as_ref().map_or_else(Vec::new, |selection| {
+            let change = if allow_text_generators { writer_model_change } else { review_model_change };
+            model_trait_controls(id, config, selection, locked, cx.entity().downgrade(), change)
+        });
         let picker = selection.filter(|_| !options.is_empty()).map(|selection| {
             let select_view = cx.entity().downgrade();
             let label = if allow_text_generators {
@@ -2395,8 +2409,16 @@ impl SettingsView {
         if !empty && let Some(reason) = disabled_reason {
             row = row.status(reason);
         }
-        row.control(h_flex().gap(r(8.)).children(picker).child(toggle)).into_any_element()
+        row.control(h_flex().flex_wrap().justify_end().gap(r(8.)).children(picker).children(traits).child(toggle)).into_any_element()
     }
+}
+
+fn writer_model_change(selection: Option<t3_core::model::ModelSelection>) -> t3_core::settings::ServerSettingChange {
+    SourceControlChange::WriterModel(selection).into_server()
+}
+
+fn review_model_change(selection: Option<t3_core::model::ModelSelection>) -> t3_core::settings::ServerSettingChange {
+    SourceControlChange::ReviewGuideModel(selection).into_server()
 }
 
 struct ModelRow {
