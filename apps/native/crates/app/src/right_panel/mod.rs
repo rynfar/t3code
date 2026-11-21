@@ -800,7 +800,7 @@ impl RightPanelView {
             });
         });
         let thread_owned = (!thread_id.starts_with("new-thread:")
-            && thread_id != t3_core::right_panel::ISSUES_PANEL_THREAD_KEY)
+            && !AppState::is_utility_panel_key(thread_id))
             .then(|| thread_id.to_owned());
         let view = cx.new(|cx| {
             crate::issues::IssueDetailPanel::new(
@@ -926,9 +926,11 @@ impl Render for RightPanelView {
         );
         let closing = !is_open && progress > 0. && self.last_open_panel.is_some();
         let rendered = if closing { self.last_open_panel.clone() } else { panel.clone() };
-        self.sync_previews(thread_id.as_deref(), rendered.as_ref(), window, cx);
-        self.sync_devices(thread_id.as_deref(), rendered.as_ref(), cx);
-        self.sync_terminals(thread_id.as_deref(), rendered.as_ref(), window, cx);
+        let utility_panel = thread_id.as_deref().is_some_and(AppState::is_utility_panel_key);
+        let surface_thread = thread_id.as_deref().filter(|_| !utility_panel);
+        self.sync_previews(surface_thread, rendered.as_ref(), window, cx);
+        self.sync_devices(surface_thread, rendered.as_ref(), cx);
+        self.sync_terminals(surface_thread, rendered.as_ref(), window, cx);
         self.sync_pull_request_tabs(thread_id.as_deref(), rendered.as_ref(), cx);
         self.sync_issue_tabs(thread_id.as_deref(), rendered.as_ref());
         if !is_open && !closing {
@@ -986,22 +988,24 @@ impl Render for RightPanelView {
                 // Markdown selection registrations cannot survive cached scene reuse.
                 self.files.clone().into_any_element()
             }
-            Some(SurfaceKind::Terminal { .. }) => match panel.active() {
+            Some(SurfaceKind::Terminal { .. }) if !utility_panel => match panel.active() {
                 Some(surface) => self.terminal_pane(&thread_id, surface, window, cx).into_any_element(),
                 None => div().into_any_element(),
             },
             Some(SurfaceKind::SideChat { thread_id }) => self.side_chat_pane(thread_id, window, cx).into_any_element(),
             // Cached: frames repaint the page view inside, not the panel around it.
-            Some(SurfaceKind::Preview { .. }) => match panel.active().and_then(|surface| self.preview_pane(&thread_id, surface, window, cx)) {
+            Some(SurfaceKind::Preview { .. }) if !utility_panel => match panel.active().and_then(|surface| self.preview_pane(&thread_id, surface, window, cx)) {
                 Some(pane) => pane.cached(StyleRefinement::default().size_full()).into_any_element(),
                 None => div().into_any_element(),
             },
             // Cached: frames repaint the device screen inside, not the panel around it.
-            Some(SurfaceKind::Device { .. }) => match panel.active().and_then(|surface| self.device_pane(&thread_id, surface, cx)) {
+            Some(SurfaceKind::Device { .. }) if !utility_panel => match panel.active().and_then(|surface| self.device_pane(&thread_id, surface, cx)) {
                 Some(pane) => pane.cached(StyleRefinement::default().size_full()).into_any_element(),
                 None => div().into_any_element(),
             },
-            None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
+            None | Some(SurfaceKind::Terminal { .. } | SurfaceKind::Preview { .. } | SurfaceKind::Device { .. }) => {
+                tabs::empty_state(self.state.clone(), window, cx).into_any_element()
+            }
         };
         let view = cx.entity();
         let add_menu = self.add_menu_open.then(|| {

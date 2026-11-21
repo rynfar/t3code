@@ -130,6 +130,9 @@ pub fn previews(cx: &App) -> Option<Entity<Previews>> {
 /// The launcher's "Browser" entry (`addBrowserSurface`): a new session in a new tab.
 pub fn add_browser_surface(state: &mut AppState, cx: &mut Context<AppState>) {
     let Some(thread_id) = state.panel_thread() else { return };
+    if AppState::is_utility_panel_key(&thread_id) {
+        return;
+    }
     cx.defer(move |cx| {
         if let Some(previews) = previews(cx) {
             previews.update(cx, |previews, cx| previews.open_session(thread_id, None, cx));
@@ -141,6 +144,9 @@ pub fn add_browser_surface(state: &mut AppState, cx: &mut Context<AppState>) {
 /// session's tab or starts one.
 pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
     let Some(thread_id) = state.panel_thread() else { return };
+    if AppState::is_utility_panel_key(&thread_id) {
+        return;
+    }
     let showing = state.panels.panels.active_surface(&thread_id).is_some_and(|surface| surface.preview_tab().is_some() || surface.id == "browser:new");
     if showing {
         state.mutate_panels(cx, |panels, thread| {
@@ -156,7 +162,11 @@ pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
                 return;
             }
             match previews.threads.thread(&thread_id).and_then(|thread| thread.active_tab_id.clone()) {
-                Some(tab) => previews.state.update(cx, |state, cx| state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some(&tab)))),
+                Some(tab) => previews.state.update(cx, |state, cx| {
+                    state.mutate_panels(cx, |panels, thread| {
+                        thread == thread_id && panels.panels.open_browser(thread, Some(&tab))
+                    });
+                }),
                 None => previews.open_session(thread_id, None, cx),
             }
         });
@@ -413,10 +423,13 @@ impl Previews {
 
     fn list_selected(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if self.server_browser != Some(true) || state.details_utility_panel_key().is_some() {
+        if self.server_browser != Some(true) {
             return;
         }
         let Some(thread_id) = state.panel_thread() else { return };
+        if AppState::is_utility_panel_key(&thread_id) {
+            return;
+        }
         self.threads.thread_mut(&thread_id);
         let connection = self.connection;
         let Some(task) = state.request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
@@ -468,6 +481,9 @@ impl Previews {
     fn panel_changed(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(thread_id) = state.panel_thread() else { return };
+        if AppState::is_utility_panel_key(&thread_id) {
+            return;
+        }
         let now: Vec<String> = state.panels.panels.panel(&thread_id).surfaces.iter().filter_map(|surface| surface.preview_tab().map(str::to_owned)).collect();
         let before = self.panel_tabs.insert(thread_id.clone(), now.clone()).unwrap_or_default();
         if self.availability() != Availability::Available {
@@ -500,6 +516,9 @@ impl Previews {
         external_fallback: bool,
         cx: &mut Context<Self>,
     ) {
+        if AppState::is_utility_panel_key(&thread_id) {
+            return;
+        }
         let url = overrides.url.clone();
         if self.availability() != Availability::Available {
             if external_fallback && let Some(url) = &url {

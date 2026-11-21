@@ -76,6 +76,14 @@ impl PanelState {
 }
 
 impl AppState {
+    pub(crate) fn is_utility_panel_key(key: &str) -> bool {
+        matches!(
+            key,
+            t3_core::right_panel::ISSUES_PANEL_THREAD_KEY
+                | crate::pull_requests::PULL_REQUESTS_UTILITY_PANEL_KEY
+        )
+    }
+
     pub(crate) fn panel_thread(&self) -> Option<String> {
         if let Some(key) = self.details_utility_panel_key() {
             return Some(key.to_owned());
@@ -200,6 +208,9 @@ impl AppState {
             return;
         }
         let Some(thread_id) = self.panel_thread() else { return };
+        if Self::is_utility_panel_key(&thread_id) {
+            return;
+        }
         let terminal_id = crate::terminal::allocate_panel_terminal_id(self, &thread_id, cx);
         if crate::terminal::launch_panel_terminal(self, &thread_id, &terminal_id, cx).is_none() {
             return;
@@ -450,7 +461,10 @@ impl AppState {
             }
             true
         });
-        if !closed_terminals.is_empty() && crate::terminal::can_operate_terminals(cx) {
+        if !closed_terminals.is_empty()
+            && !Self::is_utility_panel_key(&thread_id)
+            && crate::terminal::can_operate_terminals(cx)
+        {
             for terminal_id in closed_terminals {
                 crate::terminal::close_terminal_session(self, &thread_id, &terminal_id);
             }
@@ -509,7 +523,9 @@ impl AppState {
     /// `view.reopenClosed` (`cmd-shift-t`): may switch to the thread the tab belonged to.
     pub fn reopen_closed_view(&mut self, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        let thread_exists = |thread: &str| mounts.thread(shell, thread).is_some();
+        let thread_exists = |thread: &str| {
+            !Self::is_utility_panel_key(thread) && mounts.thread(shell, thread).is_some()
+        };
         let workspace_available = |thread: &str| {
             mounts.thread(shell, thread).is_some_and(|thread| {
                 thread.worktree_path.as_deref().is_some_and(|p| !p.is_empty())

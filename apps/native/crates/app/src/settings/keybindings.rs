@@ -480,18 +480,25 @@ impl SettingsView {
         {
             return;
         }
-        store::clear_error(cx);
-        self.keybindings.saving = Some(command);
         let state = self.state.clone();
         let app = state.read(cx);
         let active_revision = app.server_config.keybindings_revision();
-        let fallback = target.owners.is_empty().then(|| app.rpc(method, payload.clone()));
-        let lookups = target.owners.iter().filter_map(|owner| {
-            let entry = app.scoped_environment(&owner.saved_id)?;
-            Some((app.connections.destination(owner, SETTINGS_WRITE_SCOPE), entry.keybindings_revision, entry.summary.owner.saved_id.clone()))
-        }).collect::<Vec<_>>();
-        let runtime = app.runtime().clone();
         let failure = t(cx, failure).to_owned();
+        let revisions = target.owners.iter().map(|owner| {
+            app.scoped_environment(&owner.saved_id).map(|entry| entry.keybindings_revision)
+        }).collect::<Option<Vec<_>>>();
+        let Some(revisions) = revisions else {
+            let error = t(cx, "A shortcut destination changed. Try again.");
+            store::show_error(format!("{failure}: {error}"), cx);
+            return;
+        };
+        let lookups = target.owners.iter().zip(revisions).map(|(owner, revision)| {
+            (app.connections.destination(owner, SETTINGS_WRITE_SCOPE), revision, owner.saved_id.clone())
+        }).collect::<Vec<_>>();
+        let fallback = target.owners.is_empty().then(|| app.rpc(method, payload.clone()));
+        let runtime = app.runtime().clone();
+        store::clear_error(cx);
+        self.keybindings.saving = Some(command);
         cx.spawn(async move |this, cx| {
             let mut error = None;
             let mut primary_reply = None;

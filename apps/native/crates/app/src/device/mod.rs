@@ -79,6 +79,9 @@ pub fn devices(cx: &App) -> Option<Entity<Devices>> {
 /// set up, else the device list in a tab.
 pub fn add_device_surface(state: &mut AppState, cx: &mut Context<AppState>) {
     let Some(thread_id) = state.panel_thread() else { return };
+    if AppState::is_utility_panel_key(&thread_id) {
+        return;
+    }
     let needs_setup = devices(cx).and_then(|devices| devices.read(cx).service().map(ServiceState::needs_setup)) == Some(true);
     if needs_setup {
         cx.defer(move |cx| {
@@ -355,6 +358,9 @@ impl Devices {
 
     /// `selectDevice`: opens (booting if needed) a device for the thread, then its tab there.
     pub fn open_device(&mut self, thread_id: &str, device: Device, cx: &mut Context<Self>) {
+        if AppState::is_utility_panel_key(thread_id) {
+            return;
+        }
         let ticket = self.operations.start(thread_id, Some(device.clone()));
         cx.emit(DevicesEvent::Changed);
         let thread_id = thread_id.to_owned();
@@ -493,6 +499,32 @@ impl Devices {
 mod tests {
     use super::*;
     use t3_core::device::{Platform, Session};
+
+    #[gpui::test]
+    fn open_device_rejects_utility_panel_keys(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let devices = cx.update(|cx| {
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            cx.new(|cx| Devices::new(state, cx))
+        });
+        let device = Device {
+            host_id: "local".into(),
+            id: "sim-1".into(),
+            platform: Platform::Ios,
+            name: "iPhone 16".into(),
+            version: "iOS 18".into(),
+            booted: true,
+        };
+        devices.update(cx, |devices, cx| {
+            for key in [
+                t3_core::right_panel::ISSUES_PANEL_THREAD_KEY,
+                crate::pull_requests::PULL_REQUESTS_UTILITY_PANEL_KEY,
+            ] {
+                devices.open_device(key, device.clone(), cx);
+                assert!(devices.operation(key).is_none(), "{key} started a device open");
+            }
+        });
+    }
 
     #[gpui::test]
     fn agent_opened_device_session_opens_right_panel_tab_once(cx: &mut gpui::TestAppContext) {

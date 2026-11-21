@@ -37,13 +37,15 @@ struct SurfaceAction {
     unavailable: fn(&AppState, &App) -> Option<&'static str>,
 }
 
-fn always(_: &AppState, _: &App) -> Option<&'static str> {
-    None
+fn utility_panel_unavailable(state: &AppState, _: &App) -> Option<&'static str> {
+    state.details_utility_panel_key().is_some().then_some("Available from a thread.")
 }
 
 /// `browserAvailable` with `SURFACE_UNAVAILABLE_HINTS.browser`.
-fn browser_unavailable(_: &AppState, cx: &App) -> Option<&'static str> {
-    crate::preview::previews(cx).and_then(|previews| previews.read(cx).availability().launcher_hint())
+fn browser_unavailable(state: &AppState, cx: &App) -> Option<&'static str> {
+    utility_panel_unavailable(state, cx).or_else(|| {
+        crate::preview::previews(cx).and_then(|previews| previews.read(cx).availability().launcher_hint())
+    })
 }
 
 fn files_unavailable(state: &AppState, _: &App) -> Option<&'static str> {
@@ -55,6 +57,9 @@ fn server_thread_unavailable(state: &AppState, _: &App) -> Option<&'static str> 
 }
 
 fn terminal_unavailable(state: &AppState, cx: &App) -> Option<&'static str> {
+    if let Some(reason) = utility_panel_unavailable(state, cx) {
+        return Some(reason);
+    }
     if state.file_workspace().is_none() {
         return Some("Available when a project is open.");
     }
@@ -80,7 +85,7 @@ const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: server_thread_unavailable },
     SurfaceAction { label: "Pull request", icon: Icon::GitPullRequest, shortcut: "P", open: open_pull_request, unavailable: pull_request_unavailable },
     SurfaceAction { label: "Linked items", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: server_thread_unavailable },
-    SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: always },
+    SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: utility_panel_unavailable },
 ];
 
 /// Opens the launcher entry named `label` (case-insensitive), as clicking it would.
