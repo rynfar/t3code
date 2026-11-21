@@ -9,13 +9,13 @@ use t3_client::auth::Credentials;
 use t3_client::voice::{VoiceClient, VoiceClientError};
 use t3_core::client_settings::ClientSettingChange;
 use t3_core::voice_input::{
-    CLOUD_SPEECH_LANGUAGES, CloudSpeechError, CloudSpeechErrorReason, CloudSpeechProvider,
+    AudioDeviceInfo, CLOUD_SPEECH_LANGUAGES, CloudSpeechError, CloudSpeechErrorReason, CloudSpeechProvider,
     DictationSubmissionDecision, DictationSubmissionGate, EnvironmentSpeechModel,
     EnvironmentSpeechModelState, EnvironmentSpeechPostProcessingRequest, EnvironmentSpeechState,
     EnvironmentSpeechStatus, MICROPHONE_PERMISSION_ERROR, SpeechPostProcessingDraft,
     SpeechPostProcessingOptions, SpeechPostProcessingSelection, SpeechStreamText,
     SpeechTranscriptionOptions, VoiceControllerEffect, VoiceDraftSnapshot, VoiceErrorAction,
-    VoiceInputControllerMachine, VoiceInputPhase, VoiceInputState, VoiceSelection,
+    VoiceInputControllerMachine, VoiceInputPhase, VoiceInputState, VoiceMicrophoneEntry, VoiceSelection,
     VoiceTranscriptionDestination, VoiceTranscriptionError, VoiceTranscriptionErrorCode,
     choose_setup_speech_model_for_tier, cleanup_context, f32_slice_to_le_bytes,
     preferred_microphone_id, preferred_speech_languages, remember_microphones,
@@ -181,6 +181,24 @@ struct ActiveStreamHandle {
     can_send: Arc<AtomicBool>,
 }
 
+
+#[derive(Default)]
+struct RecordingSamples {
+    levels: [f32; t3_core::voice_input::WAVEFORM_BAR_COUNT],
+    next: usize,
+}
+
+impl RecordingSamples {
+    fn push(&mut self, level: f32) {
+        self.levels[self.next] = level.clamp(0., 1.);
+        self.next = (self.next + 1) % self.levels.len();
+    }
+
+    fn levels(&self) -> impl Iterator<Item = f32> + '_ {
+        self.levels[self.next..].iter().chain(&self.levels[..self.next]).copied()
+    }
+}
+
 pub struct VoiceSpeechController {
     app: Entity<AppState>,
     owner_key: String,
@@ -197,13 +215,14 @@ pub struct VoiceSpeechController {
     machine: VoiceInputControllerMachine,
     submission_gate: DictationSubmissionGate,
     setup: VoiceSetupState,
+    setup_microphones: Vec<AudioDeviceInfo>,
     last_overlay_visible: bool,
     status: Option<EnvironmentSpeechStatus>,
     status_env_id: Option<String>,
     start_request_id: u64,
 
     live_preview: Option<SpeechStreamText>,
-    audio_level: f32,
+    recording_samples: RecordingSamples,
     elapsed_seconds: u64,
     recording_started_at: Option<Instant>,
 
@@ -255,12 +274,13 @@ impl VoiceSpeechController {
             machine: VoiceInputControllerMachine::new(true, true),
             submission_gate: DictationSubmissionGate::new(),
             setup: VoiceSetupState::default(),
+            setup_microphones: Vec::new(),
             last_overlay_visible: false,
             status: None,
             status_env_id: None,
             start_request_id: 0,
             live_preview: None,
-            audio_level: 0.0,
+            recording_samples: RecordingSamples::default(),
             elapsed_seconds: 0,
             recording_started_at: None,
             recordings: HashMap::new(),
@@ -425,8 +445,8 @@ impl VoiceSpeechController {
         .flatten()
     }
 
-    pub fn level(&self) -> f32 {
-        self.audio_level
+    pub(super) fn recording_levels(&self) -> impl Iterator<Item = f32> + '_ {
+        self.recording_samples.levels()
     }
 
     pub fn elapsed_seconds(&self) -> u64 {
@@ -598,6 +618,34 @@ impl VoiceSpeechController {
         audio_platform(cx).open_microphone_settings()
     }
 
+    pub(super) fn setup_microphones(&self) -> &[AudioDeviceInfo] {
+        &self.setup_microphones
+    }
+
+    pub(super) fn setup_microphone(&self, cx: &App) -> String {
+        let order = crate::settings::store::try_client(cx).map(|doc| doc.voice_microphones()).unwrap_or_default();
+        preferred_microphone_id(&order, &self.setup_microphones)
+    }
+
+    pub(super) fn select_setup_microphone(&mut self, id: &str, cx: &mut Context<Self>) {
+        let picked = if id.is_empty() {
+            VoiceMicrophoneEntry::Default
+        } else {
+            let Some(device) = self.setup_microphones.iter().find(|device| device.device_id == id) else { return };
+            VoiceMicrophoneEntry::Device { device_id: device.device_id.clone(), label: device.label.clone() }
+        };
+        let current = crate::settings::store::try_client(cx).map(|doc| doc.voice_microphones()).unwrap_or_default();
+        let mut order = remember_microphones(&current, &self.setup_microphones);
+        order.retain(|entry| match (entry, &picked) {
+            (VoiceMicrophoneEntry::Default, VoiceMicrophoneEntry::Default) => false,
+            (VoiceMicrophoneEntry::Device { device_id, .. }, VoiceMicrophoneEntry::Device { device_id: selected, .. }) => device_id != selected,
+            _ => true,
+        });
+        order.insert(0, picked);
+        crate::settings::store::update_client(&self.app, ClientSettingChange::VoiceMicrophones(order), cx);
+        self.sync_overlay(cx);
+    }
+
     pub fn setup_set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.setup.open == open {
             return;
@@ -757,7 +805,8 @@ impl VoiceSpeechController {
     ) {
         self.machine = VoiceInputControllerMachine::new(true, true);
         self.live_preview = preview;
-        self.audio_level = level;
+        self.recording_samples = RecordingSamples::default();
+        self.recording_samples.push(level);
         self.elapsed_seconds = elapsed_seconds;
         if let Some(setup) = setup {
             self.setup = setup;
@@ -807,6 +856,7 @@ impl VoiceSpeechController {
         selected_model_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.setup_microphones = audio_platform(cx).list_input_devices();
         self.setup_credentials = Some(credentials.clone());
         self.setup_selected_model_id = Some(selected_model_id.clone());
         let runtime = self.app.read(cx).runtime().clone();
@@ -1055,7 +1105,7 @@ impl VoiceSpeechController {
                     if next_state.phase != VoiceInputPhase::Recording {
                         self._timer_task = None;
                         self.recording_started_at = None;
-                        self.audio_level = 0.0;
+                        self.recording_samples = RecordingSamples::default();
                     }
                     if !next_state.is_busy() {
                         release_voice_session(cx.entity_id(), cx);
@@ -1599,7 +1649,7 @@ impl VoiceSpeechController {
 
         let pcm_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
         self.active_pcm_buffer = Some(pcm_buffer.clone());
-        self.audio_level = 0.0;
+        self.recording_samples = RecordingSamples::default();
         self.elapsed_seconds = 0;
         self.recording_started_at = Some(Instant::now());
 
@@ -1666,7 +1716,7 @@ impl VoiceSpeechController {
                 match msg {
                     CaptureMsg::Level(level) => {
                         let _ = this.update(cx, |this, cx| {
-                            this.audio_level = level;
+                            this.recording_samples.push(level);
                             this.sync_overlay(cx);
                         });
                     }
@@ -1711,7 +1761,7 @@ impl VoiceSpeechController {
     fn stop_audio_capture(&mut self, _cx: &mut Context<Self>) {
         self._timer_task = None;
         self.recording_started_at = None;
-        self.audio_level = 0.0;
+        self.recording_samples = RecordingSamples::default();
         if let Some(mut capture) = self.active_capture.take() {
             let _ = capture.stop();
         }
@@ -1728,7 +1778,7 @@ impl VoiceSpeechController {
         self._timer_task = None;
         self._capture_events_task = None;
         self.recording_started_at = None;
-        self.audio_level = 0.0;
+        self.recording_samples = RecordingSamples::default();
         if let Some(mut capture) = self.active_capture.take() {
             let _ = capture.stop();
         }

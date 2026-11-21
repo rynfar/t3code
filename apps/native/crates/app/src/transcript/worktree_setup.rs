@@ -15,6 +15,7 @@ use t3_core::worktree_setup::{self as rules, Elapsed, Snapshot, Stage, StageId, 
 use super::RowEnv;
 use super::parts::{focusable, ghost_text_button, icon_slot, work_line, work_row_frame};
 use super::timer::WorkingTimer;
+use crate::components::motion::{Shimmer, Spinner};
 use crate::composer::controls::{Float, floating, floating_shadow};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
@@ -50,15 +51,26 @@ impl SetupEnv {
     }
 }
 
-fn stage_icon(status: StageStatus) -> Icon {
-    match status {
+fn status_icon(status: StageStatus, live: bool, cx: &App) -> AnyElement {
+    let color = hsla(palette(cx).icon_muted);
+    if status == StageStatus::Running && live {
+        return h_flex()
+            .size(rem(24.))
+            .flex_none()
+            .justify_center()
+            .child(Spinner::new("setup-stage-spinner", rem(16.).to_pixels(cx.theme().font_size), color))
+            .into_any_element();
+    }
+    let icon = match status {
         StageStatus::Done => Icon::WorkCheck,
-        StageStatus::Running => Icon::LoaderCircle,
+        StageStatus::Running => Icon::WorkCircle,
         StageStatus::Failed => Icon::WorkX,
         StageStatus::Warning => Icon::WorkCircleAlert,
         StageStatus::Skipped => Icon::WorkMinus,
         StageStatus::Pending | StageStatus::Unknown => Icon::WorkCircle,
-    }
+    };
+    let pending = matches!(status, StageStatus::Pending | StageStatus::Unknown);
+    icon_slot(icon, if pending { color.opacity(0.4) } else { color })
 }
 
 /// `stageRowClassName`.
@@ -70,12 +82,6 @@ fn stage_color(status: StageStatus, cx: &App) -> Hsla {
         StageStatus::Pending | StageStatus::Unknown => hsla(p.secondary_label).opacity(0.4),
         StageStatus::Running | StageStatus::Skipped | StageStatus::Done => hsla(p.secondary_label),
     }
-}
-
-fn status_icon(status: StageStatus, cx: &App) -> AnyElement {
-    let color = hsla(palette(cx).icon_muted);
-    let pending = matches!(status, StageStatus::Pending | StageStatus::Unknown);
-    icon_slot(stage_icon(status), if pending { color.opacity(0.4) } else { color })
 }
 
 fn muted(cx: &App) -> gpui::Div {
@@ -105,10 +111,12 @@ fn stage_row(scope: &str, stage: &Stage, snapshot: &Snapshot, env: &RowEnv, cx: 
         trailing.push(muted_text(text, cx).min_w_0().truncate().into_any_element());
     }
     trailing.extend(elapsed_label(rules::stage_elapsed(stage, snapshot), env, cx));
+    let live = snapshot.running() && stage.status == StageStatus::Running;
+    let label = div().truncate().text_color(stage_color(stage.status, cx)).child(label.to_owned());
     work_row_frame(SharedString::from(format!("{scope}:stage:{:?}", stage.id)), false)
         .child(work_line(
-            Some(status_icon(stage.status, cx)),
-            div().truncate().text_color(stage_color(stage.status, cx)).child(label.to_owned()).into_any_element(),
+            Some(status_icon(stage.status, live, cx)),
+            Shimmer::new("setup-stage-shimmer", live, label).into_any_element(),
             trailing,
             false,
             cx,
@@ -185,7 +193,7 @@ fn summary_row(scope: &str, snapshot: &Snapshot, cx: &App) -> AnyElement {
     };
     work_row_frame(SharedString::from(format!("{scope}:summary")), false)
         .child(work_line(
-            Some(status_icon(status, cx)),
+            Some(status_icon(status, false, cx)),
             div().truncate().text_color(stage_color(status, cx)).child(rules::header_label(snapshot)).into_any_element(),
             elapsed,
             false,
@@ -303,7 +311,7 @@ pub fn background_chip(env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<Any
         .cursor_pointer()
         .hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
         .when(open, |this| this.bg(hsla(p.accent)))
-        .child(Icon::LoaderCircle.render(px(12.), hsla(p.muted_foreground)))
+        .child(Spinner::new("background-setup-spinner", px(12.), hsla(p.muted_foreground)))
         .child(div().truncate().child(rules::BACKGROUND_SETUP))
         .on_click(cx.listener(|view, _, _, cx| view.toggle_setup_popover(cx)));
     let popover = open.then(|| {

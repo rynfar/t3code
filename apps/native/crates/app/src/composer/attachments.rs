@@ -1550,6 +1550,7 @@ impl Composer {
         let file_limit = self.file_limit(cx);
         let images: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::Image).collect();
         let files: Vec<&Staged> = staged.iter().filter(|staged| staged.attachment.kind == AttachmentKind::File).collect();
+        const ATTACHMENT_TILE: &str = "composer-attachment-tile";
         let tiles = (!images.is_empty()).then(|| {
             h_flex().flex_wrap().gap(px(8.)).mb(px(12.)).children(images.into_iter().map(|staged| {
                 let attachment = &staged.attachment;
@@ -1557,6 +1558,7 @@ impl Composer {
                 let size_text = rules::format_size(attachment.size_bytes);
                 let mut tooltip = format!("{}\n{}", attachment.name, size_text);
                 if let Upload::Failed { reason } = &attachment.upload { tooltip.push_str(&format!("\n\n{reason}")); }
+                let status_visible = staged.needs_reattach || (attachment.upload == Upload::Uploading && staged.show_progress);
                 let bottom_label = match &attachment.upload {
                     Upload::Uploading if staged.show_progress => format_upload_progress(staged.progress),
                     _ if staged.needs_reattach => "Reattach".to_owned(),
@@ -1594,6 +1596,7 @@ impl Composer {
                 div()
                     .id(SharedString::from(format!("attachment-{}", attachment.id)))
                     .relative()
+                    .group(ATTACHMENT_TILE)
                     .size(px(64.))
                     .flex_shrink_0()
                     .overflow_hidden()
@@ -1620,6 +1623,7 @@ impl Composer {
                             .text_size(crate::theme::rem(crate::theme::metrics::TEXT_3XS))
                             .text_center()
                             .text_color(hsla(p.foreground))
+                            .when(!status_visible, |this| this.invisible().group_hover(ATTACHMENT_TILE, |style| style.visible()))
                             .child(bottom_label),
                     )
                     .when_some((!staged.needs_reattach).then(|| failed_reason(attachment)).flatten(), |this, reason| {
@@ -1640,7 +1644,7 @@ impl Composer {
                     .when(can_copy && failed_reason(attachment).is_none(), |this| {
                         let copy_id = id.clone();
                         this.child(
-                            div().absolute().top(px(4.)).left(px(4.)).child(
+                            div().absolute().top(px(4.)).left(px(4.)).invisible().group_hover(ATTACHMENT_TILE, |style| style.visible()).child(
                                 media_button(SharedString::from(format!("copy-{}", attachment.id)), Icon::Copy, rewinding, cx)
                                     .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new("Copy image").build(window, cx))
                                     .when(!rewinding, |this| {
@@ -1726,7 +1730,7 @@ impl Composer {
     }
 
     /// Drop target for files from Finder.
-    pub(super) fn on_drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_attach(cx) {
             if self.active_question().is_some() {
                 self.error = Some(QUESTION_ATTACHMENTS_UNSUPPORTED_ERROR.to_owned());

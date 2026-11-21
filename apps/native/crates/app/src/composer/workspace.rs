@@ -21,14 +21,17 @@ use t3_core::vcs::VcsRef;
 use t3_core::vcs::refs::RefListing;
 use t3_core::workspace::{self as rules, DraftWorkspace, PreviousThread, PreviousWorktreeSeed};
 
-use super::controls::{ComposerControl, Float, MenuItem, floating, menu_surface};
+use super::controls::{ComposerControl, Float, MenuItem, branch_copy_menu, floating, menu_surface};
 use super::{Composer, Target, drafts};
 use super::menu::MenuKey;
 use crate::app_state::ScopedRouteAction;
 use crate::icons::Icon;
 use crate::new_thread::environment_machine_icon;
 use crate::sidebar::controller::now_ms;
-use crate::theme::{hsla, palette};
+use crate::i18n::t;
+use crate::settings::controls::Switch;
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette};
+use crate::transcript::middle_truncate;
 use crate::toast::{Toast, ToastKind};
 
 const BASE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -1589,7 +1592,7 @@ impl Composer {
                         .border_b_1()
                         .border_color(hsla(p.border).opacity(0.7))
                         .child(Icon::Search.sized(px(14.)).text_color(hsla(p.muted_foreground).opacity(0.6)))
-                        .child(div().flex_1().h(px(24.)).flex().items_center().child(Input::new(search).appearance(false).bordered(false))),
+                        .child(div().flex_1().h(px(24.)).flex().items_center().theme_slot(ThemeSlot::Input, cx).child(Input::new(search).appearance(false).bordered(false))),
                 )
             });
         let mut refs_list = div()
@@ -1612,17 +1615,17 @@ impl Composer {
                 let name = reference.name.clone();
                 let checked = branch.as_deref() == Some(name.as_str());
                 let highlighted = self.workspace.branch_highlighted == index;
-                let row_label = if reference.is_remote == Some(true) {
-                    format!("{name} (remote)")
+                let name_to_select = name.clone();
+                let row = MenuItem::new(("base-branch-ref", index), middle_truncate(&name, 28))
+                    .checked(checked)
+                    .highlighted(highlighted)
+                    .on_click(cx.listener(move |this, _, window, cx| this.choose_base_branch(name_to_select.clone(), window, cx)));
+                let row = if reference.is_remote() {
+                    row.trailing(div().text_xs().text_color(hsla(p.muted_foreground)).child(t(cx, "remote")))
                 } else {
-                    name.clone()
+                    row
                 };
-                refs_list = refs_list.child(
-                    MenuItem::new(("base-branch-ref", index), row_label)
-                        .checked(checked)
-                        .highlighted(highlighted)
-                        .on_click(cx.listener(move |this, _, window, cx| this.choose_base_branch(name.clone(), window, cx))),
-                );
+                refs_list = refs_list.child(branch_copy_menu(div().id(("base-branch-copy", index)).child(row), name));
             }
             if has_next_page && !loading_next {
                 refs_list = refs_list.child(
@@ -1639,6 +1642,7 @@ impl Composer {
                 );
             }
         }
+        let owner = cx.entity().downgrade();
         popup = popup
             .child(refs_list)
             .when_some(status_text, |this, status| {
@@ -1662,12 +1666,15 @@ impl Composer {
                     .pt(px(4.))
                     .border_t_1()
                     .border_color(hsla(p.border))
-                    .tooltip(|window, cx| Tooltip::new(START_FROM_REMOTE_TOOLTIP).build(window, cx))
+                    .tooltip(|window, cx| Tooltip::new(t(cx, START_FROM_REMOTE_TOOLTIP)).build(window, cx))
                     .child(
-                        MenuItem::new("base-branch-origin", "Start from remote")
-                            .checked(start_from_origin)
-                            .highlighted(self.workspace.branch_highlighted == ref_count)
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_start_from_origin(window, cx))),
+                        h_flex().px(px(8.)).py(px(4.)).justify_between()
+                            .when(self.workspace.branch_highlighted == ref_count, |row| row.bg(hsla(p.accent)).rounded(px(4.)))
+                            .child(div().text_sm().child(t(cx, "Start from remote")))
+                            .child(Switch::new("base-branch-origin", start_from_origin)
+                                .on_change(move |_, window, cx| {
+                                    let _ = owner.update(cx, |this, cx| this.toggle_start_from_origin(window, cx));
+                                })),
                     ),
             );
         Some(

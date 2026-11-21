@@ -1376,7 +1376,7 @@ async fn workspace_overlay_repaints_on_floating_indicator_and_setup_modal_update
     platform.emit_level(0.8);
     host_vcx.run_until_parked();
     assert!(
-        host_vcx.read(|cx| voice.read(cx).level()) > 0.5,
+        host_vcx.read(|cx| voice.read(cx).recording_levels().last().unwrap_or_default()) > 0.5,
         "controller should have received emitted audio level"
     );
     assert!(

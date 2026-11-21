@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
+    AnyElement, App, AppContext, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -149,12 +149,70 @@ struct MathUiState {
 
 struct MermaidUiState {
     show_code: bool,
-    dark: bool,
-    source: String,
-    svg: String,
-    image: Option<Arc<RenderImage>>,
-    intrinsic_width: f32,
-    error: Option<String>,
+    request: Option<(String, bool)>,
+    preview: Option<Result<MermaidPreview, String>>,
+    _render: Option<gpui::Task<()>>,
+}
+
+#[derive(Clone)]
+struct MermaidPreview {
+    svg: Arc<str>,
+    image: Arc<RenderImage>,
+    width: f32,
+    pixel_width: u32,
+    pixel_height: u32,
+}
+
+impl MermaidPreview {
+    const GUTTER: u32 = 2;
+
+    fn render(source: &str, dark: bool, renderer: gpui::SvgRenderer) -> Result<Self, String> {
+        let rendered = render_mermaid_svg(source, dark)?;
+        let frame = renderer.render_single_frame(rendered.svg.as_bytes(), 2.)
+            .map_err(|error| format!("SVG render failed: {error}"))?;
+        let size = frame.size(0);
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let pixels = frame.as_bytes(0).filter(|_| width > 0 && height > 0)
+            .ok_or_else(|| "SVG render returned no pixels".to_owned())?;
+        let gutter = Self::GUTTER;
+        let padded = image::RgbaImage::from_fn(width + 2 * gutter, height + 2 * gutter, |x, y| {
+            let x = x.saturating_sub(gutter).min(width - 1);
+            let y = y.saturating_sub(gutter).min(height - 1);
+            let offset = (y as usize * width as usize + x as usize) * 4;
+            image::Rgba(pixels[offset..offset + 4].try_into().unwrap())
+        });
+        Ok(Self {
+            svg: Arc::from(rendered.svg),
+            image: Arc::new(RenderImage::new(vec![image::Frame::new(padded)])),
+            width: rendered.width,
+            pixel_width: width,
+            pixel_height: height,
+        })
+    }
+
+    fn surface(self) -> impl IntoElement {
+        gpui::canvas(
+            |_, _, _| (),
+            move |visible, (), window, _| {
+                let pad_x = visible.size.width * (Self::GUTTER as f32 / self.pixel_width as f32);
+                let pad_y = visible.size.height * (Self::GUTTER as f32 / self.pixel_height as f32);
+                let fitted = gpui::Bounds::new(
+                    gpui::point(visible.origin.x - pad_x, visible.origin.y - pad_y),
+                    gpui::size(visible.size.width + 2. * pad_x, visible.size.height + 2. * pad_y),
+                );
+                let _ = window.paint_image_fitted(visible, fitted, gpui::Corners::default(), self.image, 0, false);
+            },
+        )
+        .w(px(self.width.max(240.)))
+        .max_w_full()
+        .aspect_ratio(self.pixel_width as f32 / self.pixel_height as f32)
+    }
+}
+
+fn release_mermaid_preview(preview: Option<Result<MermaidPreview, String>>, cx: &mut App) {
+    if let Some(Ok(preview)) = preview {
+        cx.defer(move |cx| cx.drop_image(preview.image, None));
+    }
 }
 
 pub(super) fn attach_rich_extensions_with_media_options(
@@ -808,11 +866,10 @@ fn render_math_block(data: &MathNodeData, nested_views: &NestedViews, window: &m
                             },
                             cx,
                         ))
-                        .child(parts::ghost_icon_button(
+                        .child(parts::CopyButton::new(
                             SharedString::from(format!("math-copy:{}", data.key)),
-                            Icon::Copy,
-                            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(tex_for_copy.clone())),
-                            cx,
+                            "Copy",
+                            move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(tex_for_copy.clone())),
                         )),
                 ),
         )
@@ -868,52 +925,42 @@ fn render_mermaid_block(
     let p = palette(cx);
     let is_dark = cx.theme().mode.is_dark();
     let key = SharedString::from(format!("mermaid:{}", data.key));
-    let svg_renderer = cx.svg_renderer();
-
-    let state = window.use_keyed_state(key, cx, |_, _| MermaidUiState {
-        show_code: false,
-        dark: !is_dark,
-        source: String::new(),
-        svg: String::new(),
-        image: None,
-        intrinsic_width: 0.0,
-        error: None,
+    let state = window.use_keyed_state(key, cx, |_, cx| {
+        cx.on_release(|state: &mut MermaidUiState, cx| release_mermaid_preview(state.preview.take(), cx)).detach();
+        MermaidUiState { show_code: false, request: None, preview: None, _render: None }
     });
-
-    let (show_code, image, svg_text, error, intrinsic_width) = state.update(cx, |s, _| {
-        if s.source != data.code || s.dark != is_dark {
-            s.source = data.code.clone();
-            s.dark = is_dark;
-            match render_mermaid_svg(&data.code, is_dark) {
-                Ok(rendered) => {
-                    s.intrinsic_width = rendered.width;
-                    s.svg = rendered.svg;
-                    match svg_renderer.render_single_frame(s.svg.as_bytes(), 2.0) {
-                        Ok(img_frame) => {
-                            s.image = Some(img_frame);
-                            s.error = None;
-                        }
-                        Err(err) => {
-                            s.image = None;
-                            s.error = Some(format!("SVG render failed: {err}"));
-                        }
-                    }
-                }
-                Err(err) => {
-                    s.image = None;
-                    s.svg.clear();
-                    s.error = Some(err);
-                }
-            }
-        }
-        (s.show_code, s.image.clone(), s.svg.clone(), s.error.clone(), s.intrinsic_width)
+    let needs_render = !state.read(cx).request.as_ref().is_some_and(|(source, dark)| {
+        source == &data.code && *dark == is_dark
     });
-
-    let show_diagram = !show_code && error.is_none() && image.is_some();
+    if needs_render {
+        let renderer = cx.svg_renderer();
+        let source = data.code.clone();
+        let owner = window.current_view();
+        let work = cx.background_executor().spawn(async move {
+            MermaidPreview::render(&source, is_dark, renderer)
+        });
+        state.update(cx, |state, cx| {
+            release_mermaid_preview(state.preview.take(), cx);
+            state.request = Some((data.code.clone(), is_dark));
+            state._render = Some(cx.spawn(async move |state, cx| {
+                let preview = work.await;
+                let _ = state.update(cx, |state, cx| {
+                    state.preview = Some(preview);
+                    cx.defer(move |cx| cx.notify(owner));
+                });
+            }));
+        });
+    }
+    let current = state.read(cx);
+    let show_code = current.show_code;
+    let preview = current.preview.as_ref().and_then(|result| result.as_ref().ok()).cloned();
+    let failed = current.preview.as_ref().is_some_and(Result::is_err);
+    let loading = current.preview.is_none();
+    let show_diagram = !show_code && preview.is_some();
     let toggle_state = state.clone();
     let copy_code = t3_core::markdown::strip_code_fence_trailing_newline(&data.code);
     let expand_ctx = action_ctx.lock().unwrap().clone();
-    let expand_svg = svg_text.clone();
+    let expand_svg = preview.as_ref().map(|preview| preview.svg.clone());
 
     v_flex()
         .w_full()
@@ -943,7 +990,7 @@ fn render_mermaid_block(
                                 .text_color(hsla(p.foreground).opacity(0.72))
                                 .child("mermaid"),
                         )
-                        .when_some(error.as_ref(), |this, _| {
+                        .when(failed, |this| {
                             this.child(
                                 div()
                                     .text_size(px(11.))
@@ -956,7 +1003,7 @@ fn render_mermaid_block(
                     h_flex()
                         .gap(px(4.))
                         .items_center()
-                        .when(error.is_none() && image.is_some(), |this| {
+                        .when(preview.is_some(), |this| {
                             this.child(parts::ghost_text_button(
                                 SharedString::from(format!("mermaid-toggle:{}", data.key)),
                                 if show_code { "Diagram" } else { "Code" },
@@ -977,8 +1024,9 @@ fn render_mermaid_block(
                                 SharedString::from(format!("mermaid-expand:{}", data.key)),
                                 Icon::Maximize2,
                                 move |_, window, cx| {
-                                    if let Some(tv) = ctx.thread_view.as_ref().and_then(|w| w.upgrade()) {
-                                        let data_url = svg_data_url(&svg_for_expand);
+                                    if let Some(tv) = ctx.thread_view.as_ref().and_then(|w| w.upgrade())
+                                        && let Some(svg) = svg_for_expand.as_ref() {
+                                        let data_url = svg_data_url(svg);
                                         tv.update(cx, |view, cx| {
                                             view.open_media(
                                                 vec![crate::media::ViewerItem::image(
@@ -995,29 +1043,25 @@ fn render_mermaid_block(
                                 cx,
                             ))
                         })
-                        .child(parts::ghost_icon_button(
+                        .child(parts::CopyButton::new(
                             SharedString::from(format!("mermaid-copy:{}", data.key)),
-                            Icon::Copy,
-                            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone())),
-                            cx,
+                            "Copy",
+                            move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone())),
                         )),
                 ),
         )
         .child(if show_diagram {
             nested_views.lock().unwrap().remove(&format!("mermaid-code:{}", data.key));
-            let rendered_img = image.unwrap();
-            let display_w = intrinsic_width.max(240.0);
             div()
                 .w_full()
                 .p(px(12.))
                 .flex()
                 .justify_center()
-                .child(
-                    img(rendered_img)
-                        .w(px(display_w))
-                        .max_w_full()
-                        .object_fit(ObjectFit::Contain),
-                )
+                .children(preview.map(MermaidPreview::surface))
+                .into_any_element()
+        } else if loading && !show_code {
+            div().p(px(12.)).text_xs().text_color(hsla(p.muted_foreground))
+                .child(crate::i18n::t(cx, "Loading"))
                 .into_any_element()
         } else {
             let nested = nested_views.clone();
@@ -1106,8 +1150,11 @@ fn render_table_block(
 
     let md_copy = data.data.to_markdown();
     let csv_copy = data.data.to_csv();
+    const TABLE_GROUP: &str = "markdown-table";
 
     v_flex()
+        .id(SharedString::from(format!("table:{}", data.key)))
+        .group(TABLE_GROUP)
         .w_full()
         .min_w_0()
         .gap(px(4.))
@@ -1115,23 +1162,21 @@ fn render_table_block(
             h_flex()
                 .justify_end()
                 .gap(px(4.))
-                .child(parts::ghost_text_button(
+                .invisible()
+                .group_hover(TABLE_GROUP, |style| style.visible())
+                .child(parts::CopyButton::new(
                     SharedString::from(format!("table-copy-md:{}", data.key)),
                     "Copy Markdown",
-                    Some(Icon::Copy),
-                    move |_, _, cx| {
+                    move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(md_copy.clone()));
                     },
-                    cx,
                 ))
-                .child(parts::ghost_text_button(
+                .child(parts::CopyButton::new(
                     SharedString::from(format!("table-copy-csv:{}", data.key)),
                     "Copy CSV",
-                    Some(Icon::Copy),
-                    move |_, _, cx| {
+                    move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(csv_copy.clone()));
                     },
-                    cx,
                 )),
         )
         .child(

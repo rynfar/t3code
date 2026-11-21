@@ -960,7 +960,11 @@ pub fn user_row(
         None
     } else {
         let source: Arc<str> = Arc::from(with_line_breaks(display_text));
-        let state = markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx);
+        let highlighted = super::highlights::marked_plain(&source, &message.id, env.find, None, cx);
+        let state = match highlighted {
+            Some(marked) => markdown.state(&format!("find-user:{id}"), &marked, cx),
+            None => markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx),
+        };
         Some(user_markdown_view(&state, &source, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
@@ -1476,6 +1480,40 @@ fn render_artifact_template_card(
         .into_any_element()
 }
 
+fn citable_prose(
+    key: SharedString,
+    state: &super::markdown::MarkdownState,
+    message_id: &str,
+    source: &Arc<str>,
+    cx: &Context<ThreadView>,
+) -> gpui::Stateful<gpui::Div> {
+    let selection_state = state.clone();
+    let message_id = message_id.to_owned();
+    let source = source.clone();
+    let bounds = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+    let bounds_paint = bounds.clone();
+    let bounds_key = bounds.clone();
+    let keyboard_state = selection_state.clone();
+    let keyboard_id = message_id.clone();
+    let keyboard_source = source.clone();
+    div()
+        .id(key)
+        .relative()
+        .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
+            view.capture_citation_selection(selection_state.clone(), message_id.clone(), source.clone(), (Some(event.position), bounds.get()), window, cx);
+        }))
+        .capture_key_down(cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
+            let key = &event.keystroke;
+            let select_all = key.key == "a" && (key.modifiers.platform || key.modifiers.control) && !key.modifiers.alt;
+            let extend = key.modifiers.shift && matches!(key.key.as_str(), "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown");
+            if select_all || extend {
+                view.capture_citation_selection(keyboard_state.clone(), keyboard_id.clone(), keyboard_source.clone(), (None, bounds_key.get()), window, cx);
+            }
+        }))
+        .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
+        .child(prose(state, cx))
+}
+
 pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
     let RowKind::Message { message, show_assistant_meta, show_copy, copy_streaming, suppress_empty_response, .. } = &row.kind else {
         return div().into_any_element();
@@ -1493,21 +1531,12 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
     {
         let source: Arc<str> = Arc::from(rewritten.as_str());
-        let state = markdown.state_in_context(&format!("assistant:{id}"), &source, Some(action_ctx), cx);
-        let selection_state = state.clone();
-        let message_id = message.id.clone();
-        let full_text = source.clone();
-        let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
-        let bounds_paint = bounds_cell.clone();
-        div()
-            .id(SharedString::from(format!("assistant-select:{id}")))
-            .relative()
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
-                view.capture_citation_selection(selection_state.clone(), message_id.clone(), full_text.clone(), (event.position, bounds_cell.get()), window, cx);
-            }))
-            .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
-            .child(prose(&state, cx))
-            .into_any_element()
+        let highlighted = super::highlights::marked_plain(&source, &message.id, env.find, env.cited_excerpt, cx);
+        let state = match highlighted {
+            Some(marked) => markdown.state(&format!("find-assistant:{id}"), &marked, cx),
+            None => markdown.state_in_context(&format!("assistant:{id}"), &source, Some(action_ctx), cx),
+        };
+        citable_prose(SharedString::from(format!("assistant-select:{id}")), &state, &message.id, &source, cx).into_any_element()
     } else {
         let thread_id = env.thread_id.map(str::to_owned);
         v_flex()
@@ -1516,19 +1545,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
                 CodexAssistantSegment::Markdown(seg_text) => {
                     let seg_arc: Arc<str> = Arc::from(seg_text);
                     let state = markdown.state_in_context(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), cx);
-                    let selection_state = state.clone();
-                    let message_id = message.id.clone();
-                    let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
-                    let bounds_paint = bounds_cell.clone();
-                    div()
-                        .id(SharedString::from(format!("assistant-select:{id}:{seg_idx}")))
-                        .relative()
-                        .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
-                            view.capture_citation_selection(selection_state.clone(), message_id.clone(), seg_arc.clone(), (event.position, bounds_cell.get()), window, cx);
-                        }))
-                        .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
-                        .child(prose(&state, cx))
-                        .into_any_element()
+                    citable_prose(SharedString::from(format!("assistant-select:{id}:{seg_idx}")), &state, &message.id, &seg_arc, cx).into_any_element()
                 }
                 CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(
                     SharedString::from(format!("use-template:{id}:{seg_idx}")),
@@ -1579,27 +1596,12 @@ pub fn sent_message_row(
 ) -> AnyElement {
     let p = palette(cx);
     let action_ctx = action_context(env, cx);
-    let state = markdown.state_in_context(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), cx);
-    let selection_state = state.clone();
-    let message_id = id.to_owned();
-    let full_text = entry.text.clone();
-    let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
-    let bounds_paint = bounds_cell.clone();
-    let body = div()
-        .id(SharedString::from(format!("sent-message-select:{id}")))
-        .relative()
-        .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
-            view.capture_citation_selection(
-                selection_state.clone(),
-                message_id.clone(),
-                full_text.clone(),
-                (event.position, bounds_cell.get()),
-                window,
-                cx,
-            );
-        }))
-        .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
-        .child(prose(&state, cx));
+    let highlighted = super::highlights::marked_plain(&entry.text, id, env.find, env.cited_excerpt, cx);
+    let state = match highlighted {
+        Some(marked) => markdown.state(&format!("find-sent:{id}"), &marked, cx),
+        None => markdown.state_in_context(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), cx),
+    };
+    let body = citable_prose(SharedString::from(format!("sent-message-select:{id}")), &state, id, &entry.text, cx);
     v_flex()
         .w_full()
         .min_w_0()

@@ -4,7 +4,9 @@
 //! `TimelineV2EventRow.tsx`, `V2LifecycleRow.tsx` and the request cards
 //! (`SecretRequestCard.tsx`, `LinkRequestCard.tsx`) in their answered and waiting states.
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px};
 use gpui_component::input::{Input, InputState};
@@ -30,6 +32,7 @@ use super::parts::{
 use super::timer::{TimerKind, WorkingTimer};
 use super::{FoldWorkState, RowEnv};
 use crate::app_state::AppState;
+use crate::components::motion::{Shimmer, prefers_reduced_motion};
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
@@ -45,23 +48,67 @@ fn fold_label_text(label: &str, work: FoldWorkState) -> String {
     }
 }
 
-fn work_history_skeleton(cx: &App) -> AnyElement {
-    let p = palette(cx);
-    let fill = hsla(p.muted_foreground).opacity(0.15);
-    v_flex()
-        .gap(px(8.))
-        .px(px(4.))
-        .pt(px(12.))
-        .pb(px(4.))
-        .children([(2. / 5.), (3. / 5.), (1. / 3.)].into_iter().map(|fraction| {
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap(px(8.))
-                .child(div().size(px(12.)).flex_none().rounded(px(4.)).bg(fill))
-                .child(div().h(px(10.)).w(gpui::relative(fraction)).rounded_full().bg(fill))
-        }))
-        .into_any_element()
+struct SkeletonPulse {
+    start: Instant,
+    pending: Cell<bool>,
+}
+
+fn work_history_skeleton(id: &str, cx: &App) -> AnyElement {
+    const STEP: Duration = Duration::from_millis(300);
+    const OPACITIES: [f32; 8] = [1., 0.89, 0.78, 0.66, 0.55, 0.66, 0.78, 0.89];
+    let fill = hsla(palette(cx).muted_foreground).opacity(0.15);
+    let clock_id = SharedString::from(format!("work-skeleton-pulse:{id}"));
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, cx| {
+            let clip = bounds.intersect(&window.content_mask().bounds);
+            if clip.size.width <= px(0.) || clip.size.height <= px(0.) {
+                return;
+            }
+            let opacity = if prefers_reduced_motion(cx) {
+                1.
+            } else {
+                let clock = window.use_keyed_state(clock_id.clone(), cx, |_, _| SkeletonPulse {
+                    start: Instant::now(),
+                    pending: Cell::new(false),
+                });
+                let timing = clock.read(cx);
+                let elapsed = timing.start.elapsed().as_millis();
+                let step = (elapsed / STEP.as_millis()) % OPACITIES.len() as u128;
+                if !timing.pending.replace(true) {
+                    let delay = STEP - Duration::from_millis((elapsed % STEP.as_millis()) as u64);
+                    let clock = clock.downgrade();
+                    let owner = window.current_view();
+                    window.spawn(cx, async move |cx| {
+                        cx.background_executor().timer(delay).await;
+                        let _ = cx.update(|window, _| {
+                            if clock.upgrade().is_some() {
+                                window.on_next_frame(move |_, cx| {
+                                    if let Some(clock) = clock.upgrade() {
+                                        clock.read(cx).pending.set(false);
+                                        cx.notify(owner);
+                                    }
+                                });
+                            }
+                        });
+                    }).detach();
+                }
+                OPACITIES[step as usize]
+            };
+            let color = fill.opacity(opacity);
+            let left = bounds.left() + px(4.);
+            for (index, fraction) in [2. / 5., 3. / 5., 1. / 3.].into_iter().enumerate() {
+                let top = bounds.top() + px(12. + 20. * index as f32);
+                let leading = gpui::Bounds::new(gpui::point(left, top), gpui::size(px(12.), px(12.)));
+                let line = gpui::Bounds::new(
+                    gpui::point(left + px(20.), top + px(1.)),
+                    gpui::size(((bounds.size.width - px(8.)) * fraction).min((bounds.size.width - px(28.)).max(px(0.))), px(10.)),
+                );
+                window.paint_quad(gpui::fill(leading, color).corner_radii(px(4.)));
+                window.paint_quad(gpui::fill(line, color).corner_radii(px(5.)));
+            }
+        },
+    ).w_full().h(px(68.)).into_any_element()
 }
 
 pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at: Option<&str>, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
@@ -100,7 +147,7 @@ pub fn turn_fold(id: &str, run_id: &str, label: &str, expanded: bool, created_at
                 .child(div().flex_1())
                 .children(created_at.map(|at| timestamp(&env.clock, at, false, cx))),
         )
-        .when(work.loading, |this| this.child(work_history_skeleton(cx)))
+        .when(work.loading, |this| this.child(work_history_skeleton(id, cx)))
         .into_any_element()
 }
 
@@ -127,7 +174,7 @@ pub fn attempt_fold(id: &str, attempt_id: &str, label: &str, expanded: bool, wor
     v_flex()
         .w_full()
         .child(focusable(fold, cx))
-        .when(work.loading, |this| this.child(work_history_skeleton(cx)))
+        .when(work.loading, |this| this.child(work_history_skeleton(id, cx)))
         .into_any_element()
 }
 
@@ -155,7 +202,7 @@ pub fn working_row(compacting: bool, env: &RowEnv, chip: Option<AnyElement>, cx:
                 .text_size(px(14.))
                 .text_color(hsla(p.muted_foreground))
                 .when(compacting && !preparing, |this| this.child(Icon::Minimize2.render(px(12.), hsla(p.muted_foreground))))
-                .child(label)
+                .child(Shimmer::new("working-status-shimmer", preparing || compacting, label))
                 .children(chip),
         )
         .into_any_element()
@@ -2004,6 +2051,8 @@ mod tests {
                         group_lists: &group_lists,
                         working_timer: None,
                         find_target: None,
+                        find: None,
+                        cited_excerpt: None,
                         turn_diffs: &turn_diffs,
                         fork_support: &fork_support,
                         forking: &forking,

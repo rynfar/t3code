@@ -11,6 +11,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex};
 
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::theme::{
     SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
@@ -188,6 +189,7 @@ impl RenderOnce for ComposerControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundKind {
     Send,
+    UpdateQueued,
     Resume,
     Steer,
     Queue,
@@ -200,6 +202,7 @@ pub struct RoundButton {
     id: ElementId,
     kind: RoundKind,
     disabled: bool,
+    busy: bool,
     stage_backdrop: Option<t3_core::client_settings::StageBackdropVariant>,
     tooltip: SharedString,
     on_click: Option<Handler>,
@@ -211,6 +214,7 @@ impl RoundButton {
             id: id.into(),
             kind,
             disabled: false,
+            busy: false,
             stage_backdrop: None,
             tooltip: tooltip.into(),
             on_click: None,
@@ -219,6 +223,11 @@ impl RoundButton {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.busy = busy;
         self
     }
 
@@ -247,12 +256,17 @@ impl RenderOnce for RoundButton {
                 (hsla(p.destructive).opacity(0.9), hsla(p.destructive), Icon::Stop, 12., gpui::white())
             }
             kind if self.disabled => {
-                let glyph = if kind == RoundKind::Send { Icon::Send } else { Icon::ArrowUp };
+                let glyph = match kind {
+                    RoundKind::UpdateQueued => Icon::Check,
+                    RoundKind::Send => Icon::Send,
+                    _ => Icon::ArrowUp,
+                };
                 let muted = hsla(p.foreground).opacity(0.12);
                 (muted, muted, glyph, 14., hsla(p.muted_foreground))
             }
             kind => {
                 let (glyph, size) = match kind {
+                    RoundKind::UpdateQueued => (Icon::Check, 16.),
                     RoundKind::Resume => (Icon::Play, 14.),
                     RoundKind::Steer => (Icon::CornerUpRight, 16.),
                     RoundKind::Queue => (Icon::ListPlus, 16.),
@@ -356,7 +370,11 @@ impl RenderOnce for RoundButton {
                 }])
             })
             .children(stage_art_el)
-            .child(div().relative().child(glyph.render(px(glyph_size), glyph_color)))
+            .child(div().relative().child(if self.busy {
+                Spinner::new("composer-send-spinner", px(14.), glyph_color).into_any_element()
+            } else {
+                glyph.render(px(glyph_size), glyph_color).into_any_element()
+            }))
             .tooltip(tooltip(self.tooltip))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))
@@ -637,6 +655,7 @@ pub struct MenuItem {
     id: ElementId,
     label: SharedString,
     icon: Option<(Icon, Hsla)>,
+    trailing: Option<AnyElement>,
     checked: Option<bool>,
     highlighted: bool,
     disabled: bool,
@@ -645,11 +664,16 @@ pub struct MenuItem {
 
 impl MenuItem {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        MenuItem { id: id.into(), label: label.into(), icon: None, checked: None, highlighted: false, disabled: false, on_click: None }
+        MenuItem { id: id.into(), label: label.into(), icon: None, trailing: None, checked: None, highlighted: false, disabled: false, on_click: None }
     }
 
     pub fn icon(mut self, icon: Icon, color: Hsla) -> Self {
         self.icon = Some((icon, color));
+        self
+    }
+
+    pub fn trailing(mut self, trailing: impl IntoElement) -> Self {
+        self.trailing = Some(trailing.into_any_element());
         self
     }
 
@@ -694,10 +718,27 @@ impl RenderOnce for MenuItem {
             }))
             .children(self.icon.map(|(glyph, color)| glyph.render(px(16.), color.opacity(0.8))))
             .child(div().min_w_0().flex_1().child(self.label))
+            .children(self.trailing)
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))
             })
     }
+}
+
+pub(crate) fn branch_copy_menu(
+    trigger: gpui::Stateful<gpui::Div>,
+    name: String,
+) -> impl IntoElement {
+    use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+
+    let for_copy = name.clone();
+    trigger.tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+        .context_menu(move |menu, _, cx| {
+            let name = for_copy.clone();
+            menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Copy branch name")).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
+            }))
+        })
 }
 
 /// `kbd.tsx`: a key cap for shortcuts.

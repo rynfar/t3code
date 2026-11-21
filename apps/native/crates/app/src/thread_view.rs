@@ -1524,6 +1524,8 @@ impl ThreadView {
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
             find_target: self.find.as_ref().and_then(|find| find.active_entry()).or(self.citation_ui.highlighted.as_deref()),
+            find: self.find.as_ref().and_then(find::FindUi::highlights),
+            cited_excerpt: self.citation_ui.cited_excerpt.as_ref(),
             turn_diffs: &self.turn_diffs,
             fork_support: &self.fork_support,
             forking: &self.forking,
@@ -2301,13 +2303,14 @@ impl ThreadView {
     }
 }
 
-impl Render for ThreadView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ThreadView {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         #[cfg(feature = "snapshot")]
         crate::snapshot::record_render("thread-shell", cx);
         remeasure_for_typography(TranscriptTypography::of(window, cx), &mut self.measured_typography, &self.list, &self.group_lists.borrow());
         let thread = self.thread_state(self.state.read(cx));
         let loading = thread.projection.is_none() && !thread.is_merging_history();
+        self.set_media_scope(cx);
         let muted = hsla(palette(cx).muted_foreground);
         if loading {
             return div()
@@ -2453,6 +2456,35 @@ impl Render for ThreadView {
                     ),
             )
             .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).children(crate::transcript::markdown::links::render_model_mention_popover(cx.entity().entity_id(), window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+    }
+}
+
+impl Render for ThreadView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = self.render_content(window, cx);
+        let p = palette(cx);
+        let overlay = self.thread_id.as_deref()
+            .and_then(|thread_id| crate::composer::for_attachment_drop(thread_id, cx))
+            .map(|composer| {
+                div().id("thread-file-drop")
+                    .absolute().inset_0().m(px(8.))
+                    .flex().items_center().justify_center()
+                    .rounded(px(12.)).border_1().border_dashed()
+                    .border_color(hsla(p.primary).opacity(0.7))
+                    .bg(hsla(p.accent).opacity(0.45))
+                    .opacity(0.)
+                    .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.))
+                    .on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
+                        composer.update(cx, |composer, cx| composer.on_drop_paths(paths, window, cx));
+                    })
+                    .child(div()
+                        .px(px(12.)).py(px(8.))
+                        .rounded(px(8.))
+                        .bg(hsla(p.popover))
+                        .text_sm().text_color(hsla(p.popover_foreground))
+                        .child(crate::i18n::t(cx, "Drop files to attach")))
+            });
+        div().relative().size_full().child(content).children(overlay)
     }
 }
 

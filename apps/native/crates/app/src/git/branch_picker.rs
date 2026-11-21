@@ -16,8 +16,11 @@ use t3_core::vcs::refs::{RefChoice, RefHighlight};
 use t3_core::vcs::{RefFilter, VcsRef, branch_selection_target, ref_badge, sanitize_new_ref_name};
 
 use super::{GitDialogs, GitEvent, GitStore};
-use crate::composer::controls::{Float, floating, menu_surface};
+use crate::composer::controls::{Float, branch_copy_menu, floating, menu_surface};
 use crate::icons::Icon;
+use crate::i18n::t;
+use crate::theme::{ThemeSlot, ThemeSlotExt};
+use crate::transcript::middle_truncate;
 use crate::sidebar::is_composing;
 use crate::theme::{hsla, palette};
 use crate::thread_details::controls::{MenuRow, ROW_WIDTH};
@@ -32,6 +35,7 @@ enum Item {
 pub struct BranchPicker {
     git: Entity<GitStore>,
     dialogs: Option<Entity<GitDialogs>>,
+    placement: Float,
     input: Entity<InputState>,
     open: bool,
     highlighted: RefHighlight,
@@ -82,6 +86,7 @@ impl BranchPicker {
         BranchPicker {
             git,
             dialogs: None,
+            placement: Float::BelowStart,
             input,
             open: false,
             highlighted: RefHighlight::default(),
@@ -97,6 +102,11 @@ impl BranchPicker {
 
     pub fn with_dialogs(mut self, dialogs: Entity<GitDialogs>) -> Self {
         self.dialogs = Some(dialogs);
+        self
+    }
+
+    pub(crate) fn above_trigger(mut self) -> Self {
+        self.placement = Float::AboveStart;
         self
     }
 
@@ -232,7 +242,7 @@ impl BranchPicker {
                 // Moving to a worktree that already has the ref only records it on the thread.
                 let reuses = checkout.is_some_and(|checkout| !checkout.is_draft && branch_selection_target(&checkout.project_cwd, git.project_checkout_root(), checkout.worktree_path.as_deref(), target).reuse_existing_worktree);
                 let enabled = git.can_change_branch() || (reuses && git.can_operate_thread());
-                let row = MenuRow::new(id, target.name.clone()).trailing(div().children(badge.map(|badge| div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.45)).child(badge))));
+                let row = MenuRow::new(id, middle_truncate(&target.name, 32)).trailing(div().children(badge.map(|badge| div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.65)).child(t(cx, badge)))));
                 (row, enabled)
             }
             Item::Create(name) => (MenuRow::new(id, SharedString::from(format!("Create new ref \"{name}\""))), true),
@@ -249,7 +259,11 @@ impl BranchPicker {
             if this.highlighted.hover(&hover_choice) { cx.notify(); }
         }));
         let row = if enabled { row.on_click(cx.listener(move |this, _, window, cx| this.activate(choice.clone(), window, cx))) } else { row };
-        div().w_full().child(row).into_any_element()
+        let trigger = div().id(("branch-copy-menu", index)).w_full().child(row);
+        match item {
+            Item::Ref(reference) => branch_copy_menu(trigger, reference.name).into_any_element(),
+            _ => trigger.into_any_element(),
+        }
     }
 }
 
@@ -318,7 +332,7 @@ impl Render for BranchPicker {
                     .border_b_1()
                     .border_color(hsla(p.border).opacity(0.7))
                     .child(Icon::Search.sized(px(16.)).text_color(hsla(p.muted_foreground).opacity(0.55)))
-                    .child(div().flex_1().h(px(26.)).flex().items_center().child(Input::new(&self.input).appearance(false).bordered(false))),
+                    .child(div().flex_1().h(px(26.)).flex().items_center().theme_slot(ThemeSlot::Input, cx).child(Input::new(&self.input).appearance(false).bordered(false))),
             )
             .when(empty, |this| this.child(div().py(px(16.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No refs found.")))
             .when(count > 0, |this| {
@@ -347,6 +361,11 @@ impl Render for BranchPicker {
                     })
                     .child(text)
             }));
-        floating(Float::BelowStart, div().pt(px(4.)).child(popup))
+        let offset = if matches!(self.placement, Float::AboveStart) {
+            div().pb(px(4.))
+        } else {
+            div().pt(px(4.))
+        };
+        floating(self.placement, offset.child(popup))
     }
 }

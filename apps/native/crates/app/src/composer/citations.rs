@@ -10,7 +10,7 @@ use crate::{
     icons::Icon,
     theme::{hsla, palette},
 };
-use gpui::{AnyElement, Context, Entity, Focusable, IntoElement, KeyDownEvent, ParentElement, Styled, Subscription, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, Entity, Focusable, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Styled, Subscription, Window, WindowId, div, prelude::*, px};
 use gpui_component::input::{Escape, InputEvent, Textarea, TextareaState};
 use gpui_component::{h_flex, v_flex};
 use t3_core::assistant_citations::{self as rules, Citation, CommentAnchor, CommentSettlement};
@@ -18,8 +18,23 @@ use t3_core::voice_input::{
     VoiceDraftSnapshot, VoiceSelection, utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
 
+struct CitationAnchor(Option<(WindowId, Citation, Point<Pixels>)>);
+impl gpui::Global for CitationAnchor {}
+
+pub(crate) fn remember_citation_anchor(citation: &Citation, position: Point<Pixels>, window: &Window, cx: &mut App) {
+    cx.set_global(CitationAnchor(Some((window.window_handle().window_id(), citation.clone(), position))));
+}
+
+fn take_citation_anchor(citation: &Citation, window: &Window, cx: &mut App) -> Option<Point<Pixels>> {
+    let matches = cx.try_global::<CitationAnchor>()?.0.as_ref().is_some_and(|(id, pending, _)| {
+        *id == window.window_handle().window_id() && pending == citation
+    });
+    matches.then(|| cx.global_mut::<CitationAnchor>().0.take().unwrap().2)
+}
+
 pub(super) struct CommentEditor {
     anchor: CommentAnchor,
+    source_position: Option<Point<Pixels>>,
     input: Entity<TextareaState>,
     pub(super) voice: Entity<crate::voice::VoiceSpeechController>,
     dictation_target_id: u64,
@@ -43,9 +58,10 @@ impl Composer {
             let reversed = input.cursor() < selected.end;
             (selected, reversed)
         };
+        let source_position = take_citation_anchor(&citation, window, cx);
         let (edit, anchor) = rules::insert_citation(&prompt, selected, reversed, citation);
         self.apply_citation_edit(edit, window, cx);
-        self.open_citation_comment(anchor, window, cx);
+        self.open_citation_comment(anchor, source_position, window, cx);
     }
 
     fn apply_citation_edit(&mut self, edit: rules::PromptEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -56,7 +72,7 @@ impl Composer {
         self.draft_changed(cx);
     }
 
-    fn open_citation_comment(&mut self, anchor: CommentAnchor, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_citation_comment(&mut self, anchor: CommentAnchor, source_position: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         if !self.close_citation_comment("outside-press", window, cx) || anchor.link.replace(&self.prompt(cx), String::new()).is_none() {
             return;
         }
@@ -198,6 +214,7 @@ impl Composer {
         });
         self.citation_editor = Some(CommentEditor {
             anchor,
+            source_position,
             input,
             voice,
             dictation_target_id,
@@ -289,7 +306,7 @@ impl Composer {
                                             s.tab_index(0)
                                                 .cursor_pointer()
                                                 .hover(|s| s.bg(color.opacity(0.17)))
-                                                .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), window, cx)))
+                                                .on_click(cx.listener(move |this, _, window, cx| this.open_citation_comment(edit.clone(), None, window, cx)))
                                         })
                                         .child(Icon::Pencil.render(px(12.), color)),
                                 )
@@ -318,7 +335,20 @@ impl Composer {
                                         .child(Icon::X.render(px(12.), color)),
                                 ),
                         )
-                        .when(open, |this| this.child(floating(Float::AboveEnd, self.citation_comment_popup(cx))))
+                        .when(open, |this| {
+                            let popup = self.citation_comment_popup(cx);
+                            let position = self.citation_editor.as_ref().and_then(|editor| editor.source_position);
+                            match position {
+                                Some(position) => this.child(gpui::deferred(
+                                    gpui::anchored()
+                                        .position_mode(gpui::AnchoredPositionMode::Window)
+                                        .position(position + gpui::point(px(0.), px(12.)))
+                                        .snap_to_window_with_margin(px(8.))
+                                        .child(popup),
+                                ).with_priority(3)),
+                                None => this.child(floating(Float::AboveEnd, popup)),
+                            }
+                        })
                 }))
                 .into_any_element(),
         )
@@ -346,7 +376,7 @@ impl Composer {
         let len = prompt.len();
         let (edit, anchor) = rules::insert_citation(&prompt, len..len, false, citation);
         self.apply_citation_edit(edit, window, cx);
-        self.open_citation_comment(anchor, window, cx);
+        self.open_citation_comment(anchor, None, window, cx);
         self.citation_editor.as_ref().map(|editor| editor.voice.clone())
     }
 

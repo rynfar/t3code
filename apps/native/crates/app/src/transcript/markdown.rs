@@ -821,14 +821,9 @@ fn style_markdown_with_source(
                         cx,
                     ))
                 })
-                .child(super::parts::ghost_icon_button(
-                    "copy-code",
-                    Icon::Copy,
-                    move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone()));
-                    },
-                    cx,
-                ))
+                .child(super::parts::CopyButton::new("copy-code", "Copy code", move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone()));
+                }))
         })
         .on_link_click(move |url: &SharedString, event, window, cx| {
             links::handle_markdown_link_click_for_source(url, event, link_ctx.as_ref(), source_key.as_deref(), window, cx);
