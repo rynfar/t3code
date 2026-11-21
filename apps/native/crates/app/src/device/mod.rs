@@ -463,6 +463,7 @@ impl Devices {
         self.floating.contains_key(&(host_id.to_owned(), device_id.to_owned()))
     }
 
+    #[cfg(any(test, not(feature = "snapshot")))]
     pub(crate) fn clear_floating_key(&mut self, key: &(String, String), cx: &mut Context<Self>) {
         if self.floating.remove(key).is_some() {
             cx.emit(DevicesEvent::Changed);

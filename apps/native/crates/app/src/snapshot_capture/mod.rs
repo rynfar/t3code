@@ -11,7 +11,7 @@ pub mod setup_dialog;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 use std::sync::Mutex;
 
 use gpui::{App, Entity, Global};
@@ -84,8 +84,7 @@ struct InstalledSnapShotPlatform(Arc<dyn SnapShotPlatform>);
 
 impl Global for InstalledSnapShotPlatform {}
 
-#[cfg(any(test, feature = "snapshot"))]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "snapshot"))]
 pub fn install_platform(platform: Arc<dyn SnapShotPlatform>, cx: &mut App) {
     cx.set_global(InstalledSnapShotPlatform(platform));
 }
@@ -245,8 +244,7 @@ impl SnapShotPlatform for StubSnapShotPlatform {
 }
 
 /// Deterministic mock platform for unit and GPUI tests (zero OS dialogs, monitors, or audio).
-#[cfg(any(test, feature = "snapshot"))]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub struct MockSnapShotPlatform {
     pub supported: AtomicBool,
     pub permissions: Mutex<Option<MacSnapShotPermissions>>,
@@ -260,26 +258,26 @@ pub struct MockSnapShotPlatform {
     pub trigger_callback: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 struct MockShortcutHandle {
     stopped: Arc<AtomicBool>,
 }
 
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 impl ShortcutListenerHandle for MockShortcutHandle {
     fn stop(&mut self) {
         self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 impl Drop for MockShortcutHandle {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 #[allow(dead_code)]
 impl MockSnapShotPlatform {
     pub fn sample_png() -> Vec<u8> {
@@ -332,7 +330,7 @@ impl MockSnapShotPlatform {
     }
 }
 
-#[cfg(any(test, feature = "snapshot"))]
+#[cfg(test)]
 impl SnapShotPlatform for MockSnapShotPlatform {
     fn is_supported(&self) -> bool {
         self.supported.load(Ordering::SeqCst)
