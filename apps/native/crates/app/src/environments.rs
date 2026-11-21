@@ -203,7 +203,7 @@ impl AppState {
     }
 
     pub(crate) fn apply_settings_routes(&mut self, id: &str, routes: Vec<CandidateRoute>, cx: &mut Context<Self>) {
-        if self.environments.get(id).is_none_or(|saved| saved.ssh.is_some() || saved.local || saved.is_relay_managed()) {
+        if self.environments.get(id).is_none_or(|saved| saved.local || saved.is_relay_managed()) {
             return;
         }
         self.record_environment_alternate_routes(id, routes);
@@ -391,6 +391,25 @@ impl AppState {
         label: String,
         cx: &mut Context<Self>,
     ) {
+        let saved = self.environments.find_by_environment_id(&resp.environment_id);
+        if let Some(saved) = saved.filter(|saved| !saved.is_relay_managed()) {
+            if saved.local {
+                return;
+            }
+            let id = saved.id.clone();
+            let mut existing = store::load_alternate_routes();
+            let current = existing.remove(&id).unwrap_or_default();
+            let routes = t3_client::routes::upsert_route(&current, CandidateRoute::relay(resp));
+            self.apply_settings_routes(&id, routes, cx);
+            let title = crate::i18n::t(cx, "T3 Connect route added").to_owned();
+            let description = crate::i18n::t_fmt(
+                cx,
+                "{environment} falls back to T3 Connect when its other routes are unreachable.",
+                &[("environment", t3_core::i18n::IcuArg::Text(label.into()))],
+            );
+            self.show_toast(Toast::new(ToastKind::Success, title).description(description), cx);
+            return;
+        }
         let id = self.environments.upsert_relay(
             &resp.environment_id,
             &label,
@@ -418,7 +437,11 @@ impl AppState {
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
         if environment.disabled { return; }
-        let Some(access_token) = environment.access_token.clone() else { return };
+        let alternate_routes = store::load_alternate_routes().remove(id).unwrap_or_default();
+        let relay = alternate_routes.iter().any(|route| route.kind() == t3_client::routes::ConnectionRouteKind::Relay)
+            .then(|| self.cloud.service.clone());
+        if environment.access_token.is_none() && relay.is_none() { return; }
+        let access_token = environment.access_token.clone().unwrap_or_default();
         if environment.ssh.is_none()
             && environment.is_relay_managed()
             && let Some(relay_env_id) = environment.environment_id.clone()
@@ -474,18 +497,19 @@ impl AppState {
                 Vec::new(),
                 environment.environment_id,
                 Some(prepare),
+                None,
             );
             self.watch_connect_approvals(id, cx);
             return;
         }
-        let Some(target) = environment.ssh.clone() else {
-            let alternate_routes = store::load_alternate_routes().remove(id).unwrap_or_default();
+        let Some(target) = environment.ssh.clone().filter(|_| !access_token.is_empty()) else {
             self.connections.watch_with_routes(
                 id,
                 Credentials { http_base: environment.http_base, access_token },
                 alternate_routes,
                 environment.environment_id,
                 None,
+                relay,
             );
             self.watch_connect_approvals(id, cx);
             return;
@@ -506,9 +530,10 @@ impl AppState {
         self.connections.watch_with_routes(
             id,
             Credentials { http_base, access_token },
-            Vec::new(),
+            alternate_routes,
             environment.environment_id,
             Some(prepare),
+            relay,
         );
         self.watch_connect_approvals(id, cx);
     }
@@ -668,7 +693,7 @@ impl AppState {
             if let Some(updated) = t3_client::routes::merge_learned_routes(env_id, &current, &primary.id, &reported, true) {
                 let alternates = updated
                     .into_iter()
-                    .filter(|candidate| candidate.http_base.trim_end_matches('/') != env.http_base.trim_end_matches('/'))
+                    .filter(|candidate| candidate.id != primary.id)
                     .collect();
                 self.record_environment_alternate_routes(&env.id, alternates);
             }
@@ -1128,7 +1153,7 @@ impl AppState {
         if !moved && self.environments.active.as_deref() == Some(id) && self.client_handle().is_some() {
             return self.close_switcher(cx);
         }
-        if environment.access_token.is_none() {
+        if !environment.has_connection_route() {
             if environment.local && self.local_saved_environment().is_some_and(|local| local.id == environment.id) {
                 return self.pair_local(cx);
             }
@@ -1148,7 +1173,7 @@ impl AppState {
                         provider_kind: "cloudflare_tunnel".into(),
                     },
                 };
-                return self.connect_cloud_environment(relay_env, cx);
+                return self.connect_cloud_environment(relay_env, true, cx);
             }
             let message = format!("Paste a new pairing link from {} to connect it again.", environment.label);
             return self.fail_pairing(PairingSource::Link, message, cx);
@@ -1202,7 +1227,7 @@ impl AppState {
 
     pub(crate) fn set_saved_environment_enabled(&mut self, id: &str, enabled: bool, cx: &mut Context<Self>) {
         let Some(entry) = self.environments.environments.iter_mut().find(|entry| entry.id == id) else { return };
-        if entry.disabled != enabled || (enabled && entry.access_token.is_none()) {
+        if entry.disabled != enabled || (enabled && !entry.has_connection_route()) {
             return;
         }
         entry.disabled = !enabled;
@@ -1231,7 +1256,7 @@ impl AppState {
 
     fn select_remaining_environment(&mut self, cx: &mut Context<Self>) {
         let next = self.environments.environments.iter()
-            .find(|saved| !saved.disabled && saved.access_token.is_some())
+            .find(|saved| !saved.disabled && saved.has_connection_route())
             .map(|saved| saved.id.clone());
         self.environments.active = next.clone();
         self.notification_route = None;

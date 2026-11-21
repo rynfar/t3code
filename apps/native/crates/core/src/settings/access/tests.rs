@@ -1,6 +1,13 @@
 use serde_json::json;
 
 use super::*;
+
+#[test]
+fn legacy_cloud_link_state_treats_a_link_as_a_managed_tunnel() {
+    let legacy = CloudLinkState::from_wire(&serde_json::json!({"linked": true})).unwrap();
+    assert!(!cloud_change_replaces_link(&legacy, true, true));
+    assert!(cloud_change_replaces_link(&legacy, false, true));
+}
 use crate::sidebar::time::format_iso;
 
 const NOW: i64 = 1_793_000_000_000;

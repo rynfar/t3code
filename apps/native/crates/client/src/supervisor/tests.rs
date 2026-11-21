@@ -116,7 +116,7 @@ async fn next_dispatch(rx: &mut mpsc::UnboundedReceiver<Command>) -> (Value, one
 async fn ordered_dispatch_waits_for_each_command_and_stops_at_a_failure() {
     let (commands, mut rx) = mpsc::unbounded_channel();
     let credentials = Arc::new(Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() });
-    let handle = ClientHandle { refs: Default::default(), commands, credentials, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 };
+    let handle = ClientHandle { refs: Default::default(), commands, credentials, active_credentials: watch::channel(None).1, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 };
     let sends = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
     let run = tokio::spawn(async move { handle.dispatch_in_order(sends).await });
 
@@ -470,7 +470,7 @@ async fn stacked_action_exits_invalidate_refs_on_success_failure_and_interruptio
 async fn media_fallback_uses_the_local_rpc_origin_and_preserves_optional_metadata() {
     fn client(base: &str) -> (ClientHandle, mpsc::UnboundedReceiver<Command>) {
         let (commands, rx) = mpsc::unbounded_channel();
-        (ClientHandle { refs: Default::default(), commands, credentials: Arc::new(Credentials { http_base: base.into(), access_token: "fixture".into() }), session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 }, rx)
+        (ClientHandle { refs: Default::default(), commands, credentials: Arc::new(Credentials { http_base: base.into(), access_token: "fixture".into() }), active_credentials: watch::channel(None).1, session_state: watch::channel(None).1, connection_generation: watch::channel(0).1 }, rx)
     }
     for tag in ["AssetWorkspaceAssetNotFoundError", "FutureAssetError"] {
         let (remote, mut remote_rx) = client("https://remote.example");

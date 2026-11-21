@@ -653,6 +653,15 @@ pub async fn post_access(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    post_access_with_timeout(credentials, path, body, None).await
+}
+
+pub(crate) async fn post_access_with_timeout(
+    credentials: &Credentials,
+    path: &str,
+    body: Option<serde_json::Value>,
+    timeout: Option<std::time::Duration>,
+) -> Result<serde_json::Value, String> {
     let url = format!("{}{path}", credentials.http_base.trim_end_matches('/'));
     let mut rejected: Option<String> = None;
     for attempt in 0..2 {
@@ -661,6 +670,9 @@ pub async fn post_access(
                 .await
                 .map_err(|error| error.to_string())?;
         let mut request = http().post(&url).header("Authorization", auth_header);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(proof) = dpop_header {
             request = request.header("DPoP", proof);
         }
@@ -772,7 +784,18 @@ pub async fn mint_mcp_approval_code(
 }
 
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
-    let mut url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
+    let url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
+    authorized_socket_url(credentials, ticket, url, "direct")
+}
+
+pub(crate) fn relay_socket_url(credentials: &Credentials, ticket: &str, mut url: url::Url) -> String {
+    if url.path() == "/" || url.path().is_empty() {
+        url.set_path("/ws");
+    }
+    authorized_socket_url(credentials, ticket, url, "relay")
+}
+
+fn authorized_socket_url(credentials: &Credentials, ticket: &str, mut url: url::Url, method: &str) -> String {
     let dpop_proof = if dpop::find_direct_credential(&credentials.http_base, &credentials.access_token).is_some() {
         dpop::ws_url_to_http_htu(&url).and_then(|http_htu| {
             dpop::device_key()
@@ -793,7 +816,7 @@ pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
             .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
             .append_pair("clientDeviceType", "desktop")
             .append_pair("clientOs", client_os())
-            .append_pair("connectionMethod", "direct")
+            .append_pair("connectionMethod", method)
             .append_pair(SOCKET_FRAME_PARTS_QUERY_PARAM, "1");
     }
     append_orchestration_protocol(url.as_str()).expect("valid ws url")

@@ -1065,7 +1065,7 @@ impl SettingsView {
         };
         let (tone, status_label, live) = if saved.disabled {
             (None, t(cx, "Off").to_owned(), false)
-        } else if saved.access_token.is_none() {
+        } else if !saved.has_connection_route() {
             (Some(DotTone::Destructive), t(cx, "Needs pairing again").to_owned(), false)
         } else if let Some(status) = status {
             (Some(status.dot()), t(cx, &status.title()).to_owned(), matches!(status.phase(), status::ConnectionPhase::Connecting | status::ConnectionPhase::Reconnecting))
@@ -1090,7 +1090,7 @@ impl SettingsView {
         let enable_id = saved.id.clone();
         let switch_id = saved.id.clone();
         let state = self.state.clone();
-        let can_switch = saved.access_token.is_some();
+        let can_switch = saved.has_connection_route();
         let trailing = h_flex().gap(r(6.)).flex_none()
             .children(update.map(|_| Spinner::new((gpui::ElementId::from(SharedString::from(saved.id.clone())), "update"), gpui::px(13.), hsla(p.muted_foreground))))
             .children(update_target.map(|target| self.catalog_update_button(target, cx)))
@@ -1122,9 +1122,10 @@ impl SettingsView {
         let primary = CandidateRoute::primary(&saved.http_base, saved.ssh.is_some());
         let active_route = progress.active_route_id.as_deref()
             .or_else(|| (connected && alternate_routes.is_empty()).then_some(primary.id.as_str()));
-        let subtitle = if !saved.local && !relay && saved.ssh.is_none() && active_route != Some(primary.id.as_str()) {
+        let subtitle = if !saved.local && !relay && active_route != Some(primary.id.as_str()) {
             active_route.and_then(|id| alternate_routes.iter().find(|route| route.id == id))
-                .map(|route| format!("via {}", route.label())).unwrap_or_else(|| transport_subtitle(saved, config))
+                .map(|route| if route.kind() == ConnectionRouteKind::Relay { t(cx, "T3 Connect").to_owned() } else { format!("via {}", route.label()) })
+                .unwrap_or_else(|| transport_subtitle(saved, config))
         } else {
             transport_subtitle(saved, config)
         };
@@ -1284,7 +1285,7 @@ impl SettingsView {
         let p = palette(cx);
         let key: SharedString = saved.id.clone().into();
         let refused = t3_client::supervisor::refused_routes_for(&saved.http_base).borrow().clone();
-        let can_edit = !saved.local && saved.ssh.is_none() && !saved.is_relay_managed();
+        let can_edit = !saved.local && !saved.is_relay_managed();
         let rows = std::iter::once((None, primary)).chain(alternate_routes.iter().enumerate().map(|(i, route)| (Some(i), route)));
         v_flex().pt(r(6.)).gap(r(5.)).border_t_1().border_color(hsla(p.border).opacity(0.5))
             .children(rows.map(|(index, route)| {
@@ -1302,8 +1303,8 @@ impl SettingsView {
                             .when(refused, |el| el.child(div().text_color(hsla(p.destructive_foreground)).child(t(cx, "Sign-in refused")))))
                         .child(div().text_xs().truncate().text_color(hsla(p.muted_foreground))
                             .child(if route.learned { format!("{} · {}", route.http_base, t(cx, "found automatically")) }
-                                else if saved.ssh.is_some() { saved.address() } else { route.http_base.clone() })))
-                    .when_some(index.filter(|_| can_edit), |el, index| {
+                                else if route.ssh { saved.address() } else { route.http_base.clone() })))
+                    .when_some(index.filter(|_| can_edit && saved.ssh.is_none()), |el, index| {
                         el.children([(-1, "Move route up", Icon::ChevronUp), (1, "Move route down", Icon::ChevronDown)].map(|(offset, title, icon)| {
                             let saved_id = saved.id.clone();
                             let route_id = route.id.clone();
@@ -1390,6 +1391,7 @@ impl SettingsView {
     fn catalog_cloud_rows(&self, cx: &Context<Self>) -> AnyElement {
         let state = self.state.read(cx);
         let cloud = &state.cloud;
+        let alternate_routes = load_alternate_routes();
         let p = palette(cx);
         let heading = h_flex().gap(r(6.)).justify_between()
             .child(section_title("T3 Connect"))
@@ -1404,12 +1406,16 @@ impl SettingsView {
         v_flex().mt(r(10.)).gap(r(5.)).child(heading)
             .children(cloud.error.as_ref().map(|error| muted_text(error.clone(), cx)))
             .children(cloud.discovery.environments.iter().filter_map(|entry| {
-                let saved = state.environments.find(Some(&entry.environment_id), &entry.endpoint.http_base_url);
-                if saved.is_some_and(SavedEnvironment::is_relay_managed) { return None; }
+                let saved = state.environments.find_by_environment_id(&entry.environment_id);
+                if saved.is_some_and(|saved| {
+                    saved.local || saved.is_relay_managed() || alternate_routes.get(&saved.id)
+                        .is_some_and(|routes| routes.iter().any(|route| route.kind() == ConnectionRouteKind::Relay))
+                }) { return None; }
                 let known = saved.and_then(|saved| state.fleet.environment(&saved.id)).and_then(|view| view.config.config.as_ref());
-                let incompatible = known.is_some_and(|config| t3_core::compatibility::protocol_mismatch(&config.environment).is_some());
+                let incompatibility = state.cloud_environment_compatibility_error(&entry.environment_id);
                 let (label, color, live) = match cloud.statuses.get(&entry.environment_id) {
                     Some(EnvironmentHealth::Online) => ("Online", p.success, false),
+                    Some(EnvironmentHealth::Incompatible(_)) => ("Client not supported", p.destructive, false),
                     Some(EnvironmentHealth::Offline { .. }) => ("Offline", p.destructive, false),
                     Some(EnvironmentHealth::Error(_)) => ("Status unavailable", p.muted_foreground, false),
                     Some(EnvironmentHealth::Checking) | None => ("Checking…", p.warning, cloud.has_clerk_session),
@@ -1417,10 +1423,8 @@ impl SettingsView {
                 let adding = cloud.connecting_env_id.as_deref() == Some(&entry.environment_id);
                 let disabled_reason = if !cloud.has_clerk_session {
                     Some("Sign in to T3 Connect first.")
-                } else if incompatible {
+                } else if incompatibility.is_some() {
                     Some("This environment uses an incompatible server version.")
-                } else if saved.is_some() {
-                    Some("Native cannot add a T3 Connect route alongside a direct or SSH route yet.")
                 } else if label != "Online" {
                     Some("This environment must be online to add it.")
                 } else {
@@ -1438,9 +1442,9 @@ impl SettingsView {
                     .child(icon(known.map_or(Icon::Cloud, Icon::machine), 16., hsla(p.muted_foreground)))
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(entry.label.clone()))
                     .child(StatusDot::new((gpui::ElementId::from(key), "cloud-status"), gpui::px(8.), hsla(color), live))
-                    .child(muted_text(t(cx, if incompatible { "Client not supported" } else { label }), cx))
+                    .child(muted_text(t(cx, if incompatibility.is_some() { "Client not supported" } else { label }), cx))
                     .child(add.on_click(cx.listener(move |this, _, _, cx| {
-                        this.state.update(cx, |state, cx| state.connect_cloud_environment(env.clone(), cx));
+                        this.state.update(cx, |state, cx| state.connect_cloud_environment(env.clone(), false, cx));
                     }))))
             }))
             .into_any_element()

@@ -182,13 +182,14 @@ pub struct ClientHandle {
     pub(crate) refs: crate::vcs::RefState,
     commands: mpsc::UnboundedSender<Command>,
     credentials: Arc<Credentials>,
+    active_credentials: watch::Receiver<Option<Credentials>>,
     session_state: watch::Receiver<Option<AuthSessionState>>,
     connection_generation: watch::Receiver<u64>,
 }
 
 impl ClientHandle {
-    pub fn credentials(&self) -> &Credentials {
-        &self.credentials
+    pub fn credentials(&self) -> Credentials {
+        self.active_credentials.borrow().clone().unwrap_or_else(|| (*self.credentials).clone())
     }
 
     /// Live extras decoded from `subscribeServerConfig` snapshots and settings updates.
@@ -235,6 +236,7 @@ impl ClientFixture {
         let (commands, received) = mpsc::unbounded_channel();
         let (grants, session_state) = watch::channel(Some(session));
         let (generation, connection_generation) = watch::channel(1);
+        let (_, active_credentials) = watch::channel(None);
         let handle = ClientHandle {
             refs: Default::default(),
             commands,
@@ -242,6 +244,7 @@ impl ClientFixture {
                 http_base,
                 access_token: String::new(),
             }),
+            active_credentials,
             session_state,
             connection_generation,
         };
@@ -360,11 +363,11 @@ impl ClientHandle {
 
     /// Fetches and decodes one page of earlier history over HTTP. Run it on the network runtime.
     pub async fn history_page(&self, thread_id: &str, cursor: &str) -> Result<HistoryPage, String> {
-        crate::history::fetch_history_page(&self.credentials, thread_id, cursor).await
+        crate::history::fetch_history_page(&self.credentials(), thread_id, cursor).await
     }
 
     pub async fn history_page_with(&self, thread_id: &str, query: crate::history::HistoryQuery) -> Result<HistoryPage, String> {
-        crate::history::fetch_history_page_with(&self.credentials, thread_id, &query).await
+        crate::history::fetch_history_page_with(&self.credentials(), thread_id, &query).await
     }
 
     /// Dispatches commands one after another, each only once the previous one committed, and
@@ -380,36 +383,36 @@ impl ClientHandle {
     /// A pull request's patch over HTTP (`POST /api/pull-requests/diff`). Run it on the network
     /// runtime.
     pub async fn pull_request_diff(&self, payload: Value) -> Result<Value, crate::pull_requests::HttpFailure> {
-        crate::pull_requests::fetch_diff(&self.credentials, payload).await
+        crate::pull_requests::fetch_diff(&self.credentials(), payload).await
     }
 
     /// An authenticated `GET` endpoint with this device's credential (`auth::get_access`). Run it
     /// on the network runtime.
     pub async fn get_access(&self, path: &str) -> Result<Value, String> {
-        auth::get_access(&self.credentials, path).await
+        auth::get_access(&self.credentials(), path).await
     }
 
     /// An access endpoint `POST` with this device's credential (`auth::post_access`). Run it on the
     /// network runtime.
     pub async fn post_access(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
-        auth::post_access(&self.credentials, path, body).await
+        auth::post_access(&self.credentials(), path, body).await
     }
 
     /// Downloads a signed asset (`assets.createUrl`) over HTTP, at most `max_bytes`. Run it on
     /// the network runtime.
     pub async fn asset_bytes(&self, relative_url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-        crate::asset::fetch_asset(&self.credentials.http_base, relative_url, max_bytes).await
+        crate::asset::fetch_asset(&self.credentials().http_base, relative_url, max_bytes).await
     }
 
     /// Opens the stream of one viewed preview tab on `runtime`. Dropping it closes the socket.
     pub fn preview_stream(&self, runtime: &tokio::runtime::Handle, target: crate::preview_stream::StreamTarget) -> crate::preview_stream::PreviewStream {
-        crate::preview_stream::open(runtime, self.credentials.clone(), target)
+        crate::preview_stream::open(runtime, Arc::new(self.credentials()), target)
     }
 
     /// Opens one device's screen and input through the device hub on `runtime`. Dropping its
     /// input handle stops it.
     pub fn device_stream(&self, runtime: &tokio::runtime::Handle, target: crate::device_stream::DeviceTarget) -> crate::device_stream::DeviceStream {
-        crate::device_stream::open(runtime, self.credentials.clone(), target)
+        crate::device_stream::open(runtime, Arc::new(self.credentials()), target)
     }
 
     /// One unary RPC on the live session, such as `orchestration.getTurnDiff`. Fails with
@@ -460,7 +463,7 @@ pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (Cli
 
 /// `start`, running `prepare` before every connection attempt.
 pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials, prepare: Option<Prepare>) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
-    start_with_routes(runtime, credentials, Vec::new(), None, prepare)
+    start_with_routes(runtime, credentials, Vec::new(), None, prepare, None)
 }
 
 /// `start_prepared` with alternate candidate routes and expected `environmentId` for multi-route
@@ -471,18 +474,21 @@ pub fn start_with_routes(
     alternate_routes: Vec<CandidateRoute>,
     expected_environment_id: Option<String>,
     prepare: Option<Prepare>,
+    relay: Option<Arc<crate::connect::Cloud>>,
 ) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
     wakeups::ensure_clock_jump_watcher(runtime);
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
     let (generations, connection_generation) = watch::channel(0);
+    let (active_credentials_tx, active_credentials) = watch::channel(None);
     let config_extras_tx = extras_sender(&credentials.http_base);
     let refused_routes_tx = refused_routes_sender(&credentials.http_base);
     let handle = ClientHandle {
         refs: Default::default(),
         commands,
         credentials: Arc::new(credentials.clone()),
+        active_credentials,
         session_state,
         connection_generation,
     };
@@ -494,10 +500,12 @@ pub fn start_with_routes(
                 alternate_routes,
                 expected_environment_id,
                 prepare,
+                relay,
                 command_rx,
                 events.clone(),
                 grants,
                 generations,
+                active_credentials_tx,
                 config_extras_tx,
                 refused_routes_tx,
             ) => {},
@@ -528,12 +536,17 @@ fn initial_candidate_routes(
     alternate_routes: Vec<CandidateRoute>,
     ssh: bool,
 ) -> Vec<CandidateRoute> {
+    if credentials.access_token.is_empty()
+        && alternate_routes.iter().any(|route| route.relay_access_token().is_some())
+    {
+        return alternate_routes.into_iter().filter(|route| route.relay_access_token().is_some()).collect();
+    }
     let primary = CandidateRoute::primary(&credentials.http_base, ssh);
     let mut routes = vec![primary.clone()];
     for candidate in alternate_routes {
-        if normalize_http_base(&candidate.http_base) != primary.http_base
+        if candidate.relay_access_token().is_some() || (normalize_http_base(&candidate.http_base) != primary.http_base
             && !routes.iter().any(|existing| normalize_http_base(&existing.http_base) == normalize_http_base(&candidate.http_base))
-        {
+        ) {
             routes.push(candidate);
         }
     }
@@ -546,10 +559,12 @@ async fn supervise(
     alternate_routes: Vec<CandidateRoute>,
     mut expected_environment_id: Option<String>,
     prepare: Option<Prepare>,
+    relay: Option<Arc<crate::connect::Cloud>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: Events,
     grants: watch::Sender<Option<AuthSessionState>>,
     generations: watch::Sender<u64>,
+    active_credentials_tx: watch::Sender<Option<Credentials>>,
     config_extras: Arc<watch::Sender<ServerConfigExtras>>,
     refused_routes_tx: Arc<watch::Sender<Vec<String>>>,
 ) {
@@ -585,11 +600,21 @@ async fn supervise(
             },
             None => Ok(()),
         };
-        let ordered_routes = prioritize_preferred_route(&routes, preferred_route_id.as_deref());
+        let mut ordered_routes = prioritize_preferred_route(&routes, preferred_route_id.as_deref());
         preferred_route_id = None;
+        let prepared = prepared.or_else(|error| {
+            if matches!(error, PrepareError::Transient(_) | PrepareError::Blocked(_))
+                && ordered_routes.iter().any(|route| route.relay_access_token().is_some())
+            {
+                ordered_routes.retain(|route| route.relay_access_token().is_some());
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
         let outcome = match prepared {
-            Ok(()) => match connect_draining(&credentials, &ordered_routes, expected_environment_id.as_deref(), &mut commands, &mut wakeup_rx, &mut resume).await {
-                ConnectOutcome::Done(result) => result,
+            Ok(()) => match connect_draining(&credentials, &ordered_routes, expected_environment_id.as_deref(), relay.as_deref(), &mut commands, &mut wakeup_rx, &mut resume).await {
+                ConnectOutcome::Done(result) => *result,
                 ConnectOutcome::RetryNow => {
                     attempt = 0;
                     awaiting_approval = false;
@@ -605,15 +630,12 @@ async fn supervise(
             Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
         };
         let (reason, is_approval) = match outcome {
-            Ok(RouteConnectResult { route: active_route, value: session, refused_route_ids }) => {
+            Ok(RouteConnectResult { route: active_route, value: (session, active_credentials), refused_route_ids }) => {
                 refused_routes = merge_refused_routes(&refused_routes, &refused_route_ids, |id| {
                     id != active_route.id && routes.iter().any(|route| route.id == id)
                 });
                 refused_routes_tx.send_replace(refused_routes.clone());
-                let active_credentials = Credentials {
-                    http_base: active_route.http_base.clone(),
-                    access_token: credentials.access_token.clone(),
-                };
+                active_credentials_tx.send_replace(Some(active_credentials.clone()));
                 generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
                 route_progress.publish(Some(&active_route.id), None);
@@ -624,6 +646,8 @@ async fn supervise(
                     &session,
                     &active_credentials,
                     &active_route,
+                    &credentials.access_token,
+                    prepare.as_ref(),
                     &mut routes,
                     &mut refused_routes,
                     &refused_routes_tx,
@@ -638,6 +662,7 @@ async fn supervise(
                 )
                 .await;
                 fetch.stop();
+                active_credentials_tx.send_replace(None);
                 match end {
                     SessionEnd::Closed(reason) => (reason, false),
                     SessionEnd::ReconnectImmediately => {
@@ -727,7 +752,7 @@ enum PrepareOutcome {
 }
 
 enum ConnectOutcome {
-    Done(Result<RouteConnectResult<Session>, ConnectError>),
+    Done(Box<Result<RouteConnectResult<(Session, Credentials)>, ConnectError>>),
     RetryNow,
     Dropped,
 }
@@ -790,15 +815,16 @@ async fn connect_draining(
     credentials: &Credentials,
     routes: &[CandidateRoute],
     expected_environment_id: Option<&str>,
+    relay: Option<&crate::connect::Cloud>,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
     resume: &mut Resume,
 ) -> ConnectOutcome {
-    let attempt = connect_routes(credentials, routes, expected_environment_id);
+    let attempt = connect_routes(credentials, routes, expected_environment_id, relay);
     tokio::pin!(attempt);
     loop {
         tokio::select! {
-            result = &mut attempt => return ConnectOutcome::Done(result),
+            result = &mut attempt => return ConnectOutcome::Done(Box::new(result)),
             reason = next_wakeup(wakeup_rx) => {
                 if resets_retry_backoff(reason) {
                     return ConnectOutcome::RetryNow;
@@ -840,7 +866,8 @@ async fn connect_routes(
     credentials: &Credentials,
     routes: &[CandidateRoute],
     expected_environment_id: Option<&str>,
-) -> Result<RouteConnectResult<Session>, ConnectError> {
+    relay: Option<&crate::connect::Cloud>,
+) -> Result<RouteConnectResult<(Session, Credentials)>, ConnectError> {
     let expected = expected_environment_id.map(str::to_owned);
     let token = credentials.access_token.clone();
     connect_over_routes(
@@ -849,6 +876,9 @@ async fn connect_routes(
         move |route| {
             let expected = expected.clone();
             async move {
+                if route.relay_access_token().is_some() {
+                    return RouteCheck::Answered;
+                }
                 match auth::fetch_descriptor_timeout(&route.http_base, ROUTE_CHECK_TIMEOUT).await {
                     Ok(descriptor) => {
                         if expected.as_deref().is_none_or(|wanted| descriptor.environment_id == wanted) {
@@ -862,11 +892,43 @@ async fn connect_routes(
             }
         },
         move |route| {
-            let route_creds = Credentials { http_base: route.http_base.clone(), access_token: token.clone() };
+            let token = token.clone();
             async move {
-                match connect(&route_creds, expected_environment_id).await {
-                    Ok(session) => Ok(session),
+                let (route_creds, relay_socket) = if let Some(seed) = route.relay_access_token() {
+                    let (relay, environment_id) = relay.zip(expected_environment_id).ok_or_else(|| {
+                        RouteAttemptError::Transient(ConnectError::Transient("Missing relay configuration.".into()))
+                    })?;
+                    let response = relay
+                        .connect_environment(environment_id)
+                        .await
+                        .map_err(|error| RouteAttemptError::Transient(ConnectError::Transient(error)))?;
+                    let socket = url::Url::parse(&response.endpoint.ws_base_url)
+                        .ok()
+                        .filter(|url| matches!(url.scheme(), "ws" | "wss"))
+                        .ok_or_else(|| RouteAttemptError::Transient(ConnectError::Transient("Invalid relay WebSocket URL.".into())))?;
+                    let expires_at = response.expires_at_epoch_ms()
+                        .ok_or_else(|| RouteAttemptError::Transient(ConnectError::Transient("Invalid relay credential expiry.".into())))?;
+                    // A direct pairing can use the same origin as the tunnel and retain its own DPoP entry.
+                    crate::dpop::put_direct_credential(&route.id, crate::dpop::DpopConnectionCredential {
+                        access_token: response.credential,
+                        expires_at_epoch_ms: expires_at,
+                        seed_token: Some(seed.to_owned()),
+                        previous_access_token: None,
+                        environment_id: Some(response.environment_id),
+                    });
+                    (Credentials {
+                        http_base: response.endpoint.http_base_url,
+                        access_token: seed.to_owned(),
+                    }, Some(socket))
+                } else {
+                    (Credentials { http_base: route.http_base.clone(), access_token: token }, None)
+                };
+                match connect(&route_creds, expected_environment_id, relay_socket).await {
+                    Ok(session) => Ok((session, route_creds)),
                     Err(err @ ConnectError::Unsupported { .. }) => Err(RouteAttemptError::Unsupported(err)),
+                    Err(ConnectError::Unauthorized { reason, .. }) if route.relay_access_token().is_some() => {
+                        Err(RouteAttemptError::Transient(ConnectError::Transient(reason)))
+                    }
                     Err(err @ ConnectError::Unauthorized { clock_skew: false, .. }) => {
                         Err(RouteAttemptError::Refused(err))
                     }
@@ -887,6 +949,7 @@ async fn connect_routes(
 async fn connect(
     credentials: &Credentials,
     expected_environment_id: Option<&str>,
+    relay_socket: Option<url::Url>,
 ) -> Result<Session, ConnectError> {
     // `orchestrationProtocolCompatibilityError`: a server on another protocol is blocked, not
     // retried. One that can't describe itself is left to the socket to accept or refuse.
@@ -917,7 +980,11 @@ async fn connect(
         AuthError::ConnectApprovalPending { message, .. } => ConnectError::ApprovalPending(message),
         other => ConnectError::Transient(other.to_string()),
     })?;
-    Session::connect(&auth::socket_url(credentials, &ticket)).await.map_err(|error| match error {
+    let socket = match relay_socket {
+        Some(url) => auth::relay_socket_url(credentials, &ticket, url),
+        None => auth::socket_url(credentials, &ticket),
+    };
+    Session::connect(&socket).await.map_err(|error| match error {
         OpenError::Unauthorized => ConnectError::Unauthorized {
             reason: error.to_string(),
             clock_skew: false,
@@ -1105,11 +1172,15 @@ fn spawn_better_route_probe(
     candidates: Vec<CandidateRoute>,
     expected_environment_id: Option<String>,
     access_token: String,
+    prepare: Option<Prepare>,
 ) -> RunningBetterRouteProbe {
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let mut refused = Vec::new();
         for candidate in candidates {
+            if candidate.ssh && let Some(prepare) = &prepare && prepare().await.is_err() {
+                continue;
+            }
             if let Ok(descriptor) = auth::fetch_descriptor_timeout(&candidate.http_base, ROUTE_CHECK_TIMEOUT).await
                 && expected_environment_id
                     .as_deref()
@@ -1397,7 +1468,7 @@ fn absorb_learned_routes(
             *expected_environment_id = Some(env_id.to_owned());
         }
         let reported = config_extras.borrow().direct_endpoint_entries.clone();
-        if !reported.is_empty() {
+        if active_route.relay_access_token().is_none() && !reported.is_empty() {
             let env_key = expected_environment_id.as_deref().unwrap_or("env");
             if let Some(updated) = merge_learned_routes(env_key, routes, &active_route.id, &reported, true) {
                 *routes = updated;
@@ -1411,6 +1482,8 @@ async fn run_session(
     session: &Session,
     active_credentials: &Credentials,
     active_route: &CandidateRoute,
+    primary_access_token: &str,
+    prepare: Option<&Prepare>,
     routes: &mut Vec<CandidateRoute>,
     refused_routes: &mut Vec<String>,
     refused_routes_tx: &watch::Sender<Vec<String>>,
@@ -1561,7 +1634,8 @@ async fn run_session(
                     better_route_probe = Some(spawn_better_route_probe(
                         better,
                         expected_environment_id.clone(),
-                        active_credentials.access_token.clone(),
+                        primary_access_token.to_owned(),
+                        prepare.cloned(),
                     ));
                 }
             }
@@ -2035,6 +2109,7 @@ mod parity_tests {
             vec![fallback],
             Some("env-multi".into()),
             None,
+            None,
         );
         let mut conn = tokio::time::timeout(Duration::from_secs(10), live.connection())
             .await
@@ -2173,6 +2248,7 @@ mod parity_tests {
             better.clone(),
             Some("env-wake".into()),
             server.credentials().access_token,
+            None,
         ));
         let winner = tokio::time::timeout(Duration::from_secs(3), next_better_route_probe(&mut probe))
             .await
@@ -2208,6 +2284,7 @@ mod parity_tests {
             vec![refusing_route.clone()],
             Some("env-wake".into()),
             "expired-token".into(),
+            None,
         ));
         let refused_result = tokio::time::timeout(Duration::from_secs(3), next_better_route_probe(&mut refused_probe))
             .await

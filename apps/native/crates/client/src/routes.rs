@@ -73,8 +73,8 @@ pub struct ReportedEndpoint {
     pub kind: Option<String>,
 }
 
-/// One candidate direct/learned route to an environment (`ConnectionRoute`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One candidate route to an environment (`ConnectionRoute`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateRoute {
     pub id: String,
@@ -85,21 +85,51 @@ pub struct CandidateRoute {
     pub tailscale: bool,
     #[serde(default)]
     pub ssh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_access_token: Option<String>,
+}
+
+impl std::fmt::Debug for CandidateRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateRoute")
+            .field("id", &self.id)
+            .field("http_base", &self.http_base)
+            .field("kind", &self.kind())
+            .field("learned", &self.learned)
+            .finish()
+    }
 }
 
 impl CandidateRoute {
     pub fn primary(http_base: impl Into<String>, ssh: bool) -> Self {
         let http_base = normalize_http_base(&http_base.into());
         let id = if ssh { format!("ssh:{http_base}") } else { format!("direct:{http_base}") };
-        Self { id, http_base, learned: false, tailscale: false, ssh }
+        Self { id, http_base, learned: false, tailscale: false, ssh, relay_access_token: None }
     }
 
     pub fn saved(http_base: impl Into<String>) -> Self {
-        let http_base = normalize_http_base(&http_base.into());
-        Self { id: format!("direct:{http_base}"), http_base, learned: false, tailscale: false, ssh: false }
+        Self::primary(http_base, false)
+    }
+
+    pub fn relay(response: t3_core::relay::EnvironmentConnectResponse) -> Self {
+        Self {
+            id: format!("relay:{}", response.environment_id),
+            http_base: normalize_http_base(&response.endpoint.http_base_url),
+            learned: false,
+            tailscale: false,
+            ssh: false,
+            relay_access_token: Some(response.credential),
+        }
+    }
+
+    pub(crate) fn relay_access_token(&self) -> Option<&str> {
+        self.relay_access_token.as_deref()
     }
 
     pub fn kind(&self) -> ConnectionRouteKind {
+        if self.relay_access_token.is_some() {
+            return ConnectionRouteKind::Relay;
+        }
         if self.ssh {
             return ConnectionRouteKind::Ssh;
         }
@@ -389,6 +419,7 @@ pub fn merge_learned_routes(
             learned: true,
             tailscale: is_ts,
             ssh: false,
+            relay_access_token: None,
         };
         next = insert_route(&next, learned, false);
     }
@@ -678,6 +709,24 @@ fn abort_remaining(checks: &mut [Option<tokio::task::JoinHandle<RouteCheck>>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_relay_candidate_preserves_its_credentials_and_falls_back_after_direct_and_ssh() {
+        let direct = CandidateRoute::saved("https://direct.example.test");
+        let ssh = CandidateRoute::primary("http://127.0.0.1:4411", true);
+        let saved = serde_json::json!({
+            "id": "relay:env-1",
+            "httpBase": "https://relay.example.test",
+            "relayAccessToken": "relay-only-token"
+        });
+        let relay: CandidateRoute = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(relay.kind(), ConnectionRouteKind::Relay);
+        let routes = upsert_route(&[direct.clone(), ssh.clone()], relay.clone());
+        assert_eq!(routes, [direct.clone(), ssh, relay.clone()]);
+        let encoded = serde_json::to_value(relay).unwrap();
+        assert_eq!(encoded["relayAccessToken"], saved["relayAccessToken"]);
+        assert!(serde_json::to_value(direct).unwrap().get("relayAccessToken").is_none());
+    }
 
     #[test]
     fn host_classification_and_route_ranking_match_web() {

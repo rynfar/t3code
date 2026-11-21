@@ -35,12 +35,14 @@ pub enum EnvironmentStatusValue {
 }
 
 /// `RelayEnvironmentStatusResponse` (`packages/contracts/src/relay.ts`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentStatusResponse {
     pub environment_id: String,
     pub endpoint: Endpoint,
     pub status: EnvironmentStatusValue,
+    #[serde(default)]
+    pub descriptor: Option<crate::server_config::EnvironmentDescriptor>,
     #[serde(default)]
     pub checked_at: Option<String>,
     #[serde(default)]
@@ -49,6 +51,20 @@ pub struct EnvironmentStatusResponse {
     pub offline_reason: Option<String>,
     #[serde(default)]
     pub trace_id: Option<String>,
+}
+
+/// `RelayEnvironmentLinkResponse` from `packages/contracts/src/relay.ts`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentLinkResponse {
+    pub ok: bool,
+    pub environment_id: String,
+    pub endpoint: Endpoint,
+    pub relay_issuer: String,
+    pub cloud_user_id: String,
+    pub environment_credential: String,
+    pub cloud_mint_public_key: String,
+    pub endpoint_runtime: Value,
 }
 
 /// `RelayEnvironmentConnectResponse` (`packages/contracts/src/relay.ts`).
@@ -73,6 +89,7 @@ impl EnvironmentConnectResponse {
 pub enum EnvironmentHealth {
     Checking,
     Online,
+    Incompatible(String),
     Offline {
         offline_reason: Option<String>,
         error: Option<String>,

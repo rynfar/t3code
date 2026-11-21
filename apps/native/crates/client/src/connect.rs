@@ -465,6 +465,10 @@ impl Cloud {
         self.config.as_ref().map_err(Clone::clone)
     }
 
+    pub fn configured(&self) -> bool {
+        self.config.is_ok()
+    }
+
     fn clerk_client(config: &Config) -> ClerkClient {
         ClerkClient::new(config.clerk_origin.clone(), config.clerk_jwt_template.clone())
     }
@@ -875,13 +879,20 @@ impl Cloud {
         method: reqwest::Method,
         url: &url::Url,
         network_error: &str,
+        body: Option<&Value>,
     ) -> Result<Value, String> {
         for attempt in 0..2 {
             let (token, generation, is_clerk) = self.bearer_token(attempt > 0).await?;
-            let response = http()
+            let mut request = http()
                 .request(method.clone(), url.clone())
-                .bearer_auth(token)
-                .send()
+                .bearer_auth(token);
+            if let Some(body) = body {
+                if !is_clerk {
+                    return Err("Sign in to T3 Connect before enabling this.".to_owned());
+                }
+                request = request.json(body);
+            }
+            let response = request.send()
                 .await
                 .map_err(|_| network_error.to_owned())?;
             let status = response.status();
@@ -904,7 +915,7 @@ impl Cloud {
         let config = self.config()?;
         let url = url::Url::parse(&format!("{}/v1/environments", config.relay))
             .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
-        let value = self.relay_bearer_json(reqwest::Method::GET, &url, "Could not load T3 Connect environments.").await?;
+        let value = self.relay_bearer_json(reqwest::Method::GET, &url, "Could not load T3 Connect environments.", None).await?;
         #[derive(Deserialize)]
         struct List {
             environments: Vec<Environment>,
@@ -929,11 +940,84 @@ impl Cloud {
             .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?
             .clear()
             .extend(["v1", "client", "environment-links", environment_id]);
-        let value = self.relay_bearer_json(reqwest::Method::DELETE, &url, "Could not reach T3 Connect relay.").await?;
+        let value = self.relay_bearer_json(reqwest::Method::DELETE, &url, "Could not reach T3 Connect relay.", None).await?;
         if value.get("ok").and_then(Value::as_bool).is_none() {
             return Err("T3 Connect returned an invalid unlink response.".to_owned());
         }
         Ok(())
+    }
+
+    /// Links the connected host and applies its requested publishing preference
+    /// (`apps/web/src/cloud/linkEnvironment.ts`).
+    pub async fn link_environment(
+        &self,
+        credentials: &crate::auth::Credentials,
+        environment_id: &str,
+        managed_tunnel: bool,
+        publish: bool,
+    ) -> Result<(), String> {
+        let relay_url = &self.config()?.relay;
+        let endpoint = url::Url::parse(&credentials.http_base)
+            .map_err(|_| "Invalid environment URL.".to_owned())?;
+        let port = endpoint.port_or_known_default().ok_or("Invalid environment port.")?;
+        let mut socket = endpoint.clone();
+        let scheme = match endpoint.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => return Err("Invalid environment URL.".to_owned()),
+        };
+        socket.set_scheme(scheme).map_err(|_| "Invalid environment URL.")?;
+        let provider = if managed_tunnel { "cloudflare_tunnel" } else { "manual" };
+        let mut capabilities = serde_json::json!({
+            "notificationsEnabled": true,
+            "liveActivitiesEnabled": true,
+            "managedTunnelsEnabled": managed_tunnel,
+        });
+        let challenge = self.post_relay_link("environment-link-challenges", &capabilities).await?;
+        let challenge = challenge["challenge"].as_str().filter(|value| !value.is_empty())
+            .ok_or("Invalid T3 Connect link challenge.")?;
+        let timeout = Duration::from_secs(60);
+        let proof = crate::auth::post_access_with_timeout(credentials, "/api/connect/link-proof", Some(serde_json::json!({
+            "challenge": challenge,
+            "relayIssuer": relay_url,
+            "endpoint": {
+                "httpBaseUrl": credentials.http_base,
+                "wsBaseUrl": socket.as_str().trim_end_matches('/'),
+                "providerKind": provider,
+            },
+            "origin": {"localHttpHost": "127.0.0.1", "localHttpPort": port},
+        })), Some(timeout)).await?;
+        if proof.as_str().is_none_or(str::is_empty) {
+            return Err("Invalid environment link proof.".to_owned());
+        }
+        capabilities["proof"] = proof;
+        let link = self.post_relay_link("environment-links", &capabilities).await?;
+        let link: t3_core::relay::EnvironmentLinkResponse = serde_json::from_value(link)
+            .map_err(|_| "Invalid T3 Connect link response.".to_owned())?;
+        if !link.ok || link.environment_id != environment_id || link.endpoint.provider_kind != provider {
+            return Err("Relay returned credentials for a different environment or endpoint provider.".to_owned());
+        }
+        let applied = crate::auth::post_access_with_timeout(credentials, "/api/connect/relay-config", Some(serde_json::json!({
+            "relayUrl": relay_url,
+            "relayIssuer": link.relay_issuer,
+            "cloudUserId": link.cloud_user_id,
+            "environmentCredential": link.environment_credential,
+            "cloudMintPublicKey": link.cloud_mint_public_key,
+            "endpointRuntime": link.endpoint_runtime,
+        })), Some(timeout)).await?;
+        if applied["ok"] != true {
+            return Err("Could not configure environment relay access.".to_owned());
+        }
+        crate::auth::post_access(credentials, "/api/connect/preferences", Some(serde_json::json!({
+            "publishAgentActivity": publish,
+        }))).await?;
+        Ok(())
+    }
+
+    async fn post_relay_link(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = url::Url::parse(&format!("{}/v1/client/{path}", self.config()?.relay))
+            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
+        self.relay_bearer_json(reqwest::Method::POST, &url, "Could not reach T3 Connect relay.", Some(body)).await
     }
 
     async fn exchange_dpop_token_internal(
@@ -1097,8 +1181,12 @@ impl Cloud {
             "clientProofKeyThumbprint": key.thumbprint(),
         });
         let (value, _) = self.post_dpop_json(&url, Some(&body)).await?;
-        serde_json::from_value(value)
-            .map_err(|_| "Invalid T3 Connect environment connection response.".to_owned())
+        let response: EnvironmentConnectResponse = serde_json::from_value(value)
+            .map_err(|_| "Invalid T3 Connect environment connection response.".to_owned())?;
+        if response.environment_id != environment_id || response.endpoint.provider_kind != "cloudflare_tunnel" {
+            return Err("Relay returned credentials for a different environment or endpoint provider.".to_owned());
+        }
+        Ok(response)
     }
 
     /// Calls [`Self::connect_environment`] and registers the minted credential in the DPoP store.
@@ -1121,6 +1209,29 @@ impl Cloud {
             seed_token,
         );
         Ok(resp)
+    }
+}
+
+impl crate::supervisor::ClientHandle {
+    pub async fn relay_client_status(&self) -> Result<Value, String> {
+        self.request("cloud.getRelayClientStatus", serde_json::json!({})).await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn install_relay_client(&self) -> Result<(), String> {
+        let mut stream = self.stream("cloud.installRelayClient", serde_json::json!({})).await
+            .map_err(|error| error.to_string())?;
+        while let Some(item) = stream.receiver.recv().await {
+            let event = item.map_err(|error| error.to_string())?;
+            if event["type"] == "complete" {
+                return if event["status"]["status"] == "available" {
+                    Ok(())
+                } else {
+                    Err("The relay client is still unavailable after installation.".to_owned())
+                };
+            }
+        }
+        Err("The relay client install completed without a final status.".to_owned())
     }
 }
 
@@ -1300,6 +1411,139 @@ mod tests {
             let (k, v) = line.split_once(':')?;
             k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
         })
+    }
+
+    #[tokio::test]
+    async fn publish_only_link_sends_host_proof_and_applies_relay_credentials_before_preferences() {
+        let mut relay = Fixture::new().await;
+        let mut host = Fixture::new().await;
+        let cloud = cloud(&relay);
+        cloud.account.lock().await.clerk = Some(ClerkSession {
+            client_token: "clerk-client".into(),
+            session_id: "sess_link".into(),
+            identity: None,
+        });
+        let jwt = fake_jwt("user_alice", now_ms() / 1000 + 300);
+        relay.reply(200, json!({"jwt": jwt}));
+        relay.reply(200, json!({"challenge": "challenge", "expiresAt": "2030-01-01T00:00:00Z"}));
+        relay.reply(200, json!({
+            "ok": true, "environmentId": "env-studio", "cloudUserId": "user_alice",
+            "endpoint": {
+                "httpBaseUrl": host.base, "wsBaseUrl": host.base.replacen("http", "ws", 1),
+                "providerKind": "manual"
+            },
+            "endpointRuntime": null, "relayIssuer": relay.base,
+            "environmentCredential": "relay-credential", "cloudMintPublicKey": "public-key"
+        }));
+        host.reply(200, json!("signed-host-proof"));
+        host.reply(200, json!({"ok": true, "endpointRuntimeStatus": null}));
+        host.reply(200, json!({"publishAgentActivity": true}));
+        cloud.link_environment(
+            &crate::auth::Credentials { http_base: host.base.clone(), access_token: "host-token".into() },
+            "env-studio",
+            false,
+            true,
+        ).await.unwrap();
+
+        let body = |request: &str| -> Value {
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let _mint = relay.request().await;
+        let challenge = relay.request().await;
+        assert!(challenge.starts_with("POST /v1/client/environment-link-challenges "));
+        assert_eq!(header_value(&challenge, "authorization"), Some(format!("Bearer {jwt}").as_str()));
+        assert_eq!(body(&challenge), json!({
+            "notificationsEnabled": true, "liveActivitiesEnabled": true, "managedTunnelsEnabled": false
+        }));
+        let proof = host.request().await;
+        assert!(proof.starts_with("POST /api/connect/link-proof "));
+        assert_eq!(header_value(&proof, "authorization"), Some("Bearer host-token"));
+        assert_eq!(body(&proof), json!({
+            "challenge": "challenge", "relayIssuer": relay.base,
+            "endpoint": {
+                "httpBaseUrl": host.base, "wsBaseUrl": host.base.replacen("http", "ws", 1), "providerKind": "manual"
+            },
+            "origin": {"localHttpHost": "127.0.0.1", "localHttpPort": url::Url::parse(&host.base).unwrap().port()}
+        }));
+        let link = relay.request().await;
+        assert!(link.starts_with("POST /v1/client/environment-links "));
+        assert_eq!(body(&link), json!({
+            "proof": "signed-host-proof",
+            "notificationsEnabled": true, "liveActivitiesEnabled": true, "managedTunnelsEnabled": false
+        }));
+        let config = host.request().await;
+        assert!(config.starts_with("POST /api/connect/relay-config "));
+        assert_eq!(body(&config), json!({
+            "relayUrl": relay.base, "relayIssuer": relay.base, "cloudUserId": "user_alice",
+            "environmentCredential": "relay-credential", "cloudMintPublicKey": "public-key",
+            "endpointRuntime": null
+        }));
+        let preferences = host.request().await;
+        assert!(preferences.starts_with("POST /api/connect/preferences "));
+        assert_eq!(body(&preferences), json!({"publishAgentActivity": true}));
+    }
+
+    #[tokio::test]
+    async fn a_saved_relay_route_falls_back_when_ssh_preparation_fails() {
+        let relay = Fixture::new().await;
+        let cloud = cloud(&relay);
+        let mut host = crate::test_server::FakeServer::start().await;
+        let environment_id = uuid::Uuid::new_v4().to_string();
+        host.set_descriptor(Some(json!({
+            "environmentId": environment_id, "label": "Studio", "serverVersion": "0.1.9",
+            "orchestrationProtocolVersion": 2,
+        })));
+        let host_base = host.credentials().http_base;
+        let socket_base = host.ws_url();
+        let primary = crate::auth::Credentials { http_base: host_base.clone(), access_token: "ssh-token".into() };
+        let expires_at = dpop::now_epoch_ms() + 300_000;
+        dpop::put_direct_credential(&host_base, dpop::DpopConnectionCredential::new(
+            primary.access_token.clone(), expires_at, Some(environment_id.clone()),
+        ));
+        cloud.account.lock().await.clerk = Some(ClerkSession {
+            client_token: "clerk-client".into(),
+            session_id: "sess_fallback".into(),
+            identity: None,
+        });
+        relay.reply(200, json!({"jwt": fake_jwt("user_alice", now_ms() / 1000 + 300)}));
+        relay.reply(200, json!({
+            "access_token": "dpop-access", "issued_token_type": RELAY_ACCESS_TOKEN_TYPE,
+            "token_type": "DPoP", "expires_in": 300, "scope": RELAY_DPOP_SCOPE,
+        }));
+        let relay_seed = format!("relay-seed-{environment_id}");
+        let relay_credential = format!("relay-credential-{environment_id}");
+        let expires = "2030-01-01T00:00:00Z";
+        relay.reply(200, json!({
+            "environmentId": environment_id,
+            "endpoint": {"httpBaseUrl": host_base, "wsBaseUrl": socket_base, "providerKind": "cloudflare_tunnel"},
+            "credential": relay_credential,
+            "expiresAt": expires,
+        }));
+        let route = crate::routes::CandidateRoute::relay(EnvironmentConnectResponse {
+            environment_id: environment_id.clone(),
+            endpoint: t3_core::relay::Endpoint {
+                http_base_url: host_base.clone(),
+                ws_base_url: socket_base,
+                provider_kind: "cloudflare_tunnel".into(),
+            },
+            credential: relay_seed.clone(),
+            expires_at: expires.into(),
+        });
+        let prepare: crate::supervisor::Prepare = Arc::new(|| Box::pin(async {
+            Err(crate::supervisor::PrepareError::Transient("SSH is unreachable".into()))
+        }));
+        let (client, _events) = crate::supervisor::start_with_routes(
+            &tokio::runtime::Handle::current(), primary.clone(), vec![route], Some(environment_id),
+            Some(prepare), Some(cloud),
+        );
+        let connected = host.connection().await;
+        assert!(connected.path.contains("connectionMethod=relay"));
+        assert!(connected.path.contains("dpop="));
+        client.connection_generation().wait_for(|generation| *generation > 0).await.unwrap();
+        assert_eq!(client.credentials().http_base, host_base);
+        assert_eq!(client.credentials().access_token, relay_seed);
+        assert_eq!(dpop::find_direct_credential(&host_base, &relay_seed).unwrap().1.access_token, relay_credential);
+        assert_eq!(dpop::get_direct_credential(&host_base).unwrap().access_token, primary.access_token);
     }
 
     fn cloud(fixture: &Fixture) -> Arc<Cloud> {
