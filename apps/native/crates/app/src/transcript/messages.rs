@@ -867,6 +867,8 @@ pub fn user_row(
     let prompt_link = t3_core::prompt_links::user_message_prompt_link(display_text);
     let sending = matches!(item_status, Some("pending" | "waiting"));
     let error_status = item_status.filter(|s| !s.is_empty() && *s != "completed" && !matches!(*s, "pending" | "waiting")).map(str::to_owned);
+    let float_actions = grouped_with_next && env.lane_width >= 592. * rem_px / 16.
+        && !sending && error_status.is_none();
     let actions = h_flex()
         .justify_end()
         .gap(px(8.))
@@ -1217,9 +1219,19 @@ pub fn user_row(
                     )
                 })
                 .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
-                .children(standalone_cards)
-                .children(bubble)
-                .child(actions),
+                .child(if float_actions {
+                    h_flex().w_full().min_w_0().justify_end().items_center().gap(px(8.))
+                        .child(div().min_w_0().max_w(relative(0.2)).child(actions))
+                        .children(standalone_cards)
+                        .children(bubble)
+                        .into_any_element()
+                } else {
+                    v_flex().w_full().items_end().gap(px(4.))
+                        .children(standalone_cards)
+                        .children(bubble)
+                        .child(actions)
+                        .into_any_element()
+                }),
         )
         .into_any_element()
 }

@@ -2,7 +2,6 @@
 //! `TimelinePendingApprovalRow.tsx`, laid out per design system §7.7; an open tool row shows the
 //! inspector (`inspector.rs`).
 
-use super::highlights::ToolFind;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,6 +21,7 @@ use t3_core::timeline::{
 };
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
+use super::highlights::ToolFind;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
 use super::media::{tool_output_image, tool_output_image_gallery_items};
@@ -342,6 +342,19 @@ pub fn group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut Mark
     subagent_notification_link(entry, env, cx).unwrap_or_else(|| entry_row(entry, None, true, env, markdown, cx))
 }
 
+fn reasoning_preview(
+    id: &str,
+    text: &str,
+    env: &RowEnv<'_>,
+    markdown: &mut MarkdownStore,
+    cx: &mut Context<ThreadView>,
+) -> gpui_component::text::TextView {
+    let limit = text.floor_char_boundary(8192);
+    let source: Arc<str> = Arc::from(&text[..limit]);
+    let state = markdown.marked_state(&format!("thought-preview:{id}"), &source, None, id, env, cx);
+    super::markdown::markdown_view(&state, cx).selectable(false)
+}
+
 /// `WorkEntryLogRow`.
 fn entry_row(
     entry: &Arc<WorkLogEntry>,
@@ -375,6 +388,11 @@ fn entry_row(
         } else {
             entry.label.clone()
         };
+        let retry_run = item.run_id.as_ref().filter(|run| {
+            failure.code.as_deref() == Some(super::worktree_setup::PREPARATION_FAILURE)
+                && env.can_operate_thread
+                && env.setup.retryable_runs.contains(*run)
+        }).cloned();
         return work_row_frame(SharedString::from(entry.id.clone()), grouped)
             .child(work_line(
                 Some(icon_slot(Icon::CircleAlert, color)),
@@ -393,6 +411,19 @@ fn entry_row(
                         .text_color(hsla(p.foreground).opacity(0.8))
                         .child(gpui::StyledText::new(failure.message.clone()).with_highlights(find.styles(&failure.message, cx))),
                 )
+            })
+            .when_some(retry_run, |this, run| {
+                let retrying = env.setup.retrying_runs.contains(&run);
+                let button = crate::settings::controls::Button::new(
+                    SharedString::from(format!("retry-preparation:{run}")),
+                    crate::settings::controls::ButtonVariant::Outline,
+                    crate::settings::controls::ButtonSize::Xs,
+                )
+                .label(crate::i18n::t(cx, "Retry"))
+                .icon(Icon::RotateCcw)
+                .disabled(retrying)
+                .on_click(cx.listener(move |view, _, _, cx| view.retry_workspace_preparation(&run, cx)));
+                this.child(div().ml(rem(28.)).pb(rem(4.)).child(button))
             })
             .into_any_element();
     }
@@ -489,6 +520,10 @@ fn entry_row(
                 })),
             )
             .child(div().flex_none().child("”"))
+            .into_any_element()
+    } else if reasoning && !expanded && let Some(detail) = entry.detail.as_deref().filter(|detail| !detail.trim().is_empty()) {
+        div().min_w_0().max_h(rem(22.75)).overflow_hidden().text_color(label_color)
+            .child(reasoning_preview(&entry.id, detail, env, markdown, cx))
             .into_any_element()
     } else {
         div()
@@ -865,7 +900,7 @@ fn live_activity(label: AnyElement, icon: Icon, failed: bool, cx: &App) -> gpui:
 }
 
 /// `LiveWorkEntryTimelineRow`.
-pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn live_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
     let RowKind::WorkLive { entry, group_id, expanded, active, thought, .. } = &row.kind else { return div().into_any_element() };
     let (id, expanded, active, thought) = (row.id.as_str(), *expanded, *active, thought.as_ref());
     if let Some(approval) = pending_approval(entry, env) {
@@ -887,13 +922,16 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
     };
     let group_id = group_id.to_owned();
     let row_id = id.to_owned();
+    let thought_preview = (!thought_line.is_empty()).then(|| {
+        reasoning_preview(thought.map_or(entry.id.as_str(), |thought| &thought.id), &thought_line, env, markdown, cx)
+    });
     focusable(work_row_frame(SharedString::from(format!("live:{id}")), false), cx)
         .cursor_pointer()
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx)))
-        .when(!thought_line.is_empty(), |this| {
+        .when_some(thought_preview, |this, preview| {
             this.child(work_line(
                 Some(icon_slot(Icon::WorkBrain, hsla(p.icon_muted))),
-                div().line_clamp(4).child(thought_line.clone()).into_any_element(),
+                div().max_h(rem(91.)).overflow_hidden().child(preview).into_any_element(),
                 Vec::new(),
                 true,
                 cx,

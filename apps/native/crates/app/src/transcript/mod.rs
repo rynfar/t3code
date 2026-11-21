@@ -35,6 +35,7 @@ pub use parts::{Clock, InlineTone, ghost_button, ghost_icon_button, ghost_text_b
 pub use timer::{TimerKind, WorkingTimer};
 pub use work::approval_card;
 pub use worktree_setup::SetupEnv;
+pub(crate) use worktree_setup::workspace_preparation_retry_runs;
 
 /// Loading and retry error status for one expanded run or attempt fold (`useDeferredWorkLoading`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +105,7 @@ pub struct RowEnv<'a> {
     pub can_operate_thread: bool,
     pub rewinding: bool,
     pub window_height: f32,
+    pub lane_width: f32,
     pub details: &'a HashMap<String, Detail>,
     /// Scroll state of each open work group's own virtualized list.
     pub group_lists: &'a RefCell<HashMap<String, ListState>>,
@@ -160,7 +162,7 @@ pub fn render_row(
     let id = row.id.as_str();
     let content = match &row.kind {
         RowKind::Work { .. } => work::work_section(row, env, markdown, cx),
-        RowKind::WorkLive { .. } => work::live_row(row, env, cx),
+        RowKind::WorkLive { .. } => work::live_row(row, env, markdown, cx),
         // `ThinkingTimelineRow` keeps its slot blank while the worktree is prepared.
         RowKind::Thinking { .. } if env.setup.view.preparing => worktree_setup::empty_work_row(id),
         RowKind::Thinking { group_id, label, live_answer_preview, .. } => {

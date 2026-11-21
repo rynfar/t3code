@@ -43,7 +43,7 @@ pub fn timestamp(clock: &Clock, iso: &str, always: bool, cx: &App) -> AnyElement
         .whitespace_nowrap()
         .text_xs()
         .text_color(hsla(palette(cx).muted_foreground))
-        .when(!always, |this| this.invisible().group_hover(ROW_GROUP, |style| style.visible()))
+        .when(!always, |this| this.absolute().invisible().group_hover(ROW_GROUP, |style| style.relative().visible()))
         .child(clock.format(iso, cx))
         .into_any_element()
 }

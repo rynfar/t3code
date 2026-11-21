@@ -2046,6 +2046,7 @@ mod tests {
                         approval_errors: &approval_errors,
                         can_operate_thread: false,
                         rewinding: false,
+                        lane_width: 0.,
                         window_height: 600.,
                         details: &details,
                         group_lists: &group_lists,
