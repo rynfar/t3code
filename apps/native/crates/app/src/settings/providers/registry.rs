@@ -902,6 +902,7 @@ impl SettingsView {
                 pending: false,
                 error: None,
                 _stream: None,
+                output_offset: super::auth_terminal::output_offset(&fixture["auth"]),
             });
         }
     }

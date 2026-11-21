@@ -14,6 +14,9 @@ mod editor;
 mod removal;
 mod form;
 mod text_generators;
+mod auth_terminal;
+mod acp_sessions;
+mod accent_picker;
 mod usage_sources;
 
 use std::collections::{HashMap, HashSet};
@@ -81,6 +84,7 @@ struct AuthSession {
     pending: bool,
     error: Option<String>,
     _stream: Option<Stream>,
+    output_offset: Option<usize>,
 }
 
 /// `provider.install.subscribe` for the selected Antigravity instance.
@@ -167,11 +171,15 @@ pub(crate) struct ProvidersState {
     install: Option<InstallSession>,
     pub(crate) display_name: Entity<InputState>,
     pub(crate) accent: Entity<InputState>,
+    accent_picker: Option<accent_picker::AccentPicker>,
+    accent_trigger: gpui::FocusHandle,
     pub(crate) custom_model: Entity<InputState>,
     pub(crate) model_filter: Entity<InputState>,
     pub(crate) health_interval: Entity<InputState>,
     pub(crate) callback_url: Entity<InputState>,
-    pub(crate) terminal_line: Entity<InputState>,
+    auth_terminal: Option<auth_terminal::ActiveTerminal>,
+    auth_owner: Option<t3_core::sidebar::grouping::EnvironmentOwner>,
+    acp_sessions: acp_sessions::AcpSessionsState,
     /// The credentials form, keyed by the flow and interaction it answers.
     credentials: Option<(String, CredentialInputs)>,
     adding_custom_model: bool,
@@ -212,6 +220,10 @@ impl ProvidersState {
         self.usage_sources.clear();
         self.chatgpt=None;
         self.auth=None;
+        self.auth_terminal=None;
+        self.accent_picker=None;
+        self.auth_owner=None;
+        self.acp_sessions=acp_sessions::AcpSessionsState::default();
         self.install=None;
         self.saving_custom_model = false;
         self.custom_model_save_gen = self.custom_model_save_gen.wrapping_add(1);
@@ -225,7 +237,6 @@ impl ProvidersState {
         let model_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter models"));
         let health_interval = cx.new(|cx| InputState::new(window, cx));
         let callback_url = cx.new(|cx| InputState::new(window, cx));
-        let terminal_line = cx.new(|cx| InputState::new(window, cx).placeholder("Type a reply, then press Enter"));
         let subscriptions = vec![
             cx.subscribe_in(&display_name, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -233,8 +244,10 @@ impl ProvidersState {
                 }
             }),
             cx.subscribe_in(&accent, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                    this.commit_accent(window, cx);
+                match event {
+                    InputEvent::Change => this.accent_input_changed(cx),
+                    InputEvent::PressEnter { .. } => this.save_accent_picker(false, window, cx),
+                    _ => {}
                 }
             }),
             cx.subscribe_in(&custom_model, window, |this, input, event: &InputEvent, window, cx| match event {
@@ -264,11 +277,6 @@ impl ProvidersState {
                     this.submit_callback(cx);
                 }
             }),
-            cx.subscribe_in(&terminal_line, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_terminal_line(window, cx);
-                }
-            }),
         ];
         ProvidersState {
             removal: removal::Removal::new(cx),
@@ -285,11 +293,15 @@ impl ProvidersState {
             install: None,
             display_name,
             accent,
+            accent_picker: None,
+            accent_trigger: cx.focus_handle().tab_stop(true),
             custom_model,
             model_filter,
             health_interval,
             callback_url,
-            terminal_line,
+            auth_terminal: None,
+            auth_owner: None,
+            acp_sessions: acp_sessions::AcpSessionsState::default(),
             credentials: None,
             adding_custom_model: false,
             saving_custom_model: false,
@@ -314,7 +326,7 @@ impl ProvidersState {
 
     /// The text fields a `/` keystroke must not steal focus from.
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
-        let mut inputs = vec![&self.display_name, &self.accent, &self.custom_model, &self.model_filter, &self.health_interval, &self.callback_url, &self.terminal_line];
+        let mut inputs = vec![&self.display_name, &self.accent, &self.custom_model, &self.model_filter, &self.health_interval, &self.callback_url];
         inputs.extend(self.form.inputs());
         inputs.extend(self.credentials.iter().flat_map(|(_, fields)| fields.iter().map(|(_, input)| input)));
         if let Some(dialog) = &self.dialog {
@@ -322,6 +334,7 @@ impl ProvidersState {
         }
         inputs.extend(self.text_generators.inputs());
         inputs.extend(self.usage_sources.inputs());
+        inputs.extend(self.acp_sessions.inputs());
         inputs
     }
 }
@@ -417,6 +430,9 @@ impl SettingsView {
 
     fn page_data(&self, cx: &App) -> Option<PageData> {
         let app = self.state.read(cx);
+        if (self.scope.machine.is_some() || self.scope.project.is_some()) && self.scoped_primary_owner(cx).is_none() {
+            return None;
+        }
         let config = self.scoped_raw_representative_config(cx)?;
         let scope_project = self
             .supports_project_provider_overrides(cx)
@@ -496,9 +512,13 @@ impl SettingsView {
         let Some(data) = self.page_data(cx) else {
             self.providers.auth = None;
             self.providers.install = None;
+            self.providers.auth_terminal = None;
+            self.providers.accent_picker = None;
+            self.sync_acp_sessions(None, cx);
             return vec![Block::new(&["providers"], muted_text("Reconnect to change this environment's providers.", cx))];
         };
         self.sync_streams(data.selected.as_ref(), cx);
+        self.sync_acp_sessions(data.selected.as_ref(), cx);
         self.sync_editor_inputs(data.selected.as_ref(), window, cx);
         if let Some(selected)=&data.selected {self.sync_provider_form(selected,window,cx);}
         self.schedule_label_refresh(data.next_label_change, cx);
@@ -510,8 +530,11 @@ impl SettingsView {
         let show_text_generators = !t3_core::managed_policy::providers_allowed_drivers_restricted(policy.as_ref());
         let providers = self.render_providers_section(&data, window, cx);
         let usage_sources = self.render_usage_sources_section(&data.environment_label, cx);
-        let text_generators = show_text_generators.then(|| self.render_text_generators_section(cx));
+        let text_generators = show_text_generators.then(|| self.render_text_generators_section(window, cx));
         let advanced = self.render_advanced(&data.panel, cx);
+        if self.take_onboarding_registry_request() {
+            self.open_add_dialog(window, cx);
+        }
         let dialog = self.render_add_dialog(window, cx);
         let removal = self.render_provider_removal(window, cx);
         let usage_source_dialog = self.render_usage_source_dialog(window, cx);
@@ -1004,21 +1027,27 @@ impl SettingsView {
     fn sync_streams(&mut self, selected: Option<&Selected>, cx: &mut Context<Self>) {
         #[cfg(feature="snapshot")]
         if let Some(fixture)=cx.try_global::<crate::chatgpt_setup::Fixture>().filter(|f|!f.managed) {
-            self.providers.auth=Some(AuthSession {instance_id:fixture.provider.instance_id.clone(),state:Some(fixture.auth.clone()),load_error:None,pending:false,error:None,_stream:None});
+            self.providers.auth=Some(AuthSession {instance_id:fixture.provider.instance_id.clone(),state:Some(fixture.auth.clone()),load_error:None,pending:false,error:None,_stream:None,output_offset:None});
             return;
         }
         if fixture_active(cx) { return; }
         if selected.is_none_or(|s| s.row.driver != "codex") { self.providers.chatgpt = None; }
         let wants_auth = self.providers.dialog.as_ref().and_then(|d|d.add.created_instance_id().map(str::to_owned)).or_else(|| selected.filter(|selected| model::chatgpt::uses_generic_account(&selected.row.driver,selected.row.instance().config.as_ref()) && editor::shows_account(selected)).map(|selected| selected.row.instance_id.clone()));
-        if self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
+        let owner = self.scoped_primary_owner(cx);
+        let owner_changed = self.providers.auth_owner != owner;
+        self.providers.auth_owner = owner;
+        if owner_changed || self.providers.auth.as_ref().map(|session| &session.instance_id) != wants_auth.as_ref() {
             self.providers.method_id = SharedString::default();
+            self.providers.auth_terminal = None;
             self.providers.auth = wants_auth.map(|instance_id| {
                 let target = instance_id.clone();
                 let stream = self.subscribe(auth::AUTH_SUBSCRIBE, auth::subscribe_payload(&instance_id), cx, move |this, item, _| {
                     let Some(session) = this.providers.auth.as_mut().filter(|session| session.instance_id == target) else { return };
                     match item {
                         Ok(value) => {
+                            let offset = auth_terminal::output_offset(&value);
                             if let Some(state) = auth::decode_auth_state(value) {
+                                session.output_offset = offset;
                                 session.state = Some(state);
                                 session.load_error = None;
                             }
@@ -1026,11 +1055,11 @@ impl SettingsView {
                         Err(message) => session.load_error = Some(message),
                     }
                 });
-                AuthSession { instance_id, state: None, load_error: None, pending: false, error: None, _stream: stream }
+                AuthSession { instance_id, state: None, load_error: None, pending: false, error: None, _stream: stream, output_offset: None }
             });
         }
         let wants_install = selected.filter(|selected| selected.row.driver == "antigravity" && selected.live.as_ref().is_some_and(|live| live.setup.is_some())).map(|selected| selected.row.instance_id.clone());
-        if self.providers.install.as_ref().map(|session| &session.instance_id) != wants_install.as_ref() {
+        if owner_changed || self.providers.install.as_ref().map(|session| &session.instance_id) != wants_install.as_ref() {
             self.providers.install = wants_install.map(|instance_id| {
                 let target = instance_id.clone();
                 let stream = self.subscribe(auth::INSTALL_SUBSCRIBE, auth::subscribe_payload(&instance_id), cx, move |this, item, _| {
@@ -1059,12 +1088,35 @@ impl SettingsView {
         cx: &mut Context<Self>,
         on_item: impl Fn(&mut SettingsView, Result<Value, String>, &mut Context<SettingsView>) + 'static,
     ) -> Option<Stream> {
-        let (client, runtime) = {
-            let app = self.state.read(cx);
-            (app.client_handle()?, app.runtime().clone())
+        let app = self.state.read(cx);
+        let remote = self.scoped_primary_owner(cx).filter(|owner| app.environments.active.as_deref() != Some(owner.saved_id.as_str()));
+        let scope = if method == auth::AUTH_SUBSCRIBE {
+            t3_core::usage::PROVIDERS_MANAGE_SCOPE
+        } else {
+            t3_core::auth::ORCHESTRATION_READ_SCOPE
         };
+        let destination = remote.as_ref().map(|owner| app.connections.destination(owner, scope));
+        let active = app.client_handle();
+        if destination.is_none() && active.is_none() {
+            return None;
+        }
+        let runtime = app.runtime().clone();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<Value, String>>();
+        let unavailable = crate::i18n::t(cx, "Reconnect to change this environment's providers.").to_owned();
         let driver = runtime.spawn(async move {
+            let client = if let Some(destination) = destination {
+                match destination.await {
+                    Ok(destination) => destination.client,
+                    Err(_) => {
+                        let _ = tx.send(Err(unavailable));
+                        return;
+                    }
+                }
+            } else if let Some(client) = active {
+                client
+            } else {
+                return;
+            };
             let mut attempt = 0u32;
             loop {
                 match client.stream(method, payload.clone()).await {
@@ -1137,6 +1189,9 @@ impl SettingsView {
             (&self.providers.accent, instance.accent_color.clone().unwrap_or_default()),
         ];
         for (input, value) in fields {
+            if self.providers.accent_picker.is_some() && *input == self.providers.accent {
+                continue;
+            }
             if (switched || !input.focus_handle(cx).is_focused(window)) && input.read(cx).value().as_ref() != value {
                 input.update(cx, |input, cx| input.set_value(value, window, cx));
             }
@@ -1344,7 +1399,7 @@ impl SettingsView {
                 return;
             }
         }
-        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) {
+        if self.scoped_session(cx).is_some_and(|session| !session.grants(t3_core::usage::PROVIDERS_MANAGE_SCOPE)) {
             on_done(Some("This connection lacks permission to manage providers.".to_owned()), cx);
             return;
         }
@@ -1486,6 +1541,7 @@ impl SettingsView {
         (value != saved).then_some((instance_id, model::InstanceEdit::DisplayName(value)))
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
     fn accent_edit(&self, cx: &App) -> Option<(String, model::InstanceEdit)> {
         let instance_id = self.editor_instance_id(cx)?;
         let value = self.providers.accent.read(cx).value().trim().to_owned();
@@ -1504,24 +1560,6 @@ impl SettingsView {
             .and_then(|instance| instance.accent_color.as_deref())
             .unwrap_or_default();
         (value != saved).then_some((instance_id, model::InstanceEdit::Accent(value)))
-    }
-
-    /// Saves a typed accent color, or puts the saved one back when it is not a `#rrggbb`.
-    fn commit_accent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(instance_id) = self.editor_instance_id(cx) else {
-            return;
-        };
-        let value = self.providers.accent.read(cx).value().trim().to_owned();
-        if !value.is_empty() && model::normalize_accent(&value).is_none() {
-            let saved = self
-                .scoped_raw_representative_config(cx)
-                .and_then(|config| config.settings.provider_instances.get(&instance_id).and_then(|instance| instance.accent_color.clone()));
-            self.providers.accent.update(cx, |input, cx| input.set_value(saved.unwrap_or_default(), window, cx));
-            return;
-        }
-        if let Some((instance_id, edit)) = self.accent_edit(cx) {
-            self.update_instance(&instance_id, edit, cx);
-        }
     }
 
     fn sync_health_interval(
@@ -1619,9 +1657,6 @@ impl SettingsView {
         self.commit_focused_form_field(window,cx);
         if self.providers.display_name.focus_handle(cx).is_focused(window) {
             self.commit_display_name(cx);
-        }
-        if self.providers.accent.focus_handle(cx).is_focused(window) {
-            self.commit_accent(window, cx);
         }
     }
 
