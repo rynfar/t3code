@@ -536,7 +536,9 @@ fn initial_candidate_routes(
     alternate_routes: Vec<CandidateRoute>,
     ssh: bool,
 ) -> Vec<CandidateRoute> {
-    if credentials.access_token.is_empty() {
+    if credentials.access_token.is_empty()
+        && alternate_routes.iter().any(|route| route.relay_access_token().is_some())
+    {
         return alternate_routes.into_iter().filter(|route| route.relay_access_token().is_some()).collect();
     }
     let primary = CandidateRoute::primary(&credentials.http_base, ssh);
