@@ -867,6 +867,8 @@ pub fn user_row(
     let prompt_link = t3_core::prompt_links::user_message_prompt_link(display_text);
     let sending = matches!(item_status, Some("pending" | "waiting"));
     let error_status = item_status.filter(|s| !s.is_empty() && *s != "completed" && !matches!(*s, "pending" | "waiting")).map(str::to_owned);
+    let float_actions = grouped_with_next && env.lane_width >= 592. * rem_px / 16.
+        && !sending && error_status.is_none();
     let actions = h_flex()
         .justify_end()
         .gap(px(8.))
@@ -960,11 +962,7 @@ pub fn user_row(
         None
     } else {
         let source: Arc<str> = Arc::from(with_line_breaks(display_text));
-        let highlighted = super::highlights::marked_plain(&source, &message.id, env.find, None, cx);
-        let state = match highlighted {
-            Some(marked) => markdown.state(&format!("find-user:{id}"), &marked, cx),
-            None => markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx),
-        };
+        let state = markdown.marked_state(&format!("user:{id}"), &source, Some(action_ctx), &message.id, env, cx);
         Some(user_markdown_view(&state, &source, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
@@ -1221,9 +1219,19 @@ pub fn user_row(
                     )
                 })
                 .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
-                .children(standalone_cards)
-                .children(bubble)
-                .child(actions),
+                .child(if float_actions {
+                    h_flex().w_full().min_w_0().justify_end().items_center().gap(px(8.))
+                        .child(div().min_w_0().max_w(relative(0.2)).child(actions))
+                        .children(standalone_cards)
+                        .children(bubble)
+                        .into_any_element()
+                } else {
+                    v_flex().w_full().items_end().gap(px(4.))
+                        .children(standalone_cards)
+                        .children(bubble)
+                        .child(actions)
+                        .into_any_element()
+                }),
         )
         .into_any_element()
 }
@@ -1531,11 +1539,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
     {
         let source: Arc<str> = Arc::from(rewritten.as_str());
-        let highlighted = super::highlights::marked_plain(&source, &message.id, env.find, env.cited_excerpt, cx);
-        let state = match highlighted {
-            Some(marked) => markdown.state(&format!("find-assistant:{id}"), &marked, cx),
-            None => markdown.state_in_context(&format!("assistant:{id}"), &source, Some(action_ctx), cx),
-        };
+        let state = markdown.marked_state(&format!("assistant:{id}"), &source, Some(action_ctx), &message.id, env, cx);
         citable_prose(SharedString::from(format!("assistant-select:{id}")), &state, &message.id, &source, cx).into_any_element()
     } else {
         let thread_id = env.thread_id.map(str::to_owned);
@@ -1544,7 +1548,7 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
             .children(segments.into_iter().enumerate().map(|(seg_idx, segment)| match segment {
                 CodexAssistantSegment::Markdown(seg_text) => {
                     let seg_arc: Arc<str> = Arc::from(seg_text);
-                    let state = markdown.state_in_context(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), cx);
+                    let state = markdown.marked_state(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), &message.id, env, cx);
                     citable_prose(SharedString::from(format!("assistant-select:{id}:{seg_idx}")), &state, &message.id, &seg_arc, cx).into_any_element()
                 }
                 CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(
@@ -1596,11 +1600,7 @@ pub fn sent_message_row(
 ) -> AnyElement {
     let p = palette(cx);
     let action_ctx = action_context(env, cx);
-    let highlighted = super::highlights::marked_plain(&entry.text, id, env.find, env.cited_excerpt, cx);
-    let state = match highlighted {
-        Some(marked) => markdown.state(&format!("find-sent:{id}"), &marked, cx),
-        None => markdown.state_in_context(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), cx),
-    };
+    let state = markdown.marked_state(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), id, env, cx);
     let body = citable_prose(SharedString::from(format!("sent-message-select:{id}")), &state, id, &entry.text, cx);
     v_flex()
         .w_full()
@@ -1957,7 +1957,7 @@ pub fn plan_card(id: &str, plan: &Arc<ProposedPlan>, env: &RowEnv, markdown: &mu
     } else {
         strip_displayed_plan_markdown(&plan.markdown)
     });
-    let prose_state = markdown.state_in_context(&format!("plan:{id}:{}", u8::from(collapsed)), &body, Some(action_context(env, cx)), cx);
+    let prose_state = markdown.marked_state(&format!("plan:{id}:{}", u8::from(collapsed)), &body, Some(action_context(env, cx)), id, env, cx);
     let key = id.to_owned();
     let view = cx.entity();
     PlanCard {

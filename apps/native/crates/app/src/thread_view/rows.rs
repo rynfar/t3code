@@ -43,6 +43,12 @@ impl ThreadView {
     fn render_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.clock = Clock::now_for(self.state.read(cx).environment());
         self.window_height = f32::from(window.viewport_size().height);
+        let viewport_width = self.list.viewport_bounds().size.width;
+        let gutter = crate::theme::rem(self.gutter()).to_pixels(window.rem_size()) * 2.;
+        let chat_width = crate::theme::chat_max_width(cx)
+            .map_or(viewport_width, |width| width.to_pixels(window.rem_size()));
+        // A list item callback runs with the list state mutably borrowed.
+        self.lane_width = f32::from((viewport_width - gutter).min(chat_width).max(px(0.)));
         self.markdown.begin_frame();
         self.media.update(cx, |media, cx| media.begin_frame(window, cx));
         self.set_media_scope(cx);

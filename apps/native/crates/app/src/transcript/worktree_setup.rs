@@ -4,7 +4,7 @@
 //! through its own `WorkingTimer`, which exists only while setup runs. Text and spacing are rem
 //! metrics, including offsets that line up with the shared work row's icon slot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,6 +32,29 @@ pub struct SetupEnv {
     pub popover_dismissed: Option<Instant>,
     /// One ticking label per running stage, by its `startedAt`.
     pub timers: HashMap<String, Entity<WorkingTimer>>,
+    pub retryable_runs: HashSet<String>,
+    pub retrying_runs: HashSet<String>,
+}
+
+pub(super) const PREPARATION_FAILURE: &str = "workspace_preparation_failed";
+
+pub(crate) fn workspace_preparation_retry_runs(projection: &t3_core::thread::ThreadProjection) -> HashSet<String> {
+    use t3_core::turn_item::TurnItemKind;
+
+    let failed: HashSet<_> = projection.runs.iter()
+        .filter(|run| run.status == "failed" && run.workspace_preparation.is_some())
+        .map(|run| run.id.as_str())
+        .collect();
+    if failed.is_empty() {
+        return HashSet::new();
+    }
+    projection.visible_turn_items.iter().filter_map(|projected| {
+        let item = &projected.item;
+        let TurnItemKind::Error { failure, .. } = &item.kind else { return None };
+        let run = item.run_id.as_ref()?;
+        (item.status == "failed" && failure.code.as_deref() == Some(PREPARATION_FAILURE) && failed.contains(run.as_str()))
+            .then(|| run.clone())
+    }).collect()
 }
 
 impl SetupEnv {

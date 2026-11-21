@@ -55,6 +55,8 @@ struct Cached {
     action_ctx: SharedActionContext,
     code_meta: SharedCodeMeta,
     media_scope: Arc<Mutex<Option<crate::media::MediaScope>>>,
+    decoration: Option<(super::highlights::MarkdownMarks, gpui_component::text::MarkdownExtensions)>,
+    pulse: Arc<Mutex<Option<super::highlights::CitationPulse>>>,
     _repaint: Subscription,
     updates: Option<MediaUpdates>,
 }
@@ -618,6 +620,8 @@ impl MarkdownStore {
                 action_ctx: shared_ctx.clone(),
                 code_meta: code_meta.clone(),
                 media_scope: shared_media_scope,
+                decoration: None,
+                pulse: Arc::default(),
                 _repaint: repaint,
                 updates,
             },
@@ -634,6 +638,39 @@ impl MarkdownStore {
             code_meta,
             source_key: Some(source_key),
         }
+    }
+
+    pub(super) fn marked_state(
+        &mut self,
+        key: &str,
+        text: &Arc<str>,
+        action_ctx: Option<MarkdownActionContext>,
+        id: &str,
+        env: &super::RowEnv<'_>,
+        cx: &mut App,
+    ) -> MarkdownState {
+        let mut state = self.state_in_context(key, text, action_ctx, cx);
+        let Some(cached) = self.states.get_mut(key) else { return state };
+        let citation = env.cited_excerpt.filter(|pulse| pulse.citation.message_id == id);
+        *cached.pulse.lock().unwrap() = citation.cloned();
+        let marks = super::highlights::MarkdownMarks::new(id, env.find, citation.map(|pulse| &pulse.citation));
+        if cached.decoration.as_ref().map(|(marks, _)| marks) != marks.as_ref() {
+            cached.decoration = marks.map(|marks| {
+                let extensions = super::highlights::mark_extensions(
+                    cached.extensions.clone(),
+                    marks.clone(),
+                    cached.pulse.clone(),
+                    cached.action_ctx.clone(),
+                    cached.code_meta.clone(),
+                    cached.nested_views.clone(),
+                );
+                (marks, extensions)
+            });
+        }
+        if let Some((_, extensions)) = &cached.decoration {
+            state.extensions = Some(extensions.clone());
+        }
+        state
     }
 
     pub fn user_context(&mut self, key: &str, text: &Arc<str>) -> Arc<t3_core::composer::records::SentPresentation> {

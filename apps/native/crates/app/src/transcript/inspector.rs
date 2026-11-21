@@ -27,6 +27,7 @@ use t3_core::timeline::{
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 use t3_core::vcs::format_diff_count;
 
+use super::highlights::ToolFind;
 use super::media::{answer_attachment, tool_output_image_gallery};
 use super::parts::mono_frame;
 use crate::icons::Icon;
@@ -74,7 +75,8 @@ pub struct ItemInspector {
     mode: Mode,
     workspace_root: Option<String>,
     /// A streamed command's output panel, in place of the item's own output.
-    output_slot: Option<Option<AnyElement>>,
+    output_slot: Option<super::command_output::OutputPanel>,
+    find: ToolFind,
     /// A file change's "Open diff".
     open_diff: Option<AnyElement>,
     /// Callback invoked after initial async derive output settles (`#21968`).
@@ -91,6 +93,7 @@ impl ItemInspector {
             mode,
             workspace_root: None,
             output_slot: None,
+            find: ToolFind::default(),
             open_diff: None,
             on_initial_output_ready: None,
         }
@@ -101,8 +104,13 @@ impl ItemInspector {
         self
     }
 
-    pub fn output_slot(mut self, slot: Option<AnyElement>) -> Self {
-        self.output_slot = Some(slot);
+    pub fn streamed_output(mut self, entry_id: &str, slot: Option<&super::command_output::CommandOutputSlot>, cx: &App) -> Self {
+        self.output_slot = Some(super::command_output::panel(entry_id, slot, cx));
+        self
+    }
+
+    pub fn find(mut self, find: ToolFind) -> Self {
+        self.find = find;
         self
     }
 
@@ -486,14 +494,14 @@ impl RenderOnce for ItemInspector {
         let owner = self.owner;
         let on_ready = self.on_initial_output_ready.clone();
         let prepared = cache(cx).update(cx, |cache, cx| cache.get_with_ready(key, owner, on_ready, cx));
-        let ItemInspector { id, owner, mut output_slot, mut open_diff, .. } = self;
+        let ItemInspector { id, owner, mut output_slot, mut open_diff, find, .. } = self;
         let mode = self.mode;
         let p = palette(cx);
         let children: Vec<AnyElement> = prepared
             .iter()
             .flat_map(|prepared| prepared.blocks.iter())
             .enumerate()
-            .map(|(index, block)| render_block(&format!("{id}:{index}"), owner, block, &mut output_slot, &mut open_diff, cx))
+            .map(|(index, block)| render_block(&format!("{id}:{index}"), owner, block, &mut output_slot, &mut open_diff, &find, cx))
             .collect();
         match mode {
             // `FetchedToolOutput`: `mt-1.5 space-y-1.5`, in mono.
@@ -757,8 +765,9 @@ fn render_block(
     id: &str,
     owner: EntityId,
     block: &Block,
-    output_slot: &mut Option<Option<AnyElement>>,
+    output_slot: &mut Option<super::command_output::OutputPanel>,
     open_diff: &mut Option<AnyElement>,
+    find: &ToolFind,
     cx: &mut App,
 ) -> AnyElement {
     let p = palette(cx);
@@ -766,10 +775,10 @@ fn render_block(
     match block {
         Block::Reasoning(text) => ReasoningMarkdown { id: SharedString::from(id.to_owned()), owner, text: text.clone() }.into_any_element(),
         Block::Call(parts) => {
-            let parts: Vec<AnyElement> = parts.iter().enumerate().map(|(index, part)| render_part(&format!("{id}:{index}"), part, output_slot, cx)).collect();
+            let parts: Vec<AnyElement> = parts.iter().enumerate().map(|(index, part)| render_part(&format!("{id}:{index}"), part, output_slot, find, cx)).collect();
             mono_frame(cx).child(v_flex().w_full().min_w_0().gap(px(6.)).children(parts)).into_any_element()
         }
-        Block::Structured(text) => mono_frame(cx).child(structured(id, text, cx)).into_any_element(),
+        Block::Structured(text) => mono_frame(cx).child(structured(id, text, find, cx)).into_any_element(),
         Block::FileChange { path, counts, failed_diff, changes } => {
             let header = h_flex()
                 .flex_wrap()
@@ -784,7 +793,7 @@ fn render_block(
                 .w_full()
                 .gap(px(8.))
                 .child(header)
-                .children(failed_diff.as_ref().map(|diff| mono_frame(cx).child(structured(&format!("{id}:diff"), diff, cx))))
+                .children(failed_diff.as_ref().map(|diff| mono_frame(cx).child(structured(&format!("{id}:diff"), diff, find, cx))))
                 .when_some((!changes.is_empty()).then_some(changes), |this, changes| {
                     this.child(
                         mono_xs(cx).text_color(hsla(p.muted_foreground)).child(v_flex().gap(px(4.)).children(
@@ -848,24 +857,22 @@ fn web_result(id: &str, result: &WebResult, cx: &mut App) -> AnyElement {
 }
 
 /// `StructuredValue`: capped at 320, muted, highlighted when it carries runs.
-fn structured(id: &str, text: &Text, cx: &App) -> AnyElement {
+fn structured(id: &str, text: &Text, find: &ToolFind, cx: &App) -> AnyElement {
     let color = hsla(palette(cx).muted_foreground);
-    Capped { id: SharedString::from(id.to_owned()), text: text.text.clone(), highlights: text.highlights(cx), max_height: 320., color }.into_any_element()
+    Capped { id: SharedString::from(id.to_owned()), text: text.text.clone(), highlights: Some(find.combine(&text.text, &text.highlights(cx).unwrap_or_default(), cx)), max_height: 320., color }.into_any_element()
 }
 
-fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyElement>>, cx: &mut App) -> AnyElement {
+fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<super::command_output::OutputPanel>, find: &ToolFind, cx: &mut App) -> AnyElement {
     let p = palette(cx);
     match part {
-        CallPart::Command(command) => super::command_output::ShellCommandBlock::new(id, command.clone()).into_any_element(),
+        CallPart::Command(command) => super::command_output::ShellCommandBlock::new(id, command.clone()).matches(find.styles(command, cx)).into_any_element(),
         CallPart::Args(text) => {
-            let mut lines = selectable(id, text.text.clone());
-            if let Some(highlights) = text.highlights(cx) {
-                lines = lines.highlights(highlights);
-            }
+            let highlights = find.combine(&text.text, &text.highlights(cx).unwrap_or_default(), cx);
+            let lines = selectable(id, text.text.clone()).highlights(highlights);
             div().text_color(hsla(p.foreground).opacity(0.85)).child(lines).into_any_element()
         }
         CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(selectable(id, key.clone())).into_any_element(),
-        CallPart::Structured(text) => structured(id, text, cx),
+        CallPart::Structured(text) => structured(id, text, find, cx),
         CallPart::Images(images) => {
             let images = images
                 .iter()
@@ -876,10 +883,10 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
         }
         CallPart::Output { line } => {
             if let Some(slot) = output_slot.take() {
-                return slot.unwrap_or_else(|| div().into_any_element());
+                return slot.render(find, cx).unwrap_or_else(|| div().into_any_element());
             }
             let line = line.as_ref().map(|line| match line {
-                Line::Text(text) => structured(&format!("{id}:output"), text, cx),
+                Line::Text(text) => structured(&format!("{id}:output"), text, find, cx),
                 Line::Note(note) => div().italic().text_color(hsla(p.muted_foreground)).child(selectable(&format!("{id}:note"), note.clone())).into_any_element(),
                 Line::Failed(error) => div().text_color(hsla(p.destructive)).child(selectable(&format!("{id}:error"), error.clone())).into_any_element(),
             });
@@ -890,11 +897,11 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
 }
 
 /// A read's paths or a skill's arguments: plain mono text capped at 256, in `secondary_label`.
-pub fn plain_body(entry_id: &str, text: &str, cx: &App) -> AnyElement {
+pub fn plain_body(entry_id: &str, text: &str, find: &ToolFind, cx: &App) -> AnyElement {
     let capped = Capped {
         id: SharedString::from(format!("plain:{entry_id}")),
         text: SharedString::from(text.to_owned()),
-        highlights: None,
+        highlights: Some(find.styles(text, cx).into()),
         max_height: 256.,
         color: hsla(palette(cx).secondary_label),
     };

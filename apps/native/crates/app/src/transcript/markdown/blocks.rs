@@ -1,14 +1,14 @@
 //! Custom GPUI `TextView` block extensions (`ALERT_NODE`, `DETAILS_NODE`, `MATH_NODE`,
 //! `MERMAID_NODE`, `TABLE_NODE`) and fenced code block metadata lookup (`title`, closed state).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, RenderImage, ScrollDelta,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, EntityId, FontWeight, Global, InteractiveElement, IntoElement, ParentElement, RenderImage, ScrollDelta,
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
@@ -107,7 +107,7 @@ struct MathNodeData {
 #[derive(Clone)]
 struct MermaidNodeData {
     key: String,
-    code: String,
+    code: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -147,18 +147,23 @@ struct MathUiState {
     show_tex: bool,
 }
 
-struct MermaidUiState {
-    show_code: bool,
-    request: Option<(String, bool)>,
-    preview: Option<Result<MermaidPreview, String>>,
-    _render: Option<gpui::Task<()>>,
+#[derive(Clone, Copy)]
+struct MermaidExtent {
+    width: f32,
+    aspect: f32,
+}
+
+impl MermaidExtent {
+    fn layout<E: Styled>(self, element: E) -> E {
+        element.w(px(self.width)).max_w_full().aspect_ratio(self.aspect)
+    }
 }
 
 #[derive(Clone)]
 struct MermaidPreview {
     svg: Arc<str>,
     image: Arc<RenderImage>,
-    width: f32,
+    extent: MermaidExtent,
     pixel_width: u32,
     pixel_height: u32,
 }
@@ -168,7 +173,8 @@ impl MermaidPreview {
 
     fn render(source: &str, dark: bool, renderer: gpui::SvgRenderer) -> Result<Self, String> {
         let rendered = render_mermaid_svg(source, dark)?;
-        let frame = renderer.render_single_frame(rendered.svg.as_bytes(), 2.)
+        let scale = (2048. / rendered.width.max(rendered.height)).min(2.);
+        let frame = renderer.render_single_frame(rendered.svg.as_bytes(), scale)
             .map_err(|error| format!("SVG render failed: {error}"))?;
         let size = frame.size(0);
         let (width, height) = (size.width.0 as u32, size.height.0 as u32);
@@ -184,14 +190,17 @@ impl MermaidPreview {
         Ok(Self {
             svg: Arc::from(rendered.svg),
             image: Arc::new(RenderImage::new(vec![image::Frame::new(padded)])),
-            width: rendered.width,
+            extent: MermaidExtent {
+                width: rendered.width.max(240.),
+                aspect: rendered.width / rendered.height,
+            },
             pixel_width: width,
             pixel_height: height,
         })
     }
 
     fn surface(self) -> impl IntoElement {
-        gpui::canvas(
+        self.extent.layout(gpui::canvas(
             |_, _, _| (),
             move |visible, (), window, _| {
                 let pad_x = visible.size.width * (Self::GUTTER as f32 / self.pixel_width as f32);
@@ -202,17 +211,142 @@ impl MermaidPreview {
                 );
                 let _ = window.paint_image_fitted(visible, fitted, gpui::Corners::default(), self.image, 0, false);
             },
-        )
-        .w(px(self.width.max(240.)))
-        .max_w_full()
-        .aspect_ratio(self.pixel_width as f32 / self.pixel_height as f32)
+        ))
     }
 }
 
-fn release_mermaid_preview(preview: Option<Result<MermaidPreview, String>>, cx: &mut App) {
-    if let Some(Ok(preview)) = preview {
-        cx.defer(move |cx| cx.drop_image(preview.image, None));
+type MermaidKey = (Arc<str>, bool);
+
+enum MermaidSlot {
+    Pending(Vec<EntityId>, gpui::Task<()>),
+    Ready(MermaidPreview),
+    Failed,
+}
+
+#[derive(Default)]
+struct MermaidStore {
+    entries: VecDeque<(MermaidKey, MermaidSlot)>,
+    // Keep geometry across theme changes and raster eviction.
+    extents: VecDeque<(Arc<str>, MermaidExtent)>,
+    bytes: usize,
+}
+
+struct MermaidCache(Entity<MermaidStore>);
+impl Global for MermaidCache {}
+
+impl MermaidStore {
+    const ENTRY_LIMIT: usize = 64;
+    const EXTENT_LIMIT: usize = 256;
+    const BYTE_LIMIT: usize = 32 * 1024 * 1024;
+
+    fn get(
+        &mut self,
+        key: MermaidKey,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) -> (Option<MermaidPreview>, Option<MermaidExtent>, bool) {
+        let (source, dark) = &key;
+        if source.len() > 64 * 1024 {
+            return (None, None, true);
+        }
+        let extent = self.extents.iter().position(|(code, _)| code == source)
+            .and_then(|index| self.extents.remove(index))
+            .map(|entry| {
+                let extent = entry.1;
+                self.extents.push_back(entry);
+                extent
+            });
+        let mut slot = self.entries.iter().position(|(candidate, _)| candidate == &key)
+            .and_then(|index| self.entries.remove(index))
+            .map_or_else(|| {
+                let renderer = cx.svg_renderer();
+                let source = source.clone();
+                let dark = *dark;
+                let completed = key.clone();
+                let task = cx.spawn(async move |cache, cx| {
+                    let preview = cx.background_executor().spawn(async move {
+                        MermaidPreview::render(&source, dark, renderer)
+                    }).await;
+                    let _ = cache.update(cx, |cache, cx| cache.finish(completed, preview, cx));
+                });
+                MermaidSlot::Pending(Vec::new(), task)
+            }, |(_, slot)| slot);
+        let result = match &mut slot {
+            MermaidSlot::Ready(preview) => (Some(preview.clone()), Some(preview.extent), false),
+            MermaidSlot::Failed => (None, None, true),
+            MermaidSlot::Pending(waiters, _) => {
+                if !waiters.contains(&owner) {
+                    waiters.push(owner);
+                }
+                (None, extent, false)
+            }
+        };
+        self.entries.push_back((key, slot));
+        self.trim(cx);
+        result
     }
+
+    fn finish(
+        &mut self,
+        key: MermaidKey,
+        preview: Result<MermaidPreview, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.entries.iter().position(|(candidate, _)| candidate == &key) else {
+            return;
+        };
+        let Some((_, MermaidSlot::Pending(waiters, task))) = self.entries.remove(index) else {
+            return;
+        };
+        task.detach();
+        let slot = match preview {
+            Ok(preview) => {
+                self.bytes += Self::preview_bytes(&preview);
+                self.remember_extent(key.0.clone(), preview.extent);
+                MermaidSlot::Ready(preview)
+            }
+            Err(_) => MermaidSlot::Failed,
+        };
+        self.entries.push_back((key, slot));
+        self.trim(cx);
+        let app: &mut App = cx;
+        for waiter in waiters {
+            app.notify(waiter);
+        }
+    }
+
+    fn remember_extent(&mut self, code: Arc<str>, extent: MermaidExtent) {
+        self.extents.retain(|(candidate, _)| candidate != &code);
+        self.extents.push_back((code, extent));
+        if self.extents.len() > Self::EXTENT_LIMIT {
+            self.extents.pop_front();
+        }
+    }
+
+    fn preview_bytes(preview: &MermaidPreview) -> usize {
+        let padding = 2 * MermaidPreview::GUTTER;
+        (preview.pixel_width + padding) as usize * (preview.pixel_height + padding) as usize * 4
+            + preview.svg.len()
+    }
+
+    fn trim(&mut self, cx: &mut Context<Self>) {
+        while self.entries.len() > Self::ENTRY_LIMIT || self.bytes > Self::BYTE_LIMIT {
+            let index = self.entries.iter().position(|(_, slot)| !matches!(slot, MermaidSlot::Pending(..))).unwrap_or(0);
+            if let Some((_, MermaidSlot::Ready(preview))) = self.entries.remove(index) {
+                self.bytes -= Self::preview_bytes(&preview);
+                cx.defer(move |cx| cx.drop_image(preview.image, None));
+            }
+        }
+    }
+}
+
+fn mermaid_cache(cx: &mut App) -> Entity<MermaidStore> {
+    if let Some(cache) = cx.try_global::<MermaidCache>() {
+        return cache.0.clone();
+    }
+    let cache = cx.new(|_| MermaidStore::default());
+    cx.set_global(MermaidCache(cache.clone()));
+    cache
 }
 
 pub(super) fn attach_rich_extensions_with_media_options(
@@ -483,7 +617,7 @@ fn parse_rich_block(
             if closed && is_mermaid_language(lang) {
                 let raw = context.node_source(node).unwrap_or(&code.value).to_owned();
                 return Some(
-                    MarkdownNode::new(MERMAID_NODE, MermaidNodeData { key, code: code.value.clone() })
+                    MarkdownNode::new(MERMAID_NODE, MermaidNodeData { key, code: Arc::from(code.value.as_str()) })
                         .text(code.value.clone())
                         .markdown(raw),
                 );
@@ -925,37 +1059,13 @@ fn render_mermaid_block(
     let p = palette(cx);
     let is_dark = cx.theme().mode.is_dark();
     let key = SharedString::from(format!("mermaid:{}", data.key));
-    let state = window.use_keyed_state(key, cx, |_, cx| {
-        cx.on_release(|state: &mut MermaidUiState, cx| release_mermaid_preview(state.preview.take(), cx)).detach();
-        MermaidUiState { show_code: false, request: None, preview: None, _render: None }
+    let state = window.use_keyed_state(key, cx, |_, _| false);
+    let show_code = *state.read(cx);
+    let owner = window.current_view();
+    let (preview, extent, failed) = mermaid_cache(cx).update(cx, |cache, cx| {
+        cache.get((data.code.clone(), is_dark), owner, cx)
     });
-    let needs_render = !state.read(cx).request.as_ref().is_some_and(|(source, dark)| {
-        source == &data.code && *dark == is_dark
-    });
-    if needs_render {
-        let renderer = cx.svg_renderer();
-        let source = data.code.clone();
-        let owner = window.current_view();
-        let work = cx.background_executor().spawn(async move {
-            MermaidPreview::render(&source, is_dark, renderer)
-        });
-        state.update(cx, |state, cx| {
-            release_mermaid_preview(state.preview.take(), cx);
-            state.request = Some((data.code.clone(), is_dark));
-            state._render = Some(cx.spawn(async move |state, cx| {
-                let preview = work.await;
-                let _ = state.update(cx, |state, cx| {
-                    state.preview = Some(preview);
-                    cx.defer(move |cx| cx.notify(owner));
-                });
-            }));
-        });
-    }
-    let current = state.read(cx);
-    let show_code = current.show_code;
-    let preview = current.preview.as_ref().and_then(|result| result.as_ref().ok()).cloned();
-    let failed = current.preview.as_ref().is_some_and(Result::is_err);
-    let loading = current.preview.is_none();
+    let loading = preview.is_none() && !failed;
     let show_diagram = !show_code && preview.is_some();
     let toggle_state = state.clone();
     let copy_code = t3_core::markdown::strip_code_fence_trailing_newline(&data.code);
@@ -1009,8 +1119,8 @@ fn render_mermaid_block(
                                 if show_code { "Diagram" } else { "Code" },
                                 Some(Icon::CodeXml),
                                 move |_, _, cx| {
-                                    toggle_state.update(cx, |s, cx| {
-                                        s.show_code = !s.show_code;
+                                    toggle_state.update(cx, |show, cx| {
+                                        *show = !*show;
                                         cx.notify();
                                     });
                                 },
@@ -1060,13 +1170,17 @@ fn render_mermaid_block(
                 .children(preview.map(MermaidPreview::surface))
                 .into_any_element()
         } else if loading && !show_code {
-            div().p(px(12.)).text_xs().text_color(hsla(p.muted_foreground))
-                .child(crate::i18n::t(cx, "Loading"))
-                .into_any_element()
+            let fallback = match extent {
+                Some(extent) => extent.layout(div()).into_any_element(),
+                None => div()
+                    .h(cx.theme().mono_font_size * 1.375 * data.code.lines().count().max(1) as f32)
+                    .into_any_element(),
+            };
+            div().w_full().p(px(12.)).flex().justify_center().child(fallback).into_any_element()
         } else {
             let nested = nested_views.clone();
             let key = format!("mermaid-code:{}", data.key);
-            let code_text = data.code.clone();
+            let code_text = data.code.to_string();
             div()
                 .w_full()
                 .min_w_0()
@@ -1083,7 +1197,7 @@ fn render_mermaid_block(
                         .line_height(cx.theme().mono_font_size * 1.375)
                         .text_color(hsla(p.foreground))
                         .child(
-                            SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), data.code.clone())
+                            SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), code_text.clone())
                                 .on_state(move |handle, _| {
                                     nested.lock().unwrap().insert(
                                         key.clone(),
@@ -1565,5 +1679,37 @@ mod wheel_propagation_tests {
             streamed_keys, initial_keys,
             "streaming content into a code block at the same start offset must keep its keyed state stable"
         );
+    }
+}
+
+#[cfg(test)]
+mod mermaid_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn revisiting_diagram_reuses_raster_and_other_theme_reserves_its_extent(cx: &mut gpui::TestAppContext) {
+        let source: Arc<str> = Arc::from("graph TD\n A --> B");
+        let store = cx.update(|cx| {
+            let preview = MermaidPreview::render(&source, false, cx.svg_renderer()).unwrap();
+            let store = mermaid_cache(cx);
+            store.update(cx, |store, _| {
+                store.remember_extent(source.clone(), preview.extent);
+                store.bytes = MermaidStore::preview_bytes(&preview);
+                store.entries.push_back(((source.clone(), false), MermaidSlot::Ready(preview)));
+            });
+            store
+        });
+        store.update(cx, |store, cx| {
+            let owner = cx.entity_id();
+            let (first, _, _) = store.get((source.clone(), false), owner, cx);
+            let (second, _, _) = store.get((source.clone(), false), owner, cx);
+            let first = first.unwrap();
+            assert!(Arc::ptr_eq(&first.image, &second.unwrap().image));
+            let (other_theme, reserved, failed) = store.get((source.clone(), true), owner, cx);
+            assert!(other_theme.is_none() && !failed);
+            let reserved = reserved.unwrap();
+            assert_eq!(reserved.width, first.extent.width);
+            assert_eq!(reserved.aspect, first.extent.aspect);
+        });
     }
 }

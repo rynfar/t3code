@@ -812,6 +812,8 @@ pub fn segmented_track(cx: &App) -> gpui::Div {
     div().flex().p(px(2.)).rounded(px(8.)).bg(hsla(palette(cx).input).opacity(0.4))
 }
 
+type HoverHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
+
 /// One segment of a segmented track: 24 tall, checked `input` at 72%.
 #[derive(IntoElement)]
 pub struct Segment {
@@ -822,11 +824,12 @@ pub struct Segment {
     disabled: bool,
     tooltip: Option<SharedString>,
     on_click: Option<Handler>,
+    on_hover: Option<HoverHandler>,
 }
 
 impl Segment {
     pub fn new(id: impl Into<ElementId>, checked: bool) -> Self {
-        Segment { id: id.into(), icon: None, label: None, checked, disabled: false, tooltip: None, on_click: None }
+        Segment { id: id.into(), icon: None, label: None, checked, disabled: false, tooltip: None, on_click: None, on_hover: None }
     }
 
     pub fn icon(mut self, icon: Icon) -> Self {
@@ -846,6 +849,11 @@ impl Segment {
 
     pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
         self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn on_hover(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
+        self.on_hover = Some(Rc::new(handler));
         self
     }
 
@@ -879,6 +887,9 @@ impl RenderOnce for Segment {
             })
             .children(self.icon.map(|glyph| glyph.render(px(14.), color)))
             .children(self.label)
+            .when_some(self.on_hover, |this, handler| {
+                this.on_hover(move |hover, window, cx| handler(hover, window, cx))
+            })
             .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| handler(event, window, cx))

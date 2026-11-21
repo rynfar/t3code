@@ -279,6 +279,7 @@ struct Resolved {
     multi_models: Vec<ModelSelection>,
     multi_models_enabled: bool,
     multi_model_label: Option<String>,
+    multi_model_marks: Vec<ProviderMark>,
     multi_model_tooltip: Option<String>,
     model_label: String,
     driver: String,
@@ -1102,6 +1103,10 @@ impl Composer {
         } else {
             (None, None)
         };
+        let multi_model_marks = multi_models.iter().take(3)
+            .filter_map(|model| entries.iter().find(|entry| entry.instance_id() == model.instance_id))
+            .map(|entry| ProviderMark::of(entry, &entries))
+            .collect();
         let mark_model = multi_models.first().or(model.as_ref());
         let mark = mark_model
             .and_then(|model| entries.iter().find(|entry| entry.instance_id() == model.instance_id))
@@ -1139,6 +1144,7 @@ impl Composer {
             multi_models,
             multi_models_enabled,
             multi_model_label,
+            multi_model_marks,
             multi_model_tooltip,
             descriptors: options.descriptors,
             dispatch_options: options.dispatch,

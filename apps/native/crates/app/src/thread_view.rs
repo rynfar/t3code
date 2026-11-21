@@ -128,6 +128,7 @@ pub struct ThreadView {
     local_error: Option<String>,
     clock: Clock,
     window_height: f32,
+    lane_width: f32,
     measured_typography: TranscriptTypography,
     rewind: rewind::RewindUi,
     media: Entity<crate::media::MediaCache>,
@@ -274,6 +275,7 @@ impl ThreadView {
             local_error: None,
             clock: Clock::now_for(state.read(cx).environment()),
             window_height: 0.,
+            lane_width: 0.,
             measured_typography: TranscriptTypography::of(_window, cx),
             rewind: rewind::RewindUi::default(),
             media,
@@ -480,6 +482,7 @@ impl ThreadView {
                 self.activity = derive_activity(projection);
                 self.fork_support = fork_support(projection);
                 self.pending_approvals = t3_core::requests::pending_requests(projection).approvals;
+                self.setup_env.retryable_runs = crate::transcript::workspace_preparation_retry_runs(projection);
                 let pending_ids: HashSet<&str> = self.pending_approvals.iter().map(|a| a.request_id.as_str()).collect();
                 self.responding_approvals.retain(|id| pending_ids.contains(id.as_str()));
                 self.approval_errors.retain(|id, _| pending_ids.contains(id.as_str()));
@@ -497,6 +500,8 @@ impl ThreadView {
                 self.entries_cache = EntriesCache::default();
                 self.activity = ThreadActivity::default();
                 self.pending_approvals.clear();
+                self.setup_env.retryable_runs.clear();
+                self.setup_env.retrying_runs.clear();
                 self.responding_approvals.clear();
                 self.approval_errors.clear();
                 self.open_approval_menu = None;
@@ -1520,12 +1525,12 @@ impl ThreadView {
             can_operate_thread: self.can_operate_thread,
             rewinding: self.rewind.busy,
             window_height: self.window_height,
+            lane_width: self.lane_width,
             details: &self.details,
             group_lists: &self.group_lists,
             working_timer: self.working_timer.as_ref(),
-            find_target: self.find.as_ref().and_then(|find| find.active_entry()).or(self.citation_ui.highlighted.as_deref()),
             find: self.find.as_ref().and_then(find::FindUi::highlights),
-            cited_excerpt: self.citation_ui.cited_excerpt.as_ref(),
+            cited_excerpt: self.citation_ui.cited_excerpt.as_ref().filter(|pulse| !pulse.finished()),
             turn_diffs: &self.turn_diffs,
             fork_support: &self.fork_support,
             forking: &self.forking,
@@ -1708,6 +1713,44 @@ impl ThreadView {
             // The working row's label and chip follow it without the row changing.
             cx.notify();
         }
+    }
+
+    pub(crate) fn retry_workspace_preparation(&mut self, run: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_id.clone() else { return };
+        let state = self.state.read(cx);
+        if !state.can_operate_threads()
+            || !self.setup_env.retryable_runs.contains(run)
+            || !self.setup_env.retrying_runs.insert(run.to_owned())
+        {
+            return;
+        }
+        let command = serde_json::json!({
+            "type": "prepared-run.retry",
+            "commandId": crate::app_state::uuid_v4(),
+            "threadId": thread,
+            "runId": run,
+        });
+        let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
+        let connection = state.connection_id();
+        let run = run.to_owned();
+        cx.spawn(async move |view, cx| {
+            let result = request.await;
+            let _ = view.update(cx, |view, cx| {
+                if view.thread_id.as_deref() != Some(&thread) || view.state.read(cx).connection_id() != connection {
+                    return;
+                }
+                view.setup_env.retrying_runs.remove(&run);
+                if let Err(error) = result {
+                    view.state.update(cx, |state, cx| {
+                        let toast = crate::toast::Toast::new(crate::toast::ToastKind::Error, crate::i18n::t(cx, "Could not retry workspace preparation"))
+                            .description(error.to_string());
+                        state.show_toast(toast, cx);
+                    });
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
     }
 
     pub fn toggle_setup_details(&mut self, cx: &mut Context<Self>) {

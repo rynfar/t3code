@@ -13,7 +13,7 @@ use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext, Context, Entity, FocusHandle, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
     Point, Render, ScrollWheelEvent, SharedString, Styled, Task, WeakEntity, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
 };
-use t3_core::media::{MediaHints, MediaKind, MediaSource};
+use t3_core::media::{AssetResource, MediaHints, MediaKind, MediaSource};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::h_flex;
 
@@ -333,7 +333,56 @@ fn media_button(id: &'static str, icon: Icon, size: f32, filled: bool) -> gpui::
         .child(icon.render(px(if filled { 16. } else { 20. }), gpui_hsla(0., 0., 1., if filled { 1. } else { 0.9 })))
 }
 
-fn media_actions(item: &ViewerItem, cx: &App) -> Option<AnyElement> {
+fn video_copy_reference(source: &MediaSource, scope: Option<&MediaScope>) -> Option<(&'static str, String)> {
+    match source {
+        MediaSource::Direct(url) | MediaSource::Asset(AssetResource::SourceControlMedia { url, .. })
+            if url.starts_with("https://") || url.starts_with("http://") => Some(("Copy URL", url.clone())),
+        MediaSource::Asset(AssetResource::MediaFile { path, .. } | AssetResource::RemoteMediaFile { path, .. }) => {
+            if path.starts_with('/') || t3_core::media::is_windows_absolute_path(path) {
+                Some(("Copy full path", path.clone()))
+            } else if let Some(root) = scope.and_then(|scope| scope.workspace_root.as_deref()) {
+                let separator = if t3_core::media::is_windows_absolute_path(root) { '\\' } else { '/' };
+                Some(("Copy full path", format!("{}{separator}{path}", root.trim_end_matches(['/', '\\']))))
+            } else {
+                Some(("Copy relative path", path.clone()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn save_video(
+    source: MediaSource,
+    name: &str,
+    state: Entity<crate::app_state::AppState>,
+    cx: &mut App,
+) {
+    let client = state.read(cx).client_handle();
+    let runtime = state.read(cx).runtime().clone();
+    let dir = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
+        .unwrap_or_else(std::env::temp_dir);
+    let prompt = cx.prompt_for_new_path(dir.as_path(), Some(name));
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(path))) = prompt.await else { return };
+        let result = runtime.spawn(async move {
+            let fetched = if let Some(client) = client {
+                t3_client::assets::fetch_media(&client, &source).await?
+            } else if let MediaSource::Direct(url) = &source {
+                t3_client::assets::fetch_data_media(url)?
+            } else {
+                return Err("Video unavailable.".to_owned());
+            };
+            tokio::fs::write(path, fetched.bytes).await.map_err(|error| error.to_string())
+        }).await.unwrap_or_else(|error| Err(error.to_string()));
+        if let Err(error) = result {
+            state.update(cx, |app, cx| {
+                app.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not save video")).description(error), cx);
+            });
+        }
+    }).detach();
+}
+
+fn media_actions(item: &ViewerItem, scope: Option<&MediaScope>, cx: &App) -> Option<AnyElement> {
     let media = cx.try_global::<super::Media>()?;
     let cache = media.cache.read(cx);
     let bytes = (item.kind == MediaKind::Image).then(|| cache.original_bytes(&item.source, cx)).flatten();
@@ -346,17 +395,27 @@ fn media_actions(item: &ViewerItem, cx: &App) -> Option<AnyElement> {
         MediaSource::Asset(_) => true,
         MediaSource::Direct(url) => url.starts_with("https://") || url.starts_with("http://"),
     };
-    if bytes.is_none() && !can_open {
+    let video = item.kind == MediaKind::Video;
+    let copy_reference = video.then(|| video_copy_reference(&source, scope)).flatten();
+    if bytes.is_none() && !can_open && !video {
         return None;
     }
 
     let app = cache.state.clone();
-    let name = std::path::Path::new(item.name.as_ref()).file_name().and_then(|name| name.to_str()).unwrap_or("image").to_owned();
+    let name = std::path::Path::new(item.name.as_ref()).file_name().and_then(|name| name.to_str()).unwrap_or(if video { "video" } else { "image" }).to_owned();
     let action = |id, glyph, label| {
         let label = t(cx, label);
         media_button(id, glyph, 28., true).aria_label(label)
             .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
     };
+    let video_save = video.then(|| {
+        let source = source.clone();
+        let name = name.clone();
+        let app = app.clone();
+        action("media-viewer-save-video", Icon::Download, "Save video").on_click(move |_, _, cx| {
+            save_video(source.clone(), &name, app.clone(), cx);
+        })
+    });
     Some(h_flex()
         .id("media-viewer-actions")
         .absolute().top(px(16.)).left(px(16.))
@@ -386,6 +445,12 @@ fn media_actions(item: &ViewerItem, cx: &App) -> Option<AnyElement> {
                 }).detach();
             })
         }))
+        .children(copy_reference.map(|(label, reference)| {
+            action("media-viewer-copy-video-reference", Icon::Copy, label).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(reference.clone()));
+            })
+        }))
+        .children(video_save)
         .when(can_open, |this| this.child(action("media-viewer-open", Icon::ExternalLink, "Open in browser")
             .on_click(move |_, _, cx| match &source {
                 MediaSource::Asset(resource) => super::open_asset(resource, cx),
@@ -552,7 +617,7 @@ impl MediaViewer {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(media)
             .children(observer)
-            .children(media_actions(&item, cx))
+            .children(media_actions(&item, self.scope.as_ref(), cx))
             .child(
                 div()
                     .h(px(CAPTION_HEIGHT))

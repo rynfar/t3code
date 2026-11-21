@@ -21,7 +21,7 @@ use t3_core::timeline::{
 };
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
-use super::command_output;
+use super::highlights::ToolFind;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
 use super::media::{tool_output_image, tool_output_image_gallery_items};
@@ -336,10 +336,23 @@ pub fn group_member(entry: &Arc<WorkLogEntry>, env: &RowEnv, markdown: &mut Mark
         && let Some(detail) = entry.detail.as_deref()
     {
         let text: Arc<str> = Arc::from(detail);
-        let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
+        let state = markdown.marked_state(&format!("reasoning:{}", entry.id), &text, None, &entry.id, env, cx);
         return div().pb(rem(12.)).child(prose(&state, cx)).into_any_element();
     }
     subagent_notification_link(entry, env, cx).unwrap_or_else(|| entry_row(entry, None, true, env, markdown, cx))
+}
+
+fn reasoning_preview(
+    id: &str,
+    text: &str,
+    env: &RowEnv<'_>,
+    markdown: &mut MarkdownStore,
+    cx: &mut Context<ThreadView>,
+) -> gpui_component::text::TextView {
+    let limit = text.floor_char_boundary(8192);
+    let source: Arc<str> = Arc::from(&text[..limit]);
+    let state = markdown.marked_state(&format!("thought-preview:{id}"), &source, None, id, env, cx);
+    super::markdown::markdown_view(&state, cx).selectable(false)
 }
 
 /// `WorkEntryLogRow`.
@@ -355,6 +368,7 @@ fn entry_row(
         return approval_card(approval, Some(&entry.created_at), grouped, env, cx);
     }
     let p = palette(cx);
+    let find = ToolFind::new(&entry.id, env.find);
     if let Some(item) = entry.item.as_ref()
         && let TurnItemKind::Error { failure, .. } = &item.kind
         && item.status == "failed"
@@ -374,10 +388,15 @@ fn entry_row(
         } else {
             entry.label.clone()
         };
+        let retry_run = item.run_id.as_ref().filter(|run| {
+            failure.code.as_deref() == Some(super::worktree_setup::PREPARATION_FAILURE)
+                && env.can_operate_thread
+                && env.setup.retryable_runs.contains(*run)
+        }).cloned();
         return work_row_frame(SharedString::from(entry.id.clone()), grouped)
             .child(work_line(
                 Some(icon_slot(Icon::CircleAlert, color)),
-                div().text_size(rem(14.)).font_weight(FontWeight::MEDIUM).text_color(color).child(label).into_any_element(),
+                div().text_size(rem(14.)).font_weight(FontWeight::MEDIUM).text_color(color).child(gpui::StyledText::new(label.clone()).with_highlights(find.styles(&label, cx))).into_any_element(),
                 vec![timestamp(&env.clock, &entry.created_at, true, cx)],
                 true,
                 cx,
@@ -390,8 +409,21 @@ fn entry_row(
                         .text_size(rem(14.))
                         .line_height(rem(22.75))
                         .text_color(hsla(p.foreground).opacity(0.8))
-                        .child(failure.message.clone()),
+                        .child(gpui::StyledText::new(failure.message.clone()).with_highlights(find.styles(&failure.message, cx))),
                 )
+            })
+            .when_some(retry_run, |this, run| {
+                let retrying = env.setup.retrying_runs.contains(&run);
+                let button = crate::settings::controls::Button::new(
+                    SharedString::from(format!("retry-preparation:{run}")),
+                    crate::settings::controls::ButtonVariant::Outline,
+                    crate::settings::controls::ButtonSize::Xs,
+                )
+                .label(crate::i18n::t(cx, "Retry"))
+                .icon(Icon::RotateCcw)
+                .disabled(retrying)
+                .on_click(cx.listener(move |view, _, _, cx| view.retry_workspace_preparation(&run, cx)));
+                this.child(div().ml(rem(28.)).pb(rem(4.)).child(button))
             })
             .into_any_element();
     }
@@ -489,13 +521,17 @@ fn entry_row(
             )
             .child(div().flex_none().child("”"))
             .into_any_element()
+    } else if reasoning && !expanded && let Some(detail) = entry.detail.as_deref().filter(|detail| !detail.trim().is_empty()) {
+        div().min_w_0().max_h(rem(22.75)).overflow_hidden().text_color(label_color)
+            .child(reasoning_preview(&entry.id, detail, env, markdown, cx))
+            .into_any_element()
     } else {
         div()
             .min_w_0()
             .truncate()
             .text_color(label_color)
             .when(warning || severe, |this| this.font_weight(FontWeight::MEDIUM))
-            .child(preview)
+            .child(gpui::StyledText::new(preview.clone()).with_highlights(find.styles(&preview, cx)))
             .into_any_element()
     };
     let label = h_flex()
@@ -504,7 +540,7 @@ fn entry_row(
         .child(heading)
         .children(answer.map(|answer| {
             let color = if expanded { hsla(p.muted_foreground) } else { hsla(p.foreground) };
-            div().min_w_0().truncate().text_color(color).child(answer)
+            div().min_w_0().truncate().text_color(color).child(gpui::StyledText::new(answer.clone()).with_highlights(find.styles(&answer, cx)))
         }))
         .into_any_element();
     let live = env.working_timer.is_some() && entry.status == Some(ToolStatus::InProgress) && !failed;
@@ -517,7 +553,7 @@ fn entry_row(
     }
     if expanded && reasoning && let Some(detail) = entry.detail.as_deref() {
         let text: Arc<str> = Arc::from(detail);
-        let state = markdown.state(&format!("reasoning:{}", entry.id), &text, cx);
+        let state = markdown.marked_state(&format!("reasoning:{}", entry.id), &text, None, &entry.id, env, cx);
         frame = frame.child(
             div()
                 .id(SharedString::from(format!("work-trace:{}", entry.id)))
@@ -567,7 +603,7 @@ fn entry_row(
             );
         }
         if let Some(body) = entry_body(entry, env.workspace_root) {
-            frame = frame.child(expanded_body(entry, body, env, cx));
+            frame = frame.child(expanded_body(entry, body, env, &find, cx));
         }
     }
     frame.into_any_element()
@@ -575,7 +611,7 @@ fn entry_row(
 
 /// What an open row shows under its line: the answers it was given, or a panel with the
 /// inspector or a read's or skill's plain output (`WorkLogDetails kind="panel"`).
-fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, find: &ToolFind, cx: &mut Context<ThreadView>) -> AnyElement {
     let Some(item) = entry.item.clone() else { return div().into_any_element() };
     let content = match body {
         EntryBody::QuestionAnswer => {
@@ -586,12 +622,13 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
         EntryBody::Plain { text, fetches } => v_flex()
             .w_full()
             .min_w_0()
-            .children(text.map(|text| plain_body(&entry.id, &text, cx)))
+            .children(text.map(|text| plain_body(&entry.id, &text, find, cx)))
             .when(fetches, |this| {
                 let weak_view = cx.weak_entity();
                 let ready_id = entry.id.clone();
                 this.child(
                     ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly, cx.entity_id())
+                        .find(find.clone())
                         .on_initial_output_ready(Rc::new(move |cx| {
                             let _ = weak_view.update(cx, |view, cx| view.mark_disclosure_content_ready(&ready_id, cx));
                         })),
@@ -602,6 +639,7 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
             let weak_view = cx.weak_entity();
             let ready_id = entry.id.clone();
             let mut inspector = ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full, cx.entity_id())
+                .find(find.clone())
                 .workspace_root(env.workspace_root)
                 .on_initial_output_ready(Rc::new(move |cx| {
                     let _ = weak_view.update(cx, |view, cx| view.mark_disclosure_content_ready(&ready_id, cx));
@@ -610,7 +648,7 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
             if let Some(outputs) = env.command_outputs
                 && matches!(item.kind, TurnItemKind::CommandExecution { .. })
             {
-                inspector = inspector.output_slot(command_output::panel(&entry.id, outputs.get(&entry.id), cx));
+                inspector = inspector.streamed_output(&entry.id, outputs.get(&entry.id), cx);
             }
             if matches!(item.kind, TurnItemKind::FileChange { .. }) {
                 let target = t3_core::diff::ToolCallTarget::of(&item);
@@ -862,7 +900,7 @@ fn live_activity(label: AnyElement, icon: Icon, failed: bool, cx: &App) -> gpui:
 }
 
 /// `LiveWorkEntryTimelineRow`.
-pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn live_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
     let RowKind::WorkLive { entry, group_id, expanded, active, thought, .. } = &row.kind else { return div().into_any_element() };
     let (id, expanded, active, thought) = (row.id.as_str(), *expanded, *active, thought.as_ref());
     if let Some(approval) = pending_approval(entry, env) {
@@ -884,13 +922,16 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
     };
     let group_id = group_id.to_owned();
     let row_id = id.to_owned();
+    let thought_preview = (!thought_line.is_empty()).then(|| {
+        reasoning_preview(thought.map_or(entry.id.as_str(), |thought| &thought.id), &thought_line, env, markdown, cx)
+    });
     focusable(work_row_frame(SharedString::from(format!("live:{id}")), false), cx)
         .cursor_pointer()
         .on_click(cx.listener(move |view, _, _, cx| view.toggle_group(&group_id, &row_id, cx)))
-        .when(!thought_line.is_empty(), |this| {
+        .when_some(thought_preview, |this, preview| {
             this.child(work_line(
                 Some(icon_slot(Icon::WorkBrain, hsla(p.icon_muted))),
-                div().line_clamp(4).child(thought_line.clone()).into_any_element(),
+                div().max_h(rem(91.)).overflow_hidden().child(preview).into_any_element(),
                 Vec::new(),
                 true,
                 cx,

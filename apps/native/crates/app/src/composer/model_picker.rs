@@ -7,15 +7,15 @@ use std::collections::HashSet;
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, ParentElement,
-    Render, ScrollStrategy, SharedString, Styled, Subscription, UniformListScrollHandle, Window, actions, div,
+    Render, ScrollHandle, ScrollStrategy, SharedString, Styled, Subscription, UniformListScrollHandle, Window, actions, div,
     prelude::*, px, uniform_list,
 };
-use gpui_component::input::{Escape, Input, InputEvent, InputState};
+use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveRight};
 use gpui_component::{h_flex, v_flex};
 use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers::{self, ProviderEntry, RefreshProviders};
-use t3_core::server_config::{OptionDescriptor, RuntimeMode, SelectDescriptor, ServerProvider, WorkspaceSnapshot};
+use t3_core::server_config::{OptionDescriptor, RuntimeMode, ServerProvider, WorkspaceSnapshot};
 use t3_core::traits::{self, OptionSelection, OptionValue, Speed};
 
 use super::controls::{Float, Segment, floating, kbd, menu_surface, segmented_track};
@@ -148,6 +148,13 @@ pub struct ModelPicker {
     rows: Vec<Row>,
     highlighted: Option<usize>,
     permissions_open: bool,
+    permission_preview: Option<RuntimeMode>,
+    effort_focus: FocusHandle,
+    effort_index: usize,
+    effort_scroll: ScrollHandle,
+    option_focus: FocusHandle,
+    option_menu: Option<(String, usize)>,
+    option_scroll: ScrollHandle,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -183,6 +190,13 @@ impl ModelPicker {
             rows: Vec::new(),
             highlighted: None,
             permissions_open: false,
+            permission_preview: None,
+            effort_focus: cx.focus_handle(),
+            effort_index: 0,
+            effort_scroll: ScrollHandle::new(),
+            option_focus: cx.focus_handle(),
+            option_menu: None,
+            option_scroll: ScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         }
@@ -244,6 +258,9 @@ impl ModelPicker {
             }
         }
         self.permissions_open = false;
+        self.permission_preview = None;
+        self.effort_index = 0;
+        self.option_menu = None;
         self.search.update(cx, |search, cx| {
             search.set_value("", window, cx);
             search.focus(window, cx);
@@ -265,6 +282,12 @@ impl ModelPicker {
     /// server config changed. A closed picker rebuilds its rows when it opens.
     pub fn update_input(&mut self, input: PickerInput, config_changed: bool, cx: &mut Context<Self>) {
         if self.input != input || config_changed {
+            if self.input.selection.as_ref().map(|selection| (&selection.instance_id, &selection.model))
+                != input.selection.as_ref().map(|selection| (&selection.instance_id, &selection.model))
+            {
+                self.option_menu = None;
+                self.effort_index = initial_effort_index(&input.driver, &input.descriptors, cx).unwrap_or_default();
+            }
             self.input = input;
             self.refresh_rows(cx);
             cx.notify();
@@ -834,51 +857,135 @@ impl ModelPicker {
         }
     }
 
-    fn render_effort(&self, model_label: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_effort(&self, model_label: SharedString, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let layout = traits::layout(&self.input.driver, &self.input.descriptors);
-        let header = layout.effort.map(|d| crate::i18n::t(cx, d.label()).to_owned()).unwrap_or_else(|| crate::i18n::t(cx, if layout.others.is_empty() { "Effort" } else { "Options" }).to_owned());
-        let mut column = v_flex().flex_1().min_h_0().gap(px(2.)).px(px(8.)).pt(px(10.)).pb(px(6.));
-        match layout.effort {
-            Some(OptionDescriptor::Select(select)) => {
-                column = column.children(self.level_rows(select, cx));
-            }
-            Some(OptionDescriptor::Boolean(boolean)) => {
-                let id = boolean.id.clone();
-                let current = boolean.current_value == Some(true);
-                column = column.children([false, true].map(|value| {
-                    let id = id.clone();
-                    self.level_row(format!("effort-{value}"), crate::i18n::t(cx, if value { "On" } else { "Off" }).into(), current == value, cx)
-                        .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Bool(value), cx)))
-                }));
-            }
-            None if layout.others.is_empty() => {
-                column = column.child(div().px(px(8.)).py(px(6.)).text_sm().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "No effort levels")));
-            }
-            None => {}
-        }
-        for descriptor in layout.others {
-            column = column.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, descriptor.label()).to_owned()));
+        let header = layout.effort.map(|d| crate::i18n::t(cx, d.label()).to_owned())
+            .unwrap_or_else(|| crate::i18n::t(cx, if layout.others.is_empty() { "Effort" } else { "Options" }).to_owned());
+        let mut rows = layout.effort.map(|effort| option_rows(effort, cx)).unwrap_or_default();
+        let effort_count = rows.len();
+        rows.extend(layout.others.iter().map(|descriptor| {
+            let choices = option_rows(descriptor, cx);
+            let current = choices.iter().find(|choice| choice.selected).map(|choice| choice.label.clone()).unwrap_or_default();
             match descriptor {
-                OptionDescriptor::Select(select) => column = column.children(self.level_rows(select, cx)),
-                OptionDescriptor::Boolean(boolean) => {
-                    let id = boolean.id.clone();
-                    let current = boolean.current_value == Some(true);
-                    column = column.children([false, true].map(|value| {
-                        let id = id.clone();
-                        self.level_row(format!("{}-{value}", boolean.id), crate::i18n::t(cx, if value { "On" } else { "Off" }).into(), current == value, cx)
-                            .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Bool(value), cx)))
-                    }));
-                }
+                OptionDescriptor::Boolean(option) => OptionRow {
+                    id: option.id.clone(),
+                    label: current,
+                    descriptor: Some(crate::i18n::t(cx, &option.label).into()),
+                    value: Some(OptionValue::Bool(option.current_value != Some(true))),
+                    selected: option.current_value == Some(true),
+                    default: false,
+                    description: None,
+                    choices: Vec::new(),
+                },
+                OptionDescriptor::Select(option) => OptionRow {
+                    id: option.id.clone(),
+                    label: current,
+                    descriptor: Some(crate::i18n::t(cx, &option.label).into()),
+                    value: None,
+                    selected: false,
+                    default: false,
+                    description: None,
+                    choices,
+                },
             }
-        }
+        }));
+        let effort_index = self.effort_index.min(rows.len().saturating_sub(1));
+        let column_active = self.effort_focus.is_focused(window);
+        let submenu_active = self.option_focus.is_focused(window);
+        let rows = std::rc::Rc::new(rows);
+        let column = v_flex().id("effort-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.effort_scroll)
+            .w_full().gap(px(2.)).px(px(8.)).pt(px(10.)).pb(px(6.))
+            .when(rows.is_empty(), |this| this.child(div().px(px(8.)).py(px(6.)).text_sm()
+                .text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "No effort levels"))))
+            .children(rows.iter().enumerate().map(|(index, row)| {
+                let open = self.option_menu.as_ref().filter(|(id, _)| id == &row.id && !row.choices.is_empty());
+                let activate = rows.clone();
+                let button = render_option_row(row, column_active && effort_index == index || open.is_some(), cx)
+                    .on_click(cx.listener(move |picker, _, window, cx| {
+                        cx.stop_propagation();
+                        picker.effort_index = index;
+                        picker.activate_option(&activate[index], window, cx);
+                    }));
+                div().relative()
+                    .when(index == effort_count && effort_count > 0, |this| this.mt(px(4.)).pt(px(4.)).border_t_1().border_color(hsla(p.border)))
+                    .child(button)
+                    .when_some(open, |this, (_, selected)| {
+                        let selected = (*selected).min(row.choices.len().saturating_sub(1));
+                        let choices = row.choices.clone();
+                        let popup = menu_surface(cx)
+                            .id("model-option-menu")
+                            .track_focus(&self.option_focus)
+                            .occlude()
+                            .w(px(240.))
+                            .on_mouse_down_out(cx.listener(|picker, _, _, cx| {
+                                picker.option_menu = None;
+                                cx.notify();
+                            }))
+                            .on_action(cx.listener(|picker, _: &Escape, window, cx| picker.close_option_menu(window, cx)))
+                            .on_key_down(cx.listener(move |picker, event: &gpui::KeyDownEvent, window, cx| {
+                                let key = event.keystroke.key.as_str();
+                                match key {
+                                    "left" | "escape" => picker.close_option_menu(window, cx),
+                                    "up" | "down" => {
+                                        let offset = if key == "up" { -1 } else { 1 };
+                                        let next = selected.saturating_add_signed(offset).min(choices.len() - 1);
+                                        if let Some((_, index)) = &mut picker.option_menu {
+                                            *index = next;
+                                        }
+                                        picker.option_scroll.scroll_to_item(next);
+                                        cx.notify();
+                                    }
+                                    "enter" | "space" => picker.activate_option(&choices[selected], window, cx),
+                                    _ => return,
+                                }
+                                cx.stop_propagation();
+                            }))
+                            .child(v_flex().id("model-option-menu-scroll").max_h(px(272.)).overflow_y_scroll().track_scroll(&self.option_scroll)
+                                .children(row.choices.iter().enumerate().map(|(index, choice)| {
+                                    let choice = choice.clone();
+                                    render_option_row(&choice, submenu_active && index == selected, cx)
+                                        .on_click(cx.listener(move |picker, _, window, cx| picker.activate_option(&choice, window, cx)))
+                                })));
+                        this.child(div().absolute().top_0().right(px(-6.)).child(
+                            gpui::deferred(gpui::anchored().anchor(gpui::Anchor::TopLeft).snap_to_window_with_margin(px(8.)).child(popup)).with_priority(2),
+                        ))
+                    })
+            }));
+        let navigation = rows.clone();
         v_flex()
+            .id("model-effort-column")
+            .track_focus(&self.effort_focus)
+            .tab_index(0)
             .w(px(EFFORT_WIDTH))
             .h_full()
             .flex_none()
             .border_l_1()
             .border_color(hsla(p.border))
             .bg(hsla(p.muted).opacity(0.4))
+            .on_key_down(cx.listener(move |picker, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() { return; }
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "left" => {
+                        picker.search.update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    }
+                    "up" | "down" if !navigation.is_empty() => {
+                        let offset = if key == "up" { -1 } else { 1 };
+                        picker.effort_index = effort_index.saturating_add_signed(offset).min(navigation.len() - 1);
+                        picker.effort_scroll.scroll_to_item(picker.effort_index);
+                        cx.notify();
+                    }
+                    "enter" | "space" | "right" => {
+                        let Some(row) = navigation.get(effort_index) else { return };
+                        if key == "right" && row.choices.is_empty() { return; }
+                        picker.activate_option(row, window, cx);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .child(
                 div().px(px(12.)).pt(px(10.)).child(
                     h_flex()
@@ -893,43 +1000,57 @@ impl ModelPicker {
                         .child(div().ml_auto().min_w_0().truncate().text_xs().child(model_label)),
                 ),
             )
-            .child(div().id("effort-scroll").flex_1().min_h_0().overflow_y_scroll().child(column))
+            .child(column)
+
     }
 
-    fn level_rows(&self, select: &SelectDescriptor, cx: &mut Context<Self>) -> Vec<gpui::Stateful<gpui::Div>> {
-        let current = traits::select_value(select);
-        traits::selectable_choices(select)
-            .map(|choice| {
-                let (id, value) = (select.id.clone(), choice.id.clone());
-                let p = palette(cx);
-                let row = self.level_row(format!("{}-{}", select.id, choice.id), choice.label.clone().into(), current.as_deref() == Some(&choice.id), cx)
-                    .when(choice.is_default, |this| this.child(
-                        div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Default")),
-                    ))
-                    .when_some(choice.description.clone(), |this, description| this.tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(description.clone()).build(window, cx)
-                    }));
-                row.on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Str(value.clone()), cx)))
-            })
-            .collect()
+    fn activate_option(&mut self, row: &OptionRow, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(value) = &row.value {
+            self.change_option(&row.id, value.clone(), cx);
+            if self.option_menu.is_some() {
+                self.close_option_menu(window, cx);
+            }
+        } else if !row.choices.is_empty() {
+            if self.option_menu.as_ref().is_some_and(|(id, _)| id == &row.id) {
+                self.close_option_menu(window, cx);
+            } else {
+                let checked = row.choices.iter().position(|choice| choice.selected).unwrap_or_default();
+                self.option_menu = Some((row.id.clone(), checked));
+                self.option_scroll.scroll_to_item(checked);
+                let focus = self.option_focus.clone();
+                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+                cx.notify();
+            }
+        }
     }
 
-    fn level_row(&self, id: String, label: SharedString, checked: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
-        let p = palette(cx);
-        h_flex()
-            .id(SharedString::from(id))
-            .h(px(32.))
-            .w_full()
-            .flex_none()
-            .px(px(8.))
-            .gap(px(8.))
-            .rounded(px(4.))
-            .cursor_pointer()
-            .text_sm()
-            .text_color(hsla(p.foreground))
-            .hover(|this| this.bg(hsla(p.foreground).opacity(0.09)))
-            .child(div().flex_1().min_w_0().truncate().child(label))
-            .child(div().size(px(14.)).flex_none().when(checked, |this| this.child(Icon::Check.render(px(14.), hsla(p.foreground)))))
+    fn move_from_search_to_effort(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let search = self.search.read(cx);
+        let end = search.value().len();
+        if !search.focus_handle(cx).is_focused(window) || search.selected_range() != (end..end) {
+            return false;
+        }
+        let new_model = self.highlighted.filter(|index| {
+            matches!(self.rows.get(*index), Some(Row::Model { selected: false, disabled: None, .. }))
+        });
+        let effort = initial_effort_index(&self.input.driver, &self.input.descriptors, cx);
+        if new_model.is_none() && effort.is_none() {
+            return false;
+        }
+        if let Some(index) = new_model {
+            self.activate(index, false, cx);
+        }
+        self.effort_index = effort.unwrap_or_default();
+        self.effort_scroll.scroll_to_item(self.effort_index);
+        window.focus(&self.effort_focus, cx);
+        cx.notify();
+        true
+    }
+
+    fn close_option_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.option_menu = None;
+        window.focus(&self.effort_focus, cx);
+        cx.notify();
     }
 
     pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1002,6 +1123,7 @@ impl ModelPicker {
                         .child(Icon::ChevronUp.render(px(12.), hsla(p.muted_foreground)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.permissions_open = !this.permissions_open;
+                            this.permission_preview = None;
                             cx.notify();
                         }))
                         .when(self.permissions_open, |this| {
@@ -1012,12 +1134,20 @@ impl ModelPicker {
                                     .mb(px(4.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                         this.permissions_open = false;
+                                        this.permission_preview = None;
                                         cx.notify();
                                     }))
-                                    .child(permissions_section_with_policy(
+                                    .child(permissions_section_with_preview(
                                         mode,
                                         &self.input.runtime_modes,
                                         self.input.managed_policy.as_ref(),
+                                        self.permission_preview,
+                                        Some(|option, hover, this: &mut Self, cx: &mut Context<Self>| {
+                                            if hover || this.permission_preview == Some(option) {
+                                                this.permission_preview = hover.then_some(option);
+                                                cx.notify();
+                                            }
+                                        }),
                                         cx,
                                         |mode, this: &mut Self, cx: &mut Context<Self>| {
                                             this.permissions_open = false;
@@ -1030,6 +1160,89 @@ impl ModelPicker {
                 ),
             )
     }
+}
+
+#[derive(Clone)]
+struct OptionRow {
+    id: String,
+    label: SharedString,
+    descriptor: Option<SharedString>,
+    value: Option<OptionValue>,
+    selected: bool,
+    default: bool,
+    description: Option<String>,
+    choices: Vec<OptionRow>,
+}
+
+fn initial_effort_index(driver: &str, descriptors: &[OptionDescriptor], cx: &App) -> Option<usize> {
+    let layout = traits::layout(driver, descriptors);
+    let choices = layout.effort.map(|effort| option_rows(effort, cx)).unwrap_or_default();
+    (!choices.is_empty() || !layout.others.is_empty())
+        .then(|| choices.iter().position(|choice| choice.selected).unwrap_or_default())
+}
+
+fn option_rows(descriptor: &OptionDescriptor, cx: &App) -> Vec<OptionRow> {
+    match descriptor {
+        OptionDescriptor::Select(select) => {
+            let current = traits::select_value(select);
+            traits::selectable_choices(select).map(|choice| OptionRow {
+                id: select.id.clone(),
+                label: choice.label.clone().into(),
+                descriptor: None,
+                value: Some(OptionValue::Str(choice.id.clone())),
+                selected: current.as_deref() == Some(&choice.id),
+                default: choice.is_default,
+                description: choice.description.clone(),
+                choices: Vec::new(),
+            }).collect()
+        }
+        OptionDescriptor::Boolean(option) => [true, false].into_iter().map(|value| OptionRow {
+            id: option.id.clone(),
+            label: crate::i18n::t(cx, if value { "On" } else { "Off" }).into(),
+            descriptor: None,
+            value: Some(OptionValue::Bool(value)),
+            selected: (option.current_value == Some(true)) == value,
+            default: false,
+            description: None,
+            choices: Vec::new(),
+        }).collect(),
+    }
+}
+
+fn render_option_row(row: &OptionRow, focused: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let p = palette(cx);
+    let boolean = row.descriptor.is_some() && matches!(row.value, Some(OptionValue::Bool(_)));
+    let value = match &row.value {
+        Some(OptionValue::Str(value)) => value.clone(),
+        Some(OptionValue::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    };
+    h_flex()
+        .id(SharedString::from(format!("model-option:{}:{value}", row.id)))
+        .min_h(px(32.))
+        .w_full()
+        .px(px(8.))
+        .py(px(4.))
+        .gap(px(6.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(hsla(p.foreground))
+        .when(focused, |this| this.bg(hsla(p.foreground).opacity(0.09)))
+        .hover(|this| this.bg(hsla(p.foreground).opacity(0.09)))
+        .child(v_flex().flex_1().min_w_0()
+            .children(row.descriptor.clone().map(|label| div().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(label)))
+            .child(div().truncate().child(row.label.clone())))
+        .when(row.default, |this| this.child(div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Default"))))
+        .when(boolean, |this| {
+            this.child(crate::settings::controls::Switch::new(SharedString::from(format!("option-toggle:{}", row.id)), row.selected))
+        })
+        .when(!boolean, |this| this.child(div().size(px(14.)).flex_none()
+            .when(!row.choices.is_empty(), |this| this.child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground))))
+            .when(row.selected, |this| this.child(Icon::Check.render(px(14.), hsla(p.foreground))))))
+        .when_some(row.description.clone(), |this, description| this.tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(description.clone()).build(window, cx)
+        }))
 }
 
 const LOCKED_REASON: &str =
@@ -1058,8 +1271,21 @@ pub fn permissions_section_with_policy<V: 'static>(
     cx: &mut Context<V>,
     on_pick: impl Fn(RuntimeMode, &mut V, &mut Context<V>) + Clone + 'static,
 ) -> gpui::Div {
+    permissions_section_with_preview(mode, modes, policy, None, None::<fn(RuntimeMode, bool, &mut V, &mut Context<V>)>, cx, on_pick)
+}
+
+fn permissions_section_with_preview<V: 'static>(
+    mode: RuntimeMode,
+    modes: &[RuntimeMode],
+    policy: Option<&serde_json::Value>,
+    preview: Option<RuntimeMode>,
+    on_preview: Option<impl Fn(RuntimeMode, bool, &mut V, &mut Context<V>) + Clone + 'static>,
+    cx: &mut Context<V>,
+    on_pick: impl Fn(RuntimeMode, &mut V, &mut Context<V>) + Clone + 'static,
+) -> gpui::Div {
     let p = palette(cx);
-    let selected_denial = t3_core::managed_policy::runtime_mode_denial(policy, mode.as_str());
+    let preview_mode = preview.unwrap_or(mode);
+    let preview_denial = t3_core::managed_policy::runtime_mode_denial(policy, preview_mode.as_str());
     v_flex()
         .w(px(288.))
         .gap(px(6.))
@@ -1078,6 +1304,9 @@ pub fn permissions_section_with_policy<V: 'static>(
                 .icon(runtime_mode_icon(option))
                 .disabled(disabled)
                 .tooltip(tooltip)
+                .when_some(on_preview.clone(), |segment, on_preview| {
+                    segment.on_hover(cx.listener(move |this, &hover, _, cx| on_preview(option, hover, this, cx)))
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if !disabled {
                         on_pick(option, this, cx);
@@ -1087,20 +1316,20 @@ pub fn permissions_section_with_policy<V: 'static>(
         .child(
             v_flex()
                 .gap(px(2.))
-                .child(div().text_sm().text_color(hsla(p.foreground)).child(runtime_mode_label(mode)))
+                .child(div().text_sm().text_color(hsla(p.foreground)).child(runtime_mode_label(preview_mode)))
                 .child(
                     div()
                         .min_h(px(32.))
                         .text_xs()
                         .line_height(px(16.))
                         .text_color(hsla(p.muted_foreground))
-                        .child(selected_denial.unwrap_or_else(|| runtime_mode_description(mode).to_owned())),
+                        .child(preview_denial.unwrap_or_else(|| runtime_mode_description(preview_mode).to_owned())),
                 ),
         )
 }
 
 impl Render for ModelPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let searching = !self.query(cx).is_empty();
         let (rail, has_favorites, model_label, empty_message) = {
@@ -1152,6 +1381,13 @@ impl Render for ModelPicker {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .occlude()
+            .capture_action(cx.listener(|picker, _: &MoveRight, window, cx| {
+                if picker.move_from_search_to_effort(window, cx) {
+                    cx.stop_propagation();
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &HighlightPrevious, _, cx| this.move_highlight(-1, cx)))
             .on_action(cx.listener(|this, _: &HighlightNext, _, cx| this.move_highlight(1, cx)))
             .on_action(cx.listener(|this, _: &PickHighlighted, _, cx| {
@@ -1217,8 +1453,52 @@ impl Render for ModelPicker {
                                 )
                             }),
                     )
-                    .child(self.render_effort(model_label, cx)),
+                    .child(self.render_effort(model_label, window, cx)),
             )
             .child(self.render_footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Host;
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn right_leaves_search_only_when_the_caret_reaches_the_end(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (_, window_cx) = cx.add_window_view(|_, _| Host);
+        window_cx.update(|window, cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let picker = cx.new(|cx| ModelPicker::new(app, window, cx));
+            picker.update(cx, |picker, cx| {
+                let effort = serde_json::from_value(serde_json::json!({
+                    "type": "select",
+                    "id": "reasoningEffort",
+                    "role": "reasoningEffort",
+                    "label": "Reasoning",
+                    "options": [{"id": "low", "label": "Low", "isDefault": true}],
+                })).unwrap();
+                picker.input = PickerInput { driver: "codex".into(), descriptors: vec![effort], ..PickerInput::default() };
+                picker.search.update(cx, |search, cx| {
+                    search.set_value("é", window, cx);
+                    search.set_selected_range(0..0, cx);
+                    search.focus(window, cx);
+                });
+                assert!(!picker.move_from_search_to_effort(window, cx));
+
+                picker.search.update(cx, |search, cx| search.set_selected_range(2..2, cx));
+                assert!(picker.move_from_search_to_effort(window, cx));
+                assert!(picker.effort_focus.is_focused(window));
+            });
+        });
     }
 }
