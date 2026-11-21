@@ -1434,8 +1434,7 @@ impl AppearanceExt for App {
 #[cfg(all(test, feature = "snapshot"))]
 mod capture {
     use super::*;
-    use gpui::{AppContext, Entity, HeadlessAppContext, Render, size};
-    use std::sync::Arc;
+    use gpui::{AppContext, Entity, Render, size};
     use t3_core::sidebar::thread::{SubagentRequest, present_thread};
 
     struct Rows {
@@ -1496,9 +1495,7 @@ mod capture {
     fn production_status_rows() {
         let Some(out) = std::env::var_os("T3_SIDEBAR_STATUS_CAPTURE") else { return };
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         let state = cx.update(|cx| {
             let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
                 "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
@@ -1550,9 +1547,7 @@ mod capture {
     fn production_cached_working_rows() {
         let Some(out) = std::env::var_os("T3_SIDEBAR_WORKING_CAPTURE") else { return };
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(), Arc::new(crate::icons::Assets), gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         let state = cx.update(|cx| {
             cx.set_global(serde_json::from_value::<crate::chatgpt_setup::Fixture>(serde_json::json!({
                 "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},

@@ -1127,6 +1127,7 @@ impl Render for Workspace {
             .when(sidebar_open && inline_progress == 1., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
             .when(sheet_progress > 0., |this| this.child(self.render_sidebar_sheet(layout::sheet_width(viewport), sheet_progress, sheet_open, cx)))
             .when(!sheet_open, |this| this.child(self.render_sidebar_toggle(window, sidebar_open, cx)))
+            .children(crate::preview::floating_preview(window, cx))
             .children(crate::transcript::html_render::fullscreen(window, cx))
             .children(crate::transcript::mcp_app::fullscreen(window, cx))
             .children(crate::media::fullscreen(window, cx))
@@ -2565,7 +2566,9 @@ mod tests {
                 // Unsent draft thread still has a `panel_thread()` and opens the right panel cleanly.
                 ws.state.update(cx, |state, cx| {
                     state.start_draft(&expected_project, cx);
-                    assert_eq!(state.panel_thread().as_deref(), Some(format!("draft:{expected_project}").as_str()));
+                    let draft = state.active_draft().expect("draft open");
+                    assert_eq!(draft.project_id, expected_project);
+                    assert_eq!(state.panel_thread().as_deref(), Some(draft.key().as_str()));
                     state.toggle_right_panel(cx);
                     let panel_key = state.panel_thread().expect("draft panel thread");
                     assert!(state.panels.panels.panel(&panel_key).is_open);

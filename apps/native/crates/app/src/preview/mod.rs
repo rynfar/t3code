@@ -726,7 +726,7 @@ impl Previews {
             .read(cx)
             .thread_shell(thread_id)
             .map(|thread| thread.project_id.clone())
-            .or_else(|| thread_id.strip_prefix("draft:").map(str::to_owned))
+            .or_else(|| t3_core::composer::drafts::DraftRef::from_key(thread_id).map(|draft| draft.project_id))
     }
 
     /// The thread's project's recently used addresses, newest first.

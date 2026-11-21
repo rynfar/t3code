@@ -5,7 +5,7 @@
 //! uploaded: their server copy outlives a restart (pending uploads are kept a day), their bytes
 //! do not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,9 +30,20 @@ pub fn thread_key(thread_id: &str) -> String {
     format!("thread:{thread_id}")
 }
 
-/// The project-based owner key still used by the terminal and panels.
-pub fn new_thread_key(project_id: &str) -> String {
-    format!("draft:{project_id}")
+/// Upgrades project-owned state to the same session key as the migrated composer draft.
+pub fn migrate_legacy_owner_key(key: &str) -> Option<String> {
+    key.strip_prefix("draft:").map(|project_id| DraftRef::legacy(project_id).key())
+}
+
+pub fn migrate_legacy_owner_keys<T>(entries: &mut HashMap<String, T>) {
+    let legacy: Vec<_> = entries.keys()
+        .filter_map(|key| migrate_legacy_owner_key(key).map(|migrated| (key.clone(), migrated)))
+        .collect();
+    for (old, new) in legacy {
+        if let Some(value) = entries.remove(&old) {
+            entries.entry(new).or_insert(value);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -215,7 +226,7 @@ impl DraftStore {
                     .iter()
                     .filter_map(|(key, draft)| {
                         let key = if version != Some(u64::from(VERSION)) {
-                            key.strip_prefix("draft:").map_or_else(|| key.clone(), |project| DraftRef::legacy(project).key())
+                            migrate_legacy_owner_key(key).unwrap_or_else(|| key.clone())
                         } else {
                             key.clone()
                         };

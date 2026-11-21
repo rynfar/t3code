@@ -324,18 +324,14 @@ impl Render for GuestFrame {
 }
 #[test]
 fn guest_dialog_frames_and_keyboard_focus() {
-    use gpui::{AppContext, HeadlessAppContext, Keystroke, size};
+    use gpui::{AppContext, Keystroke, size};
     let Some(out) = std::env::var_os("T3_MENU_CAPTURE") else {
         return;
     };
     let out = std::path::PathBuf::from(out);
     std::fs::create_dir_all(&out).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_platform::current_platform(true).text_system(),
-        std::sync::Arc::new(crate::icons::Assets),
-        gpui_platform::current_headless_renderer,
-    );
+    let mut cx = crate::snapshot::test_context();
     let (state, mut fixture) = cx.update(|cx| {
         crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
     });

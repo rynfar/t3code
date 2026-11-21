@@ -1856,11 +1856,7 @@ mod tests {
         let out = std::path::PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut cx = gpui::HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(),
-            std::sync::Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         cx.allow_parking();
         let (state, active_fixture) = cx.update(|cx| {
             let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());

@@ -155,6 +155,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     new_thread::init(state.clone(), cx);
     right_panel::init(state.clone(), cx);
     preview::init(state.clone(), cx);
+    preview::install_read_only_stream_opener(t3_client::supervisor::ClientHandle::preview_stream_read_only, cx);
     device::init(state.clone(), cx);
     pull_requests::init(state.clone(), cx);
     issues::init(state.clone(), cx);

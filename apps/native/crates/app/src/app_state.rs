@@ -374,7 +374,7 @@ impl AppState {
             state.server_config.config=serde_json::from_value(serde_json::json!({"environment":{"environmentId":"fixture-env","label":"Fixture Computer"},"cwd":"/fixture"})).ok();
             return state;
         }
-        match state.environments.active().filter(|environment| !environment.disabled && environment.credentials().is_some()).map(|environment| environment.id.clone()) {
+        match state.environments.active().filter(|environment| !environment.disabled && environment.has_connection_route()).map(|environment| environment.id.clone()) {
             Some(id) => { state.start_environment(&id, cx); state.connections.activate(Some(&id)); },
             None => {
                 if state.local_server_auto_start {
@@ -384,7 +384,7 @@ impl AppState {
                 }
             }
         }
-        let watched: Vec<_> = state.environments.environments.iter().filter(|e| !e.disabled && e.access_token.is_some()).map(|e| e.id.clone()).collect();
+        let watched: Vec<_> = state.environments.environments.iter().filter(|e| !e.disabled && e.has_connection_route()).map(|e| e.id.clone()).collect();
         for id in watched { state.start_environment(&id, cx); }
         state.refresh_cloud(cx);
         state
@@ -1083,17 +1083,27 @@ impl AppState {
             self.remember_draft(&draft, cx);
             return self.open_draft(draft, cx);
         }
-        let environment = self.environments.active.as_deref();
+        let draft = self.prepare_draft(project_id, self.environments.active.as_deref(), cx);
+        self.remember_draft(&draft, cx);
+        self.open_draft(draft, cx);
+    }
+
+    pub(crate) fn prepare_draft(&self, project_id: &str, environment: Option<&str>, cx: &mut gpui::App) -> DraftRef {
         let env = environment.unwrap_or_default();
         let logical_key = self.draft_project_key(env, project_id, cx);
         let active = self.active_draft().filter(|draft| {
             let env = draft.environment_id.as_deref().unwrap_or(env);
             self.draft_project_key(env, &draft.project_id, cx) == logical_key
         });
+        let legacy_layout = (active.is_none() && environment == self.environments.active.as_deref())
+            .then(|| DraftRef::legacy(project_id)).filter(|draft| {
+            let key = draft.key();
+            self.panels.panels.has_layout(&key) || crate::terminal::TerminalDrawer::has_saved_layout(&key, cx)
+        });
         let reusable = crate::composer::drafts::reusable_session(
-            &logical_key, project_id, active.as_ref(), |draft| self.is_promoting_draft(draft), cx,
+            &logical_key, project_id, active.as_ref().or(legacy_layout.as_ref()), |draft| self.is_promoting_draft(draft), cx,
         );
-        let draft = if let Some(draft) = reusable {
+        if let Some(draft) = reusable {
             if draft.project_id != project_id || draft.environment_id.as_deref().is_some_and(|saved| Some(saved) != environment) {
                 // A grouped checkout may have a different workspace. Never reuse its binding.
                 let remapped = DraftRef::new(draft.id.clone(), env, project_id);
@@ -1107,9 +1117,7 @@ impl AppState {
             }
         } else {
             self.new_draft_ref(project_id, environment)
-        };
-        self.remember_draft(&draft, cx);
-        self.open_draft(draft, cx);
+        }
     }
 
     pub(crate) fn is_promoting_draft(&self, draft: &DraftRef) -> bool {

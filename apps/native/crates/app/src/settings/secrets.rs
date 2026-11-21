@@ -398,9 +398,8 @@ impl SettingsView {
 #[cfg(all(test, feature = "snapshot"))]
 mod parity_tests {
     use super::*;
-    use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
+    use gpui::{AppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
     use serde_json::json;
-    use std::sync::Arc;
     use t3_core::settings::search::Section;
 
     struct SettingsFrame;
@@ -413,7 +412,7 @@ mod parity_tests {
     #[test]
     fn remove_dialog_lists_uses_dismisses_and_renders() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let drive = |cx: &mut HeadlessAppContext| {
+        let drive = |cx: &mut gpui::HeadlessAppContext| {
             cx.run_until_parked();
             runtime.block_on(async {
                 for _ in 0..8 {
@@ -422,11 +421,7 @@ mod parity_tests {
             });
             cx.run_until_parked();
         };
-        let mut cx = HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(),
-            Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         cx.allow_parking();
         let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
         fixture

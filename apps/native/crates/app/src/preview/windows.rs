@@ -162,7 +162,6 @@ impl Previews {
 }
 
 /// A workspace child layered above the chat and below dialogs.
-#[allow(dead_code, reason = "mounted by the Stage 3 workspace integration")]
 pub(crate) fn floating_preview(window: &mut Window, cx: &mut App) -> Option<Entity<FloatingPreview>> {
     let previews = previews(cx)?;
     Some(window.use_keyed_state("floating-browser-preview", cx, |_, cx| FloatingPreview::new(previews, cx)))
@@ -339,7 +338,6 @@ struct ReadOnlyStreams(ReadOnlyStreamOpener);
 impl gpui::Global for ReadOnlyStreams {}
 
 /// Registers the client transport that appends `interactive=false` to preview stream upgrades.
-#[allow(dead_code, reason = "registered by the Stage 3 client transport integration")]
 pub(crate) fn install_read_only_stream_opener(open: ReadOnlyStreamOpener, cx: &mut App) {
     cx.set_global(ReadOnlyStreams(open));
 }

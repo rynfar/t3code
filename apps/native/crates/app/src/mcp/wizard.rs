@@ -22,8 +22,8 @@ use t3_core::mcp::apps::{
 };
 use t3_core::mcp::gate::{
     CloudLinkState, ConnectReachability, DisconnectedRelay, McpCapabilities, McpGate, McpGateInput,
-    ReachabilityCheckState, RelayEndpoint, RelayGateState, T3ConnectTurnOn, after_failed_check,
-    is_managed_tunnel_active, resolve_mcp_gate, resolve_t3_connect_turn_on,
+    ReachabilityCheckState, RelayEndpoint, RelayGateState, after_failed_check,
+    is_managed_tunnel_active, resolve_mcp_gate,
 };
 use t3_core::mcp::{
     AccessEnvironmentCandidate, McpClientAccess, PeerLinkEntry,
@@ -33,7 +33,10 @@ use t3_core::mcp::{
 use t3_core::settings::search::Section;
 use t3_core::sidebar::time::parse_iso;
 
+use t3_core::settings::access::{T3ConnectTurnOn, can_configure_relay, resolve_t3_connect_turn_on};
+
 use crate::app_state::{AppEvent, AppState};
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::sidebar::controller::now_ms;
@@ -570,6 +573,71 @@ impl UseInAnotherAppDialog {
                 cx.notify();
             });
         }));
+    }
+
+    fn turn_on_route(&self, env: &ResolvedEnvironment, cx: &App) -> T3ConnectTurnOn {
+        let denial = managed_policy::capability_denial(env.managed_policy.as_ref(), Capability::Connect);
+        let grants = env.grants.as_ref();
+        resolve_t3_connect_turn_on(
+            self.link_state.as_ref().is_some_and(|link| link.linkable_here.unwrap_or(true)),
+            self.cloud_configured && self.state.read(cx).cloud.has_clerk_session && env.canonical_id.is_some(),
+            grants.is_some_and(|session| session.grants(RELAY_READ_SCOPE)),
+            grants.is_some_and(|session| session.grants(RELAY_WRITE_SCOPE)),
+            grants.is_some_and(can_configure_relay),
+            denial.as_deref(),
+        )
+    }
+
+    fn turn_on(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(env) = self.resolve_environment(cx) else { return };
+        if self.connecting || self.active_target_id.as_deref() != Some(&env.saved_id)
+            || !matches!(self.current_gate(&env, cx), McpGate::TurnOn)
+            || self.turn_on_route(&env, cx) != T3ConnectTurnOn::Here
+        {
+            return;
+        }
+        let (Some(client), Some(environment_id), Some(link)) = (
+            self.active_client.clone(), env.canonical_id, self.link_state.as_ref(),
+        ) else { return };
+        let publish = link.publish_agent_activity;
+        let state = self.state.read(cx);
+        let runtime = state.runtime().clone();
+        let cloud = state.cloud.service.clone();
+        let generation = self.generation;
+        self.connecting = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = crate::settings::link_access_relay(&client, cloud, &runtime, &environment_id, true, publish, cx).await;
+            let latest = if matches!(result, Ok(true)) {
+                runtime.spawn(async move {
+                    let value = client.get_access("/api/connect/link-state").await.ok()?;
+                    serde_json::from_value::<CloudLinkState>(value).ok()
+                }).await.ok().flatten()
+            } else {
+                None
+            };
+            let _ = this.update(cx, |this, cx| {
+                if matches!(result, Ok(true)) {
+                    this.state.update(cx, |state, cx| state.refresh_cloud(cx));
+                }
+                if !this.open || this.generation != generation || this.active_target_id.as_deref() != Some(&env.saved_id) {
+                    return;
+                }
+                this.connecting = false;
+                if let Some(link) = latest {
+                    this.link_state = Some(link);
+                    this.link_state_error = None;
+                    this.check_state = ReachabilityCheckState::Idle;
+                }
+                if let Err(error) = result {
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not check T3 Connect")).description(error), cx);
+                    });
+                }
+                this.sync_target(cx);
+                cx.notify();
+            });
+        }).detach();
     }
 
     fn run_reachability_check(&mut self, cx: &mut Context<Self>) {
@@ -1110,35 +1178,18 @@ impl UseInAnotherAppDialog {
                 )
             }
             McpGate::TurnOn | McpGate::Offline { .. } => {
-                let can_read_relay = env
-                    .grants
-                    .as_ref()
-                    .is_some_and(|s| s.grants(RELAY_READ_SCOPE));
-                let can_write_relay = env
-                    .grants
-                    .as_ref()
-                    .is_some_and(|s| s.grants(RELAY_WRITE_SCOPE));
-                let connect_denial = managed_policy::capability_denial(
-                    env.managed_policy.as_ref(),
-                    Capability::Connect,
-                );
-                // Native uses CLI OAuth without a Clerk JWT DPoP linker, so on-host `t3 connect link`
-                // handles tunnel linking unless managed policy denies T3 Connect.
-                let turn_on = resolve_t3_connect_turn_on(
-                    true,
-                    false,
-                    self.cloud_configured,
-                    can_read_relay,
-                    can_write_relay,
-                    connect_denial,
-                );
-                let body = match turn_on {
-                    T3ConnectTurnOn::Policy { reason } => div()
+                let body = match self.turn_on_route(env, cx) {
+                    T3ConnectTurnOn::Policy(reason) => div()
                         .text_sm()
                         .text_color(hsla(p.muted_foreground))
                         .child(reason)
                         .into_any_element(),
-                    T3ConnectTurnOn::Here | T3ConnectTurnOn::OnHost => {
+                    T3ConnectTurnOn::Here => Button::new("mcp-turn-on", ButtonVariant::Default, ButtonSize::Sm)
+                        .label(t(cx, if self.connecting { "Connecting…" } else { "Turn on" }))
+                        .disabled(self.connecting)
+                        .on_click(cx.listener(|this, _, window, cx| this.turn_on(window, cx)))
+                        .into_any_element(),
+                    T3ConnectTurnOn::OnHost => {
                         let copied = self.copied_key.as_deref() == Some("cmd-t3-connect-link");
                         let view = cx.entity().clone();
                         v_flex()

@@ -160,9 +160,9 @@ impl SnapShotCoordinator {
                 self.last_used_project_id = Some(project_id);
             }
             self.last_route_target = Some(CaptureTarget::Thread { environment_id: env_id, thread_id });
-        } else if let Some(project_id) = state.draft_project.clone() {
-            self.last_used_project_id = Some(project_id.clone());
-            self.last_route_target = Some(CaptureTarget::Draft { project_id });
+        } else if let Some(draft) = state.active_draft() {
+            self.last_used_project_id = Some(draft.project_id.clone());
+            self.last_route_target = Some(CaptureTarget::Draft(draft));
         }
     }
 
@@ -386,16 +386,12 @@ impl SnapShotCoordinator {
             let state = self.state.read(cx);
             let env_id = state.environment().unwrap_or("local");
             let route_thread = state.selected_thread.as_deref().map(|id| (env_id, id));
-            let active_draft = state.draft_project.as_deref();
             let lookup = ExistingTargetLookup {
                 route_thread,
-                has_draft: &|project_id| {
-                    active_draft == Some(project_id)
-                        || state
-                            .shell
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|s| s.projects.iter().any(|p| p.id == project_id))
+                has_draft: &|draft| {
+                    state.is_active_draft(draft) || (draft.environment_id.as_deref()
+                        .is_none_or(|id| state.environments.active.as_deref() == Some(id))
+                        && state.shell.project(&draft.project_id).is_some())
                 },
                 promoted_draft_thread: &|_| None,
                 has_thread_shell: &|env, thread_id| {
@@ -420,10 +416,9 @@ impl SnapShotCoordinator {
                         self.state.update(cx, |state, cx| state.select_thread(&id, cx));
                     }
                 }
-                CaptureTarget::Draft { project_id } => {
-                    if self.state.read(cx).draft_project.as_deref() != Some(project_id.as_str()) {
-                        let id = project_id.clone();
-                        self.state.update(cx, |state, cx| state.start_draft(&id, cx));
+                CaptureTarget::Draft(draft) => {
+                    if !self.state.read(cx).is_active_draft(draft) {
+                        self.state.update(cx, |state, cx| state.open_saved_draft(draft.clone(), cx));
                     }
                 }
                 CaptureTarget::Question { .. } => {}
@@ -448,7 +443,7 @@ impl SnapShotCoordinator {
         let project_id = project_id?;
         self.last_used_project_id = Some(project_id.clone());
         self.state.update(cx, |state, cx| state.start_draft(&project_id, cx));
-        let target = CaptureTarget::Draft { project_id };
+        let target = CaptureTarget::Draft(self.state.read(cx).active_draft()?);
         self.last_route_target = Some(target.clone());
         Some(target)
     }

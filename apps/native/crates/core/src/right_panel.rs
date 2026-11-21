@@ -912,7 +912,9 @@ impl RightPanels {
     /// Decodes persisted state without trusting it: every part that fails to decode falls back
     /// on its own, so one bad entry never costs the user their other tabs.
     pub fn from_value(value: &Value) -> RightPanels {
-        let threads = value
+        use crate::composer::drafts::{migrate_legacy_owner_key, migrate_legacy_owner_keys};
+
+        let mut threads = value
             .get("threads")
             .and_then(Value::as_object)
             .map(|threads| {
@@ -926,9 +928,19 @@ impl RightPanels {
         let closed = value
             .get("closed")
             .and_then(Value::as_array)
-            .map(|closed| closed.iter().filter_map(ClosedView::from_value).take(CLOSED_VIEW_LIMIT).collect())
+            .map(|closed| {
+                closed.iter().filter_map(ClosedView::from_value).take(CLOSED_VIEW_LIMIT).map(|mut view| {
+                    if let Some(key) = migrate_legacy_owner_key(&view.thread_id) {
+                        view.thread_id = key;
+                    }
+                    view
+                }).collect()
+            })
             .unwrap_or_default();
-        let widths = decode_lenient_map::<f32>(value.get("widths")).into_iter().filter(|(_, width)| width.is_finite()).collect();
+        let mut widths = decode_lenient_map::<f32>(value.get("widths"));
+        widths.retain(|_, width| width.is_finite());
+        migrate_legacy_owner_keys(&mut threads);
+        migrate_legacy_owner_keys(&mut widths);
         RightPanels { threads, widths, closed, user_action_revisions: HashMap::new() }
     }
 }
@@ -981,6 +993,10 @@ impl RightPanels {
 
     pub fn is_open(&self, thread_id: &str) -> bool {
         self.panel(thread_id).is_open
+    }
+
+    pub fn has_layout(&self, thread_id: &str) -> bool {
+        self.threads.contains_key(thread_id) || self.widths.contains_key(thread_id)
     }
 
     pub fn width(&self, thread_id: &str) -> Option<f32> {

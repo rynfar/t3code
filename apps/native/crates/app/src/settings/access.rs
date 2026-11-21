@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, App, AppContext, AsyncWindowContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     PromptLevel, StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -424,6 +424,58 @@ pub(super) fn session_permissions(session: Option<&AuthSessionState>, cx: &App) 
             }))
         })))
         .into_any_element()
+}
+
+pub(crate) async fn link_access_relay(
+    client: &ClientHandle,
+    cloud: std::sync::Arc<t3_client::connect::Cloud>,
+    runtime: &tokio::runtime::Handle,
+    environment_id: &str,
+    managed: bool,
+    publish: bool,
+    cx: &mut AsyncWindowContext,
+) -> Result<bool, String> {
+    let sessions = client.session_state();
+    let generations = client.connection_generation();
+    let generation = *generations.borrow();
+    let credentials = client.credentials();
+    let permitted = || *generations.borrow() == generation && sessions.borrow().as_ref().is_some_and(|session| {
+        session.grants(RELAY_READ) && session.grants(RELAY_WRITE) && access::can_configure_relay(session)
+    });
+    let denied = || "This connection cannot manage T3 Connect.".to_owned();
+    if !permitted() {
+        return Err(denied());
+    }
+    if managed {
+        let status = client.relay_client_status().await?;
+        match status["status"].as_str() {
+            Some("available") => {}
+            Some("missing") => {
+                let answer = cx.update(|window, cx| window.prompt(
+                    PromptLevel::Info,
+                    t(cx, "Install relay client?"),
+                    Some(t(cx, "T3 Code needs the relay client to make this environment available through T3 Connect.")),
+                    &[t(cx, "Install"), t(cx, "Cancel")],
+                    cx,
+                )).map_err(|error| error.to_string())?;
+                if answer.await.ok() != Some(0) {
+                    return Ok(false);
+                }
+                if !permitted() {
+                    return Err(denied());
+                }
+                client.install_relay_client().await?;
+            }
+            _ => return Err("The relay client is unavailable on this environment.".to_owned()),
+        }
+    }
+    if !permitted() {
+        return Err(denied());
+    }
+    let environment_id = environment_id.to_owned();
+    runtime.spawn(async move { cloud.link_environment(&credentials, &environment_id, managed, publish).await })
+        .await.map_err(|error| error.to_string())??;
+    Ok(true)
 }
 
 impl SettingsView {
@@ -1228,45 +1280,10 @@ impl SettingsView {
         }
         let service = cloud.service.clone();
         let runtime = self.state.read(cx).runtime().clone();
-        let generations = client.connection_generation();
-        let generation = *generations.borrow();
-        let credentials = client.credentials();
         self.access.relay_saving = true;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let permitted = || *generations.borrow() == generation && sessions.borrow().as_ref().is_some_and(|session| {
-                can_manage(session) && access::can_configure_relay(session)
-            });
-            let result = async {
-                if managed {
-                    let status = client.relay_client_status().await?;
-                    match status["status"].as_str() {
-                        Some("available") => {}
-                        Some("missing") => {
-                            let answer = cx.update(|window, cx| window.prompt(
-                                PromptLevel::Info,
-                                t(cx, "Install relay client?"),
-                                Some(t(cx, "T3 Code needs the relay client to make this environment available through T3 Connect.")),
-                                &[t(cx, "Install"), t(cx, "Cancel")],
-                                cx,
-                            )).map_err(|error| error.to_string())?;
-                            if answer.await.ok() != Some(0) {
-                                return Ok(());
-                            }
-                            if !permitted() {
-                                return Err("This connection cannot manage T3 Connect.".to_owned());
-                            }
-                            client.install_relay_client().await?;
-                        }
-                        _ => return Err("The relay client is unavailable on this environment.".to_owned()),
-                    }
-                }
-                if !permitted() {
-                    return Err("This connection cannot manage T3 Connect.".to_owned());
-                }
-                runtime.spawn(async move { service.link_environment(&credentials, &environment_id, managed, publish).await })
-                    .await.map_err(|error| error.to_string())?
-            }.await;
+            let result = link_access_relay(&client, service, &runtime, &environment_id, managed, publish, cx).await;
             let _ = this.update(cx, |this, cx| {
                 this.state.update(cx, |state, cx| state.refresh_cloud(cx));
                 if this.access.active_target.as_deref() == Some(&id) {

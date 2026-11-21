@@ -1285,7 +1285,7 @@ impl ProjectDialogs {
         let active_saved = self.state.read(cx).environments.active.clone().unwrap_or_default();
         let source_route = {
             let state = self.state.read(cx);
-            (state.connection_id(), state.selected_thread.clone(), state.draft_project.clone())
+            (state.connection_id(), state.selected_thread.clone(), state.active_draft())
         };
         let composer = self.composer.clone();
         let dialog_input = self.add_to_machine.as_ref().expect("submitting dialog").dest_input.downgrade();
@@ -1397,9 +1397,8 @@ impl ProjectDialogs {
                 let (route_current, source_draft, target_is_active, owner) = {
                     let state = state_entity.read(cx);
                     let route_current = modal_current && state.connection_id() == source_route.0
-                        && state.selected_thread == source_route.1 && state.draft_project == source_route.2;
-                    let source_draft = state.selected_thread.is_none()
-                        && state.draft_project.as_deref() == Some(source_project_id.as_str())
+                        && state.selected_thread == source_route.1 && state.active_draft() == source_route.2;
+                    let source_draft = source_route.2.as_ref().is_some_and(|draft| draft.project_id == source_project_id)
                         && (source_saved_id.is_empty() || source_saved_id == active_saved);
                     let owner = state.scoped_environment(&target.saved_id)
                         .map(|entry| entry.summary.owner.clone())

@@ -70,14 +70,22 @@ impl StreamSender {
 }
 
 pub fn open(runtime: &tokio::runtime::Handle, credentials: Arc<Credentials>, target: StreamTarget) -> PreviewStream {
+    open_with_mode(runtime, credentials, target, true)
+}
+
+pub(crate) fn open_read_only(runtime: &tokio::runtime::Handle, credentials: Arc<Credentials>, target: StreamTarget) -> PreviewStream {
+    open_with_mode(runtime, credentials, target, false)
+}
+
+fn open_with_mode(runtime: &tokio::runtime::Handle, credentials: Arc<Credentials>, target: StreamTarget, interactive: bool) -> PreviewStream {
     let (frames_tx, frames) = watch::channel(None);
     let (events_tx, events) = mpsc::unbounded_channel();
     let (input, input_rx) = mpsc::unbounded_channel();
-    runtime.spawn(run(credentials, target, frames_tx, events_tx, input_rx));
+    runtime.spawn(run(credentials, target, interactive, frames_tx, events_tx, input_rx));
     PreviewStream { input: StreamSender(input), frames, events }
 }
 
-pub fn stream_url(credentials: &Credentials, target: &StreamTarget, ticket: &str) -> String {
+fn stream_url(credentials: &Credentials, target: &StreamTarget, ticket: &str, interactive: bool) -> String {
     let base = websocket_base(&credentials.http_base);
     let mut url = url::Url::parse(&format!("{}{STREAM_PATH}", base.trim_end_matches("/ws"))).expect("valid preview stream url");
     url.query_pairs_mut()
@@ -86,6 +94,9 @@ pub fn stream_url(credentials: &Credentials, target: &StreamTarget, ticket: &str
         .append_pair("maxWidth", &target.max_width.max(1).to_string())
         .append_pair("maxHeight", &target.max_height.max(1).to_string())
         .append_pair("wsTicket", ticket);
+    if !interactive {
+        url.query_pairs_mut().append_pair("interactive", "false");
+    }
     url.to_string()
 }
 
@@ -189,6 +200,7 @@ async fn until_closed(input: &mut mpsc::UnboundedReceiver<StreamInput>) {
 async fn run(
     credentials: Arc<Credentials>,
     target: StreamTarget,
+    interactive: bool,
     frames: watch::Sender<Option<Frame>>,
     events: mpsc::UnboundedSender<StreamEvent>,
     mut input: mpsc::UnboundedReceiver<StreamInput>,
@@ -223,7 +235,7 @@ async fn run(
                 return;
             }
         };
-        let url = stream_url(&credentials, &target, &ticket);
+        let url = stream_url(&credentials, &target, &ticket, interactive);
         let connect = tokio_tungstenite::connect_async_with_config(url, Some(config), false);
         let socket = tokio::select! {
             result = tokio::time::timeout(OPEN_TIMEOUT, connect) => result,
@@ -372,8 +384,19 @@ mod tests {
         let credentials = Credentials { http_base: "https://host.example:3773".into(), access_token: "t".into() };
         let target = StreamTarget { thread_id: "thread 1".into(), tab_id: "tab".into(), max_width: 1080, max_height: 0 };
         assert_eq!(
-            stream_url(&credentials, &target, "abc"),
+            stream_url(&credentials, &target, "abc", true),
             "wss://host.example:3773/api/preview-stream/ws?threadId=thread+1&tabId=tab&maxWidth=1080&maxHeight=1&wsTicket=abc"
+        );
+    }
+
+    #[test]
+    fn read_only_stream_url_disables_interaction_and_keeps_the_media_ticket() {
+        let credentials = Credentials { http_base: "http://127.0.0.1:3773".into(), access_token: "t".into() };
+        let target = StreamTarget { thread_id: "thread+1".into(), tab_id: "tab/1".into(), max_width: 0, max_height: 720 };
+        let url = stream_url(&credentials, &target, "ticket&1", false);
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:3773/api/preview-stream/ws?threadId=thread%2B1&tabId=tab%2F1&maxWidth=1&maxHeight=720&wsTicket=ticket%261&interactive=false"
         );
     }
 

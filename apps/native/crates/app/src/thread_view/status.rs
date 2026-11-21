@@ -1399,11 +1399,7 @@ mod selected_provider_tests {
 
     #[test]
     fn background_work_dialog_snooze_ownership_and_snapshot_capture() {
-        let mut cx = gpui::HeadlessAppContext::with_platform(
-            gpui_platform::current_platform(true).text_system(),
-            std::sync::Arc::new(crate::icons::Assets),
-            gpui_platform::current_headless_renderer,
-        );
+        let mut cx = crate::snapshot::test_context();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = cx.update(|cx| {
             let state = crate::boot(runtime.handle().clone(), cx);

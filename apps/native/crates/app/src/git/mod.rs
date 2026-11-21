@@ -204,7 +204,7 @@ impl GitStore {
             return None;
         }
         Some(Target {
-            thread_id: t3_core::composer::drafts::new_thread_key(project_id),
+            thread_id: state.draft_route_key()?,
             project_id: project_id.to_owned(),
             is_draft: true,
             cwd: project.workspace_root.clone(),

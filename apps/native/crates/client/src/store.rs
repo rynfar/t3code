@@ -1133,6 +1133,39 @@ mod tests {
     }
 
     #[test]
+    fn relay_only_environment_has_a_connection_route_without_a_direct_credential() {
+        use crate::routes::CandidateRoute;
+        use t3_core::relay::{Endpoint, EnvironmentConnectResponse};
+
+        let id = "relay-only-startup";
+        let saved = decode_environments(Some(r#"{
+            "active": "relay-only-startup",
+            "environments": [{"id": "relay-only-startup", "label": "Relay", "httpBase": "https://host.example"}]
+        }"#), None);
+        let active = saved.active().unwrap();
+        assert!(active.credentials().is_none());
+        assert!(!active.has_connection_route());
+
+        let route = CandidateRoute::relay(EnvironmentConnectResponse {
+            environment_id: "relay-host".into(),
+            endpoint: Endpoint {
+                http_base_url: "https://host.example".into(),
+                ws_base_url: "wss://host.example".into(),
+                provider_kind: "cloudflare_tunnel".into(),
+            },
+            credential: "relay-ticket".into(),
+            expires_at: "2026-11-21T00:00:00Z".into(),
+        });
+        let _ = load_alternate_routes();
+        {
+            let mut cache = alternate_routes_cache().lock().unwrap();
+            cache.entry(base()).or_default().insert(id.into(), vec![route]);
+        }
+        assert!(active.has_connection_route());
+        alternate_routes_cache().lock().unwrap().entry(base()).or_default().remove(id);
+    }
+
+    #[test]
     fn pairing_a_saved_server_again_refreshes_its_entry_and_activates_it() {
         let mut saved = decode_environments(None, Some(r#"{"http_base":"http://127.0.0.1:3773","access_token":"old"}"#));
         let migrated = saved.active.clone().expect("active");
