@@ -5,6 +5,7 @@
 //! `t3_core::settings::diagnostics`; process tables are virtualized.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::time::Duration;
 
 use gpui::{
@@ -13,12 +14,14 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
-use serde_json::json;
-use t3_client::supervisor::ConnectionStatus;
+use serde_json::{Value, json};
+use t3_client::supervisor::{ClientHandle, ConnectionStatus};
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 use t3_core::settings::ServerSettingChange;
+use t3_core::server_config::ServerConfig;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::settings::diagnostics::{
     self as model, Dot, EndpointCheck, HISTORY_WINDOWS, OtlpSignal, ProcessDiagnostics, Query, ResourceHistory, Signal, SignalOutcome, TraceDiagnostics,
 };
@@ -27,7 +30,8 @@ use t3_core::usage::{ConnectionPhase, resolve_usage_access};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, InlineButton, InlineTone, group, icon, r, section_title, tooltip};
 use super::providers::failure_text;
-use super::{Block, SettingsView, store};
+use super::{Block, SettingsView};
+use crate::i18n::t;
 use crate::app_state::Phase;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -54,13 +58,21 @@ struct Telemetry {
     invalid: Vec<OtlpSignal>,
 }
 
+const DIAGNOSTICS_READ: &str = "diagnostics:read";
+
+#[derive(Clone, PartialEq, Eq)]
+struct DiagnosticTarget {
+    owner: Option<EnvironmentOwner>,
+    active_connection: Option<u64>,
+}
+
 pub(crate) struct DiagnosticsState {
     monitor: resource_monitor::MonitorState,
     processes: Query<ProcessDiagnostics>,
     history: Query<ResourceHistory>,
     trace: Query<TraceDiagnostics>,
     /// The connection the queries were sent on.
-    loaded_for: Option<u64>,
+    loaded_for: Option<DiagnosticTarget>,
     window: usize,
     collapsed: HashSet<u64>,
     signaling: Option<u64>,
@@ -132,6 +144,7 @@ impl DiagnosticsState {
         self.expanded.clear();
         self.form_ready = false;
         self.telemetry.drafts.clear();
+        self.telemetry.saving = false;
         self.telemetry.message = None;
         self.telemetry.checks.clear();
         self.telemetry.check_seq.clear();
@@ -160,7 +173,62 @@ fn table_height(rows: usize, window: &Window) -> f32 {
 }
 
 impl SettingsView {
+    fn diagnostic_target(&self, cx: &App) -> Option<DiagnosticTarget> {
+        let owner = self.scoped_primary_owner(cx);
+        let connection = self.state.read(cx).connection_id();
+        if owner.is_none() && (connection.is_none() || self.scope.machine.is_some() || self.scope.project.is_some()) {
+            return None;
+        }
+        Some(DiagnosticTarget { owner, active_connection: connection })
+    }
+
+    fn diagnostic_target_current(&self, target: &Option<DiagnosticTarget>, cx: &App) -> bool {
+        self.section == t3_core::settings::search::Section::Diagnostics
+            && target.is_some() && &self.diagnostic_target(cx) == target
+    }
+
+    fn diagnostic_config<'a>(&self, cx: &'a App) -> Option<&'a ServerConfig> {
+        let app = self.state.read(cx);
+        if let Some(owner) = self.diagnostic_target(cx)?.owner
+            && app.environments.active.as_deref() != Some(owner.saved_id.as_str())
+        {
+            return app.scoped_environment(&owner.saved_id)?.config.config.as_ref();
+        }
+        app.server_config.config.as_ref()
+    }
+
+    fn diagnostic_may(&self, scope: &str, cx: &App) -> bool {
+        self.diagnostic_target(cx).is_some()
+            && self.scoped_session(cx).is_none_or(|session| session.grants(scope))
+    }
+
+    fn diagnostic_client(
+        &self, scope: &'static str, cx: &App,
+    ) -> impl Future<Output = Option<ClientHandle>> + use<> {
+        let app = self.state.read(cx);
+        let target = self.diagnostic_target(cx);
+        let lookup = target.as_ref().and_then(|target| target.owner.as_ref())
+            .filter(|owner| app.environments.active.as_deref() != Some(owner.saved_id.as_str()))
+            .map(|owner| app.connections.destination(owner, scope));
+        let active = (target.is_some() && lookup.is_none()).then(|| app.client_handle()).flatten();
+        async move {
+            if let Some(lookup) = lookup {
+                lookup.await.ok().map(|destination| destination.client)
+            } else {
+                active
+            }
+        }
+    }
+
     fn connection_phase(&self, cx: &App) -> ConnectionPhase {
+        if let Some(owner) = self.diagnostic_target(cx).and_then(|target| target.owner) {
+            return match self.state.read(cx).scoped_environment(&owner.saved_id).map(|entry| &entry.status) {
+                Some(ConnectionStatus::Connected) => ConnectionPhase::Connected,
+                Some(ConnectionStatus::Connecting) => ConnectionPhase::Connecting,
+                Some(ConnectionStatus::Reconnecting { .. }) => ConnectionPhase::Reconnecting,
+                _ => ConnectionPhase::Disconnected,
+            };
+        }
         match &self.state.read(cx).phase {
             Phase::Online(ConnectionStatus::Connected) => ConnectionPhase::Connected,
             Phase::Online(ConnectionStatus::Connecting) => ConnectionPhase::Connecting,
@@ -171,7 +239,9 @@ impl SettingsView {
 
     /// Repaints when this device's grants change, and keeps relative times current.
     fn watch_diagnostics(&mut self, cx: &mut Context<Self>) {
+        // Fleet grant changes already arrive via AppEvent::ServerConfig.
         if self.diagnostics.grants.is_none()
+            && self.scoped_primary_owner(cx).is_none()
             && let Some(client) = self.state.read(cx).client_handle()
         {
             let mut grants = client.session_state();
@@ -197,59 +267,46 @@ impl SettingsView {
 
     fn load_processes(&mut self, cx: &mut Context<Self>) {
         let request = self.diagnostics.processes.begin();
-        let task = self
-            .state
-            .read(cx)
-            .request(model::GET_PROCESS_DIAGNOSTICS, json!({}), |reply| model::decode_process_diagnostics(&reply).ok_or_else(|| "Could not read process diagnostics.".to_owned()));
-        self.finish_query(task, request, |this| &mut this.diagnostics.processes, cx);
+        self.finish_query(model::GET_PROCESS_DIAGNOSTICS, json!({}), request,
+            |reply| model::decode_process_diagnostics(&reply), |this| &mut this.diagnostics.processes, cx);
     }
 
     fn load_history(&mut self, cx: &mut Context<Self>) {
         let request = self.diagnostics.history.begin();
         let payload = HISTORY_WINDOWS[self.diagnostics.window].payload();
-        let task = self
-            .state
-            .read(cx)
-            .request(model::GET_PROCESS_RESOURCE_HISTORY, payload, |reply| model::decode_resource_history(&reply).ok_or_else(|| "Could not read resource history.".to_owned()));
-        self.finish_query(task, request, |this| &mut this.diagnostics.history, cx);
+        self.finish_query(model::GET_PROCESS_RESOURCE_HISTORY, payload, request,
+            |reply| model::decode_resource_history(&reply), |this| &mut this.diagnostics.history, cx);
     }
 
     fn load_trace(&mut self, cx: &mut Context<Self>) {
         let request = self.diagnostics.trace.begin();
-        let task = self
-            .state
-            .read(cx)
-            .request(model::GET_TRACE_DIAGNOSTICS, json!({}), |reply| model::decode_trace_diagnostics(&reply).ok_or_else(|| "Could not read trace diagnostics.".to_owned()));
-        self.finish_query(task, request, |this| &mut this.diagnostics.trace, cx);
+        self.finish_query(model::GET_TRACE_DIAGNOSTICS, json!({}), request,
+            |reply| model::decode_trace_diagnostics(&reply), |this| &mut this.diagnostics.trace, cx);
     }
 
     fn finish_query<T: Send + 'static>(
-        &mut self,
-        task: Option<tokio::task::JoinHandle<Result<T, String>>>,
-        request: u64,
-        slot: fn(&mut SettingsView) -> &mut Query<T>,
-        cx: &mut Context<Self>,
+        &mut self, method: &'static str, payload: Value, request: u64,
+        decode: fn(Value) -> Option<T>, slot: fn(&mut SettingsView) -> &mut Query<T>, cx: &mut Context<Self>,
     ) {
-        let Some(task) = task else {
-            slot(self).finish(request, Err("The connection closed. Try again once it reconnects.".to_owned()));
-            return;
-        };
+        let target = self.diagnostic_target(cx);
+        let fallback = t(cx, "Could not read diagnostics.").to_owned();
+        let task = self.scoped_rpc(DIAGNOSTICS_READ, method, payload, cx);
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = task.await.map_err(|error| failure_text(&error, &fallback))
+                .and_then(|reply| decode(reply).ok_or(fallback));
             let _ = this.update(cx, |this, cx| {
-                if slot(this).finish(request, result) {
+                if this.diagnostic_target_current(&target, cx) && slot(this).finish(request, result) {
                     cx.notify();
                 }
             });
-        })
-        .detach();
+        }).detach();
         cx.notify();
     }
 
     /// `signalProcess`: SIGKILL asks first; the server refuses a pid whose start time moved on, so
     /// a process that exited meanwhile is never signaled by mistake.
     fn request_signal(&mut self, index: usize, signal: Signal, cx: &mut Context<Self>) {
-        if self.diagnostics.signaling.is_some() || !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+        if self.diagnostics.signaling.is_some() || !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
             return;
         }
         let Some(process) = self.diagnostics.processes.data.as_ref().and_then(|data| data.processes.get(index)).cloned() else {
@@ -259,15 +316,18 @@ impl SettingsView {
             // The confirmation is modal, so the row needs no lock while it is open.
             let (title, description) = model::kill_confirmation(process.pid);
             let view = cx.entity().downgrade();
+            let target = self.diagnostic_target(cx);
             crate::dialog::ask(
                 title,
                 description,
                 "Confirm",
                 move |_, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        if this.diagnostics.signaling.is_none() {
-                            this.send_signal(process, signal, cx);
-                        }
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.diagnostics.signaling.is_none() && this.diagnostic_target_current(&target, cx) {
+                                this.send_signal(process, signal, cx);
+                            }
+                        });
                     });
                 },
                 cx,
@@ -278,15 +338,17 @@ impl SettingsView {
     }
 
     fn send_signal(&mut self, process: model::ProcessEntry, signal: Signal, cx: &mut Context<Self>) {
-        if !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+        if !self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
             self.diagnostics.signaling = None;
             return;
         }
         self.diagnostics.signaling = Some(process.pid);
-        let task = self.state.read(cx).rpc(model::SIGNAL_PROCESS, signal.payload(&process));
+        let target = self.diagnostic_target(cx);
+        let task = self.scoped_rpc(model::ENVIRONMENT_MAINTAIN_SCOPE, model::SIGNAL_PROCESS, signal.payload(&process), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if !this.diagnostic_target_current(&target, cx) { return; }
                 this.diagnostics.signaling = None;
                 // The server answered: the table refreshes whatever it said.
                 let (toast, refresh) = match result {
@@ -314,13 +376,13 @@ impl SettingsView {
     }
 
     fn open_logs_directory(&mut self, cx: &mut Context<Self>) {
-        let Some(config) = self.thread_settings(cx) else {
+        let Some(config) = self.diagnostic_config(cx) else {
             return;
         };
         let Some(path) = config.observability.as_ref().and_then(|observability| observability.logs_directory_path.clone()) else {
             return;
         };
-        if !self.may(ORCHESTRATION_OPERATE_SCOPE, cx) {
+        if !self.diagnostic_may(ORCHESTRATION_OPERATE_SCOPE, cx) {
             return;
         }
         let Some((editor, _)) = preferred_editor(&config.available_editors, None) else {
@@ -329,10 +391,12 @@ impl SettingsView {
         };
         self.diagnostics.opening_logs = true;
         self.diagnostics.open_logs_error = None;
-        let task = self.state.read(cx).rpc(OPEN_IN_EDITOR, open_in_editor_request(&path, editor));
+        let target = self.diagnostic_target(cx);
+        let task = self.scoped_rpc(ORCHESTRATION_OPERATE_SCOPE, OPEN_IN_EDITOR, open_in_editor_request(&path, editor), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if !this.diagnostic_target_current(&target, cx) { return; }
                 this.diagnostics.opening_logs = false;
                 if let Err(error) = result {
                     this.diagnostics.open_logs_error = Some(failure_text(&error, "Unable to open logs folder."));
@@ -362,11 +426,14 @@ impl SettingsView {
 
     pub(super) fn diagnostics_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         let p = palette(cx);
-        let session = self.session(cx);
+        let session = self.scoped_session(cx);
         let access = resolve_usage_access(self.connection_phase(cx), session.as_ref(), false);
-        let connection = self.state.read(cx).connection_id();
-        if !access.can_read_diagnostics || connection.is_none() {
-            let text = if connection.is_none() {
+        let target = self.diagnostic_target(cx);
+        if self.diagnostics.loaded_for != target {
+            self.diagnostics.reset();
+        }
+        if !access.can_read_diagnostics || target.is_none() {
+            let text = if target.is_none() {
                 "Connect an environment to see diagnostics."
             } else if access.is_pending {
                 "Checking diagnostics access\u{2026}"
@@ -378,8 +445,8 @@ impl SettingsView {
             return vec![Block::new(&[], div().px(r(16.)).text_sm().text_color(hsla(p.muted_foreground)).child(text))];
         }
         self.watch_diagnostics(cx);
-        if self.diagnostics.loaded_for != connection {
-            self.diagnostics.loaded_for = connection;
+        if self.diagnostics.loaded_for != target {
+            self.diagnostics.loaded_for = target;
             self.load_processes(cx);
             self.load_history(cx);
             self.load_trace(cx);
@@ -525,7 +592,7 @@ impl SettingsView {
         let read_at = data.map(|data| data.read_at.clone());
         let processes = data.map(|data| data.processes.clone()).unwrap_or_default();
         let visible = model::visible_process_tree(&processes, &self.diagnostics.collapsed);
-        let can_maintain = self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx);
+        let can_maintain = self.diagnostic_may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx);
         let table = self.process_table(processes, visible, can_maintain, initial, window, cx);
         let actions = h_flex()
             .gap(r(6.))
@@ -908,8 +975,8 @@ impl SettingsView {
         let errors = Self::error_lines(lines, cx);
         let pending = query.pending;
         let read_at = data.map(|data| data.read_at.clone());
-        let has_logs = self.thread_settings(cx).and_then(|config| config.observability.as_ref()).is_some_and(|observability| observability.logs_directory_path.is_some());
-        let can_open = self.may(ORCHESTRATION_OPERATE_SCOPE, cx) && has_logs && !self.diagnostics.opening_logs;
+        let has_logs = self.diagnostic_config(cx).and_then(|config| config.observability.as_ref()).is_some_and(|observability| observability.logs_directory_path.is_some());
+        let can_open = self.diagnostic_may(ORCHESTRATION_OPERATE_SCOPE, cx) && has_logs && !self.diagnostics.opening_logs;
         let actions = h_flex()
             .gap(r(6.))
             .child(Self::last_checked(read_at.as_deref(), now, cx))
@@ -1145,7 +1212,7 @@ impl SettingsView {
     fn telemetry_edited(&mut self, signal: OtlpSignal, cx: &mut Context<Self>) {
         let index = OtlpSignal::ALL.iter().position(|candidate| *candidate == signal).unwrap_or(0);
         let value = self.diagnostics.telemetry.inputs[index].read(cx).value().to_string();
-        let saved = self.thread_settings(cx).map(|config| signal.saved(&config.settings.observability).to_owned()).unwrap_or_default();
+        let saved = self.diagnostic_config(cx).map(|config| signal.saved(&config.settings.observability).to_owned()).unwrap_or_default();
         // A field back at its saved value follows the server again, so a save never overwrites
         // another client's change.
         if value.trim() == saved {
@@ -1159,16 +1226,16 @@ impl SettingsView {
     }
 
     fn telemetry_values(&self, cx: &App) -> Vec<(OtlpSignal, String)> {
-        let saved = self.thread_settings(cx).map(|config| config.settings.observability.clone()).unwrap_or_default();
+        let saved = self.diagnostic_config(cx).map(|config| config.settings.observability.clone()).unwrap_or_default();
         OtlpSignal::ALL.iter().map(|signal| (*signal, self.diagnostics.telemetry.drafts.get(signal).cloned().unwrap_or_else(|| signal.saved(&saved).to_owned()))).collect()
     }
 
     fn save_telemetry(&mut self, cx: &mut Context<Self>) {
-        let Some(saved) = self.thread_settings(cx).map(|config| config.settings.observability.clone()) else {
+        let Some(saved) = self.diagnostic_config(cx).map(|config| config.settings.observability.clone()) else {
             return;
         };
         let values = self.telemetry_values(cx);
-        if self.diagnostics.telemetry.saving || model::changed_signals(&values, &saved).is_empty() || !self.may(SETTINGS_WRITE_SCOPE, cx) {
+        if self.diagnostics.telemetry.saving || model::changed_signals(&values, &saved).is_empty() || !self.diagnostic_may(SETTINGS_WRITE_SCOPE, cx) {
             return;
         }
         let payload = match model::telemetry_save_payload(&values, &saved) {
@@ -1182,11 +1249,12 @@ impl SettingsView {
         self.diagnostics.telemetry.message = None;
         self.diagnostics.telemetry.invalid.clear();
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        let target = self.diagnostic_target(cx);
+        self.update_scoped_single_env_then(
             ServerSettingChange::Prepared(payload),
             move |error, cx| {
                 let _ = view.update(cx, |this, cx| {
+                    if !this.diagnostic_target_current(&target, cx) { return; }
                     this.diagnostics.telemetry.saving = false;
                     if error.is_none() {
                         this.diagnostics.telemetry.drafts.clear();
@@ -1205,7 +1273,7 @@ impl SettingsView {
         self.diagnostics.telemetry.drafts.clear();
         self.diagnostics.telemetry.message = None;
         if can_check {
-            let config = self.thread_settings(cx).cloned();
+            let config = self.diagnostic_config(cx).cloned();
             let running = config.as_ref().and_then(|config| config.observability.clone());
             let saved = config.map(|config| config.settings.observability).unwrap_or_default();
             for signal in OtlpSignal::ALL {
@@ -1235,11 +1303,12 @@ impl SettingsView {
         let seq = self.diagnostics.telemetry.check_seq.entry(signal).or_insert(0);
         *seq = seq.wrapping_add(1);
         let attempt_seq = *seq;
-        let task = self.state.read(cx).rpc(model::CHECK_OTLP_ENDPOINT, signal.check_payload(&url));
+        let target = self.diagnostic_target(cx);
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, model::CHECK_OTLP_ENDPOINT, signal.check_payload(&url), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await.ok().and_then(|reply| model::decode_check(&reply));
             let _ = this.update(cx, |this, cx| {
-                if this.diagnostics.telemetry.check_seq.get(&signal).copied() != Some(attempt_seq) {
+                if !this.diagnostic_target_current(&target, cx) || this.diagnostics.telemetry.check_seq.get(&signal).copied() != Some(attempt_seq) {
                     return;
                 }
                 let checks = &mut this.diagnostics.telemetry.checks;
@@ -1261,12 +1330,12 @@ impl SettingsView {
     /// `TelemetryExportForm`.
     fn telemetry_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.diagnostic_config(cx).cloned() else {
             return div().into_any_element();
         };
         let saved = config.settings.observability.clone();
         let running = config.observability.clone();
-        let can_edit = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let can_edit = self.diagnostic_may(SETTINGS_WRITE_SCOPE, cx);
         let can_check = can_edit && config.environment.capabilities.otlp_endpoint_check == Some(true);
         if !self.diagnostics.telemetry.seeded {
             self.diagnostics.telemetry.seeded = true;

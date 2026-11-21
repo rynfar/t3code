@@ -3,6 +3,7 @@
 //! `MobileAppSettingsRow.tsx`, `OpenSourceLicenses.tsx`).
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ use super::controls::{
     icon, r, section, section_title,
 };
 use super::{Block, SettingsView};
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
@@ -39,6 +41,55 @@ const APP_STORE_URL: &str = "https://apps.apple.com/us/app/t3-code-remote-claude
 const PLAY_STORE_URL: &str = "https://play.google.com/store/apps/details?id=com.t3tools.t3code";
 const LICENSE_MANIFEST_MAX_BYTES: usize = 16 * 1024 * 1024;
 const QR_SIZE: f32 = 128.;
+
+fn bundle_resource(relative: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let macos = executable.parent()?;
+    (macos.file_name()? == "MacOS").then(|| macos.join("../Resources").join(relative))
+}
+
+fn bundled_license_manifest() -> Option<Result<ThirdPartyLicenseManifest, String>> {
+    use std::io::Read;
+    let path = bundle_resource("third-party-licenses.json")?;
+    let file = std::fs::File::open(path).ok()?;
+    let result = (|| {
+        let mut bytes = Vec::new();
+        file.take(LICENSE_MANIFEST_MAX_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > LICENSE_MANIFEST_MAX_BYTES { return None; }
+        serde_json::from_slice(&bytes).ok()
+    })();
+    Some(result.ok_or_else(|| "The bundled license manifest could not load.".to_owned())
+        .and_then(|value| decode_third_party_license_manifest(&value)))
+}
+
+fn cli_source() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("T3_NATIVE_T3_BIN").map(PathBuf::from).or_else(|| bundle_resource("bin/t3"))?;
+        let path = path.canonicalize().ok()?;
+        let meta = path.metadata().ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(path)
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+fn owns_cli_link(destination: &Path, source: &Path) -> bool {
+    std::fs::read_link(destination).is_ok_and(|target| target == source)
+}
+
+#[cfg(unix)]
+fn set_cli_link(destination: &Path, source: &Path, install: bool) -> std::io::Result<()> {
+    if install {
+        if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
+        std::os::unix::fs::symlink(source, destination)
+    } else if owns_cli_link(destination, source) {
+        std::fs::remove_file(destination)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "The t3 command now belongs to another installation."))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MobileStore {
@@ -53,6 +104,13 @@ impl MobileStore {
         match self {
             MobileStore::Ios => "ios",
             MobileStore::Android => "android",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            MobileStore::Ios => Icon::Apple,
+            MobileStore::Android => Icon::Android,
         }
     }
 
@@ -144,6 +202,9 @@ pub(crate) struct AboutState {
     qr_cache: RefCell<Option<(MobileStore, Rc<QrMatrix>)>>,
     track_switch_dialog: Option<Entity<UpdateTrackSwitchDialog>>,
     cli_status: Option<CliCommandStatus>,
+    cli_source: Option<PathBuf>,
+    cli_link_owned: bool,
+    cli_checked: bool,
     cli_path_added: bool,
     cli_path_saving: bool,
     cli_path_task: Option<Task<()>>,
@@ -175,7 +236,10 @@ impl AboutState {
             mobile_popover_dismissed: None,
             qr_cache: RefCell::new(None),
             track_switch_dialog: None,
-            cli_status: t3_client::local::cli_command_status(),
+            cli_status: None,
+            cli_source: None,
+            cli_link_owned: false,
+            cli_checked: false,
             cli_path_added: false,
             cli_path_saving: false,
             cli_path_task: None,
@@ -195,6 +259,8 @@ impl AboutState {
         self.mobile_popover_dismissed = None;
         self.track_switch_dialog = None;
         self.cli_path_task = None;
+        self.cli_status = None;
+        self.cli_checked = false;
         self.cli_path_saving = false;
         self.licenses_open = false;
         self.licenses_search_open = false;
@@ -282,6 +348,61 @@ impl SettingsView {
             )
         });
         self.about.track_switch_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn ensure_cli_status(&mut self, cx: &mut Context<Self>) {
+        if self.about.cli_checked || self.about.cli_status.is_some() {
+            return;
+        }
+        self.about.cli_checked = true;
+        let load = cx.background_executor().spawn(async {
+            let status = t3_client::local::cli_command_status();
+            let source = cli_source();
+            let owned = status.as_ref().zip(source.as_ref()).is_some_and(|(status, source)| {
+                owns_cli_link(&Path::new(&status.path_dir).join("t3"), source)
+            });
+            (status, source, owned)
+        });
+        self.about.cli_path_task = Some(cx.spawn(async move |this, cx| {
+            let (status, source, owned) = load.await;
+            let _ = this.update(cx, |this, cx| {
+                this.about.cli_status = status;
+                this.about.cli_source = source;
+                this.about.cli_link_owned = owned;
+                this.about.cli_path_task = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    #[cfg(unix)]
+    fn change_cli_installation(&mut self, install: bool, cx: &mut Context<Self>) {
+        if self.about.cli_path_saving { return; }
+        let Some(status) = self.about.cli_status.as_ref() else { return };
+        let Some(source) = self.about.cli_source.clone() else { return };
+        let destination = Path::new(&status.path_dir).join("t3");
+        self.about.cli_path_saving = true;
+        let action = cx.background_executor().spawn(async move {
+            let result = set_cli_link(&destination, &source, install);
+            let status = t3_client::local::cli_command_status();
+            let owned = owns_cli_link(&destination, &source);
+            (result, status, owned)
+        });
+        self.about.cli_path_task = Some(cx.spawn(async move |this, cx| {
+            let (result, status, owned) = action.await;
+            let _ = this.update(cx, |this, cx| {
+                this.about.cli_status = status;
+                this.about.cli_link_owned = owned;
+                this.about.cli_path_saving = false;
+                this.about.cli_path_task = None;
+                if let Err(error) = result {
+                    let title = t(cx, if install { "Could not install t3" } else { "Could not remove t3" });
+                    this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(error.to_string()), cx));
+                }
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -407,23 +528,24 @@ impl SettingsView {
         self.about.licenses_connection = connection;
         self.about.licenses_load_id += 1;
         let load_id = self.about.licenses_load_id;
-        let Some(http_base) = state.active_environment().map(|env| env.http_base.clone()) else {
-            self.about.licenses_status = LicensesStatus::Failed("Connect an environment to load open-source notices.".to_owned());
-            cx.notify();
-            return;
-        };
+        let http_base = state.active_environment().map(|env| env.http_base.clone());
         self.about.licenses_status = LicensesStatus::Loading;
         let runtime = state.runtime().clone();
-        let task = runtime.spawn(async move {
-            let bytes = t3_client::asset::fetch_asset(&http_base, "/third-party-licenses.json", LICENSE_MANIFEST_MAX_BYTES)
-                .await
-                .map_err(|_| "The license manifest could not load.".to_owned())?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| "The license manifest could not load.".to_owned())?;
-            decode_third_party_license_manifest(&value)
-        });
+        let bundled = cx.background_executor().spawn(async { bundled_license_manifest() });
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| Err("The license manifest could not load.".to_owned()));
+            let result = match bundled.await {
+                Some(result) => result,
+                None => if let Some(http_base) = http_base {
+                    runtime.spawn(async move {
+                    let bytes = t3_client::asset::fetch_asset(&http_base, "/third-party-licenses.json", LICENSE_MANIFEST_MAX_BYTES)
+                        .await.map_err(|_| "The license manifest could not load.".to_owned())?;
+                    let value = serde_json::from_slice(&bytes).map_err(|_| "The license manifest could not load.".to_owned())?;
+                    decode_third_party_license_manifest(&value)
+                    }).await.unwrap_or_else(|_| Err("The license manifest could not load.".to_owned()))
+                } else {
+                    Err("Connect an environment to load open-source notices.".to_owned())
+                },
+            };
             let _ = this.update(cx, |this, cx| {
                 if this.about.licenses_load_id != load_id || this.about.licenses_connection != connection {
                     return;
@@ -443,8 +565,8 @@ impl SettingsView {
         if self.about.licenses_open {
             return self.open_source_licenses_page(cx);
         }
+        self.ensure_cli_status(cx);
         let p = palette(cx);
-        let dark = cx.theme().is_dark();
         let policy = self
             .state
             .read(cx)
@@ -650,7 +772,16 @@ impl SettingsView {
                     ),
                 );
             }
-            if !installed {
+            #[cfg(unix)]
+            if self.about.cli_source.is_some() && (!installed || self.about.cli_link_owned) {
+                cli_controls = cli_controls.child(
+                    Button::new("about-cli-link-action", ButtonVariant::Outline, ButtonSize::Sm)
+                        .label(t(cx, if self.about.cli_link_owned { "Remove" } else { "Install" }))
+                        .disabled(self.about.cli_path_saving || (!self.about.cli_link_owned && status.shadowed_by.is_some()))
+                        .on_click(cx.listener(|this, _, _, cx| this.change_cli_installation(!this.about.cli_link_owned, cx))),
+                );
+            }
+            if !installed && self.about.cli_source.is_none() {
                 let copied_cli = self.about.copied_cli_install;
                 cli_controls = cli_controls.child(
                     div().debug_selector(|| "about-cli-install".to_owned()).child(
@@ -665,7 +796,7 @@ impl SettingsView {
             let mut cli_row = Row::new("cli-command", "t3 command")
                 .description(cli_description)
                 .highlighted(self.is_target("cli-command"));
-            if !installed || (!status.on_path && !self.about.cli_path_added && status.profile_file.is_some()) {
+            if !installed || self.about.cli_link_owned || (!status.on_path && !self.about.cli_path_added && status.profile_file.is_some()) {
                 cli_row = cli_row.control(cli_controls);
             }
             app_rows.push(cli_row.into_any_element());
@@ -683,17 +814,12 @@ impl SettingsView {
                         .anchor(gpui::Anchor::TopRight)
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            v_flex()
+                            crate::composer::controls::popup_surface(cx)
                                 .occlude()
                                 .mt(r(4.))
                                 .p(r(16.))
                                 .gap(r(12.))
                                 .items_center()
-                                .rounded(r(12.))
-                                .border_1()
-                                .border_color(hsla(p.dropdown_border))
-                                .bg(hsla(p.popover))
-                                .shadow(crate::composer::controls::floating_shadow(dark))
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                     if let Some(prev) = this.about.mobile_popover.take() {
                                         this.about.mobile_popover_dismissed = Some((prev, Instant::now()));
@@ -717,8 +843,8 @@ impl SettingsView {
                 .debug_selector(move || format!("mobile-app-{}", store.id()))
                 .child(
                     Button::new(SharedString::from(format!("mobile-app-{}", store.id())), ButtonVariant::Outline, ButtonSize::Sm)
-                        .icon(Icon::Smartphone)
-                        .label(store.label())
+                        .icon(store.icon())
+                        .label(crate::i18n::t(cx, store.label()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let just_dismissed_same = this
                                 .about
@@ -733,7 +859,7 @@ impl SettingsView {
                             cx.notify();
                         })),
                 )
-                .children(popover)
+                .children(popover.map(|popover| div().absolute().bottom_0().right_0().child(popover)))
         }));
         app_rows.push(
             Row::new("mobile-app", "Mobile app")
@@ -1008,6 +1134,24 @@ mod unit_tests {
         assert!(!is_http_url("https://"));
         assert!(!is_http_url("https://help.acme.example/with space"));
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn cli_link_preserves_a_command_from_another_installation() {
+    let directory = std::env::temp_dir().join(format!("t3-native-cli-link-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let source = directory.join("bundled-t3");
+    let destination = directory.join("bin/t3");
+    std::fs::write(&source, "cli").unwrap();
+    set_cli_link(&destination, &source, true).unwrap();
+    assert!(owns_cli_link(&destination, &source));
+    set_cli_link(&destination, &source, false).unwrap();
+    std::fs::write(&destination, "independent installation").unwrap();
+    assert!(set_cli_link(&destination, &source, true).is_err());
+    assert!(set_cli_link(&destination, &source, false).is_err());
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "independent installation");
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(all(test, feature = "snapshot"))]

@@ -4,21 +4,25 @@
 //! `confirmAndDeleteThread` uses. The rows are a virtualized list over entries computed when the
 //! archive loads or a row leaves, so a large archive costs only its visible rows on each render.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, ParentElement, Pixels, Point,
+    AnyElement, App, Context, FontWeight, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, ParentElement, Pixels, Point,
     SharedString, Styled, div, list, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{self, method};
+use t3_core::auth::{ORCHESTRATION_OPERATE_SCOPE, ORCHESTRATION_READ_SCOPE};
+use t3_core::sidebar::grouping::{EnvironmentOwner, ProjectRef};
 use t3_core::settings::archive::{self as model, ArchiveEntry, ArchiveGroup, ArchiveVisibility, GET_ARCHIVED_SHELL_SNAPSHOT};
 use t3_core::sidebar::tag_filter::ThreadKey;
 use serde_json::json;
 
-use super::controls::{Button, ButtonSize, ButtonVariant, Row, icon, r, section};
+use super::controls::{Button, ButtonSize, ButtonVariant, Row, r, section};
 use super::{Block, SettingsView, store};
-use crate::app_state::uuid_v4;
+use crate::app_state::{AppState, uuid_v4};
+use crate::i18n::t;
+use crate::project_icon::{self, ProjectVisual};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -30,13 +34,31 @@ enum Status {
     Failed,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ArchiveScope {
+    owners: Vec<EnvironmentOwner>,
+    projects: Option<HashSet<ProjectRef>>,
+    active_connection: Option<u64>,
+    active_fallback: bool,
+}
+
+#[derive(Clone)]
+struct ArchiveOrigin {
+    owner: EnvironmentOwner,
+    thread_id: String,
+    label: String,
+}
+
 pub(crate) struct ArchiveState {
     status: Status,
     entries: Vec<ArchiveEntry>,
     list: ListState,
     menu: Option<(String, Point<Pixels>)>,
     pending: HashSet<String>,
-    connection: Option<u64>,
+    scope: Option<ArchiveScope>,
+    origins: HashMap<String, ArchiveOrigin>,
+    projects: HashMap<String, ProjectRef>,
+    show_environment: bool,
     load_id: u64,
     action_error: Option<(&'static str, String)>,
 }
@@ -49,7 +71,10 @@ impl Default for ArchiveState {
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             menu: None,
             pending: HashSet::new(),
-            connection: None,
+            scope: None,
+            origins: HashMap::new(),
+            projects: HashMap::new(),
+            show_environment: false,
             load_id: 0,
             action_error: None,
         }
@@ -85,74 +110,143 @@ enum Action {
 }
 
 impl SettingsView {
+    fn archive_scope(&self, cx: &App) -> ArchiveScope {
+        let owners = self.scoped_environment_owners(cx);
+        let app = self.state.read(cx);
+        let projects = self.scope.project.is_some().then(|| {
+            self.scoped_project_members(cx).into_iter().map(|member| member.reference()).collect()
+        });
+        ArchiveScope {
+            active_fallback: owners.is_empty() && self.scope.machine.is_none() && projects.is_none()
+                && app.fleet.environments.is_empty(),
+            owners,
+            projects,
+            active_connection: app.connection_id(),
+        }
+    }
+
     pub(super) fn load_archive(&mut self, cx: &mut Context<Self>) {
-        let connection = self.state.read(cx).connection_id();
-        self.archive.connection = connection;
+        let scope = self.archive_scope(cx);
+        self.archive.scope = Some(scope.clone());
         self.archive.load_id += 1;
         let load_id = self.archive.load_id;
         self.archive.menu = None;
         self.archive.pending.clear();
         self.archive.action_error = None;
+        self.archive.origins.clear();
+        self.archive.projects.clear();
         self.archive.status = Status::Loading;
         self.archive.sync_entries();
-        let task = self.state.read(cx).rpc(GET_ARCHIVED_SHELL_SNAPSHOT, json!({}));
+        let app = self.state.read(cx);
+        let fallback = scope.active_fallback.then(|| app.rpc(GET_ARCHIVED_SHELL_SNAPSHOT, json!({})));
+        let destinations = scope.owners.iter().filter(|owner| app.scoped_ready(owner, ORCHESTRATION_READ_SCOPE))
+            .map(|owner| app.connections.destination(owner, ORCHESTRATION_READ_SCOPE)).collect::<Vec<_>>();
+        let runtime = app.runtime().clone();
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let mut snapshots = Vec::new();
+            let mut failed = false;
+            if let Some(task) = fallback {
+                match task.await {
+                    Ok(snapshot) => snapshots.push((None, snapshot)),
+                    Err(_) => failed = true,
+                }
+            }
+            for result in futures::future::join_all(destinations.into_iter().map(|destination| {
+                let runtime = runtime.clone();
+                async move {
+                    let destination = destination.await.ok()?;
+                    let response = runtime.spawn(async move {
+                        destination.client.request(GET_ARCHIVED_SHELL_SNAPSHOT, json!({})).await.ok()
+                            .map(|snapshot| (Some(destination.owner), snapshot))
+                    }).await;
+                    response.ok().flatten()
+                }
+            })).await {
+                match result {
+                    Some(snapshot) => snapshots.push(snapshot),
+                    None => failed = true,
+                }
+            }
             let _ = this.update(cx, |this, cx| {
-                if this.archive.load_id != load_id || this.archive.connection != connection {
+                if this.archive.load_id != load_id || this.archive_scope(cx) != scope {
                     return;
                 }
-                this.archive.status = match result {
-                    Ok(snapshot) => {
-                        let state = this.state.read(cx);
-                        let env_id = state
-                            .server_config
-                            .config
-                            .as_ref()
-                            .map(|config| config.environment.environment_id.as_str())
-                            .unwrap_or("");
-                        let hidden_tags = state.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
-                        let hiding_anywhere = state.hiding_thread_tags() || !state.sidebar.hidden_thread_ids.is_empty();
-                        let already_hidden: HashSet<ThreadKey> =
-                            state.sidebar.hidden_thread_ids.iter().map(|id| ThreadKey::new(env_id, id)).collect();
-                        let loaded_elsewhere: HashSet<ThreadKey> = if hiding_anywhere {
-                            state
-                                .shell
-                                .snapshot
-                                .iter()
-                                .flat_map(|snap| snap.threads.iter())
-                                .map(|thread| ThreadKey::new(env_id, &thread.id))
-                                .collect()
+                let logical_projects: HashMap<_, _> = this.project_groups(cx).into_iter().flat_map(|group| {
+                    group.members.into_iter().map(move |member| (member.project.reference(), (group.key.clone(), group.label.clone())))
+                }).collect();
+                let app = this.state.read(cx);
+                let scoped_groups = snapshots.iter().map(|(owner, snapshot)| {
+                    (owner.as_ref(), archive_groups(app, owner.as_ref(), snapshot))
+                }).collect::<Vec<_>>();
+                let multiple = scoped_groups.iter().filter(|(_, groups)| !groups.is_empty()).count() > 1;
+                let mut combined = Vec::<ArchiveGroup>::new();
+                let mut index = HashMap::<String, usize>::new();
+                for (owner, groups) in scoped_groups {
+                    let environment = owner.and_then(|owner| app.scoped_environment(&owner.saved_id));
+                    for mut group in groups {
+                        let Some(owner) = owner else {
+                            combined.push(group);
+                            continue;
+                        };
+                        let project = ProjectRef { environment_id: owner.saved_id.clone(), project_id: group.project_id.clone() };
+                        if scope.projects.as_ref().is_some_and(|projects| !projects.contains(&project)) {
+                            continue;
+                        }
+                        let key = if let Some((key, title)) = logical_projects.get(&project).filter(|_| multiple) {
+                            group.title = title.clone();
+                            format!("group:{key}")
                         } else {
-                            HashSet::new()
+                            json!([owner.saved_id, group.project_id]).to_string()
                         };
-                        let visibility = ArchiveVisibility {
-                            environment_id: env_id,
-                            hidden_tags: hidden_tags.as_deref(),
-                            already_hidden: &already_hidden,
-                            loaded_elsewhere: &loaded_elsewhere,
-                            hiding_anywhere,
-                        };
-                        Status::Loaded(model::groups_filtered(&snapshot, Some(&visibility)))
+                        this.archive.projects.entry(key.clone()).or_insert(project);
+                        group.project_id = key.clone();
+                        for thread in &mut group.threads {
+                            let thread_key = json!([owner.saved_id, thread.id]).to_string();
+                            let label = environment.and_then(|entry| entry.config.config.as_ref())
+                                .map_or_else(|| owner.saved_id.clone(), |config| config.environment.label.clone());
+                            this.archive.origins.insert(thread_key.clone(), ArchiveOrigin {
+                                owner: owner.clone(), thread_id: std::mem::replace(&mut thread.id, thread_key), label,
+                            });
+                        }
+                        if let Some(previous) = index.get(&key) {
+                            combined[*previous].threads.extend(group.threads);
+                        } else {
+                            index.insert(key, combined.len());
+                            combined.push(group);
+                        }
                     }
-                    Err(_) => Status::Failed,
-                };
-                this.archive.entries.clear();
-                this.archive.list.reset(0);
+                }
+                if multiple {
+                    for group in &mut combined {
+                        group.threads.sort_by(|left, right| right.archived_or_created().cmp(left.archived_or_created()).then(right.id.cmp(&left.id)));
+                    }
+                }
+                this.archive.show_environment = multiple;
+                this.archive.status = if failed && combined.is_empty() { Status::Failed } else { Status::Loaded(combined) };
+                if failed && matches!(&this.archive.status, Status::Loaded(_)) {
+                    this.archive.action_error = Some(("Could not load all archived threads", t(cx, "One or more environments did not respond.").to_owned()));
+                }
                 this.archive.sync_entries();
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
+    }
+
+    fn may_change_archived_thread(&self, key: &str, cx: &App) -> bool {
+        self.archive.origins.get(key).map_or_else(
+            || self.archive.scope.as_ref().is_some_and(|scope| scope.active_fallback) && self.may(ORCHESTRATION_OPERATE_SCOPE, cx),
+            |origin| self.state.read(cx).scoped_ready(&origin.owner, ORCHESTRATION_OPERATE_SCOPE),
+        )
     }
 
     fn run_archive_action(&mut self, action: Action, thread_id: String, cx: &mut Context<Self>) {
         self.archive.menu = None;
-        if self.archive.pending.contains(&thread_id) {
+        if self.archive.scope.as_ref() != Some(&self.archive_scope(cx)) || !self.may_change_archived_thread(&thread_id, cx)
+            || self.archive.pending.contains(&thread_id) {
             return;
         }
         self.archive.action_error = None;
-        let connection = self.archive.connection;
+        let load_id = self.archive.load_id;
         let title = self.archived_title(&thread_id).unwrap_or_else(|| "this thread".to_owned());
         self.archive.pending.insert(thread_id.clone());
         cx.notify();
@@ -170,20 +264,22 @@ impl SettingsView {
                     // Defer so `AppState` is no longer borrowed by `ConfirmDialog::resolve`.
                     cx.defer(move |cx| {
                         let _ = confirm_view.update(cx, |this, cx| {
-                            if this.archive.connection != connection {
+                            if this.archive.load_id != load_id || this.archive.scope.as_ref() != Some(&this.archive_scope(cx)) {
                                 this.archive.pending.remove(&confirm_id);
                                 cx.notify();
                                 return;
                             }
-                            this.dispatch_archive_action(action, confirm_id, connection, cx);
+                            this.dispatch_archive_action(action, confirm_id, load_id, cx);
                         });
                     });
                 },
                 move |_, cx| {
                     cx.defer(move |cx| {
                         let _ = cancel_view.update(cx, |this, cx| {
-                            this.archive.pending.remove(&cancel_id);
-                            cx.notify();
+                            if this.archive.load_id == load_id {
+                                this.archive.pending.remove(&cancel_id);
+                                cx.notify();
+                            }
                         });
                     });
                 },
@@ -195,24 +291,40 @@ impl SettingsView {
             }
             return;
         }
-        self.dispatch_archive_action(action, thread_id, connection, cx);
+        self.dispatch_archive_action(action, thread_id, load_id, cx);
     }
 
-    fn dispatch_archive_action(&mut self, action: Action, thread_id: String, connection: Option<u64>, cx: &mut Context<Self>) {
-        if self.archive.connection != connection {
+    fn dispatch_archive_action(&mut self, action: Action, thread_id: String, load_id: u64, cx: &mut Context<Self>) {
+        if self.archive.load_id != load_id || self.archive.scope.as_ref() != Some(&self.archive_scope(cx)) || !self.may_change_archived_thread(&thread_id, cx) {
             self.archive.pending.remove(&thread_id);
             cx.notify();
             return;
         }
         let kind = if action == Action::Unarchive { "thread.unarchive" } else { "thread.delete" };
-        let task = self.state.read(cx).rpc(method::DISPATCH_COMMAND, commands::simple_thread_command(kind, &uuid_v4(), &thread_id));
+        let origin = self.archive.origins.get(&thread_id);
+        let payload = commands::simple_thread_command(kind, &uuid_v4(), origin.map_or(thread_id.as_str(), |origin| &origin.thread_id));
+        let app = self.state.read(cx);
+        let destination = origin.map(|origin| app.connections.destination(&origin.owner, ORCHESTRATION_OPERATE_SCOPE));
+        let fallback = destination.is_none().then(|| app.rpc(method::DISPATCH_COMMAND, payload.clone()));
+        let runtime = app.runtime().clone();
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = if let Some(destination) = destination {
+                match destination.await {
+                    Ok(destination) => runtime.spawn(async move {
+                        destination.client.request(method::DISPATCH_COMMAND, payload).await.map_err(|error| error.to_string())
+                    }).await.unwrap_or_else(|error| Err(error.to_string())),
+                    Err(error) => Err(format!("{error:?}")),
+                }
+            } else if let Some(task) = fallback {
+                task.await.map_err(|error| error.to_string())
+            } else {
+                return;
+            };
             let _ = this.update(cx, |this, cx| {
-                this.archive.pending.remove(&thread_id);
-                if this.archive.connection != connection {
+                if this.archive.load_id != load_id || this.archive.scope.as_ref() != Some(&this.archive_scope(cx)) {
                     return;
                 }
+                this.archive.pending.remove(&thread_id);
                 match result {
                     Ok(_) => {
                         if let Status::Loaded(groups) = &mut this.archive.status {
@@ -222,7 +334,7 @@ impl SettingsView {
                     }
                     Err(error) => {
                         let title = if action == Action::Unarchive { "Failed to unarchive thread" } else { "Failed to delete thread" };
-                        this.archive.action_error = Some((title, error.to_string()));
+                        this.archive.action_error = Some((title, error));
                     }
                 }
                 cx.notify();
@@ -256,6 +368,9 @@ impl SettingsView {
 
     /// The loading, failed and empty states; loaded rows render through `archive_list`.
     pub(super) fn archive_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+        if self.archive.scope.as_ref() != Some(&self.archive_scope(cx)) {
+            self.load_archive(cx);
+        }
         if self.archive.has_rows() {
             return Vec::new();
         }
@@ -339,7 +454,13 @@ impl SettingsView {
         let last = index + 1 == self.archive.entries.len();
         let content = match entry {
             ArchiveEntry::Project(group) => {
-                let title = h_flex().gap(r(8.)).child(icon(Icon::Folder, 16., hsla(p.muted_foreground))).child(groups[group].title.clone());
+                let app = self.state.read(cx);
+                let project = &groups[group];
+                let visual = self.archive.projects.get(&project.project_id)
+                    .map_or_else(|| ProjectVisual::for_project(app, &project.project_id), |key| ProjectVisual::for_scoped_project(app, key));
+                let title = h_flex().gap(r(8.))
+                    .child(visual.render(project_icon::size(16., cx), hsla(p.icon_muted), cx))
+                    .child(project.title.clone());
                 div()
                     .id(SharedString::from(format!("archive-project-{}", groups[group].project_id)))
                     .pt(r(if group == 0 { 0. } else { 24. }))
@@ -352,7 +473,11 @@ impl SettingsView {
                 let thread = &groups[group].threads[position];
                 let now = chrono::Utc::now().timestamp_millis();
                 let id = thread.id.clone();
-                let pending = self.archive.pending.contains(&id);
+                let pending = self.archive.pending.contains(&id) || !self.may_change_archived_thread(&id, cx);
+                let mut description = model::description(thread, now);
+                if self.archive.show_environment && let Some(origin) = self.archive.origins.get(&id) {
+                    description = format!("{} · {description}", origin.label);
+                }
                 let (unarchive_id, delete_id, menu_id) = (id.clone(), id.clone(), id.clone());
                 // One segment of `SettingsGroup`: the card's sides on every row, its ends on the first and last.
                 div()
@@ -366,7 +491,7 @@ impl SettingsView {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                            if this.archive.pending.contains(&menu_id) {
+                            if this.archive.pending.contains(&menu_id) || !this.may_change_archived_thread(&menu_id, cx) {
                                 return;
                             }
                             this.archive.menu = Some((menu_id.clone(), event.position));
@@ -376,7 +501,7 @@ impl SettingsView {
                     .child(
                         div().when(position > 0, |this| this.border_t_1().border_color(hsla(p.border).opacity(0.5))).child(
                             Row::new(SharedString::from(format!("archived-row-{id}")), thread.title.clone())
-                                .description(model::description(thread, now))
+                                .description(description)
                                 .control(
                                     h_flex()
                                         .gap(r(8.))
@@ -413,6 +538,26 @@ impl SettingsView {
             .child(div().w_full().max_w(r(896.)).px(r(24.)).child(content))
             .into_any_element()
     }
+}
+
+fn archive_groups(app: &AppState, owner: Option<&EnvironmentOwner>, snapshot: &serde_json::Value) -> Vec<ArchiveGroup> {
+    let entry = owner.and_then(|owner| app.scoped_environment(&owner.saved_id));
+    let config = if owner.is_some() { entry.and_then(|entry| entry.config.config.as_ref()) } else { app.server_config.config.as_ref() };
+    let environment_id = config.map_or("", |config| config.environment.environment_id.as_str());
+    let hidden_tags = config.and_then(|config| config.settings.hidden_tags());
+    let active_env = app.server_config.config.as_ref().map_or("", |cfg| cfg.environment.environment_id.as_str());
+    let already_hidden: HashSet<_> = app.sidebar.hidden_thread_ids.iter().map(|id| ThreadKey::new(active_env, id)).collect();
+    let hiding_anywhere = app.hiding_thread_tags() || hidden_tags.is_some() || !already_hidden.is_empty();
+    let loaded_elsewhere: HashSet<_> = if hiding_anywhere {
+        app.fleet.environments.iter().flat_map(|entry| {
+            let env = entry.summary.owner.canonical_id.as_deref().unwrap_or(&entry.summary.owner.saved_id);
+            entry.summary.threads.iter().map(move |thread| ThreadKey::new(env, &thread.thread.id))
+        }).chain(app.shell.snapshot.iter().flat_map(|snapshot| {
+            snapshot.threads.iter().map(|thread| ThreadKey::new(active_env, &thread.id))
+        })).collect()
+    } else { HashSet::new() };
+    let visibility = ArchiveVisibility { environment_id, hidden_tags: hidden_tags.as_deref(), already_hidden: &already_hidden, loaded_elsewhere: &loaded_elsewhere, hiding_anywhere };
+    model::groups_filtered(snapshot, Some(&visibility))
 }
 
 #[cfg(all(test, feature = "snapshot"))]

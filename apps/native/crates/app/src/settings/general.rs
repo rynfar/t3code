@@ -2,7 +2,7 @@
 //! `ChatSettingsPanel` (`web/src/components/settings/SettingsPanels.tsx`),
 //! `NotificationSettings.tsx`, and `LabsSettingsPanel.tsx`. Copy and defaults match the web.
 
-use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div};
+use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Task, div};
 use gpui_component::h_flex;
 use t3_core::client_settings::{
     ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
@@ -11,6 +11,7 @@ use t3_core::client_settings::{
     screen_reader_announcements_value,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::i18n::{
     DEFAULT_LOCALE, SUPPORTED_LOCALES, SYSTEM_LANGUAGE, native_language_name, supported_language_value,
 };
@@ -30,9 +31,47 @@ use crate::theme::{hsla, palette};
 const MODIFIER: &str = if cfg!(target_os = "macos") { "\u{2318}" } else { "Ctrl" };
 const SIMLOCK_URL: &str = "https://incubator.callstack.com/simlock/";
 
+const DEVICE_DEFAULT_KEYS: &[&str] = &[
+    t3_core::client_settings::THEME_KEY, t3_core::client_settings::THEME_APPEARANCE_MODE_KEY,
+    t3_core::themes::HALVES_KEY, "appearanceContrast", "glassOpacity", "diffColorScheme",
+    "chatWidth", "effortDisplay", "mathRenderingEnabled", "panelAnimationDurationMs",
+    "environmentIdentificationMode", "language", "timestampFormat", "notificationMode",
+    "inAppNotificationsEnabled", "sidebarProjectGroupingMode", "sidebarProjectSortOrder",
+    "sidebarWorkingShelfEnabled", "wordWrap", "persistComposerContextStrip", "diffFilesCollapsed",
+    "diffIgnoreWhitespace", "diffLayout", "proactivePanelsEnabled", "showSkillsInSlashMenu",
+    "composerRichTextEnabled", "sendShortcut", "followUpBehavior", "toolCallVisibility",
+    "screenReaderAnnouncements", "screenReaderWindowTitle", "confirmThreadArchive",
+    "confirmTerminalClose", "confirmThreadDelete", "confirmThreadUnpin", "confirmQuit",
+    "fontFamilySans", "fontFamilyComposer", "fontFamilyCode", "fontFamilyTerminal",
+    "fontSizeInterface", "fontSizePrompt", "fontSizeCode", "fontSizeTerminal",
+    "browserDefaultViewport", "browserDefaultZoomFactor", "browserDefaultAppearance",
+    "browserRecordingFrameRate", "browserRecordingShowKeyPresses", "browserRecordingShowMousePresses",
+    "browserLinkTarget", "browserSearchEngine", "browserCustomSearchUrl",
+    "browserAutoShowFloatingPreview", "pullRequestLinksOpenInApp",
+];
+
+fn device_default_patch(doc: &ClientSettingsDoc) -> serde_json::Map<String, serde_json::Value> {
+    DEVICE_DEFAULT_KEYS.iter().copied()
+        .filter(|key| doc.entries().get(*key).is_some_and(|value| !value.is_null()))
+        .map(|key| (key.to_owned(), serde_json::Value::Null))
+        .collect()
+}
+
 #[derive(Default)]
 pub(crate) struct ChatState {
     advanced: bool,
+    fast_checkout: Option<FastCheckoutSupport>,
+}
+
+struct FastCheckoutSupport {
+    owners: Vec<EnvironmentOwner>,
+    connection: Option<u64>,
+    supported: bool,
+    _task: Task<()>,
+}
+
+fn advertised_fast_checkout(reply: &serde_json::Value) -> bool {
+    reply["environment"]["capabilities"]["fastWorktreeCheckout"].as_bool() == Some(true)
 }
 
 fn literal_options<T: Copy>(all: &[T], value: fn(T) -> &'static str, label: fn(T) -> &'static str) -> Vec<SelectOption> {
@@ -249,12 +288,44 @@ impl SettingsView {
             cx,
         );
 
+        let has_device_changes = !device_default_patch(&doc).is_empty();
+        let restore = section(t(cx, "Device defaults"), vec![
+            Row::new("restore-device-defaults", t(cx, "Restore device defaults"))
+                .description(t(cx, "Reset display, chat, browser, and notification preferences on this device."))
+                .control(Button::new("restore-device-defaults-button", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, "Restore")).disabled(!has_device_changes)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_restore_device_defaults(cx))))
+                .into_any_element(),
+        ], cx);
+
         vec![
             Block::new(&["notifications", "thread-notifications", "in-app-notifications"], notifications),
             Block::new(&["sidebar", "project-grouping", "project-order", "working-shelf"], sidebar),
             Block::new(&["confirmations", "unpin-confirmation", "archive-confirmation", "delete-confirmation", "terminal-close-confirmation", "quit-confirmation"], confirmations),
             Block::new(&["display", "language", "time-format"], display),
+            Block::new(&["restore-device-defaults"], restore),
         ]
+    }
+
+    fn confirm_restore_device_defaults(&self, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        crate::dialog::ask_with_options(
+            t(cx, "Restore device defaults?
+Reset personal preferences on this device. Saved environments, themes, and browser profiles are kept."),
+            t(cx, "Restore"),
+            crate::dialog::ConfirmVariant::Destructive,
+            crate::dialog::InitialFocus::Cancel,
+            move |_, cx| {
+                cx.defer(move |cx| {
+                    let patch = device_default_patch(store::client(cx));
+                    if !patch.is_empty() {
+                        store::update_client(&state, ClientSettingChange::ThemePatch(patch), cx);
+                    }
+                });
+            },
+            None,
+            cx,
+        );
     }
 
     pub(super) fn chat(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
@@ -448,6 +519,60 @@ impl SettingsView {
         ]
     }
 
+    fn fast_checkout_supported(&mut self, cx: &mut Context<Self>) -> bool {
+        use t3_core::auth::ORCHESTRATION_READ_SCOPE;
+
+        if self.is_project_scope(cx) {
+            self.chat_ui.fast_checkout = None;
+            return false;
+        }
+        let owners = self.scoped_environment_owners(cx);
+        let app = self.state.read(cx);
+        let connection = app.connection_id();
+        let fallback_allowed = self.scope.machine.is_none() && owners.is_empty() && self.connected_now(cx);
+        if owners.is_empty() && !fallback_allowed {
+            self.chat_ui.fast_checkout = None;
+            return false;
+        }
+        if let Some(probe) = self.chat_ui.fast_checkout.as_ref()
+            && probe.owners == owners && probe.connection == connection
+        {
+            return probe.supported;
+        }
+        // Read the advertised flag directly while the shared EnvironmentCapabilities type omits it.
+        let fallback = fallback_allowed.then(|| app.rpc("server.getConfig", serde_json::json!({})));
+        let lookups = owners.iter().map(|owner| app.connections.destination(owner, ORCHESTRATION_READ_SCOPE)).collect::<Vec<_>>();
+        let runtime = app.runtime().clone();
+        let captured = owners.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let supported = if let Some(request) = fallback {
+                request.await.is_ok_and(|reply| advertised_fast_checkout(&reply))
+            } else {
+                let reports = futures::future::join_all(lookups.into_iter().map(|lookup| {
+                    let runtime = runtime.clone();
+                    async move {
+                        let Ok(destination) = lookup.await else { return false };
+                        runtime.spawn(async move {
+                            destination.client.request("server.getConfig", serde_json::json!({})).await
+                                .is_ok_and(|reply| advertised_fast_checkout(&reply))
+                        }).await.unwrap_or(false)
+                    }
+                })).await;
+                reports.into_iter().all(|supported| supported)
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(probe) = this.chat_ui.fast_checkout.as_mut()
+                    && probe.owners == captured && probe.connection == connection
+                {
+                    probe.supported = supported;
+                    cx.notify();
+                }
+            });
+        });
+        self.chat_ui.fast_checkout = Some(FastCheckoutSupport { owners, connection, supported: false, _task: task });
+        false
+    }
+
     pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
         let p = palette(cx);
         let doc = self.doc(cx).clone();
@@ -535,6 +660,21 @@ impl SettingsView {
                 ServerSettingChange::GuestSharingEnabled,
             ));
 
+        let cloud = &self.state.read(cx).cloud;
+        let sign_in_denied = scoped_policies.iter().copied()
+            .find_map(|policy| managed_policy::capability_denial(policy, Capability::Connect));
+        let guest_row = if cloud.identity.is_none() && sign_in_denied.is_none() {
+            Row::new("guest-links", t(cx, "Guest links"))
+                .description(t(cx, "Share a thread with a guest who watches it live in a browser and sends messages you approve. Sign in to T3 Connect to use guest links."))
+                .highlighted(self.is_target("guest-links"))
+                .control(Button::new("labs-guest-links-sign-in", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, "Sign in"))
+                    .disabled(cloud.busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx)))))
+        } else {
+            guest_row
+        };
+
         let linked_enabled = config.as_ref().is_some_and(|c| c.settings.threads.linked_environments_enabled);
         let linked_unavailable = managed_policy::setting_lock_reason_for_any(
             scoped_policies.iter().copied(),
@@ -616,11 +756,7 @@ impl SettingsView {
             simlock_row.into_any_element(),
         ];
 
-        let is_mac_server = config
-            .as_ref()
-            .and_then(|c| c.environment.platform.as_ref())
-            .is_some_and(|platform| platform.os == "darwin");
-        if is_mac_server {
+        if self.fast_checkout_supported(cx) {
             let fast_checkout = config.as_ref().is_some_and(|c| c.settings.threads.fast_worktree_checkout);
             let fast_unavailable = managed_policy::setting_lock_reason_for_any(
                 scoped_policies.iter().copied(),
@@ -656,6 +792,29 @@ impl SettingsView {
             ],
             beta,
         )]
+    }
+}
+
+#[cfg(test)]
+mod device_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn fast_worktree_checkout_requires_an_explicit_capability() {
+        for capabilities in [serde_json::json!({}), serde_json::json!({"fastWorktreeCheckout": false})] {
+            assert!(!advertised_fast_checkout(&serde_json::json!({"environment": {"capabilities": capabilities}})));
+        }
+        assert!(advertised_fast_checkout(&serde_json::json!({"environment": {"capabilities": {"fastWorktreeCheckout": true}}})));
+    }
+
+    #[test]
+    fn device_restore_only_patches_its_preferences() {
+        let doc = ClientSettingsDoc::from_json(r#"{
+            "wordWrap": true, "language": "de", "notificationMode": null,
+            "browserProfiles": [ "profile" ], "onboardingCompletedAt": "today", "futureKey": true
+        }"#);
+        let patch = device_default_patch(&doc);
+        assert_eq!(serde_json::Value::Object(patch), serde_json::json!({"wordWrap": null, "language": null}));
     }
 }
 

@@ -652,13 +652,16 @@ impl SettingsView {
             cx,
         );
 
-        let snooze_lock = self.managed_setting_lock(&["snoozePresets"], cx);
-        let snooze_unavail = snooze_lock.clone().or_else(|| env_only.clone());
-        let snooze_section = section(
-            "Snooze",
-            vec![self.snooze_row(&threads.snooze_presets, snooze_unavail.is_some(), snooze_lock.is_some(), window, cx).unavailable(snooze_unavail).into_any_element()],
-            cx,
-        );
+        let snooze_section = (!self.is_project_scope(cx)).then(|| {
+            let snooze_unavailable = self.scoped_unavailable(&["snoozePresets"], env_only.clone(), cx);
+            let locked = self.managed_setting_lock(&["snoozePresets"], cx).is_some();
+            section(
+                crate::i18n::t(cx, "Snooze"),
+                vec![self.snooze_row(&threads.snooze_presets, snooze_unavailable.is_some(), locked, window, cx)
+                    .unavailable(snooze_unavailable).into_any_element()],
+                cx,
+            )
+        });
 
         let switch_view = cx.entity().downgrade();
         let switch = |id: &'static str, checked: bool, change: fn(bool) -> ServerSettingChange| {
@@ -929,10 +932,9 @@ impl SettingsView {
         }
         let text_generation = section("Text generation", text_gen_rows, cx);
 
-        vec![
+        let mut blocks = vec![
             Block::new(&["new-projects", "add-project-starts-in", "ghq-clone-layout"], new_projects),
             Block::new(&["project-defaults", "default-model", "fallback-model", "default-permissions", "new-threads"], new_threads),
-            Block::new(&["snooze", "snooze-options"], snooze_section),
             Block::new(&["usage-limits", "auto-resume-limited-threads", "snooze-limited-threads"], usage_limits),
             Block::new(
                 &[
@@ -945,7 +947,11 @@ impl SettingsView {
                 auto_settle,
             ),
             Block::new(&["text-generation", "text-generation-model", "thread-title-instructions", "response-streaming"], text_generation),
-        ]
+        ];
+        if let Some(snooze) = snooze_section {
+            blocks.insert(2, Block::new(&["snooze", "snooze-options"], snooze));
+        }
+        blocks
     }
 
     fn commit_base_directory(&mut self, cx: &mut Context<Self>) {

@@ -56,7 +56,7 @@ pub(super) fn shows_account(selected: &Selected) -> bool {
 
 impl SettingsView {
     pub(super) fn render_editor(&mut self, selected: &Selected, environment_label: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let mut sections = vec![self.render_identity(selected, cx).into_any_element()];
+        let mut sections = vec![self.render_identity(selected, window, cx).into_any_element()];
         if let Some(setup) = self.render_setup(selected, environment_label, window, cx) {
             sections.push(setup.into_any_element());
         }
@@ -76,6 +76,7 @@ impl SettingsView {
             );
         }
         sections.extend(self.render_environment_form(selected,cx));
+        sections.extend(self.render_acp_sessions(cx));
         if model::find_driver(&selected.row.driver).is_none() {
             let description = format!(
                 "This instance uses {}, which is not available in this build. Its configuration is preserved.",
@@ -88,7 +89,7 @@ impl SettingsView {
         v_flex().py(r(16.)).gap(r(24.)).children(sections).into_any_element()
     }
 
-    fn render_identity(&mut self, selected: &Selected, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_identity(&mut self, selected: &Selected, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let p = palette(cx);
         let view = &selected.view;
         let row = &selected.row;
@@ -138,20 +139,10 @@ impl SettingsView {
             .children(delete);
 
         let status = self.render_status_line(selected, cx);
-        let swatch = div()
-            .size(r(16.))
-            .flex_none()
-            .rounded_full()
-            .border_1()
-            .map(|this| match selected.accent {
-                Some(accent) => this.border_color(gpui::rgba(accent)).bg(gpui::rgba(accent)),
-                None => this.border_color(hsla(p.border)),
-            });
         let identity = Row::new("provider-display-name", "Display name").control(
             h_flex()
                 .gap(r(8.))
-                .child(swatch)
-                .child(div().w(r(96.)).child(Input::new(&self.providers.accent).small()))
+                .child(self.render_accent_picker(selected, window, cx))
                 .child(div().w(r(224.)).child(Input::new(&self.providers.display_name).small())),
         );
         v_flex()
@@ -356,7 +347,7 @@ impl SettingsView {
 
     pub(super) fn render_account(&mut self, selected: &Selected, live: &t3_core::server_config::ServerProvider, environment_label: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let session = self.providers.auth.as_ref();
+        let session = self.providers.auth.as_ref().filter(|session| session.instance_id == selected.row.instance_id);
         let state = session.and_then(|session| session.state.clone());
         let pending = session.is_some_and(|session| session.pending);
         let load_error = session.and_then(|session| session.load_error.clone());
@@ -487,26 +478,8 @@ impl SettingsView {
                     .into_any_element(),
             );
         }
-        if let Some(output) = &view.terminal_output {
-            let tail: Vec<&str> = output.lines().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
-            below.push(
-                v_flex()
-                    .py(r(4.))
-                    .gap(r(4.))
-                    .child(
-                        div()
-                            .p(r(8.))
-                            .rounded(r(6.))
-                            .bg(hsla(p.terminal_background))
-                            .text_color(hsla(p.terminal_foreground))
-                            .text_size(r(11.))
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(tail.join("\n")),
-                    )
-                    .child(Input::new(&self.providers.terminal_line).small())
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Sends the line followed by Enter. For prompts that need arrow keys, use the web or desktop app."))
-                    .into_any_element(),
-            );
+        if let Some(terminal) = self.render_auth_terminal(&instance_id, state.as_ref(), cx) {
+            below.push(terminal.into_any_element());
         }
         if !view.credentials.is_empty() {
             below.push(self.render_credentials(&instance_id, &view, cx));
@@ -1014,9 +987,21 @@ impl SettingsView {
     /// Runs one `provider.auth.*` call for the selected instance, one at a time, and shows the
     /// state it answers with at once.
     pub(super) fn auth_command(&mut self, method: &'static str, payload: Value, cx: &mut Context<Self>) {
-        if super::fixture_active(cx) || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) || self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()){return;}
-        let allowed = self.providers.auth.as_ref().is_some_and(|s| {
-            self.scoped_raw_representative_config(cx).is_some_and(|c| c.provider(&s.instance_id).is_some_and(|p| t3_core::managed_policy::driver_allowed(c.managed_policy.as_ref(),&p.driver)))
+        let owner = self.scoped_primary_owner(cx);
+        if super::fixture_active(cx)
+            || self.providers.auth_owner != owner
+            || self.scoped_session(cx).is_some_and(|session| !session.grants(t3_core::usage::PROVIDERS_MANAGE_SCOPE))
+            || self.providers.dialog.as_ref().is_some_and(|dialog| dialog.connection != self.state.read(cx).connection_id())
+        {
+            return;
+        }
+        let allowed = self.providers.auth.as_ref().is_some_and(|session| {
+            payload["instanceId"].as_str() == Some(&session.instance_id)
+                && self.scoped_raw_representative_config(cx).is_some_and(|config| {
+                    config.provider(&session.instance_id).is_some_and(|provider| {
+                        t3_core::managed_policy::driver_allowed(config.managed_policy.as_ref(), &provider.driver)
+                    })
+                })
         });
         if !allowed {return;}
         let Some(session) = self.providers.auth.as_mut() else { return };
@@ -1027,17 +1012,19 @@ impl SettingsView {
         session.error = None;
         let id = session.instance_id.clone();
         cx.notify();
-        let connection=self.state.read(cx).connection_id();
+        let connection = self.state.read(cx).connection_id();
         let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, method, payload, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.state.read(cx).connection_id()!=connection {return;}
+                if this.state.read(cx).connection_id()!=connection || this.scoped_primary_owner(cx) != owner {return;}
                 if let Some(session) = this.providers.auth.as_mut().filter(|session| session.instance_id == id) {
                     session.pending = false;
                     match result {
                         Ok(reply) => {
+                            let offset = super::auth_terminal::output_offset(&reply);
                             if let Some(state) = auth::decode_auth_state(reply) {
+                                session.output_offset = offset;
                                 session.state = Some(state);
                             }
                         }
@@ -1118,15 +1105,6 @@ impl SettingsView {
         let payload = self.providers.auth.as_ref().and_then(|session| session.state.as_ref()).and_then(|state| auth::credentials_payload(instance_id, state, &values));
         if let Some(payload) = payload {
             self.providers.credentials = None;
-            self.auth_command(auth::AUTH_RESPOND, payload, cx);
-        }
-    }
-
-    pub(super) fn submit_terminal_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let line = self.providers.terminal_line.read(cx).value().to_string();
-        let payload = self.providers.auth.as_ref().and_then(|session| session.state.as_ref().and_then(|state| auth::terminal_line_payload(&session.instance_id, state, &line)));
-        if let Some(payload) = payload {
-            self.providers.terminal_line.update(cx, |input, cx| input.set_value("", window, cx));
             self.auth_command(auth::AUTH_RESPOND, payload, cx);
         }
     }
