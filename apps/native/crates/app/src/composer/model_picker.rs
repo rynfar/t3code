@@ -10,7 +10,7 @@ use gpui::{
     Render, ScrollHandle, ScrollStrategy, SharedString, Styled, Subscription, UniformListScrollHandle, Window, actions, div,
     prelude::*, px, uniform_list,
 };
-use gpui_component::input::{Escape, Input, InputEvent, InputState};
+use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveRight};
 use gpui_component::{h_flex, v_flex};
 use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
@@ -286,7 +286,7 @@ impl ModelPicker {
                 != input.selection.as_ref().map(|selection| (&selection.instance_id, &selection.model))
             {
                 self.option_menu = None;
-                self.effort_index = 0;
+                self.effort_index = initial_effort_index(&input.driver, &input.descriptors, cx).unwrap_or_default();
             }
             self.input = input;
             self.refresh_rows(cx);
@@ -922,6 +922,7 @@ impl ModelPicker {
                                 picker.option_menu = None;
                                 cx.notify();
                             }))
+                            .on_action(cx.listener(|picker, _: &Escape, window, cx| picker.close_option_menu(window, cx)))
                             .on_key_down(cx.listener(move |picker, event: &gpui::KeyDownEvent, window, cx| {
                                 let key = event.keystroke.key.as_str();
                                 match key {
@@ -1021,6 +1022,29 @@ impl ModelPicker {
                 cx.notify();
             }
         }
+    }
+
+    fn move_from_search_to_effort(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let search = self.search.read(cx);
+        let end = search.value().len();
+        if !search.focus_handle(cx).is_focused(window) || search.selected_range() != (end..end) {
+            return false;
+        }
+        let new_model = self.highlighted.filter(|index| {
+            matches!(self.rows.get(*index), Some(Row::Model { selected: false, disabled: None, .. }))
+        });
+        let effort = initial_effort_index(&self.input.driver, &self.input.descriptors, cx);
+        if new_model.is_none() && effort.is_none() {
+            return false;
+        }
+        if let Some(index) = new_model {
+            self.activate(index, false, cx);
+        }
+        self.effort_index = effort.unwrap_or_default();
+        self.effort_scroll.scroll_to_item(self.effort_index);
+        window.focus(&self.effort_focus, cx);
+        cx.notify();
+        true
     }
 
     fn close_option_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1148,6 +1172,13 @@ struct OptionRow {
     default: bool,
     description: Option<String>,
     choices: Vec<OptionRow>,
+}
+
+fn initial_effort_index(driver: &str, descriptors: &[OptionDescriptor], cx: &App) -> Option<usize> {
+    let layout = traits::layout(driver, descriptors);
+    let choices = layout.effort.map(|effort| option_rows(effort, cx)).unwrap_or_default();
+    (!choices.is_empty() || !layout.others.is_empty())
+        .then(|| choices.iter().position(|choice| choice.selected).unwrap_or_default())
 }
 
 fn option_rows(descriptor: &OptionDescriptor, cx: &App) -> Vec<OptionRow> {
@@ -1350,27 +1381,12 @@ impl Render for ModelPicker {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .occlude()
-            .capture_key_down(cx.listener(|picker, event: &gpui::KeyDownEvent, window, cx| {
-                let search = picker.search.read(cx);
-                if event.keystroke.key != "right" || event.keystroke.modifiers.modified()
-                    || !search.focus_handle(cx).is_focused(window)
-                    || search.selected_range() != (search.value().len()..search.value().len())
-                {
-                    return;
+            .capture_action(cx.listener(|picker, _: &MoveRight, window, cx| {
+                if picker.move_from_search_to_effort(window, cx) {
+                    cx.stop_propagation();
+                } else {
+                    cx.propagate();
                 }
-                if let Some(index) = picker.highlighted
-                    && matches!(picker.rows.get(index), Some(Row::Model { selected: false, disabled: None, .. }))
-                {
-                    picker.activate(index, false, cx);
-                }
-                let layout = traits::layout(&picker.input.driver, &picker.input.descriptors);
-                let choices = layout.effort.map(|effort| option_rows(effort, cx)).unwrap_or_default();
-                if choices.is_empty() && layout.others.is_empty() { return; }
-                picker.effort_index = choices.iter().position(|choice| choice.selected).unwrap_or_default();
-                picker.effort_scroll.scroll_to_item(picker.effort_index);
-                window.focus(&picker.effort_focus, cx);
-                cx.stop_propagation();
-                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &HighlightPrevious, _, cx| this.move_highlight(-1, cx)))
             .on_action(cx.listener(|this, _: &HighlightNext, _, cx| this.move_highlight(1, cx)))
@@ -1440,5 +1456,49 @@ impl Render for ModelPicker {
                     .child(self.render_effort(model_label, window, cx)),
             )
             .child(self.render_footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Host;
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn right_leaves_search_only_when_the_caret_reaches_the_end(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (_, window_cx) = cx.add_window_view(|_, _| Host);
+        window_cx.update(|window, cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let app = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let picker = cx.new(|cx| ModelPicker::new(app, window, cx));
+            picker.update(cx, |picker, cx| {
+                let effort = serde_json::from_value(serde_json::json!({
+                    "type": "select",
+                    "id": "reasoningEffort",
+                    "role": "reasoningEffort",
+                    "label": "Reasoning",
+                    "options": [{"id": "low", "label": "Low", "isDefault": true}],
+                })).unwrap();
+                picker.input = PickerInput { driver: "codex".into(), descriptors: vec![effort], ..PickerInput::default() };
+                picker.search.update(cx, |search, cx| {
+                    search.set_value("é", window, cx);
+                    search.set_selected_range(0..0, cx);
+                    search.focus(window, cx);
+                });
+                assert!(!picker.move_from_search_to_effort(window, cx));
+
+                picker.search.update(cx, |search, cx| search.set_selected_range(2..2, cx));
+                assert!(picker.move_from_search_to_effort(window, cx));
+                assert!(picker.effort_focus.is_focused(window));
+            });
+        });
     }
 }
