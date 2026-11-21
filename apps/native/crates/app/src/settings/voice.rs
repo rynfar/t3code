@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
-    ParentElement, SharedString, Styled, Subscription, Task, Window, div, prelude::*,
+    ParentElement, SharedString, Styled, Subscription, Task, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Sizable, h_flex, v_flex};
@@ -48,8 +48,11 @@ use super::controls::{
 };
 use super::threads::{model_trait_controls, parse_selection, selection_value};
 use super::{Block, SettingsView, features, store};
+use crate::components::secret_source::SecretSourceInput;
+use crate::i18n::t;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::provider_icon::{ProviderIcon, ProviderMark};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer};
 use crate::voice::{
     AudioCaptureCallbacks, AudioCaptureSession, AudioPlaybackSession, MicPermissionStatus,
     VoiceControllerEvent, VoiceSpeechConfig, VoiceSpeechController, VoiceUiSize,
@@ -60,7 +63,6 @@ use crate::voice::{
 };
 
 const OFF: &str = "off";
-const STORED_SECRET_SOURCE: &str = "__stored__";
 
 #[derive(Debug, Clone)]
 enum CloudLoad<T> {
@@ -119,6 +121,8 @@ pub(crate) struct VoiceState {
     model_sort: SpeechModelSort,
     model_downloaded_only: bool,
     model_selected_languages: Option<Vec<String>>,
+    model_language_search: Entity<InputState>,
+    model_languages_open: bool,
     model_link_path: Entity<InputState>,
     advanced_open: bool,
 
@@ -149,6 +153,7 @@ pub(crate) struct VoiceState {
 impl VoiceState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
+        let model_language_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search languages"));
         let model_link_path = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Already downloaded elsewhere? Paste the model file or folder path")
@@ -169,6 +174,11 @@ impl VoiceState {
         let correction_word = cx.new(|cx| InputState::new(window, cx).placeholder("sorry"));
 
         let subscriptions = vec![
+            cx.subscribe(&model_language_search, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(&model_search, window, |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -243,6 +253,8 @@ impl VoiceState {
             model_sort: SpeechModelSort::Recommended,
             model_downloaded_only: false,
             model_selected_languages: None,
+            model_language_search,
+            model_languages_open: false,
             model_link_path,
             advanced_open: false,
             model_test_controller: None,
@@ -297,6 +309,7 @@ impl VoiceState {
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
         let mut out = vec![
             &self.model_search,
+            &self.model_language_search,
             &self.model_link_path,
             &self.personal_term,
             &self.personal_alias_input,
@@ -316,6 +329,16 @@ impl VoiceState {
     }
 }
 
+fn cloud_speech_icon(provider: CloudSpeechProvider, cx: &App) -> AnyElement {
+    match provider {
+        CloudSpeechProvider::Openai | CloudSpeechProvider::Xai => {
+            let driver = if provider == CloudSpeechProvider::Openai { "codex" } else { "grok" };
+            ProviderIcon::new(ProviderMark::configured(driver, provider.label(), None)).into_any_element()
+        }
+        CloudSpeechProvider::Openrouter => icon(Icon::Workflow, 16., hsla(palette(cx).foreground)).into_any_element(),
+    }
+}
+
 fn system_preferred_languages() -> Vec<String> {
     let lang_env = std::env::var("LANG").ok();
     preferred_speech_languages(&[], lang_env.as_deref(), &["en"])
@@ -326,6 +349,7 @@ impl SettingsView {
         if let Some(ctrl) = self.voice.model_test_controller.as_ref() {
             ctrl.update(cx, |controller, cx| controller.cancel(cx));
         }
+        self.voice.model_languages_open = false;
         self.voice.leave();
     }
 
@@ -339,6 +363,12 @@ impl SettingsView {
                 return true;
             }
             self.voice.cloud_dialog = None;
+            self.focus.focus(window, cx);
+            cx.notify();
+            return true;
+        }
+        if self.voice.model_languages_open {
+            self.voice.model_languages_open = false;
             self.focus.focus(window, cx);
             cx.notify();
             return true;
@@ -1920,6 +1950,11 @@ impl SettingsView {
                     .label(selected_dest_label)
                     .width(240.)
                     .popup_width(280.)
+                    .render_icon(|value, cx| {
+                        let provider = value.strip_prefix("cloud:")?.rsplit_once(':')?.1;
+                        CloudSpeechProvider::ALL.iter().copied().find(|item| item.as_str() == provider)
+                            .map(|provider| cloud_speech_icon(provider, cx))
+                    })
                     .on_change(move |value, window, cx| {
                         let _ = weak_dest.update(cx, |this, cx| {
                             if value.as_ref() == OFF {
@@ -2649,6 +2684,87 @@ impl SettingsView {
         row.control(control).into_any_element()
     }
 
+    fn voice_language_filter(
+        &self, ordered: &[String], selected: &[String], cx: &Context<Self>,
+    ) -> AnyElement {
+        let label = if selected.is_empty() {
+            t(cx, "All languages").to_owned()
+        } else {
+            selected.iter().map(|code| speech_language_label(code).into_owned()).collect::<Vec<_>>().join(", ")
+        };
+        let open = self.voice.model_languages_open;
+        let trigger = Button::new("voice-models-lang-filter", ButtonVariant::Outline, ButtonSize::Sm)
+            .icon(Icon::Globe).trailing(Icon::ChevronDown).label(label)
+            .justify_between()
+            .on_click(cx.listener(move |view, _, window, cx| {
+                view.voice.model_languages_open = !open;
+                if !open {
+                    view.voice.model_language_search.update(cx, |input, cx| {
+                        input.set_value("", window, cx);
+                        input.focus(window, cx);
+                    });
+                }
+                cx.notify();
+            }));
+        let popup = open.then(|| {
+            let p = palette(cx);
+            let input = &self.voice.model_language_search;
+            let query = input.read(cx).value().trim().to_lowercase();
+            let visible: Vec<_> = ordered.iter().filter_map(|code| {
+                let label = speech_language_label(code);
+                (query.is_empty() || code.contains(&query) || label.to_lowercase().contains(&query))
+                    .then(|| (code.clone(), label.into_owned()))
+            }).collect();
+            let no_matches = visible.is_empty();
+            let selection = selected.to_vec();
+            let items = visible.into_iter().map(|(language, label)| {
+                let checked = selection.contains(&language);
+                let selection = selection.clone();
+                Button::new(SharedString::from(format!("voice-language-option-{language}")), ButtonVariant::GhostMuted, ButtonSize::Xs)
+                    .label(label).justify_between()
+                    .when(checked, |button| button.trailing(Icon::Check))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        let choices = view.voice.model_selected_languages.get_or_insert_with(|| selection.clone());
+                        if let Some(index) = choices.iter().position(|item| item == &language) {
+                            choices.remove(index);
+                        } else {
+                            choices.push(language.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            });
+            let all = query.is_empty().then(|| {
+                Button::new("voice-language-all", ButtonVariant::GhostMuted, ButtonSize::Xs)
+                    .label("All languages").justify_between()
+                    .when(selected.is_empty(), |button| button.trailing(Icon::Check))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.voice.model_selected_languages = Some(Vec::new());
+                        cx.notify();
+                    }))
+            });
+            div().absolute().bottom_0().right_0().child(
+                gpui::deferred(
+                    gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                        v_flex().id("voice-language-popup").relative().occlude().mt(r(4.)).w(r(250.)).p(r(6.)).gap(r(4.))
+                            .rounded(r(8.)).border_1().border_color(hsla(p.dropdown_border)).bg(hsla(p.popover))
+                            .theme_slot(ThemeSlot::MenuPopup, cx)
+                            .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
+                            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                view.voice.model_languages_open = false;
+                                cx.notify();
+                            }))
+                            .child(Input::new(input).small().aria_label(t(cx, "Search languages")).theme_slot(ThemeSlot::Input, cx))
+                            .child(v_flex().id("voice-language-options").max_h(r(240.)).overflow_y_scroll()
+                                .children(all).children(items)
+                                .when(no_matches, |list| list.child(muted_text(t(cx, "No languages match."), cx)))),
+                    ),
+                ).with_priority(2),
+            )
+        });
+        div().relative().w(r(150.)).child(trigger).children(popup).into_any_element()
+    }
+
     fn render_speech_model_browser(
         &mut self,
         env_id: &str,
@@ -2710,33 +2826,11 @@ impl SettingsView {
             rendered_models.insert(0, active.clone());
         }
 
-        let lang_filter_options: Vec<SelectOption> = std::iter::once(SelectOption::new("all", "All languages"))
-            .chain(
-                ordered_langs
-                    .iter()
-                    .map(|code| SelectOption::new(code.clone(), speech_language_label(code).into_owned())),
-            )
-            .collect();
-        let lang_selected = selected_langs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "all".to_owned());
-        let lang_label = if selected_langs.is_empty() {
-            "All languages".to_owned()
-        } else {
-            selected_langs
-                .iter()
-                .map(|c| speech_language_label(c).into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
         let sort_options: Vec<SelectOption> = SpeechModelSort::ALL
             .iter()
             .map(|sort| SelectOption::new(sort.as_str(), sort.menu_label(&accuracy_lang)))
             .collect();
 
-        let weak_lang = cx.entity().downgrade();
         let weak_sort = cx.entity().downgrade();
         let downloaded_only = self.voice.model_downloaded_only;
         let toolbar = h_flex()
@@ -2744,22 +2838,7 @@ impl SettingsView {
             .gap(r(8.))
             .items_center()
             .child(div().flex_1().min_w_0().child(Input::new(&self.voice.model_search).small()))
-            .child(
-                Select::new("voice-models-lang-filter", lang_filter_options)
-                    .selected(lang_selected)
-                    .label(lang_label)
-                    .width(150.)
-                    .on_change(move |value, _, cx| {
-                        let _ = weak_lang.update(cx, |this, cx| {
-                            this.voice.model_selected_languages = if value.as_ref() == "all" {
-                                Some(Vec::new())
-                            } else {
-                                Some(vec![value.to_string()])
-                            };
-                            cx.notify();
-                        });
-                    }),
-            )
+            .child(self.voice_language_filter(&ordered_langs, &selected_langs, cx))
             .child(
                 Select::new("voice-models-sort", sort_options)
                     .selected(self.voice.model_sort.as_str())
@@ -3395,83 +3474,46 @@ impl SettingsView {
                             }
                             CloudLoad::Loaded(models) => {
                                 let query = dialog.model_search.read(cx).value().trim().to_lowercase();
-                                let filtered: Vec<&CloudSpeechModel> = models
-                                    .iter()
-                                    .filter(|m| {
-                                        query.is_empty()
-                                            || m.name.to_lowercase().contains(&query)
-                                            || m.id.to_lowercase().contains(&query)
-                                    })
-                                    .take(40)
-                                    .collect();
+                                let filtered: Vec<_> = models.iter().filter(|model| {
+                                    query.is_empty() || model.name.to_lowercase().contains(&query)
+                                        || model.id.to_lowercase().contains(&query)
+                                }).cloned().collect();
+                                let selected = dialog.selected_model.clone();
+                                let results = if filtered.is_empty() {
+                                    div().px(r(10.)).py(r(8.)).text_xs().text_color(hsla(p.muted_foreground))
+                                        .child(t(cx, "No transcription model matches.")).into_any_element()
+                                } else {
+                                    let count = filtered.len();
+                                    uniform_list("voice-cloud-openrouter-models", count,
+                                        cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                                            range.map(|index| {
+                                                let model = &filtered[index];
+                                                let is_selected = selected == model.id;
+                                                let model_id = model.id.clone();
+                                                h_flex().id(("voice-cloud-model-row", index)).h(r(42.))
+                                                    .px(r(10.)).justify_between().cursor_pointer()
+                                                    .when(is_selected, |row| row.bg(hsla(p.accent)))
+                                                    .hover(|row| row.bg(hsla(p.accent).opacity(0.6)))
+                                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                                        if let Some(dialog) = view.voice.cloud_dialog.as_mut() {
+                                                            dialog.selected_model = model_id.clone();
+                                                            cx.notify();
+                                                        }
+                                                    }))
+                                                    .child(v_flex().min_w_0()
+                                                        .child(div().text_xs().font_weight(FontWeight::MEDIUM)
+                                                            .text_color(hsla(p.foreground)).truncate().child(model.name.clone()))
+                                                        .child(div().text_size(r(11.)).text_color(hsla(p.muted_foreground))
+                                                            .truncate().child(model.id.clone())))
+                                                    .when(is_selected, |row| row.child(icon(Icon::Check, 14., hsla(p.foreground))))
+                                                    .into_any_element()
+                                            }).collect()
+                                        }),
+                                    ).h(r(42. * count.min(5) as f32)).into_any_element()
+                                };
                                 body = body
-                                    .child(Input::new(&dialog.model_search).small())
-                                    .child(
-                                        v_flex()
-                                            .id("voice-cloud-openrouter-models")
-                                            .max_h(r(180.))
-                                            .overflow_y_scroll()
-                                            .rounded(r(8.))
-                                            .border_1()
-                                            .border_color(hsla(p.border))
-                                            .children(if filtered.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .px(r(10.))
-                                                        .py(r(8.))
-                                                        .text_xs()
-                                                        .text_color(hsla(p.muted_foreground))
-                                                        .child("No transcription model matches.")
-                                                        .into_any_element(),
-                                                ]
-                                            } else {
-                                                filtered
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(i, m)| {
-                                                        let selected = dialog.selected_model == m.id;
-                                                        let model_id = m.id.clone();
-                                                        h_flex()
-                                                            .id(("voice-cloud-model-row", i))
-                                                            .px(r(10.))
-                                                            .py(r(6.))
-                                                            .justify_between()
-                                                            .cursor_pointer()
-                                                            .when(selected, |el| el.bg(hsla(p.accent)))
-                                                            .hover(|el| el.bg(hsla(p.accent).opacity(0.6)))
-                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                if let Some(d) = this.voice.cloud_dialog.as_mut() {
-                                                                    d.selected_model = model_id.clone();
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .child(
-                                                                v_flex()
-                                                                    .min_w_0()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .font_weight(FontWeight::MEDIUM)
-                                                                            .text_color(hsla(p.foreground))
-                                                                            .truncate()
-                                                                            .child(m.name.clone()),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(r(11.))
-                                                                            .text_color(hsla(p.muted_foreground))
-                                                                            .truncate()
-                                                                            .child(m.id.clone()),
-                                                                    ),
-                                                            )
-                                                            .when(selected, |el| {
-                                                                el.child(icon(Icon::Check, 14., hsla(p.foreground)))
-                                                            })
-                                                            .into_any_element()
-                                                    })
-                                                    .collect()
-                                            }),
-                                    );
+                                    .child(Input::new(&dialog.model_search).small().theme_slot(ThemeSlot::Input, cx))
+                                    .child(div().rounded(r(8.)).border_1().border_color(hsla(p.border)).child(results));
                                 if let Some(delisted) = &validation.delisted_model {
                                     body = body.child(
                                         div()
@@ -3487,25 +3529,33 @@ impl SettingsView {
                     }
 
                     if editing_key {
-                        let secret_sources: Vec<(String, String)> = if features(cx).secrets {
-                            self.state
-                                .read(cx)
-                                .server_config
-                                .config
-                                .as_ref()
-                                .map(|c| {
-                                    c.settings
-                                        .secret_providers
-                                        .0
-                                        .iter()
-                                        .map(|sp| (sp.id.clone(), sp.label.clone()))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
+                        let app = self.state.read(cx);
+                        let config = app.fleet.environments.iter().filter_map(|entry| entry.config.config.as_ref())
+                            .chain(app.server_config.config.as_ref())
+                            .find(|config| config.environment.environment_id == dialog.environment_id);
+                        let secret_sources = if features(cx).secrets {
+                            config.map_or(&[][..], |config| config.settings.secret_providers.0.as_slice())
                         } else {
-                            Vec::new()
+                            &[]
                         };
                         let weak_src = cx.entity().downgrade();
+                        let api_key = SecretSourceInput::new("voice-cloud-secret-source", "API key",
+                            &dialog.key_input, secret_sources, dialog.secret_source.as_deref())
+                            .disabled(dialog.busy)
+                            .on_source_change(move |source, window, cx| {
+                                let _ = weak_src.update(cx, |view, cx| {
+                                    if let Some(dialog) = view.voice.cloud_dialog.as_mut() {
+                                        dialog.secret_source = source.map(|source| source.to_string());
+                                        let masked = dialog.secret_source.is_none();
+                                        dialog.key_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                            input.set_masked(masked, window, cx);
+                                        });
+                                        dialog.error = None;
+                                        cx.notify();
+                                    }
+                                });
+                            });
                         body = body
                             .child(
                                 div()
@@ -3518,41 +3568,7 @@ impl SettingsView {
                                         "API key"
                                     }),
                             )
-                            .when(!secret_sources.is_empty(), |el| {
-                                let opts: Vec<SelectOption> = std::iter::once(SelectOption::new(
-                                    STORED_SECRET_SOURCE,
-                                    "Stored key",
-                                ))
-                                .chain(secret_sources.iter().map(|(id, label)| SelectOption::new(id.clone(), label.clone())))
-                                .collect();
-                                el.child(
-                                    Select::new("voice-cloud-secret-source", opts)
-                                        .selected(
-                                            dialog
-                                                .secret_source
-                                                .clone()
-                                                .unwrap_or_else(|| STORED_SECRET_SOURCE.to_owned()),
-                                        )
-                                        .width(200.)
-                                        .disabled(dialog.busy)
-                                        .on_change(move |value, window, cx| {
-                                            let _ = weak_src.update(cx, |this, cx| {
-                                                if let Some(d) = this.voice.cloud_dialog.as_mut() {
-                                                    d.secret_source = (value.as_ref() != STORED_SECRET_SOURCE)
-                                                        .then(|| value.to_string());
-                                                    let masked = d.secret_source.is_none();
-                                                    d.key_input.update(cx, |i, cx| {
-                                                        i.set_value("", window, cx);
-                                                        i.set_masked(masked, window, cx);
-                                                    });
-                                                    d.error = None;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }),
-                                )
-                            })
-                            .child(Input::new(&dialog.key_input).small())
+                            .child(api_key)
                             .child(
                                 div()
                                     .text_xs()

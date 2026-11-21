@@ -1,30 +1,29 @@
 //! `DiffsSettingsPanel` / `DiffColorsSettingsRow` (`SettingsPanels.tsx`), `BrowserSettingsPanel`
 //! (`IntegrationsSettings.tsx`, with `BrowserImportWizard.tsx`) and `SnapShotSettings.tsx`.
-//! Server-streamed preview defaults (profiles, viewport, zoom, appearance, link target, search
-//! engine, agent access) and macOS native SnapShots capture are live; Electron desktop cookie
-//! import, floating preview, and WebView recordings remain Electron-only N/A.
+//! Server-streamed browser preferences and macOS SnapShot capture.
 
 use std::collections::HashMap;
 
 use gpui::{
-    App, AppContext, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*,
+    App, AppContext, Context, ElementId, Entity, Focusable, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use t3_core::client_settings::{
-    BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
+    BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, ClientSettingsDoc, DiffColorScheme, valid_search_template,
 };
 use t3_core::diff::Layout;
 use t3_core::preview::viewport::{
     AppearancePreference, BROWSER_PROFILE_MAX_COUNT, BROWSER_PROFILE_NAME_MAX_LENGTH,
     BrowserProfile, BrowserProfileKind, DEFAULT_BROWSER_PROFILE_ID, RESPONSIVE_SEED_SIZE,
     VIEWPORT_PRESETS, ViewportSetting, find_viewport_preset, is_built_in_browser_profile_id,
-    next_unique_profile_name, preset_setting, rotate_viewport, validate_viewport_dimensions,
+    next_unique_profile_name, preset_setting, report_profiles_payload, rotate_viewport, validate_viewport_dimensions,
     viewport_select_value, zoom_label,
 };
 use t3_core::preview::{DEFAULT_ZOOM, ZOOM_LEVELS, method as preview_method};
 use t3_core::settings::ServerSettingChange;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::settings::snapshot::{
     SnapShotBackendState, SnapShotMode, SnapShotModifier, SnapShotShortcut, SnapShotSound,
     SnapShotSoundSelection, same_snap_shot_shortcut, snap_shot_description,
@@ -33,8 +32,7 @@ use t3_core::settings::snapshot::{
 };
 
 use super::controls::{
-    Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section,
-    unavailable_group,
+    Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section, unavailable_group,
 };
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
@@ -42,11 +40,19 @@ use crate::icons::Icon;
 use crate::snapshot_capture::setup_dialog::{
     render_shortcut_keycaps, shortcut_conflict_message, shortcut_from_keystroke,
 };
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer};
 use crate::toast::{Toast, ToastKind};
 
 const MAC: bool = cfg!(target_os = "macos");
-const BROWSER_ELECTRON_ONLY: &str = "Only available in the desktop app.";
+const BROWSER_COOKIE_IMPORT_UNAVAILABLE: &str =
+    "Importing browser cookies from installed desktop browsers requires the Electron desktop app.";
+const RECORDING_OVERLAYS_UNAVAILABLE: &str =
+    "Input overlays are available in Electron browser recordings only.";
+const CLEAR_PROFILE_UNAVAILABLE: &str =
+    "Connect to an environment to clear profile data";
+const AUTO_SHOW_FLOATING_PREVIEW: &str = "browserAutoShowFloatingPreview";
+const RECORDING_FRAME_RATE: &str = "browserRecordingFrameRate";
+const DEFAULT_RECORDING_FRAME_RATE: u64 = 30;
 const ADVANCED: &[&str] = &[
     "browser-default-viewport",
     "browser-default-zoom",
@@ -57,6 +63,7 @@ const ADVANCED: &[&str] = &[
 struct SnapShotPageState {
     candidate: Option<SnapShotShortcut>,
     recording: bool,
+    sound_menu: bool,
 }
 
 pub(super) struct BrowserState {
@@ -64,6 +71,8 @@ pub(super) struct BrowserState {
     viewport_width: Entity<InputState>,
     viewport_height: Entity<InputState>,
     profile_inputs: HashMap<String, (Entity<InputState>, Subscription)>,
+    profile_menu: Option<String>,
+    clearing_profile: bool,
     advanced: bool,
     snapshot: SnapShotPageState,
     _subscriptions: Vec<Subscription>,
@@ -125,11 +134,31 @@ impl BrowserState {
             });
         });
         let self_sub = cx.observe_self(|view, cx| {
+            if view.section != t3_core::settings::search::Section::Browser {
+                view.browser.profile_menu = None;
+            }
+            if view.section != t3_core::settings::search::Section::SnapShot {
+                view.browser.snapshot.sound_menu = false;
+            }
             if view.browser.snapshot.recording
                 && view.section != t3_core::settings::search::Section::SnapShot
             {
                 view.stop_snapshot_recording(cx);
             }
+        });
+        let view = cx.entity().downgrade();
+        let dismiss_menu = cx.intercept_keystrokes(move |event, _, cx| {
+            if event.keystroke.key != "escape" || crate::dialog::is_open(cx) {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                if view.browser.profile_menu.take().is_some()
+                    || std::mem::take(&mut view.browser.snapshot.sound_menu)
+                {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            });
         });
         let release_sub = cx.on_release(|view: &mut SettingsView, cx| {
             if view.browser.snapshot.recording {
@@ -139,7 +168,7 @@ impl BrowserState {
                 }
             }
         });
-        let mut subscriptions = vec![url_sub, width_sub, height_sub, snap_key_sub, self_sub, release_sub];
+        let mut subscriptions = vec![url_sub, width_sub, height_sub, snap_key_sub, self_sub, dismiss_menu, release_sub];
         if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
             subscriptions.push(cx.observe(&coordinator, |view, _, cx| {
                 if view.section == t3_core::settings::search::Section::SnapShot {
@@ -162,6 +191,8 @@ impl BrowserState {
             viewport_width,
             viewport_height,
             profile_inputs: HashMap::new(),
+            profile_menu: None,
+            clearing_profile: false,
             advanced: false,
             snapshot: SnapShotPageState::default(),
             _subscriptions: subscriptions,
@@ -189,69 +220,99 @@ fn zoom_value_key(level: f64) -> String {
     format!("{level}")
 }
 
-fn clear_server_profile(
-    state: Entity<AppState>,
-    profile_id: String,
-    profile_name: String,
-    remove_after: bool,
-    cx: &mut App,
+fn profile_clear_targets(state: &AppState) -> Option<Vec<EnvironmentOwner>> {
+    use t3_client::supervisor::ConnectionStatus;
+
+    let mut owners = Vec::new();
+    for entry in &state.fleet.environments {
+        if !entry.config.config.as_ref().is_some_and(|config| {
+            config.environment.capabilities.server_browser == Some(true)
+        }) {
+            continue;
+        }
+        if entry.status != ConnectionStatus::Connected
+            || !entry.summary.synchronized
+            || !entry.grants.as_ref().is_some_and(|grants| grants.grants("preview:operate"))
+        {
+            return None;
+        }
+        owners.push(entry.summary.owner.clone());
+    }
+    (!owners.is_empty()).then_some(owners)
+}
+
+fn client_preference(key: &str, value: impl Into<serde_json::Value>) -> ClientSettingChange {
+    ClientSettingChange::ThemePatch([(key.to_owned(), value.into())].into_iter().collect())
+}
+
+pub(crate) fn browser_auto_show_floating_preview(doc: &ClientSettingsDoc) -> bool {
+    doc.entries()
+        .get(AUTO_SHOW_FLOATING_PREVIEW)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+// Device events already produce a docked surface; the device controller can float it in place.
+#[allow(dead_code)]
+pub(crate) fn maybe_float_agent_device(
+    devices: &mut crate::device::Devices,
+    opened: &t3_core::device::AgentOpenedSession,
+    cx: &mut Context<crate::device::Devices>,
 ) {
-    let Some(task) = state.read(cx).request(
-        preview_method::CLEAR_PROFILE,
-        serde_json::json!({ "profileId": profile_id }),
-        Ok,
-    ) else {
-        let title = if remove_after {
-            crate::i18n::t(cx, "Connect to an environment before removing this profile.").to_owned()
-        } else {
-            crate::i18n::t_fmt(cx, "Could not clear {name}''s data", &[("name", profile_name.as_str().into())])
-        };
-        state.update(cx, |state, cx| {
-            state.show_toast(Toast::new(ToastKind::Error, title), cx);
-        });
+    if !store::try_client(cx).is_some_and(browser_auto_show_floating_preview) {
         return;
-    };
-    cx.spawn(async move |cx| {
-        let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-        cx.update(|cx| match result {
-            Ok(_) => {
-                if remove_after {
-                    let mut profiles = store::client(cx).browser_user_profiles();
-                    profiles.retain(|profile| profile.id != profile_id);
-                    let was_default = store::client(cx).browser_default_profile_id() == profile_id;
-                    store::update_client(&state, ClientSettingChange::BrowserProfiles(profiles), cx);
-                    if was_default {
-                        store::update_client(
-                            &state,
-                            ClientSettingChange::BrowserDefaultProfileId(DEFAULT_BROWSER_PROFILE_ID.to_owned()),
-                            cx,
-                        );
-                    }
-                    report_browser_profiles(cx);
-                } else {
-                    let title = crate::i18n::t_fmt(
-                        cx,
-                        "Cleared {name}''s cookies and cache",
-                        &[("name", profile_name.as_str().into())],
-                    );
-                    state.update(cx, |state, cx| {
-                        state.show_toast(Toast::new(ToastKind::Success, title), cx);
-                    });
-                }
-            }
-            Err(_) => {
-                let title = if remove_after {
-                    crate::i18n::t(cx, "Profile data could not be deleted. Try again.").to_owned()
-                } else {
-                    crate::i18n::t_fmt(cx, "Could not clear {name}''s data", &[("name", profile_name.as_str().into())])
-                };
-                state.update(cx, |state, cx| {
-                    state.show_toast(Toast::new(ToastKind::Error, title), cx);
-                });
-            }
-        });
-    })
-    .detach();
+    }
+    let Some(device) = devices.service()
+        .and_then(|service| service.device(&opened.host_id, &opened.device_id)).cloned()
+    else { return };
+    let surface = t3_core::right_panel::Surface::device(Some(t3_core::right_panel::DeviceTarget {
+        host_id: opened.host_id.clone(),
+        device_id: opened.device_id.clone(),
+        platform: opened.platform,
+        name: opened.name.clone(),
+    }));
+    devices.float_device(&opened.thread_id, &surface.id, device, cx);
+}
+
+fn recording_frame_rate(doc: &ClientSettingsDoc) -> u64 {
+    match doc.entries().get(RECORDING_FRAME_RATE).and_then(serde_json::Value::as_u64) {
+        Some(60) => 60,
+        _ => DEFAULT_RECORDING_FRAME_RATE,
+    }
+}
+
+// The preview reporter uses the same payload on settings changes and reconnects.
+#[allow(dead_code)]
+pub(crate) fn browser_profile_report_payload(doc: &ClientSettingsDoc) -> serde_json::Value {
+    let mut payload = report_profiles_payload(
+        &doc.browser_user_profiles(),
+        &doc.browser_default_profile_id(),
+    );
+    payload["recordingFrameRate"] = recording_frame_rate(doc).into();
+    payload
+}
+
+#[derive(Clone, Copy)]
+enum ProfileDataAction {
+    Clear,
+    Remove,
+}
+
+impl ProfileDataAction {
+    fn confirmation(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Clear => (
+                "Clear “{name}”’s cookies and cache?",
+                "You are signed out of its sites. Server browser tabs open in this profile close now.",
+                "Clear cookies and cache",
+            ),
+            Self::Remove => (
+                "Remove “{name}”?",
+                "Its cookies and logins are deleted. Server browser tabs open in this profile close now.",
+                "Remove profile",
+            ),
+        }
+    }
 }
 
 fn reset(
@@ -291,18 +352,218 @@ fn unavailable(
     id: &'static str,
     title: &'static str,
     description: &'static str,
-    value: &'static str,
+    reason: &'static str,
     target: bool,
     cx: &App,
 ) -> gpui::AnyElement {
     Row::new(id, title)
         .description(description)
         .highlighted(target)
-        .control(muted_text(crate::i18n::t(cx, value), cx))
+        .unavailable(Some(reason))
+        .control(muted_text(crate::i18n::t(cx, "Unavailable"), cx))
         .into_any_element()
 }
 
 impl SettingsView {
+    fn confirm_profile_action(
+        &mut self,
+        profile: BrowserProfile,
+        action: ProfileDataAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.browser.profile_menu = None;
+        cx.notify();
+        if self.browser.clearing_profile || crate::dialog::is_open(cx) {
+            return;
+        }
+        let (title, description, label) = action.confirmation();
+        let name = if is_built_in_browser_profile_id(&profile.id) {
+            crate::i18n::t(cx, &profile.name)
+        } else {
+            &profile.name
+        };
+        let title = crate::i18n::t_fmt(cx, title, &[("name", name.into())]);
+        let question = format!("{title}\n{description}");
+        let view = cx.entity().downgrade();
+        crate::dialog::ask_with_options(
+            &question,
+            label,
+            crate::dialog::ConfirmVariant::Destructive,
+            crate::dialog::InitialFocus::Cancel,
+            move |_, cx| {
+                cx.defer(move |cx| {
+                    let _ = view.update(cx, |view, cx| view.apply_profile_action(profile, action, cx));
+                });
+            },
+            None,
+            cx,
+        );
+    }
+
+    fn apply_profile_action(
+        &mut self,
+        profile: BrowserProfile,
+        action: ProfileDataAction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser.clearing_profile {
+            return;
+        }
+        let app = self.state.read(cx);
+        let Some(owners) = profile_clear_targets(app) else {
+            let message = crate::i18n::t(cx, CLEAR_PROFILE_UNAVAILABLE).to_owned();
+            self.state.update(cx, |app, cx| {
+                app.show_toast(Toast::new(ToastKind::Error, message), cx);
+            });
+            return;
+        };
+        let lookups: Vec<_> = owners
+            .iter()
+            .map(|owner| app.connections.destination(owner, "preview:operate"))
+            .collect();
+        let fleet = app.connections.view();
+        let state = self.state.clone();
+        let profile_id = profile.id.clone();
+        let task = app.runtime().spawn(async move {
+            let destinations = futures::future::try_join_all(lookups).await.map_err(|_| ())?;
+            if !destinations.iter().all(|target| target.is_current(&fleet.borrow())) {
+                return Err(());
+            }
+            let requests = destinations.into_iter().map(|target| {
+                let payload = serde_json::json!({ "profileId": profile_id });
+                async move {
+                    target.client.request(preview_method::CLEAR_PROFILE, payload).await
+                }
+            });
+            if futures::future::join_all(requests).await.iter().all(Result::is_ok) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
+        self.browser.clearing_profile = true;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            cx.update(|cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.browser.clearing_profile = false;
+                    cx.notify();
+                });
+                let name = if is_built_in_browser_profile_id(&profile.id) {
+                    crate::i18n::t(cx, &profile.name)
+                } else {
+                    &profile.name
+                };
+                let (kind, title) = match (result, action) {
+                    (Ok(Ok(())), ProfileDataAction::Remove) => {
+                        let doc = store::client(cx);
+                        let mut profiles = doc.browser_user_profiles();
+                        profiles.retain(|item| item.id != profile.id);
+                        let mut changes = doc.clone().apply_change(&ClientSettingChange::BrowserProfiles(profiles));
+                        if doc.browser_default_profile_id() == profile.id {
+                            changes.insert("browserDefaultProfileId".to_owned(), DEFAULT_BROWSER_PROFILE_ID.into());
+                        }
+                        store::update_client(&state, ClientSettingChange::ThemePatch(changes), cx);
+                        report_browser_profiles(cx);
+                        return;
+                    }
+                    (Ok(Ok(())), ProfileDataAction::Clear) => (ToastKind::Success, crate::i18n::t_fmt(
+                        cx, "Cleared {name}''s cookies and cache", &[("name", name.into())],
+                    )),
+                    (_, ProfileDataAction::Remove) => (ToastKind::Error, crate::i18n::t(
+                        cx, "Profile data could not be deleted. Try again.",
+                    ).to_owned()),
+                    (_, ProfileDataAction::Clear) => (ToastKind::Error, crate::i18n::t_fmt(
+                        cx, "Could not clear {name}''s data", &[("name", name.into())],
+                    )),
+                };
+                state.update(cx, |app, cx| app.show_toast(Toast::new(kind, title), cx));
+            });
+        }).detach();
+    }
+
+    fn browser_profile_menu(
+        &self,
+        profile: &BrowserProfile,
+        is_default: bool,
+        default_read_only: bool,
+        clear_available: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = ElementId::Name(profile.id.clone().into());
+        let open = self.browser.profile_menu.as_deref() == Some(profile.id.as_str());
+        let toggle_id = profile.id.clone();
+        let trigger = Button::new((id.clone(), "browser-profile-actions"), ButtonVariant::GhostMuted, ButtonSize::IconXs)
+            .icon(Icon::Ellipsis)
+            .tooltip(crate::i18n::t_fmt(cx, "{name} options", &[("name", profile.name.as_str().into())]))
+            .disabled(self.browser.clearing_profile)
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.browser.profile_menu = (!open).then(|| toggle_id.clone());
+                cx.notify();
+            }));
+        let popup = open.then(|| {
+            let p = palette(cx);
+            let make_default = profile.id.clone();
+            let clear = profile.clone();
+            let remove = profile.clone();
+            let item = |key, label| {
+                Button::new((id.clone(), key), ButtonVariant::GhostMuted, ButtonSize::Xs)
+                    .label(label)
+                    .justify_between()
+            };
+            let data_action = |button: Button| {
+                button.disabled(!clear_available).when(!clear_available, |button| {
+                    button.tooltip(CLEAR_PROFILE_UNAVAILABLE)
+                })
+            };
+            div().absolute().bottom_0().right_0().child(
+                gpui::deferred(
+                    gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                        v_flex()
+                            .id((id.clone(), "browser-profile-menu"))
+                            .relative()
+                            .occlude()
+                            .mt(r(4.))
+                            .w(r(208.))
+                            .p(r(4.))
+                            .rounded(r(8.))
+                            .border_1()
+                            .border_color(hsla(p.dropdown_border))
+                            .bg(hsla(p.popover))
+                            .theme_slot(ThemeSlot::MenuPopup, cx)
+                            .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
+                            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                                view.browser.profile_menu = None;
+                                cx.notify();
+                            }))
+                            .child(item("default", "Set as default")
+                                .disabled(is_default || default_read_only)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.browser.profile_menu = None;
+                                    store::update_client(&view.state, ClientSettingChange::BrowserDefaultProfileId(make_default.clone()), cx);
+                                    report_browser_profiles(cx);
+                                    cx.notify();
+                                })))
+                            .child(data_action(item("clear", "Clear cookies and cache"))
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.confirm_profile_action(clear.clone(), ProfileDataAction::Clear, cx);
+                                })))
+                            .when(!is_built_in_browser_profile_id(&profile.id), |menu| {
+                                menu.child(data_action(Button::new((id.clone(), "remove"), ButtonVariant::GhostDestructive, ButtonSize::Xs)
+                                    .label("Remove profile and data")
+                                    .justify_between())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.confirm_profile_action(remove.clone(), ProfileDataAction::Remove, cx);
+                                    })))
+                            }),
+                    )
+                ).with_priority(2),
+            )
+        });
+        div().relative().flex_none().child(trigger).children(popup).into_any_element()
+    }
+
     pub(super) fn commit_browser_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .browser
@@ -557,13 +818,7 @@ impl SettingsView {
                 .and_then(|c| c.managed_policy.as_ref()),
             t3_core::managed_policy::Capability::BrowserCookieImport,
         );
-        let has_server_browser = self
-            .state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()
-            .is_some_and(|cfg| cfg.environment.capabilities.server_browser == Some(true));
+        let clear_available = profile_clear_targets(self.state.read(cx)).is_some();
         let user_profiles = doc.browser_user_profiles();
         let resolved_profiles = doc.browser_profiles();
         let listed_profiles: Vec<BrowserProfile> = resolved_profiles
@@ -607,15 +862,6 @@ impl SettingsView {
             .map(|(index, profile)| {
                 let built_in = is_built_in_browser_profile_id(&profile.id);
                 let is_default = profile.id == default_profile_id;
-                let profile_id_default = profile.id.clone();
-                let state_default = state.clone();
-                let profile_id_clear = profile.id.clone();
-                let profile_name_clear = profile.name.clone();
-                let state_clear = state.clone();
-                let profile_id_remove = profile.id.clone();
-                let profile_name_remove = profile.name.clone();
-                let state_remove = state.clone();
-
                 let name_slot: gpui::AnyElement = if built_in {
                     div()
                         .truncate()
@@ -626,7 +872,7 @@ impl SettingsView {
                 } else if let Some((input, _)) = self.browser.profile_inputs.get(&profile.id) {
                     div()
                         .w(r(200.))
-                        .child(Input::new(input).small())
+                        .child(Input::new(input).small().theme_slot(ThemeSlot::Input, cx))
                         .into_any_element()
                 } else {
                     div()
@@ -636,75 +882,6 @@ impl SettingsView {
                         .child(profile.name.clone())
                         .into_any_element()
                 };
-
-                let mut clear_btn = Button::new(
-                    SharedString::from(format!("browser-profile-clear-{}", profile.id)),
-                    ButtonVariant::GhostMuted,
-                    ButtonSize::Xs,
-                )
-                .label("Clear cookies and cache")
-                .disabled(!has_server_browser)
-                .on_click(move |_, _, cx| {
-                    clear_server_profile(
-                        state_clear.clone(),
-                        profile_id_clear.clone(),
-                        profile_name_clear.clone(),
-                        false,
-                        cx,
-                    );
-                });
-                if !has_server_browser {
-                    clear_btn = clear_btn.tooltip("Connect to an environment to clear profile data");
-                }
-
-                let mut actions = h_flex().flex_none().items_center().gap(r(4.));
-                if !is_default {
-                    actions = actions.child(
-                        Button::new(
-                            SharedString::from(format!("browser-profile-default-{}", profile.id)),
-                            ButtonVariant::GhostMuted,
-                            ButtonSize::Xs,
-                        )
-                        .label("Set as default")
-                        .disabled(is_project_scope)
-                        .on_click(move |_, _, cx| {
-                            store::update_client(
-                                &state_default,
-                                ClientSettingChange::BrowserDefaultProfileId(profile_id_default.clone()),
-                                cx,
-                            );
-                            report_browser_profiles(cx);
-                        }),
-                    );
-                }
-                actions = actions.child(clear_btn);
-                if !built_in {
-                    let mut remove_btn = Button::new(
-                        SharedString::from(format!("browser-profile-remove-{}", profile.id)),
-                        ButtonVariant::DestructiveOutline,
-                        ButtonSize::Xs,
-                    )
-                    .icon(Icon::Trash2)
-                    .tooltip(if has_server_browser {
-                        "Remove profile and data"
-                    } else {
-                        "Connect to an environment to remove this profile and its data."
-                    })
-                    .disabled(!has_server_browser)
-                    .on_click(move |_, _, cx| {
-                        clear_server_profile(
-                            state_remove.clone(),
-                            profile_id_remove.clone(),
-                            profile_name_remove.clone(),
-                            true,
-                            cx,
-                        );
-                    });
-                    if has_server_browser {
-                        remove_btn = remove_btn.label("Remove profile");
-                    }
-                    actions = actions.child(remove_btn);
-                }
 
                 h_flex()
                     .id(SharedString::from(format!("browser-profile-row-{}", profile.id)))
@@ -739,7 +916,7 @@ impl SettingsView {
                                 )
                             }),
                     )
-                    .child(actions)
+                    .child(self.browser_profile_menu(profile, is_default, is_project_scope, clear_available, cx))
                     .into_any_element()
             })
             .collect();
@@ -863,36 +1040,29 @@ impl SettingsView {
                 row.control(
                     div()
                         .w(r(256.))
-                        .child(Input::new(&self.browser.custom_url).small()),
+                        .child(Input::new(&self.browser.custom_url).small().theme_slot(ThemeSlot::Input, cx)),
                 )
                 .into_any_element(),
             );
         }
+        let auto_show = browser_auto_show_floating_preview(&doc);
+        let auto_show_state = state.clone();
         browsing.push(
-            unavailable_group(
-                BROWSER_ELECTRON_ONLY,
-                vec![
-                    unavailable(
-                        "browser-auto-show-floating-preview",
-                        "Auto-show floating preview",
-                        "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.",
-                        "Unavailable",
-                        self.is_target("browser-auto-show-floating-preview"),
-                        cx,
-                    ),
-                    unavailable(
-                        "browser-cookie-import",
-                        "Import from",
-                        "Importing browser cookies from installed desktop browsers requires the Electron desktop app.",
-                        "Unavailable",
-                        false,
-                        cx,
-                    ),
-                ],
-                cx,
-            )
-            .into_any_element(),
+            Row::new("browser-auto-show-floating-preview", "Auto-show floating preview")
+                .description("Show the floating preview when an agent opens a browser or device unless the agent says otherwise.")
+                .highlighted(self.is_target("browser-auto-show-floating-preview"))
+                .reset(!auto_show, reset(&state, client_preference(AUTO_SHOW_FLOATING_PREVIEW, true)))
+                .control(Switch::new("browser-auto-show-floating-preview-switch", auto_show)
+                    .on_change(move |enabled, _, cx| {
+                        store::update_client(&auto_show_state, client_preference(AUTO_SHOW_FLOATING_PREVIEW, enabled), cx);
+                    }))
+                .into_any_element(),
         );
+        browsing.push(unavailable(
+            "browser-cookie-import", "Import from",
+            "Import cookies from an installed browser into a browser profile.",
+            BROWSER_COOKIE_IMPORT_UNAVAILABLE, self.is_target("browser-cookie-import"), cx,
+        ));
         let advanced = self.browser.advanced || ADVANCED.iter().any(|id| self.is_target(id));
         browsing.push(
             div()
@@ -1077,11 +1247,29 @@ impl SettingsView {
                     .into_any_element(),
             ]);
         }
-        let recordings = section("Recordings", vec![unavailable_group(BROWSER_ELECTRON_ONLY, vec![
-            unavailable("browser-recording-frame-rate", "Browser recording frame rate", "Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.", "Unavailable", self.is_target("browser-recording-frame-rate"), cx),
-            unavailable("browser-recording-key-presses", "Show key presses in recordings", "Show pressed keys and shortcuts in new recordings. Password fields are excluded.", "Unavailable", self.is_target("browser-recording-key-presses"), cx),
-            unavailable("browser-recording-mouse-presses", "Show mouse presses in recordings", "Highlight mouse presses and held buttons in new recordings.", "Unavailable", self.is_target("browser-recording-mouse-presses"), cx),
-        ], cx).into_any_element()], cx);
+        let frame_rate = recording_frame_rate(&doc);
+        let frame_rate_state = state.clone();
+        let reset_frame_rate_state = state.clone();
+        let recordings = section("Recordings", vec![
+            Row::new("browser-recording-frame-rate", "Browser recording frame rate")
+                .description("Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.")
+                .highlighted(self.is_target("browser-recording-frame-rate"))
+                .reset(frame_rate != DEFAULT_RECORDING_FRAME_RATE, move |_, _, cx| {
+                    store::update_client(&reset_frame_rate_state, client_preference(RECORDING_FRAME_RATE, DEFAULT_RECORDING_FRAME_RATE), cx);
+                    report_browser_profiles(cx);
+                })
+                .control(Select::new(
+                    "browser-recording-frame-rate-select",
+                    vec![SelectOption::new("30", "30 fps"), SelectOption::new("60", "60 fps")],
+                ).selected(frame_rate.to_string()).show_check().on_change(move |value, _, cx| {
+                    let rate = if value.as_ref() == "60" { 60 } else { DEFAULT_RECORDING_FRAME_RATE };
+                    store::update_client(&frame_rate_state, client_preference(RECORDING_FRAME_RATE, rate), cx);
+                    report_browser_profiles(cx);
+                }))
+                .into_any_element(),
+            unavailable("browser-recording-key-presses", "Show key presses in recordings", "Show pressed keys and shortcuts in new recordings. Password fields are excluded.", RECORDING_OVERLAYS_UNAVAILABLE, self.is_target("browser-recording-key-presses"), cx),
+            unavailable("browser-recording-mouse-presses", "Show mouse presses in recordings", "Highlight mouse presses and held buttons in new recordings.", RECORDING_OVERLAYS_UNAVAILABLE, self.is_target("browser-recording-mouse-presses"), cx),
+        ], cx);
         vec![
             Block::new(&["browser-agent-access", "agent-browser-access"], access),
             Block::new(
@@ -1149,6 +1337,58 @@ impl SettingsView {
         } else {
             SnapShotBackendState::unsupported(doc.snap_shot_shortcut())
         }
+    }
+
+    fn snapshot_sound_menu(&self, selection: SnapShotSoundSelection, cx: &Context<Self>) -> gpui::AnyElement {
+        let p = palette(cx);
+        let open = self.browser.snapshot.sound_menu;
+        let trigger = Button::new("snap-shot-sound-select", ButtonVariant::Outline, ButtonSize::Sm)
+            .label(selection.label()).trailing(Icon::ChevronDown)
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.browser.snapshot.sound_menu = !open;
+                cx.notify();
+            }));
+        let popup = open.then(|| {
+            let items = SnapShotSoundSelection::ALL.iter().copied().map(|option| {
+                let id = ElementId::Name(option.as_str().into());
+                let pick = Button::new((id.clone(), "snapshot-sound"), ButtonVariant::GhostMuted, ButtonSize::Xs)
+                    .label(option.label()).justify_between()
+                    .when(option == selection, |button| button.trailing(Icon::Check))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.browser.snapshot.sound_menu = false;
+                        store::update_client(&view.state, ClientSettingChange::SnapShotSoundSelection(option), cx);
+                        cx.notify();
+                    }));
+                h_flex().gap(r(4.)).child(div().flex_1().min_w_0().child(pick))
+                    .children(match option {
+                        SnapShotSoundSelection::Off => None,
+                        SnapShotSoundSelection::Sound(sound) => Some(
+                            Button::new((id, "snapshot-sound-play"), ButtonVariant::GhostMuted, ButtonSize::IconXs)
+                                .icon(Icon::Play)
+                                .tooltip(match sound {
+                                    SnapShotSound::SoftPop => "Play Whoosh",
+                                    SnapShotSound::CameraShutter => "Play Click",
+                                })
+                                .on_click(move |_, _, cx| crate::snapshot_capture::platform(cx).play_sound(sound)),
+                        ),
+                    })
+            });
+            div().absolute().bottom_0().right_0().child(
+                gpui::deferred(gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                    v_flex().id("snap-shot-sound-menu").relative().occlude()
+                        .mt(r(4.)).w(r(196.)).p(r(4.)).rounded(r(8.)).border_1()
+                        .border_color(hsla(p.dropdown_border)).bg(hsla(p.popover))
+                        .theme_slot(ThemeSlot::MenuPopup, cx)
+                        .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
+                        .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                            view.browser.snapshot.sound_menu = false;
+                            cx.notify();
+                        }))
+                        .children(items),
+                )).with_priority(2)
+            )
+        });
+        div().relative().child(trigger).children(popup).into_any_element()
     }
 
     pub(super) fn snapshots_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
@@ -1445,49 +1685,6 @@ impl SettingsView {
             rows.push(shortcut_row.into_any_element());
 
             let sound_selection = doc.snap_shot_sound_selection();
-            let sound_state = state.clone();
-            let sound_select = Select::new(
-                "snap-shot-sound-select",
-                SnapShotSoundSelection::ALL
-                    .iter()
-                    .map(|opt| SelectOption::new(opt.as_str(), opt.label()))
-                    .collect(),
-            )
-            .selected(sound_selection.as_str())
-            .width(176.)
-            .show_check()
-            .on_change(move |next, _, cx| {
-                if let Some(selection) = SnapShotSoundSelection::parse(next.as_ref()) {
-                    store::update_client(
-                        &sound_state,
-                        ClientSettingChange::SnapShotSoundSelection(selection),
-                        cx,
-                    );
-                }
-            });
-            let preview_sound = match sound_selection {
-                SnapShotSoundSelection::Off => None,
-                SnapShotSoundSelection::Sound(sound) => Some(sound),
-            };
-            let sound_controls = h_flex()
-                .items_center()
-                .gap(r(6.))
-                .child(sound_select)
-                .child(
-                    Button::new("snap-shot-sound-preview", ButtonVariant::Outline, ButtonSize::IconSm)
-                        .icon(Icon::Play)
-                        .tooltip(match preview_sound {
-                            Some(SnapShotSound::SoftPop) => "Play Whoosh",
-                            Some(SnapShotSound::CameraShutter) => "Play Click",
-                            None => "Sound is off",
-                        })
-                        .disabled(preview_sound.is_none())
-                        .on_click(move |_, _, cx| {
-                            if let Some(sound) = preview_sound {
-                                crate::snapshot_capture::platform(cx).play_sound(sound);
-                            }
-                        }),
-                );
             rows.push(
                 Row::new("snap-shot-sound", "Capture sound")
                     .description("Choose the sound played when capture starts.")
@@ -1501,7 +1698,7 @@ impl SettingsView {
                             ),
                         ),
                     )
-                    .control(sound_controls)
+                    .control(self.snapshot_sound_menu(sound_selection, cx))
                     .into_any_element(),
             );
 
@@ -1604,6 +1801,19 @@ mod tests {
         assert_eq!(rg_when_bo, (base.diff_deletion, base.diff_addition));
         assert_eq!(bo_when_bo, (base.blue_orange_diff_addition, base.blue_orange_diff_deletion));
         assert_ne!(rg_when_bo, bo_when_bo);
+    }
+
+    #[test]
+    fn preview_preferences_keep_contract_defaults_and_report_saved_frame_rate() {
+        let mut settings = ClientSettingsDoc::default();
+        assert!(browser_auto_show_floating_preview(&settings));
+        assert_eq!(browser_profile_report_payload(&settings)["recordingFrameRate"], 30);
+        settings.apply_change(&client_preference(AUTO_SHOW_FLOATING_PREVIEW, false));
+        settings.apply_change(&client_preference(RECORDING_FRAME_RATE, 60_u64));
+        assert!(!browser_auto_show_floating_preview(&settings));
+        assert_eq!(browser_profile_report_payload(&settings)["recordingFrameRate"], 60);
+        settings.apply_change(&client_preference(RECORDING_FRAME_RATE, 24_u64));
+        assert_eq!(browser_profile_report_payload(&settings)["recordingFrameRate"], 30);
     }
 
     #[test]
