@@ -1,11 +1,10 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
-use gpui::{AnyElement, App, AppContext, Entity, HighlightStyle, IntoElement, ParentElement, Styled, Window, div};
+use gpui::{App, AppContext, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render, Styled, Window, div};
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast::Node};
 use t3_core::assistant_citations::{self as rules, Citation};
 
@@ -20,26 +19,30 @@ pub(crate) struct FindHighlights<'a> {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct ToolFind {
-    scope: Option<(String, Option<u64>)>,
-    next: Rc<Cell<u64>>,
+pub(super) struct ToolFind(Option<Rc<ToolMatches>>);
+
+struct ToolMatches {
+    query: String,
+    active: Option<u64>,
+    next: Cell<u64>,
 }
 
 impl ToolFind {
     pub fn new(id: &str, find: Option<FindHighlights<'_>>) -> Self {
-        Self {
-            scope: find.map(|find| (find.query.to_owned(), find.active.filter(|(entry, _)| *entry == id).map(|(_, index)| index))),
-            next: Rc::default(),
-        }
+        Self(find.map(|find| Rc::new(ToolMatches {
+            query: find.query.to_owned(),
+            active: find.active.filter(|(entry, _)| *entry == id).map(|(_, index)| index),
+            next: Cell::new(0),
+        })))
     }
 
     pub fn styles(&self, text: &str, cx: &App) -> Vec<(Range<usize>, HighlightStyle)> {
-        let Some((query, active)) = &self.scope else { return Vec::new() };
+        let Some(matches) = &self.0 else { return Vec::new() };
         let p = palette(cx);
-        occurrences(text, query).into_iter().map(|range| {
-            let index = self.next.get();
-            self.next.set(index + 1);
-            let color = if *active == Some(index) { p.search_match_active_background } else { p.search_match_background };
+        occurrences(text, &matches.query).into_iter().map(|range| {
+            let index = matches.next.get();
+            matches.next.set(index + 1);
+            let color = if matches.active == Some(index) { p.search_match_active_background } else { p.search_match_background };
             (range, HighlightStyle { background_color: Some(crate::theme::hsla(color)), ..Default::default() })
         }).collect()
     }
@@ -110,12 +113,11 @@ impl MarkdownMarks {
 pub(crate) struct CitationPulse {
     pub citation: Citation,
     started: Instant,
-    pending: Arc<AtomicBool>,
 }
 
 impl CitationPulse {
     pub fn new(citation: Citation) -> Self {
-        Self { citation, started: Instant::now(), pending: Arc::default() }
+        Self { citation, started: Instant::now() }
     }
 
     pub fn finished(&self) -> bool {
@@ -176,8 +178,7 @@ impl Inline {
         Some(())
     }
 
-    fn html(&self, level: Option<u8>, marks: &[(Range<usize>, Mark)], cx: &App) -> String {
-        let p = palette(cx);
+    fn html(&self, level: Option<u8>, marks: &[(Range<usize>, Mark)], colors: [u32; 3]) -> String {
         let tag = level.map_or_else(|| "p".to_owned(), |level| format!("h{level}"));
         let mut out = format!("<{tag}>");
         for (run, tags) in &self.runs {
@@ -195,9 +196,9 @@ impl Inline {
                 let start = range.start.max(run.start);
                 let end = range.end.min(run.end);
                 let color = match mark {
-                    Mark::Find => p.search_match_background,
-                    Mark::ActiveFind => p.search_match_active_background,
-                    Mark::Citation => p.context_chip_citation,
+                    Mark::Find => colors[0],
+                    Mark::ActiveFind => colors[1],
+                    Mark::Citation => colors[2],
                 };
                 escape_html(&mut out, &self.text[offset..start]);
                 out.push_str(&format!(r##"<mark color="#{:08x}">"##, color));
@@ -301,9 +302,14 @@ pub(super) fn mark_extensions(
             let pulse = pulse.lock().unwrap().clone();
             let overlay = if let (Some(range), Some(pulse)) = (&data.cited, pulse) {
                 let cited = html_state(data, Some(range), window, cx);
-                Some(render_pulse(pulse, super::markdown::style_markdown_internal(
-                    TextView::new(&cited).selectable(false), ctx.clone(), code_meta.clone(), cx,
-                ).selectable(false), window, cx))
+                let key = gpui::ElementId::NamedInteger(data.key.clone().into(), 2);
+                let view = window.use_keyed_state(key, cx, |_, _| PulseView::new(pulse.started, cited.clone()));
+                view.update(cx, |view, _| {
+                    if view.started != pulse.started || view.text != cited {
+                        *view = PulseView::new(pulse.started, cited);
+                    }
+                });
+                Some(div().absolute().inset_0().child(view))
             } else {
                 None
             };
@@ -324,18 +330,18 @@ fn html_state(data: &Arc<HighlightedProse>, cited: Option<&Range<usize>>, window
     let p = palette(cx);
     let colors = [p.search_match_background, p.search_match_active_background, p.context_chip_citation];
     let key = gpui::ElementId::NamedInteger(data.key.clone().into(), u64::from(cited.is_some()));
-    let html = |cx: &App| match cited {
-        Some(range) => data.inline.html(data.level, &[(range.clone(), Mark::Citation)], cx),
-        None => data.inline.html(data.level, &data.find, cx),
+    let html = || match cited {
+        Some(range) => data.inline.html(data.level, &[(range.clone(), Mark::Citation)], colors),
+        None => data.inline.html(data.level, &data.find, colors),
     };
     let entity = window.use_keyed_state(key, cx, |_, cx| HtmlState {
         data: data.clone(),
         colors,
-        child: cx.new(|cx| TextViewState::html(&html(cx), cx).selectable(cited.is_none())),
+        child: cx.new(|cx| TextViewState::html(&html(), cx).selectable(cited.is_none())),
     });
     entity.update(cx, |state, cx| {
         if !Arc::ptr_eq(&state.data, data) || state.colors != colors {
-            let html = html(cx);
+            let html = html();
             state.child.update(cx, |child, cx| child.set_text(&html, cx));
             state.data = data.clone();
             state.colors = colors;
@@ -344,42 +350,66 @@ fn html_state(data: &Arc<HighlightedProse>, cited: Option<&Range<usize>>, window
     })
 }
 
-fn render_pulse(pulse: CitationPulse, content: TextView, window: &Window, cx: &App) -> AnyElement {
-    let reduced = crate::components::motion::prefers_reduced_motion(cx);
-    let elapsed = pulse.started.elapsed().as_secs_f32() * 1000.;
-    let opacity = if reduced {
-        0.45
-    } else {
-        let stops = [(0., 0.), (325., 0.45), (650., 0.), (975., 0.45), (2550., 0.45), (3000., 0.)];
-        stops.windows(2).find_map(|pair| {
-            let [(a, start), (b, end)] = pair else { return None };
-            (elapsed <= *b).then(|| start + (end - start) * ((elapsed - a) / (b - a)))
-        }).unwrap_or(0.)
-    };
-    if pulse.finished() {
-        return div().into_any_element();
+struct PulseView {
+    started: Instant,
+    text: Entity<TextViewState>,
+    pending: Rc<Cell<bool>>,
+}
+
+impl PulseView {
+    fn new(started: Instant, text: Entity<TextViewState>) -> Self {
+        Self { started, text, pending: Rc::default() }
     }
-    let owner = window.current_view();
-    div().absolute().inset_0().opacity(opacity)
-        .child(gpui::canvas(|_, _, _| (), move |bounds, (), window, cx| {
-            if bounds.intersects(&window.content_mask().bounds)
-                && !pulse.pending.swap(true, Ordering::Relaxed) {
-                let delay = if reduced { (3000. - elapsed) as u64 } else if (975. ..2550.).contains(&elapsed) {
-                    (2550. - elapsed) as u64
-                } else { 34 };
+}
+
+impl Render for PulseView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let reduced = crate::components::motion::prefers_reduced_motion(cx);
+        let elapsed = self.started.elapsed().as_secs_f32() * 1000.;
+        if elapsed >= 3000. {
+            return div();
+        }
+        let stops = [(0., 0.), (325., 0.45), (650., 0.), (975., 0.45), (2550., 0.45), (3000., 0.)];
+        let (opacity, delay) = if reduced {
+            (0.45, 3000. - elapsed)
+        } else {
+            stops.windows(2).find_map(|pair| {
+                let [(a, start), (b, end)] = pair else { return None };
+                (elapsed <= *b).then(|| {
+                    let phase = (elapsed - a) / (b - a);
+                    let delay = if start == end { b - elapsed } else { 34. };
+                    (start + (end - start) * phase, delay)
+                })
+            }).unwrap_or((0., 34.))
+        };
+        let pending = self.pending.clone();
+        let owner = cx.weak_entity();
+        div().relative().size_full().opacity(opacity)
+            .child(gpui::canvas(|_, _, _| (), move |bounds, (), window, cx| {
+                if !bounds.intersects(&window.content_mask().bounds) || pending.replace(true) {
+                    return;
+                }
                 window.spawn(cx, async move |cx| {
-                    cx.background_executor().timer(Duration::from_millis(delay)).await;
+                    cx.background_executor().timer(Duration::from_millis((delay.ceil() as u64).max(1))).await;
                     let _ = cx.update(|window, _| {
+                        if owner.upgrade().is_none() {
+                            return;
+                        }
                         window.on_next_frame(move |_, cx| {
-                            pulse.pending.store(false, Ordering::Relaxed);
-                            cx.notify(owner);
+                            pending.set(false);
+                            if let Some(owner) = owner.upgrade() {
+                                owner.update(cx, |view, cx| {
+                                    if Rc::ptr_eq(&pending, &view.pending) {
+                                        cx.notify();
+                                    }
+                                });
+                            }
                         });
                     });
                 }).detach();
-            }
-        }).absolute().inset_0())
-        .child(content)
-        .into_any_element()
+            }).absolute().inset_0())
+            .child(super::markdown::style_markdown(TextView::new(&self.text), cx).selectable(false))
+    }
 }
 
 #[cfg(test)]
@@ -406,24 +436,21 @@ mod tests {
         assert_eq!(occurrences("aaaa", "aa"), [0..2, 2..4]);
     }
 
-    #[gpui::test]
-    fn a_match_spanning_formatted_runs_marks_only_the_visible_substrings(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::theme::init(cx);
-            let inline = Inline {
-                text: "one blue bird flies".to_owned(),
-                runs: vec![
-                    (0..4, Tags::default()),
-                    (4..8, Tags { formatting: vec!["strong"], link: None }),
-                    (8..19, Tags::default()),
-                ],
-            };
-            let marks = occurrences(&inline.text, "BLUE BIRD").into_iter().map(|range| (range, Mark::ActiveFind)).collect::<Vec<_>>();
-            let html = inline.html(None, &marks, cx);
-            assert!(html.starts_with("<p>one <strong><mark "));
-            assert!(html.contains(">blue</mark></strong><mark "));
-            assert!(html.ends_with("> bird</mark> flies</p>"));
-        });
+    #[test]
+    fn a_match_spanning_formatted_runs_marks_only_the_visible_substrings() {
+        let inline = Inline {
+            text: "one blue bird flies".to_owned(),
+            runs: vec![
+                (0..4, Tags::default()),
+                (4..8, Tags { formatting: vec!["strong"], link: None }),
+                (8..19, Tags::default()),
+            ],
+        };
+        let marks = occurrences(&inline.text, "BLUE BIRD").into_iter().map(|range| (range, Mark::ActiveFind)).collect::<Vec<_>>();
+        let p = crate::theme::BUILT_IN_THEMES[0].light.unwrap();
+        let html = inline.html(None, &marks, [p.search_match_background, p.search_match_active_background, p.context_chip_citation]);
+        assert!(html.starts_with("<p>one <strong><mark "));
+        assert!(html.contains(">blue</mark></strong><mark "));
+        assert!(html.ends_with("> bird</mark> flies</p>"));
     }
-
 }
