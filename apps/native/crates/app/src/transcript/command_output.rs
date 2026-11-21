@@ -37,7 +37,7 @@ pub struct CommandOutputSlot {
 }
 
 #[derive(Clone)]
-struct Display {
+pub(super) struct Display {
     text: SharedString,
     highlights: Highlights,
 }
@@ -112,40 +112,58 @@ fn note(text: impl Into<SharedString>, cx: &App) -> AnyElement {
     mono_block(text, cx).italic().text_color(hsla(palette(cx).muted_foreground)).into_any_element()
 }
 
-/// The output slot of an open command row; `None` while a running command has printed nothing.
-pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Option<AnyElement> {
-    let Some(slot) = slot else { return Some(note(LOADING, cx)) };
-    let output = match slot.status.panel() {
-        Panel::Loading => return Some(note(LOADING, cx)),
-        Panel::Waiting => return None,
-        Panel::Empty => return Some(note(NO_OUTPUT, cx)),
+pub(super) enum OutputPanel {
+    Other(Option<AnyElement>),
+    Text { id: String, display: Display, origin: usize, truncated: bool, scroll: ScrollHandle },
+}
+
+pub(super) fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> OutputPanel {
+    let Some(slot) = slot else { return OutputPanel::Other(Some(note(LOADING, cx))) };
+    match slot.status.panel() {
+        Panel::Loading => OutputPanel::Other(Some(note(LOADING, cx))),
+        Panel::Waiting => OutputPanel::Other(None),
+        Panel::Empty => OutputPanel::Other(Some(note(NO_OUTPUT, cx))),
         Panel::Failed(error) => {
             let text = format!("Couldn't load output: {error}");
-            return Some(mono_block(text, cx).text_color(hsla(palette(cx).destructive)).into_any_element());
+            OutputPanel::Other(Some(mono_block(text, cx).text_color(hsla(palette(cx).destructive)).into_any_element()))
         }
-        Panel::Output(output) => output,
-    };
-    let display = slot.display(output, cx.theme().is_dark());
-    let scroller = div()
-        .id(SharedString::from(format!("command-output:{entry_id}")))
-        .w_full()
-        .max_h(rem(320.))
-        .overflow_y_scroll()
-        .track_scroll(&slot.scroll)
-        .when(output.truncated, |this| {
-            this.child(div().mb(px(4.)).text_size(px(11.)).italic().text_color(hsla(palette(cx).muted_foreground)).child(TRUNCATED))
-        })
-        .child(
-            mono_frame(cx)
-                .text_color(hsla(palette(cx).muted_foreground))
-                .child(
-                    SelectableText::new(SharedString::from(format!("command-output-text:{entry_id}")), display.text)
-                        .highlights(display.highlights)
-                        .origin(output.origin)
-                        .autoscroll(&slot.scroll),
-                ),
-        );
-    Some(scroller.into_any_element())
+        Panel::Output(output) => OutputPanel::Text {
+            id: entry_id.to_owned(),
+            display: slot.display(output, cx.theme().is_dark()),
+            origin: output.origin,
+            truncated: output.truncated,
+            scroll: slot.scroll.clone(),
+        },
+    }
+}
+
+impl OutputPanel {
+    pub fn render(self, find: &super::highlights::ToolFind, cx: &App) -> Option<AnyElement> {
+        let (id, display, origin, truncated, scroll) = match self {
+            Self::Other(node) => return node,
+            Self::Text { id, display, origin, truncated, scroll } => (id, display, origin, truncated, scroll),
+        };
+        let highlights = find.combine(&display.text, &display.highlights, cx);
+        Some(div()
+            .id(SharedString::from(format!("command-output:{id}")))
+            .w_full()
+            .max_h(rem(320.))
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .when(truncated, |this| {
+                this.child(div().mb(px(4.)).text_size(px(11.)).italic().text_color(hsla(palette(cx).muted_foreground)).child(TRUNCATED))
+            })
+            .child(
+                mono_frame(cx)
+                    .text_color(hsla(palette(cx).muted_foreground))
+                    .child(
+                        SelectableText::new(SharedString::from(format!("command-output-text:{id}")), display.text)
+                            .highlights(highlights)
+                            .origin(origin)
+                            .autoscroll(&scroll),
+                    ),
+            ).into_any_element())
+    }
 }
 
 /// `ShellCommandBlock.tsx` and `HighlightedTokens.tsx`, shared by streamed command rows and
@@ -154,6 +172,7 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
 pub struct ShellCommandBlock {
     id: SharedString,
     command: SharedString,
+    matches: Vec<(std::ops::Range<usize>, HighlightStyle)>,
 }
 
 impl ShellCommandBlock {
@@ -161,8 +180,14 @@ impl ShellCommandBlock {
         Self {
             id: SharedString::from(format!("shell-command:{id}")),
             command,
+            matches: Vec::new(),
         }
     }
+    pub fn matches(mut self, matches: Vec<(std::ops::Range<usize>, HighlightStyle)>) -> Self {
+        self.matches = matches;
+        self
+    }
+
 }
 
 struct CommandSyntax {
@@ -212,10 +237,13 @@ impl gpui::RenderOnce for ShellCommandBlock {
             }
             state.highlights.clone()
         });
-        let mut text = SelectableText::new(self.id, command);
-        if let Some(highlights) = highlights {
-            text = text.highlights(highlights);
-        }
+        let syntax = highlights.unwrap_or_default();
+        let highlights = if self.matches.is_empty() {
+            syntax
+        } else {
+            gpui::combine_highlights(syntax.iter().cloned(), self.matches).collect()
+        };
+        let text = SelectableText::new(self.id, command).highlights(highlights);
         div()
             .w_full()
             .min_w_0()

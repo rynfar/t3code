@@ -29,7 +29,7 @@ pub(super) struct CitationUi {
     pub(super) selection_focus: FocusHandle,
     pending: Option<(Citation, rules::CitationProcedure)>,
     pub(super) highlighted: Option<String>,
-    pub(super) cited_excerpt: Option<Citation>,
+    pub(super) cited_excerpt: Option<crate::transcript::highlights::CitationPulse>,
 }
 impl CitationUi {
     pub fn new(cx: &mut Context<ThreadView>) -> Self {
@@ -366,7 +366,7 @@ impl ThreadView {
             HistoryAction::Found => {
                 self.citation_ui.pending = None;
                 self.citation_ui.highlighted = Some(citation.message_id.clone());
-                self.citation_ui.cited_excerpt = Some(citation.clone());
+                self.citation_ui.cited_excerpt = Some(crate::transcript::highlights::CitationPulse::new(citation.clone()));
                 let matched_excerpt = self.entries_cache.entries().iter().find_map(|entry| match &entry.kind {
                     t3_core::timeline::EntryKind::Message(msg) if msg.id == citation.message_id => {
                         let rendered = rules::markdown_text(&msg.text);

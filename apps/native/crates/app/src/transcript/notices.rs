@@ -2050,7 +2050,6 @@ mod tests {
                         details: &details,
                         group_lists: &group_lists,
                         working_timer: None,
-                        find_target: None,
                         find: None,
                         cited_excerpt: None,
                         turn_diffs: &turn_diffs,
