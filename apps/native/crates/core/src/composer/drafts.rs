@@ -22,15 +22,66 @@ pub const PERSIST_DEBOUNCE_MS: u64 = 300;
 pub const STORE_NAME: &str = "composer-drafts";
 /// Old drafts beyond this many are dropped, oldest first, so the file stays small.
 pub const MAX_DRAFTS: usize = 200;
-const VERSION: u32 = 1;
+const VERSION: u32 = 7;
+const SESSION_PREFIX: &str = "draft-session:";
 
-/// The key a draft is stored under: an existing thread, or a project's new-thread draft.
+/// The storage key for the composer of an existing thread.
 pub fn thread_key(thread_id: &str) -> String {
     format!("thread:{thread_id}")
 }
 
+/// The project-based owner key still used by the terminal and panels.
 pub fn new_thread_key(project_id: &str) -> String {
     format!("draft:{project_id}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DraftId(String);
+
+impl DraftId {
+    pub fn new(id: String) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftRef {
+    pub id: DraftId,
+    pub environment_id: Option<String>,
+    pub project_id: String,
+}
+
+impl DraftRef {
+    pub fn new(id: DraftId, environment_id: &str, project_id: &str) -> Self {
+        Self {
+            id,
+            environment_id: (!environment_id.is_empty()).then(|| environment_id.to_owned()),
+            project_id: project_id.to_owned(),
+        }
+    }
+
+    /// Legacy project keys did not record an environment. Reserve an ID for each old key so
+    /// decoding it again before the next save produces the same session.
+    pub fn legacy(project_id: &str) -> Self {
+        use std::fmt::Write as _;
+        let mut id = String::from("legacy-");
+        for byte in project_id.bytes() {
+            let _ = write!(id, "{byte:02x}");
+        }
+        Self::new(DraftId::new(id), "", project_id)
+    }
+
+    pub fn key(&self) -> String {
+        format!("{SESSION_PREFIX}{}:{}:{}", self.id.0, self.environment_id.as_deref().unwrap_or_default(), self.project_id)
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        let mut parts = key.strip_prefix(SESSION_PREFIX)?.splitn(3, ':');
+        let (id, environment_id, project_id) = (parts.next()?, parts.next()?, parts.next()?);
+        (!id.is_empty()).then(|| Self::new(DraftId::new(id.to_owned()), environment_id, project_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,17 +155,12 @@ pub struct Draft {
 
 impl Draft {
     pub fn has_user_content(&self) -> bool {
-        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || !self.review_comments.is_empty() || self.reply_to.is_some() || self.pending_attachment_count > 0
+        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || !self.review_comments.is_empty() || self.reply_to.is_some() || self.pending_attachment_count > 0 || !self.threads.is_empty() || !self.context_records.is_empty()
     }
 
     /// Nothing worth keeping: `composerDraftHasUserContent` plus the choices.
     pub fn is_empty(&self) -> bool {
-        self.prompt.trim().is_empty()
-            && self.attachments.is_empty()
-            && self.pending_attachment_count == 0
-            && self.terminals.is_empty()
-            && self.review_comments.is_empty()
-            && self.reply_to.is_none()
+        !self.has_user_content()
             && self.workspace.is_none()
             && self.model_selection.is_none()
             && self.runtime_mode.is_none()
@@ -151,16 +197,15 @@ impl Draft {
 pub struct DraftStore {
     drafts: BTreeMap<String, Draft>,
     pruned_keys: Vec<String>,
+    preferred: BTreeMap<String, DraftRef>,
 }
 
 impl DraftStore {
     /// Reads the saved document; a draft that does not decode is dropped alone, and bad fields
     /// within a draft degrade individually rather than wiping valid prompt/draft state (`#225`).
     pub fn from_value(value: Option<&Value>) -> DraftStore {
-        let valid_version = value
-            .and_then(|value| value.get("version"))
-            .and_then(Value::as_u64)
-            .is_some_and(|version| version == u64::from(VERSION) || (3..=6).contains(&version));
+        let version = value.and_then(|value| value.get("version")).and_then(Value::as_u64);
+        let valid_version = matches!(version, Some(1 | 3..=7));
         let drafts = value
             .filter(|_| valid_version)
             .and_then(|value| value.get("drafts"))
@@ -168,16 +213,77 @@ impl DraftStore {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter_map(|(key, draft)| Some((key.clone(), decode_draft(draft)?)))
+                    .filter_map(|(key, draft)| {
+                        let key = if version != Some(u64::from(VERSION)) {
+                            key.strip_prefix("draft:").map_or_else(|| key.clone(), |project| DraftRef::legacy(project).key())
+                        } else {
+                            key.clone()
+                        };
+                        Some((key, decode_draft(draft)?))
+                    })
                     .filter(|(_, draft)| !draft.is_empty())
                     .collect()
             })
             .unwrap_or_default();
-        DraftStore { drafts, pruned_keys: Vec::new() }
+        let preferred = value.filter(|_| version == Some(u64::from(VERSION)))
+            .and_then(|value| value.get("preferred"))
+            .and_then(Value::as_object)
+            .map(|entries| entries.iter().filter_map(|(key, draft)| {
+                Some((key.clone(), serde_json::from_value(draft.clone()).ok()?))
+            }).collect())
+            .unwrap_or_default();
+        DraftStore { drafts, preferred, pruned_keys: Vec::new() }
     }
 
     pub fn to_value(&self) -> Value {
-        serde_json::json!({ "version": VERSION, "drafts": self.drafts })
+        serde_json::json!({ "version": VERSION, "drafts": self.drafts, "preferred": self.preferred })
+    }
+
+    pub fn session_drafts(&self) -> impl Iterator<Item = (DraftRef, &Draft)> {
+        self.drafts.iter().filter_map(|(key, draft)| Some((DraftRef::from_key(key)?, draft)))
+    }
+
+    pub fn reusable_session(
+        &self,
+        logical_project: &str,
+        project_id: &str,
+        active_in_project: Option<&DraftRef>,
+        mut promoting: impl FnMut(&DraftRef) -> bool,
+    ) -> Option<DraftRef> {
+        let legacy = DraftRef::legacy(project_id);
+        let preferred = self.preferred.get(logical_project)
+            .or_else(|| self.drafts.contains_key(&legacy.key()).then_some(&legacy));
+        preferred.into_iter().chain(active_in_project).find(|draft| {
+            !promoting(draft) && self.get(&draft.key()).is_none_or(|content| !content.has_user_content())
+        }).cloned()
+    }
+
+    pub fn remember_session(&mut self, logical_project: &str, draft: &DraftRef) -> bool {
+        if self.preferred.get(logical_project) == Some(draft) {
+            return false;
+        }
+        self.preferred.retain(|_, existing| existing.id != draft.id);
+        self.preferred.insert(logical_project.to_owned(), draft.clone());
+        true
+    }
+
+    pub fn forget_session(&mut self, draft: &DraftRef) -> Vec<String> {
+        let mut forgotten = Vec::new();
+        self.preferred.retain(|key, existing| {
+            if existing == draft {
+                forgotten.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        forgotten
+    }
+
+    pub fn restore_session(&mut self, draft: &DraftRef, logical_projects: &[String]) {
+        for logical_project in logical_projects {
+            self.preferred.entry(logical_project.clone()).or_insert_with(|| draft.clone());
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&Draft> {
@@ -239,6 +345,9 @@ impl DraftStore {
         while self.drafts.len() > MAX_DRAFTS {
             let Some(oldest) = self.drafts.iter().min_by_key(|(_, draft)| draft.updated_at).map(|(key, _)| key.clone()) else { break };
             self.drafts.remove(&oldest);
+            if let Some(draft) = DraftRef::from_key(&oldest) {
+                self.forget_session(&draft);
+            }
             self.pruned_keys.push(oldest);
         }
     }

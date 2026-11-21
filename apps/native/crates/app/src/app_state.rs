@@ -13,6 +13,7 @@ use t3_client::store::{self, SavedEnvironments};
 use t3_client::supervisor::{ClientEvent, ClientHandle, ConnectionStatus};
 use t3_core::commands::{self, method};
 use t3_core::composer::ClientSettings;
+use t3_core::composer::drafts::{DraftId, DraftRef};
 use t3_core::history::{HistoryStep, PageOutcome};
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::{ShellState, ShellStreamItem};
@@ -143,6 +144,9 @@ pub struct AppState {
     pub client_settings: ClientSettings,
     /// The project of the new-thread draft, while the user composes a thread that does not exist.
     pub draft_project: Option<String>,
+    draft_route: Option<DraftRef>,
+    pub(crate) pending_draft_retarget: Option<DraftRef>,
+    pub(crate) promoting_drafts: std::collections::HashSet<DraftRef>,
     pub(crate) branch_draft: Option<(crate::context_menu::ThreadMenuOwner, t3_core::workspace::DraftWorkspace)>,
     pub panels: crate::right_panel::PanelState,
     /// The pull requests page replaces the thread area while open (`/pull-requests`).
@@ -158,7 +162,7 @@ pub struct AppState {
     pub(crate) side_threads: crate::side_chat::SideThreads,
     pub(crate) opening_delegated_parent: bool,
     /// A thread just launched from the draft, selected once the shell lists it.
-    select_when_listed: Option<String>,
+    select_when_listed: Option<(String, Option<DraftRef>)>,
     /// Prompts and attachments handed back to the composer per thread, as "Edit from here" restores one.
     composer_restores: std::collections::HashMap<String, ComposerRestore>,
     /// Per-thread in-flight rewinds (kept across thread switches so navigation cannot unlock or drop restore).
@@ -206,6 +210,8 @@ pub struct AppState {
 pub(crate) enum ScopedRouteAction {
     Thread(String),
     Draft(String),
+    OpenDraft(DraftRef),
+    ReopenDraft(DraftRef),
     Branch(String),
     ProjectSettings(String),
     Project { group: Box<t3_core::sidebar::grouping::ScopedProjectGroup>, action: t3_core::thread_actions::ProjectAction },
@@ -304,6 +310,9 @@ impl AppState {
             server_config: ServerConfigState::default(),
             client_settings: settings,
             draft_project: None,
+            draft_route: None,
+            pending_draft_retarget: None,
+            promoting_drafts: Default::default(),
             branch_draft: None,
             panels: Default::default(),
             pull_requests_open: false,
@@ -439,6 +448,7 @@ impl AppState {
         crate::theme::set_environment_themes(&[], cx);
         self.sync_shortcut_keybindings(cx);
         self.draft_project = None;
+        self.draft_route = None;
         self.branch_draft = None;
         self.pull_requests_open = false;
         self.issues_open = false;
@@ -693,6 +703,11 @@ impl AppState {
                 else { self.select_thread(&id,cx); }
             },
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
+            ScopedRouteAction::OpenDraft(draft) => {
+                self.remember_draft(&draft, cx);
+                self.open_draft(draft, cx);
+            }
+            ScopedRouteAction::ReopenDraft(draft) => self.open_draft(draft, cx),
             ScopedRouteAction::Branch(id) => self.start_branch_draft(&id, cx),
             ScopedRouteAction::ProjectSettings(id) => {
                 crate::settings::open_scoped_project(Some(&route.owner.saved_id), &id, cx)
@@ -796,9 +811,8 @@ impl AppState {
 
     fn restore_shell_selection(&mut self, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        if let Some(id) = self.select_when_listed.take_if(|id| mounts.thread(shell, id).is_some()) {
-            self.sidebar.history.replace_draft();
-            self.select_thread(&id, cx);
+        if let Some((id, draft)) = self.select_when_listed.take_if(|(id, _)| mounts.thread(shell, id).is_some()) {
+            self.finish_launch_selection(&id, draft.as_ref(), cx);
         } else if self.selected_thread.is_none()
             && self.draft_project.is_none()
             && let Some(id) = self.restore_thread.take_if(|id| mounts.thread(shell, id).is_some())
@@ -824,7 +838,7 @@ impl AppState {
             && self.draft_project.is_none()
             && !self.pull_requests_open
             && !self.issues_open;
-        let waiting = self.notification_route.is_some() || self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
+        let waiting = self.pending_scoped_route.is_some() || self.notification_route.is_some() || self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
         if !idle || waiting || !self.shell.synchronized {
             return;
         }
@@ -934,6 +948,7 @@ impl AppState {
         self.pull_requests_open = false;
         self.issues_open = false;
         self.draft_project = None;
+        self.draft_route = None;
         self.branch_draft = None;
         if let (Some(client), Some(previous)) = (&self.client, &self.selected_thread) {
             client.close_thread(previous);
@@ -1019,25 +1034,129 @@ impl AppState {
         .detach();
     }
 
-    /// Opens the new-thread draft for `project_id`, leaving the open thread.
+    pub(crate) fn draft_route_key(&self) -> Option<String> {
+        self.active_draft().map(|draft| draft.key())
+    }
+
+    pub(crate) fn is_active_draft(&self, draft: &DraftRef) -> bool {
+        if self.selected_thread.is_some() || self.draft_project.as_deref() != Some(&draft.project_id) {
+            return false;
+        }
+        self.draft_route.as_ref().filter(|route| route.project_id == draft.project_id)
+            .map_or_else(|| DraftRef::legacy(&draft.project_id) == *draft, |route| route == draft)
+    }
+
+    pub(crate) fn active_draft(&self) -> Option<DraftRef> {
+        if self.selected_thread.is_some() {
+            return None;
+        }
+        let project_id = self.draft_project.as_deref()?;
+        self.draft_route.as_ref()
+            .filter(|draft| draft.project_id == project_id)
+            .cloned()
+            .or_else(|| Some(DraftRef::legacy(project_id)))
+    }
+
+    pub(crate) fn new_draft_ref(&self, project_id: &str, environment: Option<&str>) -> DraftRef {
+        DraftRef::new(DraftId::new(uuid_v4()), environment.unwrap_or_default(), project_id)
+    }
+
+    fn draft_project_key(&self, environment: &str, project_id: &str, cx: &gpui::App) -> String {
+        let settings = crate::settings::store::try_client(cx).map(|doc| doc.project_grouping_settings()).unwrap_or_default();
+        if let Some(project) = self.sidebar.grouping_projects.iter().find(|project| {
+            project.owner.saved_id == environment && project.project.id == project_id
+        }) {
+            return t3_core::sidebar::grouping::scoped_logical_key(project, &settings, false);
+        }
+        format!("project:{environment}:{project_id}")
+    }
+
+    pub(crate) fn remember_draft(&self, draft: &DraftRef, cx: &mut gpui::App) {
+        let environment = draft.environment_id.as_deref().or(self.environments.active.as_deref()).unwrap_or_default();
+        let logical_key = self.draft_project_key(environment, &draft.project_id, cx);
+        crate::composer::drafts::remember_session(&logical_key, draft, cx);
+    }
+
+    /// Opens New Thread using the web's preferred-draft and active-draft reuse order.
     pub fn start_draft(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if let Some(draft) = self.pending_draft_retarget.take().filter(|draft| draft.project_id == project_id) {
+            self.remember_draft(&draft, cx);
+            return self.open_draft(draft, cx);
+        }
+        let environment = self.environments.active.as_deref();
+        let env = environment.unwrap_or_default();
+        let logical_key = self.draft_project_key(env, project_id, cx);
+        let active = self.active_draft().filter(|draft| {
+            let env = draft.environment_id.as_deref().unwrap_or(env);
+            self.draft_project_key(env, &draft.project_id, cx) == logical_key
+        });
+        let reusable = crate::composer::drafts::reusable_session(
+            &logical_key, project_id, active.as_ref(), |draft| self.is_promoting_draft(draft), cx,
+        );
+        let draft = if let Some(draft) = reusable {
+            if draft.project_id != project_id || draft.environment_id.as_deref().is_some_and(|saved| Some(saved) != environment) {
+                // A grouped checkout may have a different workspace. Never reuse its binding.
+                let remapped = DraftRef::new(draft.id.clone(), env, project_id);
+                crate::composer::drafts::remap_empty_session(&draft, &remapped, cx);
+                remapped
+            } else {
+                if active.as_ref() != Some(&draft) {
+                    crate::composer::drafts::reset_session_workspace(&draft, cx);
+                }
+                draft
+            }
+        } else {
+            self.new_draft_ref(project_id, environment)
+        };
+        self.remember_draft(&draft, cx);
+        self.open_draft(draft, cx);
+    }
+
+    pub(crate) fn is_promoting_draft(&self, draft: &DraftRef) -> bool {
+        self.promoting_drafts.contains(draft)
+            || self.select_when_listed.as_ref().and_then(|(_, source)| source.as_ref()) == Some(draft)
+    }
+
+    pub(crate) fn open_saved_draft(&mut self, draft: DraftRef, cx: &mut Context<Self>) {
+        let environment = draft.environment_id.as_deref().or_else(|| {
+            if self.shell.project(&draft.project_id).is_some() {
+                return self.environments.active.as_deref();
+            }
+            let mut matches = self.sidebar.grouping_projects.iter().filter(|project| project.project.id == draft.project_id);
+            let project = matches.next()?;
+            matches.next().is_none().then_some(project.owner.saved_id.as_str())
+        });
+        match environment {
+            Some(env) if self.environments.active.as_deref() != Some(env) => {
+                if let Some(owner) = self.scoped_environment(env).map(|entry| entry.summary.owner.clone()) {
+                    self.navigate_scoped(owner, ScopedRouteAction::ReopenDraft(draft), cx);
+                }
+            }
+            _ => self.open_draft(draft, cx),
+        }
+    }
+
+    pub(crate) fn open_draft(&mut self, draft: DraftRef, cx: &mut Context<Self>) {
         self.notification_route = None;
         self.pending_thread_find = None;
         self.pending_composer_file_drop = None;
         self.citation_source = None;
-        if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
+        if self.active_draft().as_ref() == Some(&draft) && self.selected_thread.is_none() {
             self.set_issues_open(false, cx);
             return self.set_pull_requests_open(false, cx);
         }
         self.pull_requests_open = false;
         self.issues_open = false;
-        if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
+        if let (Some(previous), Some(client)) = (self.selected_thread.take(), &self.client) {
             client.close_thread(&previous);
         }
         self.thread = ThreadState::default();
         self.restore_thread = None;
-        self.draft_project = Some(project_id.to_owned());
-        self.sidebar.history.visit(NavEntry::Draft(project_id.to_owned()));
+        self.draft_project = Some(draft.project_id.clone());
+        self.draft_route = Some(draft.clone());
+        self.branch_draft = None;
+        self.sidebar.history.retarget_draft(&draft);
+        self.sidebar.history.visit(NavEntry::Draft(draft));
         self.sync_side_threads(cx);
         self.rebuild_sidebar(cx);
         cx.emit(AppEvent::Selection);
@@ -1049,7 +1168,7 @@ impl AppState {
         self.pending_thread_find = None;
         self.pending_composer_file_drop = None;
         self.citation_source = None;
-        if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
+        if let (Some(previous), Some(client)) = (self.selected_thread.take(), &self.client) {
             client.close_thread(&previous);
         }
         self.thread = ThreadState::default();
@@ -1060,14 +1179,27 @@ impl AppState {
         self.land_home(cx);
     }
 
-    /// Selects a thread the draft launched as soon as the shell lists it.
+    /// Selects a thread once the shell lists it.
     pub fn select_when_listed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.select_launch_when_listed(thread_id, self.active_draft(), cx);
+    }
+
+    pub(crate) fn select_launch_when_listed(&mut self, thread_id: &str, draft: Option<DraftRef>, cx: &mut Context<Self>) {
         if self.thread_shell(thread_id).is_some() {
-            self.sidebar.history.replace_draft();
-            self.select_thread(thread_id, cx);
+            self.finish_launch_selection(thread_id, draft.as_ref(), cx);
         } else {
-            self.select_when_listed = Some(thread_id.to_owned());
+            self.select_when_listed = Some((thread_id.to_owned(), draft));
         }
+    }
+
+    fn finish_launch_selection(&mut self, thread_id: &str, draft: Option<&DraftRef>, cx: &mut Context<Self>) {
+        if let Some(draft) = draft {
+            if self.active_draft().as_ref() != Some(draft) || self.selected_thread.is_some() {
+                return;
+            }
+            self.sidebar.history.replace_draft();
+        }
+        self.select_thread(thread_id, cx);
     }
 
     /// Marks `thread_id` as launching from a draft before `thread.launch` commits so the sidebar

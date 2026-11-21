@@ -13,6 +13,7 @@ use t3_client::load_balancing::{
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
 use t3_core::composer::context::{ExpiredNotice, TerminalContext, TerminalSend, expired_toast_copy};
+use t3_core::composer::drafts::DraftRef;
 use t3_core::composer::menu::ThreadContext;
 use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
 use t3_core::model::ModelSelection;
@@ -67,7 +68,7 @@ pub(super) struct Outgoing {
 /// activating its destination environment before launching the draft thread.
 pub(super) struct PendingRoutedSend {
     saved_id: String,
-    pub(super) project_id: String,
+    pub(super) draft: DraftRef,
     pub(super) expected_prompt: String,
     intent: SubmitIntent,
     preserved_workspace: Option<(ThreadEnvMode, Option<String>, Option<bool>)>,
@@ -296,8 +297,8 @@ impl Composer {
             self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
         }
         match self.snapshot.target.clone() {
-            Some(Target::Draft(project_id)) => {
-                self.submit_draft_with_routing(project_id, outgoing, intent, window, cx)
+            Some(Target::Draft(draft)) => {
+                self.submit_draft_with_routing(draft, outgoing, intent, window, cx)
             }
             Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
             _ => {}
@@ -327,7 +328,7 @@ impl Composer {
         let (
             selected_thread,
             active_env,
-            draft_project,
+            active_draft,
             has_pending_scoped_route,
             has_client,
             has_config,
@@ -337,15 +338,15 @@ impl Composer {
             (
                 state.selected_thread.is_some(),
                 state.environments.active.clone(),
-                state.draft_project.clone(),
+                state.active_draft(),
                 state.has_pending_scoped_route(),
                 state.client_handle().is_some(),
                 state.server_config.config.is_some(),
-                state.shell.project(&pending.project_id).is_some(),
+                state.shell.project(&pending.draft.project_id).is_some(),
             )
         };
         let route_dropped =
-            !has_pending_scoped_route && draft_project.as_deref() != Some(pending.project_id.as_str());
+            !has_pending_scoped_route && active_draft.as_ref() != Some(&pending.draft);
         if selected_thread
             || active_env.as_deref() != Some(pending.saved_id.as_str())
             || route_dropped
@@ -356,7 +357,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        let ready = draft_project.as_deref() == Some(pending.project_id.as_str())
+        let ready = active_draft.as_ref() == Some(&pending.draft)
             && has_client
             && has_config
             && has_project;
@@ -365,7 +366,7 @@ impl Composer {
         }
         let pending = self.pending_routed_send.take().expect("checked above");
         self.sending = false;
-        let expected_target = Target::Draft(pending.project_id.clone());
+        let expected_target = Target::Draft(pending.draft.clone());
         if self.snapshot.target.as_ref() != Some(&expected_target) {
             self.refresh(false, window, cx);
             self.sync_workspace(false, cx);
@@ -391,14 +392,14 @@ impl Composer {
         }
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
         let outgoing = self.outgoing(terminals.text, &staged);
-        self.launch(pending.project_id, outgoing, pending.intent, window, cx);
+        self.launch(pending.draft, outgoing, pending.intent, window, cx);
     }
 
     /// Ports `needsLoadBalancing` (`useComposerSend.ts:461-474`) and `refreshBeforeSend`
     /// (`useDraftEnvironmentRouting.ts:135-200`, `useComposerSend.ts:1487-1499`).
     fn submit_draft_with_routing(
         &mut self,
-        project_id: String,
+        draft: DraftRef,
         outgoing: Outgoing,
         intent: SubmitIntent,
         window: &mut Window,
@@ -435,7 +436,7 @@ impl Composer {
             || self.workspace.routing.resolved_environment_id.is_none()
             || !self.staged_attachments().is_empty()
         {
-            self.launch(project_id, outgoing, intent, window, cx);
+            self.launch(draft, outgoing, intent, window, cx);
             return;
         }
 
@@ -453,7 +454,7 @@ impl Composer {
         let orig_workspace = self
             .selected_workspace()
             .map(|w| (w.mode, w.branch, w.start_from_origin));
-        let orig_project_id = project_id.clone();
+        let original_target = Target::Draft(draft.clone());
 
         self.sending = true;
         cx.notify();
@@ -489,7 +490,8 @@ impl Composer {
                 let cur_resolved = this.resolve(cx);
                 let cur_instance = cur_resolved.model.as_ref().map(|m| m.instance_id.clone());
                 let unchanged = this.snapshot.target.as_ref()
-                    == Some(&Target::Draft(orig_project_id.clone()))
+                    == Some(&original_target)
+                    && this.state.read(cx).active_draft().as_ref() == Some(&draft)
                     && this.state.read(cx).environments.active == orig_active_env
                     && this.workspace.routing.logical_project_key == orig_logical_key
                     && this.automatic_environment(&cur_host, cx)
@@ -534,12 +536,12 @@ impl Composer {
                 this.workspace.routing.resolved_environment_id =
                     Some(target.canonical_environment_id.clone());
                 let same_env = orig_active_env.as_deref() == Some(target.saved_id.as_str());
-                if same_env && target.project_id == orig_project_id {
+                if same_env && target.project_id == draft.project_id {
                     let prompt = this.prompt(cx);
                     let staged = this.staged_attachments();
                     let terminals = TerminalSend::of(&prompt, this.current_terminals());
                     let fresh_outgoing = this.outgoing(terminals.text, &staged);
-                    this.launch(orig_project_id, fresh_outgoing, intent, window, cx);
+                    this.launch(draft, fresh_outgoing, intent, window, cx);
                     return;
                 }
 
@@ -567,16 +569,11 @@ impl Composer {
                     cx.notify();
                     return;
                 }
-                this.retarget_draft_for_routing(
-                    &orig_project_id,
-                    &target.project_id,
-                    same_env,
-                    window,
-                    cx,
-                );
+                let destination = DraftRef::new(draft.id, &target.saved_id, &target.project_id);
+                this.retarget_session(&destination, same_env, window, cx);
                 this.pending_routed_send = Some(PendingRoutedSend {
                     saved_id: target.saved_id.clone(),
-                    project_id: target.project_id.clone(),
+                    draft: destination.clone(),
                     expected_prompt: orig_prompt,
                     intent,
                     preserved_workspace: orig_workspace,
@@ -588,7 +585,7 @@ impl Composer {
                 }
                 this.sending = true;
                 this.state.update(cx, |state, cx| {
-                    state.navigate_scoped(owner, ScopedRouteAction::Draft(target.project_id), cx);
+                    state.navigate_scoped(owner, ScopedRouteAction::OpenDraft(destination), cx);
                 });
                 this.try_finish_pending_routed_send(window, cx);
                 cx.notify();
@@ -943,10 +940,10 @@ impl Composer {
         Some(traits::model_selection(&model.instance_id, &model.model, &resolved.dispatch_options))
     }
 
-    fn launch(&mut self, project_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+    fn launch(&mut self, draft: DraftRef, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         let resolved = self.resolve(cx);
         if !resolved.multi_models.is_empty() {
-            self.launch_multiple(project_id, resolved, outgoing, window, cx);
+            self.launch_multiple(draft, resolved, outgoing, window, cx);
             return;
         }
         let Some(selection) = Self::dispatch_selection(&resolved) else {
@@ -954,13 +951,14 @@ impl Composer {
             cx.notify();
             return;
         };
+        let project_id = draft.project_id.clone();
         let state = self.state.read(cx);
         let star_origin = state.star_prompt_origin();
         let config = state.server_config.config.as_ref();
         let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
         let configured = config.and_then(|config| workspace::configured_env_mode(&config.settings, &project_id));
         let workspace_choice = self.selected_workspace();
-        let target = Target::Draft(project_id.clone());
+        let target = Target::Draft(draft.clone());
         let stored_workspace = self.drafts.store.get(&super::drafts::key(&target)).and_then(|draft| draft.workspace.clone());
         let destination = (
             state.environments.active.clone(),
@@ -1018,7 +1016,7 @@ impl Composer {
                     state.shell.project(&project_id).map(|project| project.created_at.clone()),
                 );
                 let current_workspace = this.drafts.store.get(&super::drafts::key(&target)).and_then(|draft| draft.workspace.as_ref());
-                if current_destination != destination || current_workspace != stored_workspace.as_ref() || current != origin || state.selected_thread.is_some() || state.draft_project.as_deref() != Some(project_id.as_str()) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
+                if current_destination != destination || current_workspace != stored_workspace.as_ref() || current != origin || state.selected_thread.is_some() || state.active_draft().as_ref() != Some(&draft) || this.snapshot.target.as_ref() != Some(&target) || state.shell.project(&project_id).map(|project| &project.workspace_root) != root.as_ref() {
                     return Err("The destination changed before launch. Select the workspace again.".to_owned());
                 }
                 let strategy = strategy.map_err(str::to_owned)?;
@@ -1069,7 +1067,8 @@ impl Composer {
         .detach();
     }
 
-    fn launch_multiple(&mut self, project_id: String, resolved: Resolved, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
+    fn launch_multiple(&mut self, draft: DraftRef, resolved: Resolved, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
+        let project_id = draft.project_id.clone();
         let (supports_bootstrap, root, start_from_origin, star_origin, origin, destination, dispatch_selections) = {
             let state = self.state.read(cx);
             let config = state.server_config.config.as_ref();
@@ -1119,7 +1118,7 @@ impl Composer {
             self.state.update(cx, |state, cx| state.show_toast(toast, cx));
             return;
         };
-        let target = Target::Draft(project_id.clone());
+        let target = Target::Draft(draft.clone());
         let refs = self.state.read(cx).request(
             method::VCS_LIST_REFS,
             workspace::list_refs_request(&cwd),
@@ -1148,7 +1147,7 @@ impl Composer {
                 if current_destination != destination
                     || current != origin
                     || state.selected_thread.is_some()
-                    || state.draft_project.as_deref() != Some(project_id.as_str())
+                    || state.active_draft().as_ref() != Some(&draft)
                     || this.snapshot.target.as_ref() != Some(&target)
                 {
                     return Err("The destination changed before launch. Select the workspace again.".to_owned());
@@ -1221,6 +1220,7 @@ impl Composer {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
+                this.end_draft_promotion(&taken.target, cx);
                 if !failed_thread_ids.is_empty() {
                     this.state.update(cx, |state, cx| {
                         for tid in &failed_thread_ids {
@@ -1240,6 +1240,7 @@ impl Composer {
                 if failed_selections.is_empty() {
                     if !this.current_draft(&taken.target, cx).has_user_content() {
                         this.discard_draft(&taken.target, cx);
+                        this.open_next_background_draft(&taken.target, cx);
                     }
                     if let Some(choices) = this.choices.get_mut(&taken.target) {
                         choices.multi_models.clear();
@@ -1263,21 +1264,50 @@ impl Composer {
 
     fn finish_launch(&mut self, intent: SubmitIntent, (result, worktree_launch): (Result<String, String>, Option<t3_core::worktree_setup::DraftLaunch>), taken: Taken, window: &mut Window, cx: &mut Context<Self>) {
         self.sending = false;
-        let shown = self.state.read(cx).environment() == taken.environment.as_deref() && self.snapshot.target.as_ref() == Some(&taken.target);
+        let draft = self.end_draft_promotion(&taken.target, cx);
+        let state = self.state.read(cx);
+        let shown = state.environment() == taken.environment.as_deref()
+            && state.active_draft().as_ref() == draft.as_ref()
+            && self.snapshot.target.as_ref() == Some(&taken.target);
         match result {
             Err(error) => self.restore(taken, error, window, cx),
             Ok(thread_id) => {
                 self.retire_sent_attachments(&taken.target, &taken.attachments, cx);
-                if intent != SubmitIntent::Background && !self.current_draft(&taken.target, cx).has_user_content() { self.discard_draft(&taken.target, cx); }
+                if !self.current_draft(&taken.target, cx).has_user_content() {
+                    self.discard_draft(&taken.target, cx);
+                    if shown && intent == SubmitIntent::Background {
+                        self.open_next_background_draft(&taken.target, cx);
+                    } else if !shown && let Some(draft) = &draft {
+                        self.state.update(cx, |state, _| state.sidebar.history.promote_draft(draft, &thread_id));
+                    }
+                }
                 if shown && intent != SubmitIntent::Background {
                     if let (Some(launch), Some(setup)) = (worktree_launch, self.setup.clone()) {
                         setup.update(cx, |setup, cx| setup.record_launch(launch, cx));
                     }
-                    self.state.update(cx, |state, cx| state.select_when_listed(&thread_id, cx));
+                    self.state.update(cx, |state, cx| state.select_launch_when_listed(&thread_id, draft, cx));
                 }
             }
         }
         cx.notify();
+    }
+
+    fn end_draft_promotion(&mut self, target: &Target, cx: &mut Context<Self>) -> Option<DraftRef> {
+        let Target::Draft(draft) = target else { return None };
+        self.state.update(cx, |state, _| state.promoting_drafts.remove(draft));
+        Some(draft.clone())
+    }
+
+    fn open_next_background_draft(&self, target: &Target, cx: &mut Context<Self>) {
+        let Target::Draft(draft) = target else { return };
+        self.state.update(cx, |state, cx| {
+            state.sidebar.history.forget_draft(draft);
+            if state.is_active_draft(draft) {
+                state.promoting_drafts.insert(draft.clone());
+                state.start_draft(&draft.project_id, cx);
+                state.promoting_drafts.remove(draft);
+            }
+        });
     }
 
     /// `useComposerResume`: resumes an interrupted or usage-limited run (`manualContinuationOfRunId`)
@@ -1472,6 +1502,9 @@ impl Composer {
     /// clears the composer on send. Whatever is added while the send is in flight stays.
     fn begin_send(&mut self, target: &Target, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> Taken {
         let draft = self.current_draft(target, cx);
+        if let Target::Draft(session) = target {
+            self.state.update(cx, |state, _| state.promoting_drafts.insert(session.clone()));
+        }
         let environment = self.state.read(cx).environment().map(str::to_owned);
         self.sending = true;
         self.error = None;
@@ -1514,9 +1547,11 @@ impl Composer {
 impl Composer {
     pub(crate) fn verify_failed_launch_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
         use t3_core::composer::attachments::{AttachmentKind, Upload};
-        use t3_core::composer::menu::ThreadContext;
+        use t3_core::composer::drafts::DraftRef;
+use t3_core::composer::menu::ThreadContext;
         let original = self.snapshot.target.clone().ok_or("open a draft for recovery fixture")?;
-        let other = Target::Draft("fixture-other-project".into());
+        let Target::Draft(ref source) = original else { return Err("open a draft for recovery fixture".into()) };
+        let other = Target::Draft(DraftRef::new(t3_core::composer::drafts::DraftId::new(uuid_v4()), source.environment_id.as_deref().unwrap_or_default(), &source.project_id));
         for (error, concurrent_edit) in [("destination changed", false), ("RPC failure", false), ("RPC failure", true)] {
             let mention = ThreadContext::new("fixture-env", "fixture-thread", "Original context");
             let text = format!("recover original {}", mention.reference());

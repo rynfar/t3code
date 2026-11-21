@@ -462,8 +462,10 @@ impl Composer {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn test_staged_draft_attachments(&self, project_id: &str) -> Vec<crate::app_state::RestoredAttachment> {
-        self.staged_for(&Target::Draft(project_id.to_owned()))
-            .iter()
+        self.snapshot.target.as_ref()
+            .filter(|target| matches!(target, Target::Draft(draft) if draft.project_id == project_id))
+            .into_iter()
+            .flat_map(|target| self.staged_for(target))
             .map(|entry| crate::app_state::RestoredAttachment {
                 kind: entry.attachment.kind,
                 name: entry.attachment.name.clone(),
@@ -478,7 +480,7 @@ impl Composer {
             || self
                 .pending_routed_send
                 .as_ref()
-                .is_some_and(|pending| *target == Target::Draft(pending.project_id.clone()));
+                .is_some_and(|pending| *target == Target::Draft(pending.draft.clone()));
         matches && self.cancel_pending_routed_send()
     }
 
@@ -573,10 +575,10 @@ impl Composer {
             let state = self.state.read(cx);
             match (
                 self.fixed.as_ref().or(state.selected_thread.as_ref()),
-                &state.draft_project,
+                state.active_draft(),
             ) {
                 (Some(thread_id), _) => Target::Thread(thread_id.clone()),
-                (None, Some(project_id)) => Target::Draft(project_id.clone()),
+                (None, Some(draft)) => Target::Draft(draft),
                 _ => match self.snapshot.target.clone() {
                     Some(target) => target,
                     None => return Err("No active thread or draft.".to_owned()),

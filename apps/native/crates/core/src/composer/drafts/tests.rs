@@ -1,4 +1,6 @@
 use super::*;
+
+fn new_thread_key(project: &str) -> String { DraftRef::legacy(project).key() }
 use serde_json::json;
 
 fn draft(prompt: &str, at: i64) -> Draft {
@@ -125,11 +127,11 @@ fn the_oldest_drafts_go_first() {
         rows.update(&store, None, None);
         assert_eq!(rows.rows.len(), 1);
         store.set(&saved_key, draft("new", MAX_DRAFTS as i64 + 1));
-        if let Some(project) = saved_key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+        rows.update_draft(&store, &saved_key, None);
         for key in store.take_pruned_keys() {
-            if let Some(project) = key.strip_prefix("draft:") { rows.update_draft(&store, project, None); }
+            rows.update_draft(&store, &key, None);
         }
-        assert!(!rows.rows.iter().any(|row| row.project_id == "old-project"), "pruning must invalidate a row even when another thread or project was saved");
+        assert!(!rows.rows.iter().any(|row| row.draft.project_id == "old-project"), "pruning must invalidate a row even when another thread or project was saved");
     }
     let oversized = (0..MAX_DRAFTS + 2).map(|index| (new_thread_key(&index.to_string()), serde_json::to_value(draft("x", index as i64)).unwrap())).collect::<serde_json::Map<_, _>>();
     let mut store = DraftStore::from_value(Some(&json!({"version":1,"drafts":oversized})));
@@ -282,4 +284,54 @@ fn preserves_instance_scoped_custom_model_slugs_verbatim() {
     let sel = store.get("thread:custom").unwrap().model_selection.as_ref().unwrap();
     assert_eq!(sel.instance_id, "provider-instance:custom-openai");
     assert_eq!(sel.model, "gpt-5.3");
+}
+
+#[test]
+fn legacy_project_draft_keeps_prompt_and_attachments_under_a_session_key() {
+    let legacy = json!({"version": 1, "drafts": {
+        "draft:project": {
+            "prompt": "preserve this",
+            "attachments": [{
+                "id": "file", "name": "notes.txt", "mimeType": "text/plain",
+                "image": false, "sizeBytes": 10, "attachmentId": "upload"
+            }]
+        },
+        "thread:existing": {"prompt": "keep the thread draft"}
+    }});
+    let store = DraftStore::from_value(Some(&legacy));
+    let key = store.keys().find(|key| key.starts_with("draft-session:")).expect("migrated session key");
+    let saved = store.get(key).unwrap();
+    assert_eq!(saved.prompt, "preserve this");
+    assert_eq!(saved.attachments[0].attachment_id, "upload");
+    assert_eq!(store.get("thread:existing").unwrap().prompt, "keep the thread draft");
+    let reloaded = DraftStore::from_value(Some(&store.to_value()));
+    assert_eq!(reloaded.get(key), Some(saved));
+}
+
+#[test]
+fn new_thread_reuses_only_the_preferred_or_active_empty_session() {
+    let mut store = DraftStore::default();
+    let session = |id: &str| DraftRef::new(DraftId::new(id.into()), "env", "project");
+    let first = session("first");
+    let second = session("second");
+    let third = session("third");
+    store.remember_session("logical", &first);
+    store.set(&first.key(), draft("keep this", 1));
+    assert_eq!(store.reusable_session("logical", "project", Some(&first), |_| false), None);
+
+    store.remember_session("logical", &second);
+    assert_eq!(store.reusable_session("logical", "project", Some(&third), |_| false), Some(second.clone()));
+    assert_eq!(store.reusable_session("logical", "project", Some(&third), |draft| draft == &second), Some(third.clone()));
+    store.set(&second.key(), Draft { pending_attachment_count: 1, ..Draft::default() });
+    assert_eq!(store.reusable_session("logical", "project", Some(&third), |_| false), Some(third));
+
+    let former_projects = store.forget_session(&second);
+    store.remove(&second.key());
+    assert_eq!(store.reusable_session("logical", "project", None, |_| false), None);
+    assert_eq!(store.get(&first.key()).unwrap().prompt, "keep this");
+    let replacement = session("replacement");
+    store.remember_session("logical", &replacement);
+    store.restore_session(&second, &former_projects);
+    let store = DraftStore::from_value(Some(&store.to_value()));
+    assert_eq!(store.reusable_session("logical", "project", None, |_| false), Some(replacement));
 }

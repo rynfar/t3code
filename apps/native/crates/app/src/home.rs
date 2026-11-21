@@ -75,14 +75,20 @@ impl AppState {
         if self.scratch_root().is_none() {
             return;
         }
+        let route = (self.environments.active.clone(), self.selected_thread.clone(), self.active_draft());
         let rpc = self.rpc(PROJECTS_ENSURE_SCRATCH, json!({}));
         cx.spawn(async move |this, cx| {
             let result = rpc.await;
-            let _ = this.update(cx, |state, cx| match result.as_ref().ok().and_then(ensure_scratch_project_id) {
-                Some(project_id) => state.start_draft(&project_id, cx),
-                None => {
-                    let description = result.err().map_or_else(|| t(cx, "An error occurred.").to_owned(), |error| error.to_string());
-                    state.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not start without a project")).description(description), cx);
+            let _ = this.update(cx, |state, cx| {
+                if route != (state.environments.active.clone(), state.selected_thread.clone(), state.active_draft()) {
+                    return;
+                }
+                match result.as_ref().ok().and_then(ensure_scratch_project_id) {
+                    Some(project_id) => state.start_draft(&project_id, cx),
+                    None => {
+                        let description = result.err().map_or_else(|| t(cx, "An error occurred.").to_owned(), |error| error.to_string());
+                        state.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not start without a project")).description(description), cx);
+                    }
                 }
             });
         })

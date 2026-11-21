@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gpui::{BorrowAppContext, Context, EventEmitter, Task, Window};
 use t3_client::store;
-use t3_core::composer::drafts::{self as rules, Draft, DraftStore, SavedAttachment};
+use t3_core::composer::drafts::{self as rules, Draft, DraftRef, DraftStore, SavedAttachment};
 
 use super::{Choices, Composer, Target};
 use crate::sidebar::controller::now_ms;
@@ -39,6 +39,66 @@ fn load_shared_store(cx: &mut gpui::App) -> DraftStore {
     cx.global::<SharedDraftStore>().store.clone()
 }
 
+pub(crate) fn reusable_session(
+    logical_key: &str,
+    project: &str,
+    active: Option<&DraftRef>,
+    mut promoting: impl FnMut(&DraftRef) -> bool,
+    cx: &gpui::App,
+) -> Option<DraftRef> {
+    if let Some(shared) = cx.try_global::<SharedDraftStore>() {
+        shared.store.reusable_session(logical_key, project, active, promoting)
+    } else {
+        active.filter(|draft| !promoting(draft)).cloned()
+    }
+}
+
+pub(crate) fn remember_session(logical_key: &str, draft: &DraftRef, cx: &mut gpui::App) {
+    if cx.try_global::<SharedDraftStore>().is_some_and(|shared| shared.loaded)
+        && cx.update_global::<SharedDraftStore, _>(|shared, _| shared.store.remember_session(logical_key, draft))
+    {
+        schedule_shared_save(cx);
+    }
+}
+
+pub(crate) fn reset_session_workspace(draft: &DraftRef, cx: &mut gpui::App) {
+    if cx.try_global::<SharedDraftStore>().is_some_and(|shared| shared.loaded) {
+        cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            let key = draft.key();
+            if let Some(mut composer) = shared.store.get(&key).cloned() {
+                composer.workspace = None;
+                shared.store.set(&key, composer);
+            }
+        });
+    }
+}
+
+pub(crate) fn remap_empty_session(from: &DraftRef, to: &DraftRef, cx: &mut gpui::App) {
+    if cx.try_global::<SharedDraftStore>().is_some_and(|shared| shared.loaded) {
+        cx.update_global::<SharedDraftStore, _>(|shared, _| {
+            let key = from.key();
+            if let Some(mut composer) = shared.store.get(&key).cloned() {
+                shared.store.remove(&key);
+                composer.workspace = None;
+                shared.store.set(&to.key(), composer);
+            }
+        });
+    }
+}
+
+pub(super) fn sync_saved_session(composer: &mut Composer, target: Option<&Target>, cx: &mut Context<Composer>) {
+    let Some(target @ Target::Draft(_)) = target else { return };
+    let Some(shared) = cx.try_global::<SharedDraftStore>() else { return };
+    let storage_key = key(target);
+    let stored = shared.store.get(&storage_key);
+    if stored != composer.drafts.store.get(&storage_key) {
+        composer.drafts.store = shared.store.clone();
+    }
+    if let Some(draft) = stored.filter(|_| !composer.choices.contains_key(target)).cloned() {
+        composer.hydrate_draft(target, &draft, cx);
+    }
+}
+
 fn live_composers(cx: &gpui::App) -> Vec<gpui::Entity<Composer>> {
     cx.try_global::<super::RegisteredComposers>()
         .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
@@ -68,12 +128,12 @@ fn save_shared_now(cx: &mut gpui::App) {
 
 fn emit_draft_events(target: &Target, pruned: &[String], cx: &mut Context<Composer>) {
     match target {
-        Target::Draft(project_id) => cx.emit(DraftsChanged { project_id: project_id.clone() }),
+        Target::Draft(draft) => cx.emit(DraftsChanged { key: draft.key() }),
         Target::Thread(_) => cx.emit(ThreadDraftsChanged),
         Target::Question(_) => {}
     }
     for key in pruned {
-        if let Some(project_id) = key.strip_prefix("draft:") { cx.emit(DraftsChanged { project_id: project_id.to_owned() }); }
+        if DraftRef::from_key(key).is_some() { cx.emit(DraftsChanged { key: key.clone() }); }
         if key.starts_with("thread:") { cx.emit(ThreadDraftsChanged); }
     }
 }
@@ -93,7 +153,7 @@ fn broadcast_draft_events(target: &Target, pruned: &[String], self_id: gpui::Ent
 pub(super) fn key(target: &Target) -> String {
     match target {
         Target::Thread(id) => rules::thread_key(id),
-        Target::Draft(project) => rules::new_thread_key(project),
+        Target::Draft(draft) => draft.key(),
         Target::Question(key) => key.storage_key(),
     }
 }
@@ -134,7 +194,7 @@ pub(super) fn write_stored_prompt(storage_key: &str, prompt: String, cx: &mut gp
 pub(super) fn target(key: &str) -> Option<Target> {
     key.strip_prefix("thread:")
         .map(|id| Target::Thread(id.to_owned()))
-        .or_else(|| key.strip_prefix("draft:").map(|project| Target::Draft(project.to_owned())))
+        .or_else(|| DraftRef::from_key(key).map(Target::Draft))
         .or_else(|| t3_core::requests::attachments::QuestionDraftKey::parse(key).map(Target::Question))
 }
 
@@ -147,19 +207,31 @@ impl Composer {
     /// Loads the saved drafts: choices, mentions and uploaded attachments go back to their
     /// targets; prompts load when a target opens.
     pub(super) fn load_drafts(&mut self, cx: &mut Context<Self>) {
+        let initializing = cx.try_global::<SharedDraftStore>().is_none_or(|shared| !shared.loaded);
         let store = load_shared_store(cx);
+        if initializing {
+            self.state.update(cx, |state, cx| {
+                if let Some(draft) = state.active_draft() {
+                    state.remember_draft(&draft, cx);
+                }
+            });
+        }
         for key in store.keys() {
             let (Some(target), Some(draft)) = (target(key), store.get(key)) else { continue };
-            self.restore_draft_choices(&target, draft, cx);
-            self.seed_records(&target, draft.context_records.clone());
-            self.seed_mentions(&target, draft.thread_contexts());
-            self.seed_terminals(&target, draft.terminals.clone());
-        self.seed_reviews(&target, draft.review_comments.clone());
-            self.seed_reply_to(&target, draft.reply_to.clone());
-            self.publish_review_comments(&target, &draft.prompt, cx);
-            self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect(), true, cx);
+            self.hydrate_draft(&target, draft, cx);
         }
         self.drafts.store = store;
+    }
+
+    fn hydrate_draft(&mut self, target: &Target, draft: &Draft, cx: &mut Context<Self>) {
+        self.restore_draft_choices(target, draft, cx);
+        self.seed_records(target, draft.context_records.clone());
+        self.seed_mentions(target, draft.thread_contexts());
+        self.seed_terminals(target, draft.terminals.clone());
+        self.seed_reviews(target, draft.review_comments.clone());
+        self.seed_reply_to(target, draft.reply_to.clone());
+        self.publish_review_comments(target, &draft.prompt, cx);
+        self.seed_attachments(target, draft.attachments.iter().map(SavedAttachment::restore).collect(), true, cx);
     }
 
     pub(super) fn mutate_drafts<R>(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut DraftStore) -> R) -> R {
@@ -245,7 +317,16 @@ impl Composer {
     pub(super) fn discard_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
         self.choices.remove(target);
         self.sync_provider_target(cx);
-        if self.mutate_drafts(cx, |store| store.remove(&key(target))) {
+        if self.mutate_drafts(cx, |store| {
+            let storage_key = key(target);
+            let removed = store.remove(&storage_key);
+            let unmapped = if let Target::Draft(draft) = target {
+                !store.forget_session(draft).is_empty()
+            } else {
+                false
+            };
+            removed || unmapped
+        }) {
             self.schedule_draft_save(target, cx);
         }
     }
@@ -277,23 +358,28 @@ impl Composer {
     pub(super) fn schedule_draft_save(&mut self, target: &Target, cx: &mut Context<Self>) {
         let pruned = std::mem::take(&mut self.drafts.pruned);
         broadcast_draft_events(target, &pruned, cx.entity_id(), cx);
-        let task = gpui::App::spawn(cx, async move |cx| {
-            cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
-            cx.update(save_shared_now);
-        });
-        cx.update_global::<SharedDraftStore, _>(|shared, _| {
-            shared.save = Some(task);
-        });
+        schedule_shared_save(cx);
     }
+}
+
+fn schedule_shared_save(cx: &mut gpui::App) {
+    let task = cx.spawn(async move |cx| {
+        cx.background_executor().timer(Duration::from_millis(rules::PERSIST_DEBOUNCE_MS)).await;
+        cx.update(save_shared_now);
+    });
+    cx.update_global::<SharedDraftStore, _>(|shared, _| {
+        shared.save = Some(task);
+    });
 }
 
 pub(crate) struct DiscardedDraft {
     target: Target,
     draft: Draft,
     attachments: Vec<super::attachments::Staged>,
+    preferred_keys: Vec<String>,
 }
 
-pub(crate) struct DraftsChanged { pub project_id: String }
+pub(crate) struct DraftsChanged { pub key: String }
 impl EventEmitter<DraftsChanged> for Composer {}
 
 pub(crate) struct ThreadDraftsChanged;
@@ -302,8 +388,11 @@ impl EventEmitter<ThreadDraftsChanged> for Composer {}
 impl Composer {
     pub(crate) fn sidebar_drafts(&self) -> &DraftStore { &self.drafts.store }
 
-    pub(crate) fn discard_sidebar_draft(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
-        self.discard_target_draft(&Target::Draft(project.into()), false, window, cx)
+    pub(crate) fn discard_sidebar_draft(&mut self, draft: &DraftRef, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
+        if self.state.read(cx).is_promoting_draft(draft) {
+            return None;
+        }
+        self.discard_target_draft(&Target::Draft(draft.clone()), false, window, cx)
     }
 
     pub(crate) fn discard_thread_draft(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
@@ -311,9 +400,15 @@ impl Composer {
     }
 
     fn discard_target_draft(&mut self, target: &Target, keep_choices: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<DiscardedDraft> {
-        self.record_draft(target, cx);
+        if keep_choices || self.snapshot.target.as_ref() == Some(target) {
+            self.record_draft(target, cx);
+        }
         let storage_key = key(target);
-        let draft = self.drafts.store.get(&storage_key)?.clone();
+        let draft = cx.global::<SharedDraftStore>().store.get(&storage_key)?.clone();
+        let preferred_keys = match target {
+            Target::Draft(draft) => self.mutate_drafts(cx, |store| store.forget_session(draft)),
+            _ => Vec::new(),
+        };
         if keep_choices && !draft.has_user_content() { return None; }
         if keep_choices {
             if self.mutate_drafts(cx, |store| store.clear_content(&storage_key, now_ms())) {
@@ -324,14 +419,17 @@ impl Composer {
         }
         let attachments = self.take_draft_attachments(target);
         self.clear_mentions(target);
+        self.context.records.remove(target);
+        self.context.reviews.remove(target);
+        self.clear_terminals(target);
         self.take_reply_to(target);
         if self.snapshot.target.as_ref() == Some(target) { self.set_prompt("", window, cx); }
         cx.notify();
-        Some(DiscardedDraft { target: target.clone(), draft, attachments })
+        Some(DiscardedDraft { target: target.clone(), draft, attachments, preferred_keys })
     }
 
-    pub(crate) fn restore_sidebar_draft(&mut self, project: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
-        self.restore_target_draft(&Target::Draft(project.into()), discarded, window, cx);
+    pub(crate) fn restore_sidebar_draft(&mut self, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_target_draft(&discarded.target.clone(), discarded, window, cx);
     }
 
     pub(crate) fn restore_thread_draft(&mut self, thread_id: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
@@ -339,10 +437,18 @@ impl Composer {
     }
 
     fn restore_target_draft(&mut self, target: &Target, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
-        let DiscardedDraft { target: discarded_target, draft, attachments } = discarded;
+        let DiscardedDraft { target: discarded_target, draft, attachments, preferred_keys } = discarded;
         let live = self.current_draft(target, cx);
-        if !self.mutate_drafts(cx, |store| store.restore(&key(target), draft.clone(), &live)) {
-            self.commit_sidebar_discard(DiscardedDraft { target: discarded_target, draft, attachments }, cx);
+        if !self.mutate_drafts(cx, |store| {
+            if !store.restore(&key(target), draft.clone(), &live) {
+                return false;
+            }
+            if let Target::Draft(draft) = target {
+                store.restore_session(draft, &preferred_keys);
+            }
+            true
+        }) {
+            self.commit_sidebar_discard(DiscardedDraft { target: discarded_target, draft, attachments, preferred_keys }, cx);
             self.error = Some("Failed to restore draft: The draft has new content.".into());
             cx.notify();
             return;
@@ -359,9 +465,7 @@ impl Composer {
         cx.notify();
     }
 
-    /// Moves a non-empty draft from `from_project` to `to_project` when the user switches projects
-    /// in the draft hero (`DraftHeroHeadline.tsx`: `selectProject`). Empty drafts are left alone so
-    /// switching away never clobbers the destination project's saved draft.
+    /// Moves the open draft's content when the project creation flow changes its checkout.
     pub(crate) fn retarget_draft(
         &mut self,
         from_project: &str,
@@ -370,39 +474,67 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if from_project == to_project {
+        let state = self.state.read(cx);
+        let Some(source) = state.active_draft().filter(|draft| draft.project_id == from_project) else {
+            return false;
+        };
+        let environment = keep_attachments.then_some(state.environments.active.as_deref()).flatten();
+        let destination = DraftRef::new(source.id.clone(), environment.unwrap_or_default(), to_project);
+        if !self.retarget_non_empty_session(&destination, keep_attachments, window, cx) {
             return false;
         }
-        let from = Target::Draft(from_project.to_owned());
-        let to = Target::Draft(to_project.to_owned());
+        self.state.update(cx, |state, _| state.pending_draft_retarget = Some(destination));
+        true
+    }
+
+    pub(crate) fn retarget_non_empty_session(
+        &mut self,
+        destination: &DraftRef,
+        keep_attachments: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.snapshot.target.as_ref().is_some_and(|target| self.current_draft(target, cx).has_user_content()) {
+            return false;
+        }
+        self.retarget_session(destination, keep_attachments, window, cx)
+    }
+
+    /// Retargets the displayed draft without replacing the destination project's other drafts.
+    pub(crate) fn retarget_session(
+        &mut self,
+        destination: &DraftRef,
+        keep_attachments: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(Target::Draft(source)) = self.snapshot.target.clone() else { return false; };
+        if self.state.read(cx).is_promoting_draft(&source) { return false; }
+        let from = Target::Draft(source);
+        let to = Target::Draft(destination.clone());
+        if from == to {
+            return false;
+        }
         let mut draft = self.current_draft(&from, cx);
-        if !draft.has_user_content() {
-            return false;
-        }
-        if !keep_attachments
-            && draft.prompt.trim().is_empty()
-            && draft.terminals.is_empty()
-            && draft.review_comments.is_empty()
-        {
-            return false;
-        }
+        let multi_models = self.choices.get(&from).map(|choices| choices.multi_models.clone()).unwrap_or_default();
+        let source_key = key(&from);
+        draft.created_at = self.drafts.store.get(&source_key).and_then(|saved| saved.created_at);
         draft.workspace = None;
         let attachments = if keep_attachments {
             self.take_draft_attachments(&from)
         } else {
             let dropped = self.take_draft_attachments(&from);
-            self.commit_sidebar_discard(DiscardedDraft { target: from.clone(), draft: Draft::default(), attachments: dropped }, cx);
+            self.commit_sidebar_discard(DiscardedDraft { target: from.clone(), draft: Draft::default(), attachments: dropped, preferred_keys: Vec::new() }, cx);
             draft.attachments.clear();
             draft.pending_attachment_count = 0;
             Vec::new()
         };
-        let old_to = self.take_draft_attachments(&to);
-        self.commit_sidebar_discard(DiscardedDraft { target: to.clone(), draft: Draft::default(), attachments: old_to }, cx);
         self.discard_draft(&from, cx);
         self.clear_mentions(&from);
         self.context.records.remove(&from);
         self.context.reviews.remove(&from);
         self.clear_terminals(&from);
+        self.take_reply_to(&from);
         if self.snapshot.target.as_ref() == Some(&from) {
             self.set_prompt("", window, cx);
         }
@@ -411,6 +543,10 @@ impl Composer {
         self.clear_terminals(&to);
         self.clear_mentions(&to);
         self.restore_draft_choices(&to, &draft, cx);
+        if !multi_models.is_empty() {
+            self.choices.entry(to.clone()).or_default().multi_models = multi_models;
+        }
+        self.seed_reply_to(&to, draft.reply_to.clone());
         self.seed_records(&to, draft.context_records.clone());
         self.seed_mentions(&to, draft.thread_contexts());
         self.seed_terminals(&to, draft.terminals.clone());
@@ -425,49 +561,6 @@ impl Composer {
         cx.notify();
         true
     }
-
-    /// Retargets a draft across machines while preserving multi-model fan-out selections
-    /// (`useDraftEnvironmentRouting.ts:177-188`) and clearing stale source-machine workspace
-    /// bindings even when both machines share the same `project_id`.
-    pub(super) fn retarget_draft_for_routing(
-        &mut self,
-        from_project: &str,
-        to_project: &str,
-        same_env: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let from = Target::Draft(from_project.to_owned());
-        let to = Target::Draft(to_project.to_owned());
-        let multi_models = self
-            .choices
-            .get(&from)
-            .map(|c| c.multi_models.clone())
-            .unwrap_or_default();
-        if from_project != to_project {
-            self.retarget_draft(from_project, to_project, same_env, window, cx);
-        } else if !same_env {
-            self.clear_draft_workspace(to_project, cx);
-        }
-        if !multi_models.is_empty() {
-            self.choices.entry(to).or_default().multi_models = multi_models;
-        }
-    }
-
-    /// Clears a draft's stored `DraftWorkspace` (for example when switching machines or enabling
-    /// automatic routing).
-    pub(super) fn clear_draft_workspace(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let target = Target::Draft(project_id.to_owned());
-        let storage_key = key(&target);
-        if let Some(mut draft) = self.drafts.store.get(&storage_key).cloned()
-            && draft.workspace.is_some()
-        {
-            draft.workspace = None;
-            if self.mutate_drafts(cx, |store| store.set(&storage_key, draft)) {
-                self.schedule_draft_save(&target, cx);
-            }
-        }
-    }
 }
 
 impl Composer {
@@ -481,7 +574,7 @@ impl Composer {
             let target = Target::Thread(id.clone());
             let attachments = self.take_draft_attachments(&target);
             if !attachments.is_empty() {
-                self.commit_sidebar_discard(DiscardedDraft { target: target.clone(), draft: Draft::default(), attachments }, cx);
+                self.commit_sidebar_discard(DiscardedDraft { target: target.clone(), draft: Draft::default(), attachments, preferred_keys: Vec::new() }, cx);
                 changed = true;
             } else {
                 self.release_target_uploads(&target, cx);
@@ -611,6 +704,9 @@ impl Composer {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn stored_draft_prompt(&self, project_id: &str) -> Option<&str> {
-        self.drafts.store.get(&key(&Target::Draft(project_id.to_owned()))).map(|draft| draft.prompt.as_str())
+        self.drafts.store.session_drafts()
+            .filter(|(session, _)| session.project_id == project_id)
+            .max_by_key(|(_, draft)| draft.updated_at)
+            .map(|(_, draft)| draft.prompt.as_str())
     }
 }
