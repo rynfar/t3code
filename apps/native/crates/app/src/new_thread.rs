@@ -29,7 +29,9 @@ use t3_core::sidebar::grouping::{
 
 use crate::app_state::{AppEvent, AppState};
 use crate::composer::Composer;
+pub(crate) use crate::context_chip::environment_machine_icon;
 use crate::icons::Icon;
+use crate::i18n::t;
 use crate::project_icon::ProjectVisual;
 use crate::theme::{hsla, palette};
 
@@ -98,7 +100,10 @@ pub fn new_thread_button(cx: &App) -> impl IntoElement {
         .cursor_pointer()
         .hover(|this| this.bg(hsla(p.accent)))
         .child(Icon::SquarePen.render(px(16.), hsla(p.foreground).opacity(0.8)))
-        .tooltip(|window, cx| Tooltip::new("New thread (⌘N)").build(window, cx))
+        .tooltip(|window, cx| Tooltip::new(crate::keymap::label("chat.new", cx).map_or_else(
+            || crate::i18n::t(cx, "New thread").to_owned(),
+            |key| crate::i18n::t_fmt(cx, "New thread ({shortcut})", &[("shortcut", key.into())]),
+        )).build(window, cx))
         .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx))
 }
 
@@ -147,26 +152,7 @@ impl PickerRow {
     }
 }
 
-pub(crate) fn environment_machine_icon(state: &AppState, saved_id: &str) -> Icon {
-    let config = state
-        .scoped_environment(saved_id)
-        .and_then(|entry| entry.config.config.as_ref())
-        .or_else(|| (state.environments.active.as_deref() == Some(saved_id)).then_some(state.server_config.config.as_ref()).flatten());
-    let machine = config
-        .and_then(|cfg| cfg.settings.environment_icon.as_deref().or_else(|| cfg.environment.platform.as_ref().map(|platform| platform.machine.as_str())))
-        .unwrap_or("server");
-    match machine {
-        "laptop" => Icon::Laptop,
-        "desktop" => Icon::Monitor,
-        "cloud" => Icon::Cloud,
-        "linux" => Icon::Linux,
-        "mac-mini" => Icon::MacMini,
-        "mac-studio" => Icon::MacStudio,
-        _ => Icon::Server,
-    }
-}
-
-fn primary_environment_id(state: &AppState) -> Option<&str> {
+pub(crate) fn primary_environment_id(state: &AppState) -> Option<&str> {
     state.local_saved_environment().map(|environment| environment.id.as_str()).or_else(|| {
         let mut local = state.environments.environments.iter().filter(|environment| environment.local);
         let first = local.next()?;
@@ -675,7 +661,7 @@ impl DraftHero {
         let copied = self.triage_copied_until.is_some_and(|until| Instant::now() < until);
         let mono = crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx);
         let copy_row = if copied {
-            div().child("Copied").into_any_element()
+            div().child(t(cx, "Copied")).into_any_element()
         } else {
             h_flex()
                 .items_baseline()
@@ -698,7 +684,7 @@ impl DraftHero {
                     .text_size(heading_size)
                     .line_height(heading_lh)
                     .text_color(hsla(p.foreground))
-                    .child("What went wrong?"),
+                    .child(t(cx, "What went wrong?")),
             )
             .child(
                 h_flex()
@@ -718,7 +704,7 @@ impl DraftHero {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(hsla(p.foreground))
                             .tooltip(|window, cx| {
-                                Tooltip::new("The agent reads T3 Code's logs and source here, and asks before it applies a fix or posts anything.")
+                                Tooltip::new(t(cx, "The agent reads T3 Code's logs and source here, and asks before it applies a fix or posts anything."))
                                     .build(window, cx)
                             })
                             .child(machine_label)
@@ -740,7 +726,7 @@ impl DraftHero {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(hsla(p.muted_foreground))
                             .hover(|this| this.underline().text_color(hsla(p.foreground)))
-                            .tooltip(|window, cx| Tooltip::new("Copy command, for a terminal").build(window, cx))
+                            .tooltip(|window, cx| Tooltip::new(t(cx, "Copy command, for a terminal")).build(window, cx))
                             .child(copy_row)
                             .on_click(cx.listener(|this, _, _, cx| this.copy_triage_command(cx))),
                     ),
@@ -793,7 +779,7 @@ impl DraftHero {
                 .border_color(hsla(p.muted_foreground).opacity(0.35))
                 .text_color(hsla(p.muted_foreground).opacity(0.6))
                 .hover(|this| this.border_color(hsla(p.muted_foreground).opacity(0.6)).text_color(hsla(p.muted_foreground).opacity(0.8)))
-                .tooltip(|window, cx| Tooltip::new("Add a project").build(window, cx))
+                .tooltip(|window, cx| Tooltip::new(t(cx, "Add a project")).build(window, cx))
                 .child(div().min_w_0().truncate().child(label))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx))
                 .into_any_element();
@@ -865,7 +851,7 @@ impl DraftHero {
                             .when(highlighted, |s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .child(Icon::FolderPlus.render(px(16.), hsla(p.muted_foreground)))
-                            .child(div().min_w_0().truncate().child("Add project"))
+                            .child(div().min_w_0().truncate().child(t(cx, "Add project")))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_picker(Some(window), false, cx);
                                 window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
@@ -991,7 +977,7 @@ impl DraftHero {
                 .justify_center()
                 .text_xs()
                 .text_color(hsla(p.muted_foreground))
-                .child("No matching projects.")
+                .child(t(cx, "No matching projects."))
                 .into_any_element()
         } else {
             div()
@@ -1194,7 +1180,7 @@ impl Render for DraftHero {
                             .gap(px(8.))
                             .text_size(px(30.))
                             .line_height(px(36.))
-                            .child("What should we build in")
+                            .child(t(cx, "What should we build in"))
                             .child(h_flex().min_w_0().max_w_full().items_baseline().child(trigger).child("?"))
                             .into_any_element()
                     } else {
@@ -1202,7 +1188,7 @@ impl Render for DraftHero {
                             .w_full()
                             .items_center()
                             .gap(px(8.))
-                            .child(div().text_size(heading_size).line_height(heading_lh).child("What should we build?"))
+                            .child(div().text_size(heading_size).line_height(heading_lh).child(t(cx, "What should we build?")))
                             .child(div().max_w_full().text_size(px(16.)).line_height(px(24.)).child(trigger))
                             .into_any_element()
                     })
@@ -1214,7 +1200,7 @@ impl Render for DraftHero {
                 .text_size(heading_size)
                 .line_height(heading_lh)
                 .text_color(hsla(p.foreground))
-                .child("What should we work on?")
+                .child(t(cx, "What should we work on?"))
                 .into_any_element(),
             None => {
                 let trigger = self.picker_trigger(

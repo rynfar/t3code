@@ -14,9 +14,11 @@ use t3_core::sidebar::time::{compact_relative_label, working_duration_label};
 use t3_core::sidebar::{Section, Shelf, SidebarRow, sort::settled_timestamp};
 
 use super::SidebarPane;
+use super::tree::{TreeRow, context_menu_key};
 use super::drag::{DraggedSweep, DraggedThread, ThreadDragPreview, drop_verb_badge};
 use super::hover::{HoverTarget, pr_icon, pr_tone};
 use crate::icons::Icon;
+use crate::components::motion::StatusDot;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::theme::{
     Palette, SlotState, ThemeSlot, ThemeSlotExt as _, hsla, palette, refine_slot_active,
@@ -201,6 +203,7 @@ struct RowExtras {
     remote: Option<Icon>,
     scratch_machine: Option<(Icon, String)>,
     pr: Option<PrBadge>,
+    issues: Vec<t3_core::issues::wire::ThreadIssueLink>,
 }
 
 struct PrBadge {
@@ -218,7 +221,7 @@ impl RowExtras {
     fn meta_line_empty(&self, thread: &SidebarThread) -> bool {
         thread.branch.as_deref().is_none_or(str::is_empty)
             && self.scratch_machine.is_none()
-            && self.pr.is_none()
+            && self.pr.is_none() && self.issues.is_empty()
             && self.running.is_empty()
     }
 }
@@ -232,7 +235,7 @@ pub(super) struct RowTarget<'a> {
 
 impl SidebarPane {
     pub(super) fn render_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if index < self.drafts.rows.len() { return self.render_draft_row(index, cx); }
+        if index < self.drafts.rows.len() { return self.render_draft_row(index, window, cx); }
         let index = if self.drafts.rows.is_empty() { index } else {
             if index == self.drafts.rows.len() {
                 return div().h(px(13.)).mx(px(10.)).py(px(6.)).child(div().h(px(1.)).bg(hsla(palette(cx).sidebar_border).opacity(0.6))).into_any_element();
@@ -261,8 +264,8 @@ impl SidebarPane {
                         self.render_compact(RowTarget { key: Some(&row.key), thread: &row.thread, project: project.as_deref(), section: *section }, variant, active, window, cx)
                     }
                 }
-                t3_core::sidebar::fleet::ScopedSidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
-                t3_core::sidebar::fleet::ScopedSidebarRow::ShowMore { count } => self.render_show_more(*count, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, window, cx),
+                t3_core::sidebar::fleet::ScopedSidebarRow::ShowMore { count } => self.render_show_more(*count, window, cx),
                 t3_core::sidebar::fleet::ScopedSidebarRow::Marker(marker) => self.render_marker(*marker, cx),
                 t3_core::sidebar::fleet::ScopedSidebarRow::Folder { key, expanded, hidden_count, dot, .. } => self.render_project_folder(key, *expanded, *hidden_count, *dot, window, cx),
             };
@@ -285,8 +288,8 @@ impl SidebarPane {
                     self.render_compact(RowTarget { key: None, thread, project: project.as_deref(), section: *section }, CompactVariant::Slim, active, window, cx)
                 }
             }
-            SidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, cx),
-            SidebarRow::ShowMore { count } => self.render_show_more(*count, cx),
+            SidebarRow::Shelf { shelf, count, expanded } => self.render_shelf(*shelf, *count, *expanded, window, cx),
+            SidebarRow::ShowMore { count } => self.render_show_more(*count, window, cx),
             SidebarRow::Marker(marker) => self.render_marker(*marker, cx),
         };
         div()
@@ -319,7 +322,9 @@ impl SidebarPane {
         let hover_bounds_id = row_id.clone();
         let hover_row_id = row_id.clone();
         let focus_key = ElementId::Name(row_id.clone());
-        let row_focus = crate::settings::controls::focus_handle(&focus_key, window, cx);
+        let row_focus = self.tree.focus(&TreeRow::Thread(key.cloned().unwrap_or_else(|| {
+            t3_core::sidebar::tag_filter::ThreadKey::new("", &thread.id)
+        }))).unwrap_or_else(|| crate::settings::controls::focus_handle(&focus_key, window, cx));
         #[cfg(all(test, feature = "snapshot"))]
         self.row_focuses.borrow_mut().insert(row_id.clone(), row_focus.clone());
         let key_focus = row_focus.clone();
@@ -330,7 +335,11 @@ impl SidebarPane {
         let can_operate = can_operate_thread(state, key);
         let renaming = self.rename.as_ref().is_some_and(|(renaming, _)| *renaming == thread.id && self.rename_key.as_ref() == key);
         let dragging = key.map_or_else(|| state.sidebar.drag.as_ref().is_some_and(|(dragged, _)| *dragged == thread.id), |key| state.sidebar.fleet_drag.as_ref().is_some_and(|(dragged, _)| dragged == key));
-        let draggable = section != Section::Working && can_operate && !renaming && row.swept.is_none();
+        let reorderable = section != Section::Working && can_operate;
+        let draggable = (reorderable || section == Section::Working) && !renaming && row.swept.is_none();
+        let keyboard_menu_key = menu_key.clone();
+        let keyboard_menu_id = menu_id.clone();
+        let (menu_bounds, measure_menu) = super::measure_trigger();
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
         let focus_ring = BoxShadow { color: hsla(p.ring), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true };
         let visual = key.map_or_else(|| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id), |key| crate::project_icon::ProjectVisual::for_scoped_project(state, &t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: thread.project_id.clone() }));
@@ -390,11 +399,17 @@ impl SidebarPane {
                 this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.hover.dismiss(cx)))
+            .child(measure_menu)
             .when(draggable, |this| {
                 this.on_drag(DraggedThread { id: thread.id.clone(), key: key.cloned() }, move |dragged, _, _, cx| {
                     let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
                     if let Some(pane) = pane.upgrade() {
-                        pane.update(cx, |pane, cx| pane.begin_drag(&dragged.id, dragged.key.as_ref(), preview.clone(), cx));
+                        pane.update(cx, |pane, cx| {
+                            pane.hover.dismiss(cx);
+                            if reorderable {
+                                pane.begin_drag(&dragged.id, dragged.key.as_ref(), preview.clone(), cx);
+                            }
+                        });
                     }
                     preview
                 })
@@ -442,6 +457,14 @@ impl SidebarPane {
                     return;
                 }
                 let stroke = &event.keystroke;
+                if context_menu_key(stroke) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    if !event.is_held && let Some(bounds) = menu_bounds.get() {
+                        this.open_row_menu(keyboard_menu_key.as_ref(), &keyboard_menu_id, bounds.bottom_left(), window, cx);
+                    }
+                    return;
+                }
                 if stroke.modifiers.modified() {
                     return;
                 }
@@ -486,14 +509,24 @@ impl SidebarPane {
                 });
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                this.hover.dismiss(cx);
-                if let Some(key) = &menu_key {
-                    let selected = this.state.read(cx).sidebar.fleet_selection.contains(key);
-                    this.menu.update(cx, |menu, cx| if selected { menu.open_for_selection(event.position, window, cx); } else { menu.open_for_scoped_thread(key, event.position, window, cx); });
-                }
-                else { this.open_menu(&menu_id, event.position, window, cx); }
+                window.focus(&row_focus, cx);
+                this.open_row_menu(menu_key.as_ref(), &menu_id, event.position, window, cx);
                 cx.stop_propagation();
             }))
+    }
+
+    fn open_row_menu(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread_id: &str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
+        if let Some(key) = key {
+            let selected = self.state.read(cx).sidebar.fleet_selection.contains(key);
+            self.menu.update(cx, |menu, cx| if selected {
+                menu.open_for_selection(position, window, cx);
+            } else {
+                menu.open_for_scoped_thread(key, position, window, cx);
+            });
+        } else {
+            self.open_menu(thread_id, position, window, cx);
+        }
     }
 
     fn render_title(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, color: Hsla, recede: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -631,6 +664,10 @@ impl SidebarPane {
             };
             state.sidebar.fleet.scratch_machine_labels.get(&project_ref).map(|label| (machine_icon, label.clone()))
         });
+        let issues = key.map_or_else(
+            || state.thread_shell(&thread.id),
+            |key| state.scoped_thread(key).and_then(|row| super::search::scoped_thread_shell(state, &row.owner, &thread.id)),
+        ).map_or_else(Vec::new, |shell| shell.issues.clone());
         RowExtras {
             draft,
             config_loaded,
@@ -639,6 +676,7 @@ impl SidebarPane {
             remote: (!current_environment && scratch_machine.is_none()).then_some(machine_icon),
             scratch_machine,
             pr,
+            issues,
         }
     }
 
@@ -653,8 +691,8 @@ impl SidebarPane {
         let id = thread.id.clone();
         let debug_id = scoped_id("pr-badge-", key, &thread.id);
         let key = key.cloned();
-        Some(
-            div()
+        let links = thread.pull_requests.clone();
+        let badge = div()
                 .id(SharedString::from(debug_id.clone()))
                 .debug_selector(move || debug_id.clone())
                 .flex_none()
@@ -665,7 +703,7 @@ impl SidebarPane {
                 .cursor_pointer()
                 .child(icon.render(px(12.), hsla(tone)))
                 .child(div().text_color(hsla(p.sidebar_secondary_label)).child(pr.text.clone()))
-                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -677,7 +715,11 @@ impl SidebarPane {
                                     None => state.click_sidebar_thread(&id, gpui::Modifiers::default(), cx),
                                 }
                             }
-                            state.add_pull_requests_surface(cx);
+                            if state.selected_thread.as_deref() == Some(&id)
+                                && key.as_ref().is_none_or(|key| state.active_sidebar_row_key().as_ref() == Some(key))
+                            {
+                                state.add_pull_requests_surface(cx);
+                            }
                         });
                     } else if let Some(url) = &url {
                         if key.as_ref().is_none_or(|key| this.state.read(cx).environments.active.as_deref() == Some(key.environment_id.as_str())) {
@@ -686,9 +728,86 @@ impl SidebarPane {
                             cx.open_url(url);
                         }
                     }
-                }))
-                .into_any_element(),
-        )
+                }));
+        let badge = if links.is_empty() {
+            badge.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+        } else {
+            badge.hoverable_tooltip(move |_, cx| {
+                cx.new(|_| super::hover::PrMiniList(links.clone())).into()
+            })
+        };
+        Some(badge.into_any_element())
+    }
+
+    fn render_issue_badge(
+        &self,
+        key: Option<&t3_core::sidebar::tag_filter::ThreadKey>,
+        thread: &SidebarThread,
+        issues: &[t3_core::issues::wire::ThreadIssueLink],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let first = issues.first()?;
+        let p = palette(cx);
+        let muted = hsla(p.sidebar_secondary_label);
+        let environment = key.map(|key| key.environment_id.clone());
+        let target = t3_core::right_panel::IssueTarget::from_thread_link(environment.clone(), first);
+        let detail = (issues.len() == 1).then(|| {
+            crate::issues::HeldIssueKey::of(self.state.read(cx), environment.as_deref(), &target.issue_ref())
+                .and_then(|key| crate::issues::held_issue_detail(&key, cx))
+        }).flatten();
+        let (icon, ink) = detail.as_ref().map_or((Icon::CircleDot, muted), |detail| {
+            crate::issues::state_glyph(&detail.state, cx)
+        });
+        let count = issues.len();
+        let label = if count == 1 {
+            if let Some(detail) = &detail {
+                crate::i18n::t_fmt(cx, "Issue {key}: {title}, {state}", &[
+                    ("key", first.display_key.as_str().into()),
+                    ("title", first.title.as_str().into()),
+                    ("state", detail.state.name.as_str().into()),
+                ])
+            } else {
+                crate::i18n::t_fmt(cx, "Issue {key}: {title}", &[
+                    ("key", first.display_key.as_str().into()),
+                    ("title", first.title.as_str().into()),
+                ])
+            }
+        } else {
+            crate::i18n::t_fmt(cx, "{count, plural, one {{count} linked issue} other {{count} linked issues}}", &[
+                ("count", (count as i64).into()),
+            ])
+        };
+        let value = if count == 1 { first.display_key.clone() } else { crate::i18n::format_integer(cx, count as i64) };
+        let id = thread.id.clone();
+        let key = key.cloned();
+        Some(div()
+            .id(SharedString::from(scoped_id("issue-badge-", key.as_ref(), &id)))
+            .flex_none()
+            .max_w(px(80.))
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .text_xs()
+            .cursor_pointer()
+            .child(icon.render(px(12.), ink))
+            .child(div().min_w_0().truncate().text_color(muted).child(value))
+            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.state.update(cx, |state, cx| {
+                    match &key {
+                        Some(key) => state.click_scoped_sidebar_thread(key, gpui::Modifiers::default(), cx),
+                        None => state.click_sidebar_thread(&id, gpui::Modifiers::default(), cx),
+                    }
+                    if state.selected_thread.as_deref() == Some(&id)
+                        && key.as_ref().is_none_or(|key| state.active_sidebar_row_key().as_ref() == Some(key))
+                    {
+                        state.add_pull_requests_surface(cx);
+                    }
+                });
+            }))
+            .into_any_element())
     }
 
     /// `SidebarProviderStack` with the remote machine before it: earlier instances small, faded and
@@ -713,9 +832,12 @@ impl SidebarPane {
     /// `ThreadTerminalStatusButton`: opens the first running terminal in the thread's drawer.
     fn render_terminal_button(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, running: &[String], cx: &mut Context<Self>) -> Option<AnyElement> {
         let terminal_id = running.first()?.clone();
-        let label: SharedString = if running.len() == 1 { "1 terminal process running. Open terminal".into() } else { format!("{} terminal processes running. Open terminal", running.len()).into() };
+        let label = crate::i18n::t_fmt(cx, "{count, plural, one {{count} terminal process running. Open terminal} other {{count} terminal processes running. Open terminal}}",
+            &[("count", (running.len() as i64).into())]);
         let id = thread.id.clone();
         let debug_id = scoped_id("terminal-status-", key, &thread.id);
+        let pulse_id = SharedString::from(format!("{debug_id}-pulse"));
+        let color = hsla(palette(cx).terminal_running);
         let key = key.cloned();
         Some(
             div()
@@ -725,7 +847,10 @@ impl SidebarPane {
                 .cursor_pointer()
                 .text_color(hsla(palette(cx).terminal_running))
                 .hover(|this| this.opacity(0.8))
-                .child(Icon::Terminal.render(px(14.), hsla(palette(cx).terminal_running)))
+                .relative()
+                .child(Icon::Terminal.render(px(14.), color))
+                .child(div().absolute().right(px(-2.)).top(px(-1.))
+                    .child(StatusDot::new(pulse_id, px(3.), color, true)))
                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -831,6 +956,7 @@ impl SidebarPane {
                 .child(div().flex_1().min_w_0().truncate().children(leading_label))
                 .children(self.render_terminal_button(key, thread, &extras.running, cx))
                 .children(self.render_pr_badge(key, thread, extras.pr.as_ref(), active, cx))
+                .children(self.render_issue_badge(key, thread, &extras.issues, cx))
                 .children(trailing.map(|icons| div().ml_auto().child(icons)))
                 .into_any_element(),
         )
@@ -921,13 +1047,22 @@ impl SidebarPane {
             })
             .when(show_snooze, |this| {
                 let debug_id = scoped_id("snooze-", key, &thread.id);
-                this.child(hover_action(SharedString::from(debug_id.clone()), p).debug_selector(move || debug_id.clone()).child(Icon::Clock.render(px(12.), hsla(p.muted_foreground))).on_click(cx.listener(
-                    move |this, event: &gpui::ClickEvent, window, cx| {
+                let (bounds, measure) = super::measure_trigger();
+                this.child(hover_action(SharedString::from(debug_id.clone()), p)
+                    .debug_selector(move || debug_id.clone())
+                    .relative()
+                    .child(measure)
+                    .child(Icon::Clock.render(px(12.), hsla(p.muted_foreground)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        if let Some(key) = &snooze_key { this.menu.update(cx, |menu, cx| menu.open_scoped_snooze(key, event.position(), window, cx)); }
-                        else { this.open_snooze_menu(&snooze_id, event.position(), window, cx); }
-                    },
-                )))
+                        let Some(bounds) = bounds.get() else { return };
+                        let position = bounds.bottom_left();
+                        if let Some(key) = &snooze_key {
+                            this.menu.update(cx, |menu, cx| menu.open_scoped_snooze(key, position, window, cx));
+                        } else {
+                            this.open_snooze_menu(&snooze_id, position, window, cx);
+                        }
+                    })))
             })
             .when(extras.config_loaded, |this| {
                 let debug_id = scoped_id("settle-", key, &thread.id);
@@ -1130,7 +1265,9 @@ impl SidebarPane {
             .child(self.render_title(key, thread, title_color, state.recede, cx))
             .children(title_icons)
             .children(self.pin_indicator(key, thread, interactive_pin, cx))
-            .when(!variant.multiline(), |this| this.children(self.render_terminal_button(key, thread, &extras.running, cx)))
+            .when(!variant.multiline(), |this| this
+                .children(self.render_issue_badge(key, thread, &extras.issues, cx))
+                .children(self.render_terminal_button(key, thread, &extras.running, cx)))
             .child(right_slot);
         let surface = self.row_surface(&target, is_repo, &state, window, cx);
         let surface = if variant.multiline() {
@@ -1206,8 +1343,11 @@ impl SidebarPane {
         )
     }
 
-    fn render_shelf(&self, shelf: Shelf, count: usize, expanded: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_shelf(&self, shelf: Shelf, count: usize, expanded: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let id = ElementId::Name(SharedString::from(format!("shelf-{}", shelf.label())));
+        let focus = self.tree.focus(&TreeRow::Shelf(shelf))
+            .unwrap_or_else(|| crate::settings::controls::focus_handle(&id, window, cx));
         let tone = if shelf == Shelf::Settled && self.drop_target() == Some(Section::Settled) {
             hsla(p.primary)
         } else if self.drag.is_some() {
@@ -1220,7 +1360,11 @@ impl SidebarPane {
             .pb(px(1.))
             .child(
                 div()
-                    .id(SharedString::from(format!("shelf-{}", shelf.label())))
+                    .id(id)
+                    .track_focus(&focus)
+                    .role(gpui::Role::Button)
+                    .aria_expanded(expanded)
+                    .focus_visible(|this| this.bg(hsla(p.sidebar_row_hover)))
                     .h(px(SHELF_HEIGHT))
                     .flex()
                     .items_center()
@@ -1241,14 +1385,20 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn render_show_more(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_show_more(&self, count: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let label = self.state.read(cx).settled_show_more_label(count, cx);
+        let id = ElementId::Name("settled-show-more".into());
+        let focus = self.tree.focus(&TreeRow::ShowMore)
+            .unwrap_or_else(|| crate::settings::controls::focus_handle(&id, window, cx));
         div()
             .px(px(8.))
             .child(
                 div()
-                    .id("settled-show-more")
+                    .id(id)
+                    .track_focus(&focus)
+                    .role(gpui::Role::Button)
+                    .focus_visible(|this| this.bg(hsla(p.sidebar_row_hover)))
                     .min_h(px(36.))
                     .flex()
                     .items_center()

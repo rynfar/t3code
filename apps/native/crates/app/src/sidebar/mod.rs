@@ -8,12 +8,15 @@ mod bulk;
 mod drafts;
 pub mod controller;
 mod drag;
+pub(crate) use drag::DraggedThread;
 mod favicons;
 mod hover;
 mod project_filter;
 mod project_folders;
 mod row;
 mod search;
+mod shift_guard;
+mod tree;
 #[cfg(all(test, feature = "snapshot"))]
 mod drag_tests;
 
@@ -38,12 +41,23 @@ use crate::dialog::ConfirmDialog;
 use crate::snooze_dialog::SnoozeDialog;
 use crate::icons::Icon;
 use crate::theme::{
-    SlotState, ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, slot_has_floating_inset,
+    SlotState, ThemeSlot, ThemeSlotExt as _, ThemeSlotInteractiveExt as _, hsla, palette, slot_has_floating_inset,
     slot_style, theme_slot_state_background_layer,
 };
 use crate::workspace::TITLEBAR_HEIGHT;
 use controller::now_ms;
 use search::SearchState;
+
+type TriggerBounds = std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>;
+
+fn measure_trigger() -> (TriggerBounds, impl IntoElement) {
+    let bounds = TriggerBounds::default();
+    let measured = bounds.clone();
+    let probe = gpui::canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, _, _, _| {})
+        .absolute()
+        .inset_0();
+    (bounds, probe)
+}
 
 const JUMP_HINT_SHOW_DELAY_MS: u64 = 200;
 
@@ -102,10 +116,15 @@ pub struct SidebarPane {
     list: ListState,
     measured_font: Option<(Pixels, gpui::SharedString)>,
     row_keys: Vec<PaneRowKey>,
+    tree: tree::TreeNavigation,
+    shift_guard: shift_guard::ShiftGuard,
+    first_shelf: Option<usize>,
+    shelf_gap: Pixels,
     pub(crate) search_input: Entity<InputState>,
     pub(crate) search: SearchState,
     rename: Option<(String, Entity<InputState>)>,
     rename_previous_focus: Option<gpui::FocusHandle>,
+    rename_subscription: Option<Subscription>,
     /// Where the project filter popover opens, while it is open.
     pub(crate) project_filter: Option<gpui::Point<gpui::Pixels>>,
     pub(crate) project_filter_search: Entity<InputState>,
@@ -587,10 +606,15 @@ impl SidebarPane {
             list: ListState::new(0, ListAlignment::Top, px(200.)),
             measured_font: None,
             row_keys: Vec::new(),
+            tree: Default::default(),
+            shift_guard: Default::default(),
+            first_shelf: None,
+            shelf_gap: px(0.),
             search_input,
             search: SearchState::default(),
             rename: None,
             rename_previous_focus: None,
+            rename_subscription: None,
             project_filter: None,
             project_filter_search,
             project_filter_focus,
@@ -684,7 +708,9 @@ impl SidebarPane {
         else { keys.extend(state.sidebar.fleet.row_keys().into_iter().map(PaneRowKey::Scoped)); }
         if let Some((range, count)) = t3_core::sidebar::splice_range(&self.row_keys, &keys) {
             let scroll_top = self.list.logical_scroll_top();
-            self.list.splice(range.clone(), count);
+            self.tree.sync(&keys, cx);
+            self.shift_guard.layout_changed();
+            self.list.splice_focusable(range.clone(), keys[range.start..range.start + count].iter().map(|key| self.tree.focus_for_row(key)));
             if let Some(target) = reanchored_scroll_top(&self.row_keys, &keys, scroll_top, &range, count, self.drag.is_some()) {
                 let after = self.list.logical_scroll_top();
                 if (after.item_ix, after.offset_in_item) != (target.item_ix, target.offset_in_item) {
@@ -692,10 +718,51 @@ impl SidebarPane {
                 }
             }
         }
+        let first_shelf = keys.iter().position(|key| matches!(
+            key,
+            PaneRowKey::Thread(RowKey::Shelf(_)) | PaneRowKey::Scoped(t3_core::sidebar::fleet::ScopedRowKey::Shelf(_))
+        ));
+        if first_shelf != self.first_shelf {
+            for index in [self.first_shelf, first_shelf].into_iter().flatten().filter(|index| *index < keys.len()) {
+                self.list.remeasure_items(index..index + 1);
+            }
+            self.first_shelf = first_shelf;
+            self.shelf_gap = px(0.);
+        }
         self.row_keys = keys;
         let state = self.state.read(cx);
         self.prune_checkout_repos(state);
         self.schedule_clock(cx);
+    }
+
+    fn shelf_gap_probe(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let shelf = self.first_shelf?;
+        let list = self.list.clone();
+        let generation = self.row_keys.len();
+        let gap = self.shelf_gap;
+        let dragging = self.drag.is_some();
+        let pane = cx.weak_entity();
+        Some(gpui::canvas(|_, _, _| {}, move |_, _, window, _| {
+            let top = list.logical_scroll_top();
+            let fully_measured = top.item_ix == 0 && list.bounds_for_item(generation - 1).is_some();
+            let gap_target = if fully_measured && !dragging {
+                let natural_height = list.offset_for_item(generation) - gap;
+                (list.viewport_bounds().size.height - natural_height).max(px(0.))
+            } else {
+                px(0.)
+            };
+            if (gap_target - gap).abs() >= px(0.5) {
+                window.on_next_frame(move |_, cx| {
+                    let _ = pane.update(cx, |this, cx| {
+                        if this.first_shelf == Some(shelf) && this.row_keys.len() == generation && this.shelf_gap == gap {
+                            this.shelf_gap = gap_target;
+                            this.list.remeasure_items(shelf..shelf + 1);
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+        }).absolute().size_0())
     }
 
     pub(super) fn ensure_checkout_repo(
@@ -978,11 +1045,13 @@ impl SidebarPane {
                 let title = input.read(cx).value().to_string();
                 this.rename = None;
                 this.rename_key = None;
+                this.rename_previous_focus = None;
+                this.rename_subscription = None;
                 this.state.update(cx, |state, cx| {
                     if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) {
                         match t3_core::thread_actions::resolve_rename(&title, &original_title) {
                             t3_core::thread_actions::RenameOutcome::Empty => {
-                                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Warning, "Thread title cannot be empty"), cx);
+                                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Warning, crate::i18n::t(cx, "Thread title cannot be empty")), cx);
                             }
                             t3_core::thread_actions::RenameOutcome::Unchanged => {}
                             t3_core::thread_actions::RenameOutcome::Rename(next_title) => {
@@ -997,7 +1066,7 @@ impl SidebarPane {
         });
         self.rename_key = Some(key.clone());
         self.rename = Some((key.thread_id.clone(), input.clone()));
-        self._subscriptions.push(subscription);
+        self.rename_subscription = Some(subscription);
         input.update(cx, |input, cx| { input.focus(window, cx); input.select_all(window, cx); });
         cx.notify();
     }
@@ -1019,6 +1088,8 @@ impl SidebarPane {
                 let title = input.read(cx).value().to_string();
                 if this.rename.as_ref().is_some_and(|(renaming, _)| *renaming == id) {
                     this.rename = None;
+                    this.rename_previous_focus = None;
+                    this.rename_subscription = None;
                     this.state.update(cx, |state, cx| {
                         if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) {
                             state.rename_thread_with_original(&id, &title, Some(&original_title), cx);
@@ -1030,17 +1101,19 @@ impl SidebarPane {
             }
             _ => {}
         });
-        self._subscriptions.push(subscription);
+        self.rename_key = None;
+        self.rename = Some((thread_id.to_owned(), input.clone()));
+        self.rename_subscription = Some(subscription);
         input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.rename = Some((thread_id.to_owned(), input));
         cx.notify();
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
         self.rename_key = None;
+        self.rename_subscription = None;
         if let Some((_, input)) = self.rename.take() {
             let input_focus = input.read(cx).focus_handle(cx);
             let previous = self.rename_previous_focus.take();
@@ -1122,7 +1195,7 @@ impl SidebarPane {
     /// `SidebarChromeHeader`: the brand (a link home), history buttons, and environment
     /// identification artwork or version pill (`SidebarChrome.tsx`, `SidebarStageBackdrop.tsx`)
     /// in the 52px drag strip after the window controls and the sidebar toggle.
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         use t3_core::client_settings::{
             EnvironmentIdentificationMode, StageBackdropVariant,
             resolve_environment_identification_pill_label,
@@ -1137,17 +1210,21 @@ impl SidebarPane {
         let pill_label = (effective_mode == EnvironmentIdentificationMode::Pill)
             .then(|| resolve_environment_identification_pill_label(stage_label))
             .flatten();
+        let on_backdrop = backdrop_variant.is_some();
+        let stage_base = if gpui_component::ActiveTheme::theme(&**cx).is_dark() { p.sidebar } else { p.sidebar_foreground };
+        let brand_ink = if on_backdrop { hsla(crate::theme::WHITE) } else { hsla(p.foreground) };
+        let code_ink = if on_backdrop { brand_ink.opacity(0.7) } else { hsla(p.muted_foreground) };
         let backdrop = backdrop_variant.map(|variant| {
             let (top_color, mid_color, line_color) = match variant {
                 StageBackdropVariant::Dev => (
-                    hsla(p.info).opacity(0.24),
-                    hsla(p.primary).opacity(0.12),
-                    hsla(p.info).opacity(0.22),
+                    hsla(p.message_action).opacity(0.72),
+                    hsla(p.message_action).opacity(0.52),
+                    brand_ink.opacity(0.18),
                 ),
                 StageBackdropVariant::Nightly => (
-                    hsla(p.primary).opacity(0.26),
-                    hsla(p.accent).opacity(0.16),
-                    hsla(p.foreground).opacity(0.35),
+                    hsla(p.message_action).opacity(0.78),
+                    hsla(p.message_action).opacity(0.28),
+                    brand_ink.opacity(0.72),
                 ),
             };
             div()
@@ -1156,11 +1233,12 @@ impl SidebarPane {
                 .absolute()
                 .inset_0()
                 .overflow_hidden()
-                .bg(gpui::linear_gradient(
-                    180.,
+                .bg(hsla(stage_base))
+                .child(div().absolute().inset_0().bg(gpui::linear_gradient(
+                    120.,
                     gpui::linear_color_stop(top_color, 0.),
-                    gpui::linear_color_stop(mid_color.opacity(0.), 1.),
-                ))
+                    gpui::linear_color_stop(mid_color, 1.),
+                )))
                 .child(
                     gpui::canvas(
                         |_, _, _| {},
@@ -1168,7 +1246,7 @@ impl SidebarPane {
                             match variant {
                                 StageBackdropVariant::Dev => {
                                     // Subtle blueprint grid lines (`DevBlueprintArt`).
-                                    let step = 16.0_f32;
+                                    let step = 8.0_f32;
                                     let width = f32::from(bounds.size.width);
                                     let height = f32::from(bounds.size.height);
                                     let mut x = step;
@@ -1178,7 +1256,7 @@ impl SidebarPane {
                                                 gpui::point(bounds.origin.x + px(x), bounds.origin.y),
                                                 gpui::size(px(1.), bounds.size.height),
                                             ),
-                                            line_color,
+                                            if (x % 32.) == 0. { line_color } else { line_color.opacity(0.5) },
                                         ));
                                         x += step;
                                     }
@@ -1189,7 +1267,7 @@ impl SidebarPane {
                                                 gpui::point(bounds.origin.x, bounds.origin.y + px(y)),
                                                 gpui::size(bounds.size.width, px(1.)),
                                             ),
-                                            line_color,
+                                            if (y % 32.) == 0. { line_color } else { line_color.opacity(0.5) },
                                         ));
                                         y += step;
                                     }
@@ -1249,7 +1327,7 @@ impl SidebarPane {
             .overflow_hidden()
             .flex()
             .items_center()
-            .pl(px(130.))
+            .pl(crate::workspace::traffic_light_inset(window, true))
             .pr(px(12.))
             .gap(px(8.))
             .window_control_area(gpui::WindowControlArea::Drag)
@@ -1264,6 +1342,8 @@ impl SidebarPane {
                     .child(
                         div()
                             .id("sidebar-brand")
+                            .role(gpui::Role::Link)
+                            .aria_label(crate::i18n::t(cx, "T3 Code home"))
                             .h(px(28.))
                             .flex()
                             .items_center()
@@ -1274,14 +1354,14 @@ impl SidebarPane {
                             .child(
                                 div()
                                     .flex()
-                                    .items_baseline()
+                                    .items_center()
                                     .gap(px(4.))
-                                    .child(div().text_color(hsla(p.foreground)).font_weight(FontWeight::SEMIBOLD).child("T3"))
-                                    .child(div().text_color(hsla(p.muted_foreground)).child("Code")),
+                                    .child(Icon::T3Wordmark.sized(crate::project_icon::size(16., cx)).text_color(brand_ink))
+                                    .child(div().text_color(code_ink).child("Code")),
                             )
                             .on_click(move |_, _, cx| state.update(cx, |state, cx| state.go_home(cx))),
                     )
-                    .child(div().flex().items_center().child(self.render_history_button(true, cx)).child(self.render_history_button(false, cx)))
+                    .child(div().flex().items_center().child(self.render_history_button(true, on_backdrop, cx)).child(self.render_history_button(false, on_backdrop, cx)))
                     .children(pill),
             )
     }
@@ -1320,9 +1400,11 @@ impl SidebarPane {
     }
 
     /// `HistoryNavigationButton`: ghost `icon-sm` with a 14px arrow, disabled at either end.
-    fn render_history_button(&self, back: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_history_button(&self, back: bool, on_backdrop: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let enabled = self.state.read(cx).can_navigate(back);
+        let ink = if on_backdrop { hsla(crate::theme::WHITE).opacity(0.8) } else { hsla(p.sidebar_icon) };
+        let hover = if on_backdrop { ink.opacity(0.16) } else { hsla(p.sidebar_accent) };
         let command = if back { "navigation.back" } else { "navigation.forward" };
         let label = format!("{}{}", crate::i18n::t(cx, if back { "Go back" } else { "Go forward" }), crate::keymap::label(command, cx).map_or_else(String::new, |key| format!(" ({key})")));
         div()
@@ -1334,8 +1416,8 @@ impl SidebarPane {
             .justify_center()
             .rounded(px(8.))
             .when(!enabled, |this| this.opacity(0.64))
-            .when(enabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.sidebar_accent))))
-            .child((if back { Icon::ArrowLeft } else { Icon::ArrowRight }).render(px(14.), hsla(p.sidebar_icon)))
+            .when(enabled, |this| this.cursor_pointer().hover(|this| this.bg(hover)))
+            .child((if back { Icon::ArrowLeft } else { Icon::ArrowRight }).render(px(14.), ink))
             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
             .when(enabled, |this| this.on_click(cx.listener(move |this, _, _, cx| this.state.update(cx, |state, cx| state.navigate_history(back, cx)))))
     }
@@ -1345,16 +1427,16 @@ impl SidebarPane {
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let searching = self.search.is_active();
-        let (has_filterable_projects, has_any_projects) = {
+        let (project_groups, has_any_projects) = {
             let state = self.state.read(cx);
             if state.fleet.environments.is_empty() {
                 let any = state.shell.snapshot.as_ref().is_some_and(|snapshot| !snapshot.projects.is_empty());
-                (!self.project_groups(cx).is_empty(), any)
+                (self.project_groups(cx).len(), any)
             } else {
                 let pickable = t3_core::sidebar::grouping::pickable_scoped_project_groups(
                     &state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx),
                 );
-                (!pickable.is_empty(), !state.sidebar.grouping_projects.is_empty())
+                (pickable.len(), !state.sidebar.grouping_projects.is_empty())
             }
         };
         div().p(px(8.)).flex().items_center().gap(px(4.)).child(
@@ -1393,7 +1475,7 @@ impl SidebarPane {
                     }
                 }))
                 .child(Icon::Search.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
-                .child(div().flex_1().min_w_0().child(Input::new(&self.search_input).appearance(false).bordered(false)))
+                .child(div().flex_1().min_w_0().child(Input::new(&self.search_input).appearance(false).bordered(false).theme_slot(ThemeSlot::Input, cx)))
                 .when(searching, |this| {
                     this.child(
                         div()
@@ -1415,7 +1497,7 @@ impl SidebarPane {
                 .flex()
                 .flex_none()
                 .items_center()
-                .when(has_filterable_projects, |this| {
+                .when(project_groups > 0, |this| {
                     this.child(self.render_project_filter_button(cx)).child(
                         Self::header_button("add-project", Self::button_icon(Icon::FolderPlus, "add-project", cx), |cx| crate::i18n::t(cx, "Add project").to_owned(), true, cx)
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
@@ -1423,7 +1505,17 @@ impl SidebarPane {
                 })
                 .child(
                     Self::header_button("new-thread-sidebar", Self::button_icon(Icon::SquarePen, "new-thread-sidebar", cx), new_thread_label, has_any_projects, cx)
-                        .when(has_any_projects, |this| this.on_click(|_, window, cx| window.dispatch_action(Box::new(crate::new_thread::NewThread), cx))),
+                        .when(has_any_projects, |this| this.on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            let use_current = event.modifiers().shift || project_groups <= 1;
+                            if use_current && crate::new_thread::default_project(this.state.read(cx)).is_some() {
+                                this.state.update(cx, |state, cx| {
+                                    state.close_sidebar_sheet(cx);
+                                    crate::new_thread::start_new_thread(state, cx);
+                                });
+                            } else {
+                                window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
+                            }
+                        }))),
                 ),
         )
     }
@@ -1629,29 +1721,26 @@ fn snooze_access(state: &AppState) -> bool {
 }
 
 fn pull_requests_supported(state: &AppState) -> bool {
+    sidebar_environment_supports(state, |_| true)
+}
+
+fn sidebar_environment_supports(
+    state: &AppState,
+    supports: impl Fn(&t3_core::server_config::ServerConfig) -> bool,
+) -> bool {
+    let enabled = |id: &str| {
+        !state.environments.environments.iter().any(|record| record.id == id && record.disabled)
+    };
+    let active = state.environments.active.as_deref();
     if state.fleet.environments.is_empty() {
-        let active_disabled = state.environments.active.as_deref().is_some_and(|active| {
-            state
-                .environments
-                .environments
-                .iter()
-                .any(|record| record.id == active && record.disabled)
-        });
-        !active_disabled && state.server_config.config.is_some()
-    } else {
-        state.fleet.environments.iter().any(|entry| {
-            let disabled = state
-                .environments
-                .environments
-                .iter()
-                .any(|record| record.id == entry.summary.owner.saved_id && record.disabled);
-            !disabled
-                && (entry.config.config.is_some()
-                    || (state.environments.active.as_deref()
-                        == Some(entry.summary.owner.saved_id.as_str())
-                        && state.server_config.config.is_some()))
-        })
+        return active.is_none_or(enabled) && state.server_config.config.as_ref().is_some_and(supports);
     }
+    state.fleet.environments.iter().any(|entry| {
+        let id = entry.summary.owner.saved_id.as_str();
+        enabled(id) && entry.config.config.as_ref()
+            .or_else(|| state.server_config.config.as_ref().filter(|_| active == Some(id)))
+            .is_some_and(&supports)
+    })
 }
 
 fn new_thread_label(cx: &App) -> String {
@@ -1770,6 +1859,8 @@ impl Render for SidebarPane {
         } else if self.row_keys.is_empty() {
             empty_notice().into_any_element()
         } else {
+            let shift_frame = self.shift_guard.frame();
+            let row_frame = shift_frame.clone();
             let thread_list = div()
                 .id("sidebar-thread-list")
                 .flex_1()
@@ -1777,12 +1868,22 @@ impl Render for SidebarPane {
                 .flex()
                 .flex_col()
                 .child(
-                    list(self.list.clone(), cx.processor(|this, index: usize, window, cx| this.render_row(index, window, cx)))
+                    list(self.list.clone(), cx.processor(move |this, index: usize, window, cx| {
+                        let row = this.render_row(index, window, cx);
+                        let probe = this.row_keys.get(index).and_then(|key| row_frame.row(key));
+                        div()
+                            .when(this.first_shelf == Some(index), |wrapper| wrapper.pt(this.shelf_gap))
+                            .child(div().relative().child(row).children(probe))
+                            .into_any_element()
+                    }))
                         .flex_1()
                         .min_h_0()
                         .when(self.drag.is_some(), |this| this.pb(px(40.))),
                 )
-                .on_drop(cx.listener(|this, _: &drag::DraggedThread, _, cx| this.finish_drag(true, cx)))
+                .children(self.shelf_gap_probe(cx))
+                .child(shift_frame.finish())
+                .capture_key_down(cx.listener(Self::navigate_tree))
+                .on_drop(cx.listener(|this, _: &DraggedThread, _, cx| this.finish_drag(true, cx)))
                 .on_drop(cx.listener(|this, _: &drag::DraggedSweep, _, cx| this.finish_sweep(true, cx)))
                 .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)));
             if show_empty_notice {
@@ -1822,7 +1923,28 @@ impl Render for SidebarPane {
             .flex_col()
             .when(!sidebar_overrides_bg, |this| this.bg(hsla(p.sidebar)))
             .theme_slot_interactive(ThemeSlot::SidebarInner, cx)
+            .capture_any_mouse_down(cx.listener(|this, event, window, cx| {
+                if !this.search.is_active() && this.shift_guard.press(event) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, event, window, cx| {
+                if this.shift_guard.release(event) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let editing = this.search_input.read(cx).focus_handle(cx).is_focused(window)
+                    || this.rename.as_ref().is_some_and(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window));
+                let stroke = &event.keystroke;
+                if !editing || stroke.key == "enter" || stroke.modifiers.control || stroke.modifiers.platform || stroke.modifiers.alt {
+                    this.shift_guard.note_input();
+                }
+            }))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.shift_guard.note_input();
                 if this.hover.is_active() {
                     cx.notify();
                 }
@@ -1853,7 +1975,7 @@ impl Render for SidebarPane {
             }))
             .children(inner_bg_layer)
             .child(self.hover.begin_frame_probe())
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .child(self.hover.end_frame_probe(cx.entity().downgrade(), active_list))
@@ -3376,6 +3498,18 @@ mod sb_sections_pane_tests {
         vcx.update(|window, cx| {
             assert!(pane.update(cx, |p, cx| p.handle_escape(false, window, cx)));
             assert!(state.read(cx).sidebar.selection.is_empty());
+            let settled_focus = pane.read(cx).tree.focus(&tree::TreeRow::Shelf(t3_core::sidebar::Shelf::Settled)).unwrap();
+            let th4_focus = pane.read(cx).tree.focus(&tree::TreeRow::Thread(
+                t3_core::sidebar::tag_filter::ThreadKey::new("", "th-4"),
+            )).unwrap();
+            window.focus(&th3_focus, cx);
+            for (key, focus) in [("end", &th4_focus), ("left", &settled_focus), ("right", &th4_focus), ("up", &settled_focus), ("down", &th4_focus)] {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+                assert!(focus.is_focused(window), "{key} moves focus in the virtual sidebar");
+                assert!(state.read(cx).selected_thread.is_none(), "{key} leaves selection alone");
+            }
+            window.dispatch_keystroke(gpui::Keystroke::parse("home").unwrap(), cx);
+            assert!(pane.read(cx).tree.focus_for_row(&pane.read(cx).row_keys[0]).unwrap().is_focused(window));
             window.focus(&th3_focus, cx);
             window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("space").unwrap(),
@@ -3390,6 +3524,7 @@ mod sb_sections_pane_tests {
             }), cx);
             assert!(pane.read(cx).rename.as_ref().is_some_and(|(id, _)| id == "th-3"), "F2 starts inline rename on focused row");
             pane.update(cx, |p, cx| p.cancel_rename(cx));
+            assert!(pane.read(cx).rename_subscription.is_none());
         });
         vcx.run_until_parked();
         state.update(vcx, |s, _| s.stop_pump());
