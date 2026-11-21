@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement,
@@ -29,6 +30,7 @@ use t3_core::files::{
 use super::Root;
 use super::audio::{self, AudioState};
 use super::binary::{self, BinaryState, BinaryViewMode};
+use super::attachment::{AttachmentTarget, DecodedAttachment, Kind as AttachmentKind};
 use super::code::CodeView;
 use super::editor::{FileEditorController, target_to_save_target};
 use super::font::{self, FontState};
@@ -50,6 +52,7 @@ pub enum RenderedMode {
     Mermaid,
     Table,
     Notebook,
+    Html,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,9 +66,9 @@ pub struct Target {
 /// A file's identity: the server, the workspace and the path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
-    environment: String,
-    cwd: String,
-    path: String,
+    pub(super) environment: String,
+    pub(super) cwd: String,
+    pub(super) path: String,
 }
 
 impl Key {
@@ -115,6 +118,7 @@ enum Content {
 pub struct Preview {
     pub(super) state: Entity<AppState>,
     pub(super) target: Option<Target>,
+    attachment: Option<AttachmentTarget>,
     key: Option<Key>,
     content: Content,
     cache: VecDeque<Rc<TextFile>>,
@@ -132,6 +136,8 @@ pub struct Preview {
     render_mermaid: bool,
     render_table: bool,
     render_notebook: bool,
+    render_html: bool,
+    html: Option<(Rc<TextFile>, Rc<crate::webview::WebView>)>,
     markdown: Option<(Key, Entity<TextViewState>)>,
     markdown_scroll: ScrollHandle,
     mutation: Option<String>,
@@ -151,6 +157,7 @@ impl Preview {
         let mut preview = Preview {
             state,
             target: None,
+            attachment: None,
             key: None,
             content: Content::Empty,
             cache: VecDeque::new(),
@@ -168,6 +175,8 @@ impl Preview {
             render_mermaid: true,
             render_table: true,
             render_notebook: true,
+            render_html: false,
+            html: None,
             markdown: None,
             markdown_scroll: ScrollHandle::new(),
             mutation: None,
@@ -193,6 +202,7 @@ impl Preview {
     }
 
     pub fn set_target(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
+        self.set_attachment(None, cx);
         self.refresh_write_scope(cx);
         if target == self.target {
             return;
@@ -230,7 +240,99 @@ impl Preview {
         cx.notify();
     }
 
+    pub(super) fn set_attachment(&mut self, attachment: Option<AttachmentTarget>, cx: &mut Context<Self>) {
+        if self.attachment == attachment {
+            return;
+        }
+        if self.target.is_some() {
+            self.set_target(None, cx);
+        }
+        self.attachment = attachment;
+        self._fetch = None;
+        self.generation += 1;
+        self.key = None;
+        self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
+        self.replace_content(Content::Empty, cx);
+        self.fetch_attachment(cx);
+        cx.notify();
+    }
+
+    fn fetch_attachment(&mut self, cx: &mut Context<Self>) {
+        let Some(attachment) = self.attachment.clone() else { return };
+        let Some(resource) = attachment.resource() else {
+            self.replace_content(Content::Failed(ReadFailure::message("No preview for this file")), cx);
+            return;
+        };
+        let app = self.state.read(cx);
+        let Some(client) = app.client_handle().filter(|_| app.environment() == Some(&attachment.environment)) else {
+            self.replace_content(Content::Failed(ReadFailure::message("Not connected to the server.")), cx);
+            return;
+        };
+        let kind = AttachmentKind::of(&attachment.file);
+        let limit = kind.limit();
+        if attachment.file.size_bytes > limit as u64 {
+            self.replace_content(Content::Failed(ReadFailure::message("This file exceeds the preview size limit.")), cx);
+            return;
+        }
+        let request = app.runtime().spawn(async move {
+            let asset = t3_client::assets::mint_media_url(&client, &resource).await?;
+            client.asset_bytes(&asset.relative_url, limit).await
+                .map_err(|_| "Unable to load attachment.".to_owned())
+        });
+        self.generation += 1;
+        let generation = self.generation;
+        self.replace_content(Content::Loading, cx);
+        let doc_key = format!("{}:attachment:{}", attachment.environment, attachment.file.id);
+        let key = Key {
+            environment: attachment.environment,
+            cwd: format!("attachment:{}", attachment.file.id),
+            path: attachment.file.name,
+        };
+        self._fetch = Some(cx.spawn(async move |this, cx| {
+            let decoded = match request.await {
+                Ok(Ok(bytes)) => cx.background_executor().spawn(async move { kind.decode(key, bytes) }).await,
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err("Unable to load attachment.".to_owned()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                let content = match decoded {
+                    Ok(DecodedAttachment::Text(file)) => {
+                        this.show_text(Rc::new(*file), cx);
+                        cx.notify();
+                        return;
+                    }
+                    Ok(DecodedAttachment::Audio(audio)) => Content::Audio(AudioState::from_decoded(Ok(audio))),
+                    Ok(DecodedAttachment::Binary(binary)) => Content::Binary(BinaryState::from(Ok(binary))),
+                    Ok(DecodedAttachment::Font(font)) => Content::Font(FontState::from_decoded(Ok(font), cx)),
+                    Ok(DecodedAttachment::Image(image)) => Content::Image(ImageState::from(Ok(image))),
+                    Ok(DecodedAttachment::Office(office)) => Content::Office(OfficeState::from_decoded(Ok(office))),
+                    Ok(DecodedAttachment::Pdf(pdf)) => {
+                        Content::Pdf(PdfState::from_decoded(doc_key, Ok(pdf), &this.pdf_positions))
+                    }
+                    Err(error) => Content::Failed(ReadFailure::message(error)),
+                };
+                this.replace_content(content, cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    pub(super) fn attachment_resource(&self) -> Option<t3_core::media::AssetResource> {
+        self.attachment.as_ref()?.resource()
+    }
+
+    pub(super) fn retry_attachment(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.content, Content::Failed(_)) {
+            self.fetch_attachment(cx);
+            cx.notify();
+        }
+    }
+
     fn replace_content(&mut self, content: Content, cx: &mut Context<Self>) {
+        self.html = None;
         let previous = std::mem::replace(&mut self.content, content);
         match previous {
             Content::Image(image) => image.release(cx),
@@ -318,7 +420,11 @@ impl Preview {
             || matches!(&self.content, Content::Office(office) if office.failed())
             || matches!(&self.content, Content::Binary(binary) if binary.failed());
         if needs_retry {
-            self.fetch(cx);
+            if self.attachment.is_some() {
+                self.fetch_attachment(cx);
+            } else {
+                self.fetch(cx);
+            }
         }
     }
 
@@ -649,7 +755,8 @@ impl Preview {
     }
 
     pub fn rendered_mode(&self) -> Option<RenderedMode> {
-        let path = &self.target.as_ref()?.path;
+        let path = self.target.as_ref().map(|target| &target.path)
+            .or_else(|| self.attachment.as_ref().map(|target| &target.file.name))?;
         if is_mermaid(path) {
             Some(RenderedMode::Mermaid)
         } else if is_markdown(path) {
@@ -658,6 +765,10 @@ impl Preview {
             Some(RenderedMode::Table)
         } else if is_notebook(path) {
             Some(RenderedMode::Notebook)
+        } else if cfg!(target_os = "macos") && (is_html(path) || self.attachment.as_ref().is_some_and(|target| {
+            target.file.mime_type.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+        })) {
+            Some(RenderedMode::Html)
         } else {
             None
         }
@@ -678,6 +789,7 @@ impl Preview {
             Some(RenderedMode::Mermaid) => self.render_mermaid,
             Some(RenderedMode::Table) => self.render_table,
             Some(RenderedMode::Notebook) => self.render_notebook,
+            Some(RenderedMode::Html) => self.render_html,
             None => false,
         }
     }
@@ -722,6 +834,20 @@ impl Preview {
         }
         if render != self.render_notebook {
             self.render_notebook = render;
+            cx.notify();
+        }
+    }
+
+    pub fn set_render_html(&mut self, render: bool, cx: &mut Context<Self>) {
+        let revealed = self.reveal_forces_source();
+        if render && let Some(target) = &self.target {
+            self.rendered_after_reveal = Some((target.path.clone(), target.reveal_request_id));
+        }
+        if self.render_html != render || (render && revealed) {
+            self.render_html = render;
+            if !render {
+                self.html = None;
+            }
             cx.notify();
         }
     }
@@ -1008,7 +1134,7 @@ impl Preview {
     }
 
     fn render_markdown(&mut self, file: &Rc<TextFile>, cx: &mut Context<Self>) -> AnyElement {
-        let target = self.target.as_ref().unwrap();
+        let target = self.target.as_ref();
         let state = match &self.markdown {
             Some((key, state)) if *key == file.key => state.clone(),
             _ => {
@@ -1017,7 +1143,7 @@ impl Preview {
                     &raw,
                     t3_core::markdown::DisplayMarkdownOptions {
                         is_dark: cx.theme().is_dark(),
-                        cwd: Some(&target.root.workspace.cwd),
+                        cwd: target.map(|target| target.root.workspace.cwd.as_str()),
                         math_enabled: crate::settings::client_settings(cx).math_rendering_enabled(),
                     },
                     true,
@@ -1035,9 +1161,9 @@ impl Preview {
         };
         let scope = crate::media::MediaScope {
             owner: cx.entity_id(),
-            thread_id: Some(target.root.workspace.thread_id.clone()),
-            workspace_root: Some(t3_core::media::markdown_image_base_dir(&target.root.workspace.cwd, &target.path)),
-            workspace_mutation_id: self.mutation.clone(),
+            thread_id: target.map(|target| target.root.workspace.thread_id.clone()),
+            workspace_root: target.map(|target| t3_core::media::markdown_image_base_dir(&target.root.workspace.cwd, &target.path)),
+            workspace_mutation_id: target.and(self.mutation.clone()),
             source_control_media: false,
             source_control_media_repository: None,
             viewer: self.viewer.downgrade(),
@@ -1095,23 +1221,65 @@ impl Preview {
                     .text_center()
                     .text_xs()
                     .line_height(px(19.5))
-                    .child(div().text_color(hsla(p.destructive)).child(failure.describe()))
+                    .child(div().text_color(hsla(p.destructive)).child(crate::i18n::t(cx, &failure.describe()).to_owned()))
                     .children(failure.attempted_path.clone().map(|path| {
                         v_flex()
                             .text_color(hsla(p.muted_foreground))
                             .child("Attempted path")
                             .child(div().font_family(mono.clone()).text_color(hsla(p.foreground)).child(path))
                     }))
-                    .when(!host, |this| {
+                    .when(target.is_some() && !host, |this| {
                         this.child(
                             div()
                                 .text_color(hsla(p.muted_foreground))
                                 .child(format!("Workspace folder: {cwd}. Check the link's path or locate the file in Files.")),
                         )
+                    })
+                    .when(self.attachment_resource().is_some(), |this| {
+                        this.child(super::Button::new("attachment-retry")
+                            .label(crate::i18n::t(cx, "Retry"))
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_attachment(cx))))
                     }),
             )
             .into_any_element()
     }
+
+    fn render_html(&mut self, file: &Rc<TextFile>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use crate::webview::{Layer, Page, WebView, web_view};
+
+        let dark = cx.theme().is_dark();
+        if self.html.as_ref().is_some_and(|(current, _)| !Rc::ptr_eq(current, file)) {
+            self.html = None;
+        }
+        if self.html.is_none() && window.is_window_active() {
+            let page = Page {
+                html: Arc::from(file.contents.as_str()),
+                dark,
+                allow_popups: false,
+                scroll_through: false,
+                script: String::new(),
+                content_security_policy: Some(
+                    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'".into(),
+                ),
+            };
+            let (events, _) = futures::channel::mpsc::unbounded();
+            self.html = WebView::new(page, Layer::Transcript, events, window, cx)
+                .map(|view| (file.clone(), view));
+        }
+        self.html.as_ref().map_or_else(
+            || div().flex_1().items_center().justify_center().flex().text_xs()
+                .text_color(hsla(palette(cx).muted_foreground))
+                .child(crate::i18n::t(cx, "Unable to load file preview.")).into_any_element(),
+            |(_, view)| div().flex_1().min_h_0().overflow_hidden()
+                .child(web_view("file-html-preview", view.clone(), dark)).into_any_element(),
+        )
+    }
+}
+
+fn is_html(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+    })
 }
 
 /// A still skeleton of a few code lines while the file loads (design-system §6.8).
@@ -1167,14 +1335,11 @@ impl Render for Preview {
                         Some(RenderedMode::Markdown) => self.render_markdown(&file, cx),
                         Some(RenderedMode::Mermaid) => self.render_mermaid(&file.key, &file.contents, cx),
                         Some(RenderedMode::Table) => {
-                            let sep = self
-                                .target
-                                .as_ref()
-                                .and_then(|t| delimited_separator(&t.path))
-                                .unwrap_or(',');
+                            let sep = delimited_separator(&file.key.path).unwrap_or(',');
                             self.render_table(&file.key, &file.contents, sep, cx)
                         }
                         Some(RenderedMode::Notebook) => self.render_notebook(&file.key, &file.contents, cx),
+                        Some(RenderedMode::Html) => self.render_html(&file, window, cx),
                         None => self.render_code(window, cx),
                     }
                 } else {

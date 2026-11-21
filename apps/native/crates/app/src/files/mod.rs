@@ -5,9 +5,10 @@
 //! decoding run on the background executor; views paint only what is on screen.
 
 mod actions;
+mod attachment;
 mod audio;
 mod binary;
-mod code;
+pub(crate) mod code;
 mod editor;
 mod explorer;
 mod explorer_rows;
@@ -40,6 +41,7 @@ use t3_core::files::{breadcrumbs, group_thousands, is_host_path};
 use t3_core::right_panel::{FileAttachment, SurfaceKind, breadcrumb_path_of, retained_breadcrumb_trail};
 
 pub use actions::FileWorkspace;
+pub(crate) use explorer_rows::file_icon;
 
 pub fn init(cx: &mut App) {
     explorer::init(cx);
@@ -82,6 +84,7 @@ struct Prefs {
     render_mermaid: bool,
     render_table: bool,
     render_notebook: bool,
+    render_html: bool,
 }
 
 impl Prefs {
@@ -99,6 +102,7 @@ impl Prefs {
             render_mermaid: value.get("renderMermaid").and_then(Value::as_bool).unwrap_or(true),
             render_table: value.get("renderTable").and_then(Value::as_bool).unwrap_or(true),
             render_notebook: value.get("renderNotebook").and_then(Value::as_bool).unwrap_or(true),
+            render_html: value.get("renderBrowserFile").and_then(Value::as_bool).unwrap_or(true),
         }
     }
 
@@ -112,6 +116,7 @@ impl Prefs {
                 "renderMermaid": self.render_mermaid,
                 "renderTable": self.render_table,
                 "renderNotebook": self.render_notebook,
+                "renderBrowserFile": self.render_html,
             }),
         );
     }
@@ -184,6 +189,7 @@ impl FilesPanel {
             preview.set_render_mermaid(prefs.render_mermaid, cx);
             preview.set_render_table(prefs.render_table, cx);
             preview.set_render_notebook(prefs.render_notebook, cx);
+            preview.set_render_html(prefs.render_html, cx);
         });
         let mut panel = FilesPanel {
             state,
@@ -257,6 +263,9 @@ impl FilesPanel {
             workspace_mutation_id(projection.visible_turn_items.iter().map(|row| row.item.as_ref()), self.latest_checkpoint.as_deref())
         });
         let visible = shown.is_some();
+        let attachment = shown.as_ref().and_then(|shown| shown.attachment.clone())
+            .zip(state.environment().map(str::to_owned))
+            .map(|(file, environment)| attachment::AttachmentTarget { environment, file });
         let root_changed = root != self.root;
         if root_changed {
             self.root = root.clone();
@@ -280,7 +289,11 @@ impl FilesPanel {
             });
             self.preview.update(cx, |preview, cx| {
                 preview.set_mutation(self.mutation.clone(), cx);
-                preview.set_target(target, cx);
+                if attachment.is_some() {
+                    preview.set_attachment(attachment, cx);
+                } else {
+                    preview.set_target(target, cx);
+                }
             });
             if std::mem::take(&mut self.stale) {
                 self.explorer.update(cx, |explorer, cx| explorer.refresh_entries(cx));
@@ -293,6 +306,8 @@ impl FilesPanel {
             let selected = shown.as_ref().and_then(|shown| shown.path.clone()).filter(|path| !is_host_path(path));
             let reveal = shown.as_ref().map_or(0, |shown| shown.reveal_request_id);
             self.explorer.update(cx, |explorer, cx| explorer.set_selected(selected, reveal, cx));
+        } else if self.shown.as_ref().is_some_and(|shown| shown.attachment.is_some()) {
+            self.preview.update(cx, |preview, cx| preview.set_attachment(None, cx));
         }
         if shown != self.shown || root_changed {
             self.shown = shown;
@@ -309,6 +324,7 @@ impl FilesPanel {
             preview.set_render_mermaid(prefs.render_mermaid, cx);
             preview.set_render_table(prefs.render_table, cx);
             preview.set_render_notebook(prefs.render_notebook, cx);
+            preview.set_render_html(prefs.render_html, cx);
         });
         cx.notify();
     }
@@ -397,59 +413,8 @@ impl FilesPanel {
             .gap(px(8.))
             .bg(hsla(p.background))
             .child(crumb_row)
-            .when_some(rendered_mode, |this, mode| {
-                let tooltip = match (mode, rendered) {
-                    (RenderedMode::Markdown, true) => "Show markdown source",
-                    (RenderedMode::Markdown, false) => "Show rendered markdown",
-                    (RenderedMode::Mermaid, true) => "Show Mermaid source",
-                    (RenderedMode::Mermaid, false) => "Show rendered diagram",
-                    (RenderedMode::Table, true) => "Show source",
-                    (RenderedMode::Table, false) => "Show table",
-                    (RenderedMode::Notebook, true) => "Show notebook JSON",
-                    (RenderedMode::Notebook, false) => "Show rendered notebook",
-                };
-                let icon = if rendered {
-                    Icon::CodeXml
-                } else if mode == RenderedMode::Table {
-                    Icon::Rows3
-                } else {
-                    Icon::Eye
-                };
-                this.child(
-                    Button::new("file-render-toggle")
-                        .variant(Variant::Toggle)
-                        .icon(icon)
-                        .icon_size(14.)
-                        .pressed(rendered)
-                        .tooltip(tooltip)
-                        .on_click(toggle(match mode {
-                            RenderedMode::Markdown => |this, cx| {
-                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
-                                if !this.preview.read(cx).is_editing() {
-                                    this.set_prefs(|prefs| prefs.render_markdown = !prefs.render_markdown, cx);
-                                }
-                            },
-                            RenderedMode::Mermaid => |this, cx| {
-                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
-                                if !this.preview.read(cx).is_editing() {
-                                    this.set_prefs(|prefs| prefs.render_mermaid = !prefs.render_mermaid, cx);
-                                }
-                            },
-                            RenderedMode::Table => |this, cx| {
-                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
-                                if !this.preview.read(cx).is_editing() {
-                                    this.set_prefs(|prefs| prefs.render_table = !prefs.render_table, cx);
-                                }
-                            },
-                            RenderedMode::Notebook => |this, cx| {
-                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
-                                if !this.preview.read(cx).is_editing() {
-                                    this.set_prefs(|prefs| prefs.render_notebook = !prefs.render_notebook, cx);
-                                }
-                            },
-                        })),
-                )
-            })
+            .when(previewing, |this| this.children(self.open_in_picker(path, cx)))
+            .when_some(rendered_mode, |this, mode| this.child(self.render_mode_toggle(mode, rendered, cx)))
             .when(can_edit, |this| {
                 this.child(
                     Button::new("file-edit-toggle")
@@ -545,89 +510,151 @@ impl FilesPanel {
             })
             .child(self.explorer.clone())
     }
+    fn render_mode_toggle(&self, mode: RenderedMode, rendered: bool, cx: &mut Context<Self>) -> Button {
+        let tooltip = match (mode, rendered) {
+            (RenderedMode::Markdown, true) => "Show markdown source",
+            (RenderedMode::Markdown, false) => "Show rendered markdown",
+            (RenderedMode::Mermaid, true) => "Show Mermaid source",
+            (RenderedMode::Mermaid, false) => "Show rendered diagram",
+            (RenderedMode::Table, true) => "Show source",
+            (RenderedMode::Table, false) => "Show table",
+            (RenderedMode::Notebook, true) => "Show notebook JSON",
+            (RenderedMode::Notebook, false) => "Show rendered notebook",
+            (RenderedMode::Html, true) => "Show HTML source",
+            (RenderedMode::Html, false) => "Show rendered page",
+        };
+        Button::new("file-render-toggle")
+            .variant(Variant::Toggle)
+            .icon(if rendered { Icon::CodeXml } else if mode == RenderedMode::Table { Icon::Rows3 } else { Icon::Eye })
+            .icon_size(14.)
+            .pressed(rendered)
+            .tooltip(crate::i18n::t(cx, tooltip))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.preview.update(cx, |preview, cx| preview.request_exit_edit_mode(cx));
+                if this.preview.read(cx).is_editing() {
+                    return;
+                }
+                this.set_prefs(|prefs| {
+                    let render = match mode {
+                        RenderedMode::Markdown => &mut prefs.render_markdown,
+                        RenderedMode::Mermaid => &mut prefs.render_mermaid,
+                        RenderedMode::Table => &mut prefs.render_table,
+                        RenderedMode::Notebook => &mut prefs.render_notebook,
+                        RenderedMode::Html => &mut prefs.render_html,
+                    };
+                    *render = !rendered;
+                }, cx);
+            }))
+    }
+
+    fn open_in_picker(&self, path: &str, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let app = self.state.read(cx);
+        if !app.should_show_open_in_picker(self.root.is_some()) {
+            return None;
+        }
+        let editors = actions::file_editors(app, cx);
+        let preferred = preferred_file_editor(&editors, cx);
+        let disabled = preferred.is_none();
+        let root = self.root.as_ref()?.clone();
+        let path = path.to_owned();
+        let reveal = self.shown.as_ref().and_then(|shown| shown.reveal_line);
+        let state = self.state.clone();
+        let open = move |editor: &str, cx: &mut App| {
+            state.update(cx, |state, cx| state.open_file_in_editor(&root, &path, reveal, editor, cx));
+        };
+        let open_favorite = open.clone();
+        let label = crate::i18n::t(cx, "Open in");
+        let options = t3_core::vcs::editor_options(&editors).into_iter().map(|editor| {
+            let name = t3_core::vcs::editor_label(editor, cfg!(target_os = "macos"));
+            crate::settings::controls::SelectOption::new(editor, name)
+        }).collect();
+        let picker = crate::settings::controls::Select::new("file-open-in-menu", options)
+            .label(crate::i18n::t(cx, "Choose editor"))
+            .disabled(disabled)
+            .show_check()
+            .on_change(move |editor, _, cx| open(editor.as_ref(), cx));
+        Some(h_flex()
+            .gap(px(2.))
+            .child(Button::new("file-open-in")
+                .icon(Icon::SquareArrowOutUpRight)
+                .tooltip(label)
+                .disabled(disabled)
+                .on_click(move |_, _, cx| {
+                    if let Some(editor) = preferred {
+                        open_favorite(editor, cx);
+                    }
+                }))
+            .child(match preferred {
+                Some(editor) => picker.selected(editor),
+                None => picker,
+            })
+            .into_any_element())
+    }
+
+    fn open_in_favorite(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((shown, root)) = self.shown.as_ref().zip(self.root.as_ref()) else { return false };
+        let Some(path) = &shown.path else { return false };
+        if shown.attachment.is_some() || self.preview.read(cx).is_folder() {
+            return false;
+        }
+        let app = self.state.read(cx);
+        if !app.should_show_open_in_picker(true) {
+            return false;
+        }
+        let editors = actions::file_editors(app, cx);
+        let Some(editor) = preferred_file_editor(&editors, cx) else { return false };
+        self.state.update(cx, |state, cx| state.open_file_in_editor(root, path, shown.reveal_line, editor, cx));
+        true
+    }
+
     fn render_attachment(&self, attachment: &FileAttachment, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
-        let size_label = format!("{} bytes", group_thousands(attachment.size_bytes));
+        let metadata = format!("{} · {} bytes", attachment.mime_type, group_thousands(attachment.size_bytes));
         let open_target = attachment_open_target(attachment);
+        let preview = self.preview.read(cx);
+        let mode = preview.rendered_mode();
+        let rendered = preview.is_rendered_active();
         v_flex()
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
-            .child(
-                h_flex()
-                    .flex_none()
-                    .h(px(28.))
-                    .mb(px(12.))
-                    .px(px(12.))
-                    .gap(px(6.))
-                    .items_center()
-                    .bg(hsla(p.background))
-                    .child(Icon::Paperclip.render(px(13.), hsla(p.muted_foreground)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(hsla(p.foreground))
-                            .child(attachment.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.))
-                            .text_color(hsla(p.muted_foreground))
-                            .child(format!("{} · {size_label}", attachment.mime_type)),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .px(px(20.))
-                    .child(Icon::FileText.render(px(28.), hsla(p.muted_foreground).opacity(0.6)))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(hsla(p.foreground))
-                            .child(attachment.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(hsla(p.muted_foreground))
-                            .child(format!("{} ({size_label})", attachment.mime_type)),
-                    )
-                    .when_some(open_target, |this, target| {
-                        this.child(
-                            div()
-                                .debug_selector(|| "attachment-open-url".into())
-                                .child(
-                                    Button::new("attachment-open-url")
-                                        .icon(Icon::ExternalLink)
-                                        .label("Open attachment")
-                                        .on_click(move |_, _, cx| match &target {
-                                            AttachmentOpenTarget::Url(url) => cx.open_url(url),
-                                            AttachmentOpenTarget::ServerAsset(attachment_id) => {
-                                                crate::media::open_asset(
-                                                    &t3_core::media::AssetResource::Attachment {
-                                                        attachment_id: attachment_id.clone(),
-                                                    },
-                                                    cx,
-                                                );
-                                            }
-                                        }),
-                                ),
-                        )
-                    }),
-            )
+            .child(h_flex()
+                .flex_none()
+                .h(px(28.))
+                .px(px(12.))
+                .gap(px(6.))
+                .items_center()
+                .child(file_icon(&attachment.name).render(px(13.), hsla(p.muted_foreground)))
+                .child(v_flex().flex_1().min_w_0()
+                    .child(div().truncate().text_xs().font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.foreground)).child(attachment.name.clone()))
+                    .child(div().truncate().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(metadata)))
+                .when_some(mode, |this, mode| this.child(self.render_mode_toggle(mode, rendered, cx)))
+                .when_some(open_target, |this, target| {
+                    this.child(div().debug_selector(|| "attachment-open-url".into())
+                        .child(Button::new("attachment-open-url")
+                            .icon(Icon::ExternalLink)
+                            .tooltip(crate::i18n::t(cx, "Open attachment"))
+                            .on_click(move |_, _, cx| match &target {
+                                AttachmentOpenTarget::Url(url) => cx.open_url(url),
+                                AttachmentOpenTarget::ServerAsset(attachment_id) => {
+                                    crate::media::open_asset(
+                                        &t3_core::media::AssetResource::Attachment { attachment_id: attachment_id.clone() },
+                                        cx,
+                                    );
+                                }
+                            })))
+                }))
+            .child(div().flex_1().min_h_0().child(self.preview.clone()))
             .into_any_element()
     }
+
+}
+
+fn preferred_file_editor(editors: &[String], cx: &App) -> Option<&'static str> {
+    crate::thread_details::details(cx)
+        .and_then(|details| details.read(cx).preferred_editor(editors))
+        .or_else(|| t3_core::vcs::preferred_editor(None, editors))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,6 +722,11 @@ impl Render for FilesPanel {
                     if !handled && show_explorer {
                         this.explorer.update(cx, |explorer, cx| explorer.focus_search(window, cx));
                     }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::thread_details::OpenFavoriteEditor, _, cx| {
+                if !this.open_in_favorite(cx) {
+                    cx.propagate();
                 }
             }))
             .children(subheader_path.map(|path| self.render_subheader(path, previewing, cx)))

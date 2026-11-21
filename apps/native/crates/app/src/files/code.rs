@@ -5,14 +5,15 @@
 //! and kept while it stays near the viewport.
 
 use std::collections::HashMap;
-use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, HighlightStyle, IntoElement, ListAlignment,
     ListOffset, ListState, ParentElement, Pixels, ScrollWheelEvent, SharedString, Styled,
-    StyledText, Subscription, Window, div, list, prelude::*, px,
+    Subscription, Window, div, list, prelude::*, px,
 };
+use gpui_base::input::HighlightStyleResolver;
+use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
@@ -21,6 +22,7 @@ use t3_core::files::expand_tabs;
 use super::preview::{Preview, TextFile};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
+use crate::selectable_text::{Highlights, SelectableText};
 use crate::theme::{hsla, palette};
 
 const LINE_HEIGHT: f32 = 20.;
@@ -32,11 +34,28 @@ const MAX_HIGHLIGHT_BYTES: usize = 4096;
 const LINE_CACHE_SOFT_LIMIT: usize = 600;
 const KEEP_FRAMES: u64 = 2;
 
-type Runs = Vec<(Range<usize>, HighlightStyle)>;
+type Runs = Vec<(std::ops::Range<usize>, HighlightStyle)>;
+
+pub(crate) fn syntax_runs(
+    highlighter: Option<&SyntaxHighlighter>,
+    source: &str,
+    range: std::ops::Range<usize>,
+    theme: &dyn HighlightStyleResolver,
+) -> Runs {
+    match highlighter {
+        Some(highlighter) if source.len() <= MAX_HIGHLIGHT_BYTES && !source.is_empty() => highlighter
+            .styles(&range, theme)
+            .into_iter()
+            .filter(|(_, style)| *style != HighlightStyle::default())
+            .map(|(styled, style)| (styled.start - range.start..styled.end - range.start, style))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 struct RenderedLine {
     text: SharedString,
-    runs: Runs,
+    runs: Highlights,
     drawn: u64,
 }
 
@@ -214,7 +233,7 @@ impl CodeView {
     }
 
     /// The line as drawn, highlighted on first use. Called only for rows on screen.
-    fn line(&mut self, index: usize, cx: &Context<Preview>) -> Option<(SharedString, Runs)> {
+    fn line(&mut self, index: usize, cx: &Context<Preview>) -> Option<(SharedString, Highlights)> {
         let frame = self.frame;
         if let Some(line) = self.lines.get_mut(&index) {
             line.drawn = frame;
@@ -223,20 +242,10 @@ impl CodeView {
         let file = self.file.as_ref()?;
         let range = file.lines.range(index)?;
         let source = &file.contents[range.clone()];
-        let runs: Runs = match &file.highlighter {
-            Some(highlighter) if source.len() <= MAX_HIGHLIGHT_BYTES && !source.is_empty() => {
-                let theme = cx.theme().highlight_theme.clone();
-                highlighter
-                    .styles(&range, &*theme)
-                    .into_iter()
-                    .filter(|(_, style)| *style != HighlightStyle::default())
-                    .map(|(styled, style)| (styled.start - range.start..styled.end - range.start, style))
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+        let runs = syntax_runs(file.highlighter.as_ref(), source, range, &*cx.theme().highlight_theme);
         let (text, runs) = expand_tabs(source, &runs);
         let text = SharedString::from(text);
+        let runs: Highlights = runs.into();
         self.lines.insert(index, RenderedLine { text: text.clone(), runs: runs.clone(), drawn: frame });
         Some((text, runs))
     }
@@ -411,7 +420,7 @@ impl Preview {
         let digits = code.file.as_ref().map_or(3, |file| file.lines.digits());
         let revealed = code.reveal == Some(index);
         let family = cx.theme().mono_font_family.clone();
-        let styled = StyledText::new(text).with_highlights(runs);
+        let styled = SelectableText::new(("file-code-line", index), text).highlights(runs);
         div()
             .flex()
             .w_full()

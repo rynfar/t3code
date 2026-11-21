@@ -325,8 +325,9 @@ impl Preview {
                 } else {
                     format_audio_time(*elapsed)
                 };
-                let open_path = path.clone();
-                let open_thread = thread_id.clone();
+                let open_resource = self.attachment_resource().unwrap_or_else(|| {
+                    t3_core::media::AssetResource::MediaFile { thread_id: thread_id.clone(), path: path.clone() }
+                });
 
                 v_flex()
                     .id("file-audio-preview")
@@ -434,13 +435,7 @@ impl Preview {
                                                         .icon(Icon::ExternalLink)
                                                         .label("Open externally")
                                                         .on_click(move |_, _, cx| {
-                                                            crate::media::open_asset(
-                                                                &t3_core::media::AssetResource::MediaFile {
-                                                                    thread_id: open_thread.clone(),
-                                                                    path: open_path.clone(),
-                                                                },
-                                                                cx,
-                                                            );
+                                                            crate::media::open_asset(&open_resource, cx);
                                                         }),
                                                 )
                                             }),

@@ -8,6 +8,7 @@ mod comments;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 mod header;
+pub(crate) mod highlight;
 pub(crate) mod lines;
 mod source;
 mod tree;
@@ -90,6 +91,7 @@ pub struct DiffPanel {
     wrap: bool,
     wrap_override: Option<bool>,
     measured_font: Option<(gpui::SharedString, Pixels)>,
+    highlighted_lines: RefCell<highlight::DiffHighlightCache>,
     ignore_whitespace: bool,
     h_offset: Pixels,
     char_width: Option<Pixels>,
@@ -243,6 +245,7 @@ impl DiffPanel {
             wrap: true,
             wrap_override: None,
             measured_font: None,
+            highlighted_lines: RefCell::default(),
             ignore_whitespace: crate::settings::client_settings(cx).diff_ignore_whitespace(),
             h_offset: px(0.),
             char_width: None,

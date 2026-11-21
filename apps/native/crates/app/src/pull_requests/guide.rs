@@ -4,6 +4,7 @@
 //! attention callouts, sliced diff excerpts, lettered notes (A/B/C), clickable file jumps to the
 //! Code tab, review questions, and `j`/`k` stepping.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -26,7 +27,9 @@ use super::controls::{BadgeKind, Button, Size, Variant, badge};
 use super::detail::DetailView;
 use super::{destination_error_message, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppState, uuid_v4};
+use crate::diff::highlight::{DiffHighlightCache, display_text};
 use crate::icons::Icon;
+use crate::selectable_text::SelectableText;
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::{MarkdownStore, prose};
 
@@ -52,6 +55,7 @@ pub struct GuideTab {
     show_failure_details: bool,
     progress: TourProgress,
     diff_files: Vec<FileDiff>,
+    highlighted_lines: RefCell<DiffHighlightCache>,
     diff_loaded_sha: Option<String>,
     diff_error: Option<String>,
     /// Files expanded inline under "Also in this stop" (`pingdotgg/t3code#38858`).
@@ -138,6 +142,7 @@ impl GuideTab {
             show_failure_details: false,
             progress: TourProgress::default(),
             diff_files: Vec::new(),
+            highlighted_lines: RefCell::default(),
             diff_loaded_sha: None,
             diff_error: None,
             expanded_files: HashSet::new(),
@@ -626,6 +631,7 @@ impl GuideTab {
         banner: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.highlighted_lines.borrow_mut().begin_bounded_frame();
         let p = palette(cx);
         let notes = letter_stop_notes(stop);
         let summary_text: Arc<str> = Arc::from(stop.summary.as_str());
@@ -689,13 +695,24 @@ impl GuideTab {
                                     LineKind::Addition => DiffSide::Additions,
                                     LineKind::Context => side_for_excerpt,
                                 };
+                                let id = format!("ex-{index}-{ex_ix}-{row_ix}");
+                                let styled = file.and_then(|file| {
+                                    let lines = &file.hunks.get(row.hunk)?.lines;
+                                    let line = lines.iter().position(|line| line.old_line == row.old_line && line.new_line == row.new_line)?;
+                                    self.highlighted_lines.borrow_mut().line(file, row.hunk, line, line_side == DiffSide::Deletions, cx)
+                                });
+                                let text_id = SharedString::from(id.clone());
+                                let text = styled.map_or_else(
+                                    || SelectableText::new(text_id.clone(), row.text),
+                                    |(text, runs)| SelectableText::new(text_id.clone(), text).highlights(runs),
+                                );
                                 self.render_guide_diff_line(
-                                    format!("ex-{index}-{ex_ix}-{row_ix}"),
+                                    id,
                                     &excerpt.path,
                                     line_no,
                                     line_side,
                                     row.kind,
-                                    row.text,
+                                    text,
                                     markers,
                                     &pending_for_file,
                                     can_comment,
@@ -759,13 +776,20 @@ impl GuideTab {
                                                 LineKind::Deletion => (line.old_line, DiffSide::Deletions),
                                                 LineKind::Addition | LineKind::Context => (line.new_line.or(line.old_line), DiffSide::Additions),
                                             };
+                                            let id = format!("file-{index}-{file_ix}-{hunk_ix}-{line_ix}");
+                                            let text_id = SharedString::from(id.clone());
+                                            let styled = self.highlighted_lines.borrow_mut().line(&df, hunk_ix, line_ix, side == DiffSide::Deletions, cx);
+                                            let text = styled.map_or_else(
+                                                || SelectableText::new(text_id.clone(), display_text(line).to_owned()),
+                                                |(text, runs)| SelectableText::new(text_id.clone(), text).highlights(runs),
+                                            );
                                             line_els.push(self.render_guide_diff_line(
-                                                format!("file-{index}-{file_ix}-{hunk_ix}-{line_ix}"),
+                                                id,
                                                 &file.path,
                                                 line_no,
                                                 side,
                                                 line.kind,
-                                                line.text.to_string(),
+                                                text,
                                                 Vec::new(),
                                                 &pending_for_file,
                                                 can_comment,
@@ -915,7 +939,7 @@ impl GuideTab {
         line_no: Option<u32>,
         side: DiffSide,
         kind: LineKind,
-        text: String,
+        text: SelectableText,
         markers: Vec<t3_core::pull_requests::guide::ExcerptLineMarker>,
         pending_for_file: &[PendingReviewComment],
         can_comment: bool,
@@ -972,7 +996,7 @@ impl GuideTab {
             .child(div().w(px(36.)).flex_none().text_color(hsla(p.muted_foreground)).child(line_no.map_or(String::new(), |n| n.to_string())))
             .children(comment_btn)
             .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(prefix))
-            .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.code_foreground)).child(text))
+            .child(div().flex_1().min_w_0().text_color(hsla(p.code_foreground)).child(text))
             .children(markers.into_iter().map(|m| badge(m.marker, BadgeKind::Info, false, cx)));
 
         if matching_pending.is_empty() && !composer_open {
