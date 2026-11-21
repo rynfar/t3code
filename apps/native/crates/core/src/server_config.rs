@@ -568,6 +568,8 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub environment_themes: Option<bool>,
     #[serde(default)]
+    pub issues: Option<bool>,
+    #[serde(default)]
     pub provider_workspace_snapshots_on_demand: Option<bool>,
     /// File attachments and the largest upload the server takes; absent when it takes none.
     #[serde(default, deserialize_with = "lenient_option")]

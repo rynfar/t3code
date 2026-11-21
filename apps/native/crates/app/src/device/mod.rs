@@ -278,7 +278,7 @@ impl Devices {
                     host_id: opened.host_id.clone(),
                     device_id: opened.device_id.clone(),
                     platform: opened.platform,
-                    name: opened.name,
+                    name: opened.name.clone(),
                 };
                 self.state.update(cx, |state, cx| {
                     let already_open = state
@@ -298,6 +298,7 @@ impl Devices {
                         edit_panels(state, &opened.thread_id, cx, |panels, thread| panels.open_device(thread, target));
                     }
                 });
+                crate::settings::maybe_float_agent_device(self, &opened, cx);
             }
         }
         if changed {
@@ -522,7 +523,7 @@ mod tests {
             assert!(s.panels.panels.panel("t-agent").surfaces.is_empty());
         });
 
-        // Second snapshot adds an agent-opened session: opens a device tab on that thread.
+        // The default auto-show setting floats the newly opened device tab.
         let mut with_session = initial.clone();
         with_session.sessions.push(Session {
             thread_id: "t-agent".into(),
@@ -531,7 +532,9 @@ mod tests {
             platform: Platform::Ios,
         });
         devices.update(cx, |d, cx| d.apply(Ok(with_session.clone()), cx));
+        assert!(devices.read_with(cx, |d, _| d.is_floating("local", "sim-1")));
         state.read_with(cx, |s, _| {
+            assert!(!s.panels.panels.is_open("t-agent"));
             let surfaces = &s.panels.panels.panel("t-agent").surfaces;
             assert_eq!(surfaces.len(), 1);
             assert!(matches!(
@@ -541,9 +544,25 @@ mod tests {
         });
 
         // Repeat snapshot does not duplicate the tab.
-        devices.update(cx, |d, cx| d.apply(Ok(with_session), cx));
+        devices.update(cx, |d, cx| d.apply(Ok(with_session.clone()), cx));
         state.read_with(cx, |s, _| {
             assert_eq!(s.panels.panels.panel("t-agent").surfaces.len(), 1);
         });
+
+        cx.update(|cx| {
+            crate::settings::store::install_committed_client(
+                &state,
+                serde_json::from_value(json!({ "browserAutoShowFloatingPreview": false })).unwrap(),
+                cx,
+            );
+        });
+        with_session.sessions.push(Session {
+            thread_id: "t-docked".into(),
+            host_id: "local".into(),
+            device_id: "sim-1".into(),
+            platform: Platform::Ios,
+        });
+        devices.update(cx, |d, cx| d.apply(Ok(with_session), cx));
+        state.read_with(cx, |s, _| assert!(s.panels.panels.is_open("t-docked")));
     }
 }

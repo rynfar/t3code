@@ -28,7 +28,6 @@ use t3_core::right_panel::{
 
 pub use controls::{Button, Size, Variant, focusable, segment, segmented, tooltip_view};
 pub use state::PanelState;
-#[allow(unused_imports, reason = "Integration hook for the file editor")]
 pub(crate) use tabs::publish_file_tab_dirty;
 #[cfg(feature = "snapshot")]
 pub use tabs::open_surface;
@@ -680,7 +679,7 @@ impl RightPanelView {
     }
 
     fn pull_request_tab_pane(&mut self, thread_id: &str, surface: &Surface, cx: &mut Context<Self>) -> Option<Entity<crate::pull_requests::DetailView>> {
-        let SurfaceKind::PullRequest { project_id, host, repository, number, reveal_url, detail_tab, .. } = &surface.kind else {
+        let SurfaceKind::PullRequest { environment_id, project_id, host, repository, number, reveal_url, detail_tab, .. } = &surface.kind else {
             return None;
         };
         if let Some((_, _, view)) = self.pull_request_tabs.iter().find(|(tid, sid, _)| tid == thread_id && sid == &surface.id) {
@@ -705,10 +704,11 @@ impl RightPanelView {
             state_close.update(cx, |state, cx| state.close_surface(&close_sid, cx));
         });
         let state_select = self.state.clone();
+        let pr_env_id = environment_id.clone();
         let on_select = std::rc::Rc::new(move |pr_ref: PrRef, cx: &mut App| {
             state_select.update(cx, |state, cx| {
                 let target = PullRequestTarget {
-                    environment_id: state.environment().map(str::to_owned),
+                    environment_id: pr_env_id.clone().or_else(|| state.environment().map(str::to_owned)),
                     project_id: pr_ref.project_id,
                     host: pr_ref.host,
                     repository: pr_ref.repository,
@@ -717,14 +717,18 @@ impl RightPanelView {
                     reveal_url: None,
                     detail_tab: None,
                 };
-                state.open_pull_request_surface(target, cx);
+                if !state.open_utility_pull_request(target.clone(), cx) {
+                    state.open_pull_request_surface(target, cx);
+                }
             });
         });
         let initial_tab = detail_tab.unwrap_or_default();
         let initial_reveal = reveal_url.clone();
         let state = self.state.clone();
         let view = cx.new(|cx| {
-            let mut detail = crate::pull_requests::DetailView::new_embedded(state, reference, None, on_close, on_select, cx);
+            let mut detail = crate::pull_requests::DetailView::new_embedded_in_environment(
+                state, environment_id.clone(), reference, on_close, on_select, cx,
+            );
             let mapped = match initial_tab {
                 PullRequestDetailTab::Summary => crate::pull_requests::DetailTab::Summary,
                 PullRequestDetailTab::Guide => crate::pull_requests::DetailTab::Guide,
@@ -790,7 +794,9 @@ impl RightPanelView {
                     reveal_url: None,
                     detail_tab: None,
                 };
-                state.open_pull_request_surface(target, cx);
+                if !state.open_utility_pull_request(target.clone(), cx) {
+                    state.open_pull_request_surface(target, cx);
+                }
             });
         });
         let thread_owned = (!thread_id.starts_with("new-thread:")

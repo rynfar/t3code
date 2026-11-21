@@ -245,7 +245,7 @@ fn client_preference(key: &str, value: impl Into<serde_json::Value>) -> ClientSe
     ClientSettingChange::ThemePatch([(key.to_owned(), value.into())].into_iter().collect())
 }
 
-pub(crate) fn browser_auto_show_floating_preview(doc: &ClientSettingsDoc) -> bool {
+fn browser_auto_show_floating_preview(doc: &ClientSettingsDoc) -> bool {
     doc.entries()
         .get(AUTO_SHOW_FLOATING_PREVIEW)
         .and_then(serde_json::Value::as_bool)
@@ -253,7 +253,6 @@ pub(crate) fn browser_auto_show_floating_preview(doc: &ClientSettingsDoc) -> boo
 }
 
 // Device events already produce a docked surface; the device controller can float it in place.
-#[allow(dead_code)]
 pub(crate) fn maybe_float_agent_device(
     devices: &mut crate::device::Devices,
     opened: &t3_core::device::AgentOpenedSession,
@@ -282,7 +281,6 @@ fn recording_frame_rate(doc: &ClientSettingsDoc) -> u64 {
 }
 
 // The preview reporter uses the same payload on settings changes and reconnects.
-#[allow(dead_code)]
 pub(crate) fn browser_profile_report_payload(doc: &ClientSettingsDoc) -> serde_json::Value {
     let mut payload = report_profiles_payload(
         &doc.browser_user_profiles(),

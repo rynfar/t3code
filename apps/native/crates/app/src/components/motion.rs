@@ -355,7 +355,7 @@ pub fn animated_chevron(
 }
 
 macro_rules! animated_extent {
-    ($name:ident, $extent:ident, $cross:ident, $axis:literal) => {
+    ($(#[$attr:meta])* $name:ident, $extent:ident, $cross:ident, $axis:literal) => {
         #[doc = concat!("An overflow clip that animates ", $axis, " and keeps the full-size child mounted.")]
         #[derive(IntoElement)]
         pub struct $name {
@@ -366,9 +366,9 @@ macro_rules! animated_extent {
             content: AnyElement,
         }
 
-        #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
         impl $name {
             /// Wraps a child at its full extent and animates the visible area to or from zero.
+            $(#[$attr])*
             pub fn new(id: impl Into<ElementId>, extent: Pixels, open: bool, duration: Duration, content: impl IntoElement) -> Self {
                 Self { id: id.into(), extent: extent.max(px(0.)), open, duration, content: content.into_any_element() }
             }
@@ -387,7 +387,10 @@ macro_rules! animated_extent {
 }
 
 animated_extent!(AnimatedHeight, h, w_full, "height");
-animated_extent!(AnimatedWidth, w, min_h_0, "width");
+animated_extent!(
+    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
+    AnimatedWidth, w, min_h_0, "width"
+);
 
 #[cfg(test)]
 mod tests {

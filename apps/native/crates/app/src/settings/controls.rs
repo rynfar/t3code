@@ -170,7 +170,6 @@ impl Button {
     }
 
     /// Fills the available width, aligning the label left and the trailing icon right.
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
     pub fn justify_between(mut self) -> Self {
         self.justify_between = true;
         self

@@ -394,6 +394,7 @@ impl SidebarPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::composer::register_thread_drop(cx, |drag: &drag::DraggedThread| (drag.id.as_str(), drag.key.as_ref()));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search")));
         let project_filter_search = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search projects...")));
         let project_filter_focus = cx.focus_handle();
@@ -1583,8 +1584,11 @@ impl SidebarPane {
         let p = palette(cx);
         let (on_utility_page, show_pull_requests, show_issues) = {
             let state = self.state.read(cx);
-            let supported = pull_requests_supported(state);
-            (state.pull_requests_open || state.issues_open, supported, supported)
+            (
+                state.pull_requests_open || state.issues_open,
+                pull_requests_supported(state),
+                sidebar_environment_supports(state, |config| config.environment.capabilities.issues == Some(true)),
+            )
         };
         let utility = |id: &'static str, glyph: Icon, label: &'static str| {
             div()
@@ -3919,6 +3923,7 @@ mod footer_tests {
             vcx.debug_bounds("sidebar-pull-requests").is_some(),
             "Pull requests utility button must appear once server_config loads"
         );
+        assert!(vcx.debug_bounds("sidebar-issues").is_none());
 
         // Multi-environment fleet gating: disabled env does not expose PRs; enabled env with config does.
         let mut config_loaded = t3_core::server_config::ServerConfigState::default();
@@ -4006,7 +4011,7 @@ mod footer_tests {
             s.fleet = Arc::new(t3_client::environments::FleetView::default());
             s.environments.environments.clear();
             s.server_config.config = serde_json::from_value(serde_json::json!({
-                "environment": { "environmentId": "local", "label": "Local" },
+                "environment": { "environmentId": "local", "label": "Local", "capabilities": { "issues": true } },
                 "cwd": "/tmp",
                 "providers": []
             }))
@@ -4014,6 +4019,8 @@ mod footer_tests {
             cx.emit(AppEvent::ServerConfig);
         });
         vcx.run_until_parked();
+        draw_bounds(vcx);
+        assert!(vcx.debug_bounds("sidebar-issues").is_some());
 
         // Provider pill renders stacked ABOVE footer while circular 32x32 #update-everything renders inline at right end.
         let before_updates_fixture = pane_notifications.get();
