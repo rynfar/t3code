@@ -1083,34 +1083,26 @@ mod tests {
             })))
             .unwrap();
 
-        let mut saw_create = false;
-        let mut saw_link = false;
-        for _ in 0..4 {
-            if saw_create && saw_link {
-                break;
-            }
-            let (m, p, r) = fixture.next_request().await;
-            if m == t3_core::commands::method::DISPATCH_COMMAND {
-                match p["type"].as_str() {
-                    Some("thread.create") => {
-                        saw_create = true;
-                        assert_eq!(p["threadId"], generated_thread_id);
-                        assert_eq!(p["projectId"], "proj-t3");
-                        assert_eq!(p["branch"], "feat/pr-111");
-                        assert_eq!(p["worktreePath"], "/repo/.worktrees/pr-111");
-                    }
-                    Some("thread.pull-request.link") => {
-                        saw_link = true;
-                        assert_eq!(p["threadId"], generated_thread_id);
-                        assert_eq!(p["number"], 111);
-                        assert_eq!(p["repository"], "pingdotgg/t3code");
-                    }
-                    _ => {}
+        for expected in ["thread.create", "thread.pull-request.link"] {
+            let (payload, reply) = loop {
+                let (method, payload, reply) = fixture.next_request().await;
+                if method == t3_core::commands::method::DISPATCH_COMMAND {
+                    break (payload, reply);
                 }
+                let _ = reply.send(Ok(json!({})));
+            };
+            assert_eq!(payload["type"], expected);
+            assert_eq!(payload["threadId"], generated_thread_id);
+            if expected == "thread.create" {
+                assert_eq!(payload["projectId"], "proj-t3");
+                assert_eq!(payload["branch"], "feat/pr-111");
+                assert_eq!(payload["worktreePath"], "/repo/.worktrees/pr-111");
+            } else {
+                assert_eq!(payload["number"], 111);
+                assert_eq!(payload["repository"], "pingdotgg/t3code");
             }
-            let _ = r.send(Ok(json!({ "sequence": 1 })));
+            reply.send(Ok(json!({ "sequence": 1 }))).unwrap();
         }
-        assert!(saw_create && saw_link, "expected thread.create and thread.pull-request.link");
         done_rx.await.unwrap();
 
         vcx.read_entity(&prompt_links, |view, _| {

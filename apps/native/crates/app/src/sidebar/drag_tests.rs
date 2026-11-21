@@ -633,6 +633,7 @@ async fn omitted_thread_file_drop_selects_over_active_thread_or_draft_and_is_env
             "id": "proj-1",
             "title": "App",
             "workspaceRoot": "/app",
+            "projectIcon": {"kind": "monogram", "text": "A", "color": "blue"},
             "createdAt": "2026-01-01T00:00:00.000Z",
             "updatedAt": "2026-01-01T00:00:00.000Z"
         })).unwrap()];

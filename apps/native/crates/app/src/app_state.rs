@@ -398,6 +398,13 @@ impl AppState {
         self._local_host_pump = None;
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn reset_fixture_preferences(&mut self) {
+        self.client_settings = ClientSettings::default();
+        self.restore_thread = None;
+        self.project_preferences = Default::default();
+    }
+
     /// Turn-item fixtures keep asset RPCs alive while holding their projected UI state.
     #[cfg(feature = "snapshot")]
     pub(crate) fn freeze_snapshot(&mut self) {

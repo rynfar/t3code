@@ -621,6 +621,8 @@ pub struct EnvironmentCapabilities {
     pub project_organization: Option<bool>,
     #[serde(default)]
     pub worktrees_directory: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub fast_worktree_checkout: Option<bool>,
     #[serde(default)]
     pub storage_cleanup: Option<bool>,
     #[serde(default)]
@@ -1642,6 +1644,14 @@ mod keybindings_issues_tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn decodes_fast_worktree_checkout_capability() {
+        for (value, expected) in [(json!({}), None), (json!({"fastWorktreeCheckout": false}), Some(false)), (json!({"fastWorktreeCheckout": true}), Some(true))] {
+            let capabilities: EnvironmentCapabilities = serde_json::from_value(value).unwrap();
+            assert_eq!(capabilities.fast_worktree_checkout, expected);
+        }
     }
 
     #[test]

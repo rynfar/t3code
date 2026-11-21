@@ -58,6 +58,11 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
+fn connect_policy_notice(reason: String, cx: &App) -> impl IntoElement {
+    div().debug_selector(|| "managed-connect-notice".to_owned())
+        .child(crate::components::managed::notice(reason, cx))
+}
+
 /// Human-readable relative/date label for `ConnectDevice.approved_at` instead of raw ISO text.
 fn format_approved_since(approved_at: &str, now_ms: i64) -> String {
     let Some(ms) = t3_core::sidebar::time::parse_iso(approved_at) else {
@@ -1205,12 +1210,17 @@ impl SettingsView {
         let sign_in = || Button::new("access-relay-sign-in", ButtonVariant::Outline, ButtonSize::Xs)
             .label(t(cx, "Sign in")).disabled(state.cloud.busy)
             .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx))));
-        let mut connect = Row::new("access-relay-configure", t(cx, "T3 Connect"))
-            .description(if managed { t(cx, "The environment is linked to T3 Connect.").to_owned() }
+        let mut connect = Row::new("access-relay-configure", t(cx, "T3 Connect"));
+        connect = if !managed && let Some(reason) = denial.clone() {
+            connect.description_content(connect_policy_notice(reason, cx))
+        } else {
+            connect.description(if managed { t(cx, "The environment is linked to T3 Connect.").to_owned() }
                 else if on_host { t(cx, if link.link_revoked {
                     "This environment was removed from T3 Connect. Run `t3 connect link` on the host to link it again."
                 } else { "Run `t3 connect link` on the host, then restart T3 Code there." }).to_owned() }
-                else { denial.clone().unwrap_or_else(|| t(cx, "Make this environment available to your other devices through T3 Connect.").to_owned()) })
+                else { t(cx, "Make this environment available to your other devices through T3 Connect.").to_owned() })
+        };
+        connect = connect
             .below(v_flex().gap(r(4.)).when(link.managed_tunnel_active, |el| {
                 el.children(reachability.into_iter().map(|text| muted_text(text, cx)))
                     .child(div().child(Button::new("access-check-reachability", ButtonVariant::Outline, ButtonSize::Xs)
@@ -1422,6 +1432,13 @@ impl SettingsView {
         let mut machine_rows = vec![version, network];
         if let Some(link) = self.access.cloud_link_state.as_ref() {
             machine_rows.extend(self.access_relay_rows(&target, link, cx));
+        } else if let Some(reason) = t3_core::managed_policy::capability_denial(
+            target.config.as_ref().and_then(|config| config.managed_policy.as_ref()),
+            t3_core::managed_policy::Capability::Connect,
+        ) {
+            machine_rows.push(Row::new("access-relay-configure", t(cx, "T3 Connect"))
+                .description_content(connect_policy_notice(reason, cx))
+                .into_any_element());
         } else if target.grants.as_ref().is_some_and(|session| !session.grants(RELAY_READ)) {
             machine_rows.push(Row::new("access-relay-configure", t(cx, "T3 Connect"))
                 .description(t(cx, "Run `t3 connect link` on the host, then restart T3 Code there."))

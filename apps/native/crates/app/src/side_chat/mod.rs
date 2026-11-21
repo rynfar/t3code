@@ -882,6 +882,9 @@ mod history_tests {
 
     #[gpui::test]
     async fn embedded_and_main_composers_share_draft_store_without_overwriting(cx: &mut gpui::TestAppContext) {
+        if crate::snapshot::run_test_in_isolated_home(concat!(module_path!(), "::embedded_and_main_composers_share_draft_store_without_overwriting")) {
+            return;
+        }
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (state, fixture) = cx.update(|cx| {

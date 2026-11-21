@@ -1934,13 +1934,13 @@ impl Render for SidebarPane {
             .when(!sidebar_overrides_bg, |this| this.bg(hsla(p.sidebar)))
             .theme_slot_interactive(ThemeSlot::SidebarInner, cx)
             .capture_any_mouse_down(cx.listener(|this, event, window, cx| {
-                if !this.search.is_active() && this.shift_guard.press(event) {
+                if !this.search.is_active() && this.shift_guard.press(event, cx.background_executor().now()) {
                     window.prevent_default();
                     cx.stop_propagation();
                 }
             }))
             .capture_any_mouse_up(cx.listener(|this, event, window, cx| {
-                if this.shift_guard.release(event) {
+                if this.shift_guard.release(event, cx.background_executor().now()) {
                     window.prevent_default();
                     cx.stop_propagation();
                 }
@@ -1950,11 +1950,11 @@ impl Render for SidebarPane {
                     || this.rename.as_ref().is_some_and(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window));
                 let stroke = &event.keystroke;
                 if !editing || stroke.key == "enter" || stroke.modifiers.control || stroke.modifiers.platform || stroke.modifiers.alt {
-                    this.shift_guard.note_input();
+                    this.shift_guard.note_input(cx.background_executor().now());
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                this.shift_guard.note_input();
+                this.shift_guard.note_input(cx.background_executor().now());
                 if this.hover.is_active() {
                     cx.notify();
                 }
@@ -2527,7 +2527,7 @@ mod grouping_frames {
 mod sb_sections_pane_tests {
     use super::*;
     use crate::context_menu::project_filter_tests::{install_state, session};
-    use gpui::{AppContext, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, StyleRefinement, point};
+    use gpui::{AppContext, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, StyleRefinement};
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
     use t3_client::supervisor::{ClientFixture, ConnectionStatus};
@@ -2591,10 +2591,12 @@ mod sb_sections_pane_tests {
                     }))
                     .unwrap()
                 };
+                let mut active = make("act-1", "checkout-a", "idle", false, false);
+                active.last_visited_at = Some(None);
                 let snap = s.shell.snapshot.as_mut().unwrap();
                 snap.threads = vec![
                     make("pin-1", "checkout-a", "idle", true, false),
-                    make("act-1", "checkout-a", "idle", false, false),
+                    active,
                     make("work-sel", "checkout-a", "running", false, false),
                     make("work-2", "checkout-a", "running", false, false),
                     make("settled-1", "checkout-a", "idle", false, true),
@@ -2636,11 +2638,11 @@ mod sb_sections_pane_tests {
         // Expand Settled -> Loading -> Retry -> Ok -> collapse releases page mount.
         let before_expand = notifications.get();
         state.update(vcx, |s, cx| s.toggle_shelf(Shelf::Settled, cx));
+        assert_eq!(state.read_with(vcx, |s, cx| s.settled_show_more_label(15, cx)), "Loading");
         let (method, _, fail_reply) = fixture.next_request().await;
         assert_eq!(method, GET_OLDER_SETTLED_THREADS);
         vcx.run_until_parked();
         assert!(notifications.get() > before_expand);
-        assert_eq!(state.read_with(vcx, |s, cx| s.settled_show_more_label(15, cx)), "Loading");
         vcx.update(|window, cx| { window.draw(cx).clear(); });
 
         let before_fail = notifications.get();
@@ -2668,14 +2670,9 @@ mod sb_sections_pane_tests {
         assert_eq!(state.read_with(vcx, |s, cx| s.settled_show_more_label(15, cx)), "Could not load older threads. Retry");
 
         vcx.update(|window, cx| { window.draw(cx).clear(); });
-        let show_more_center = pane.read_with(vcx, |pane, _| {
-            let idx = pane
-                .row_keys
-                .iter()
-                .position(|k| matches!(k, PaneRowKey::Thread(RowKey::ShowMore)))
-                .expect("settled show-more row key present");
-            pane.list.bounds_for_item(idx).expect("show-more row measured").center()
-        });
+        assert!(pane.read_with(vcx, |pane, _| pane.row_keys.contains(&PaneRowKey::Thread(RowKey::ShowMore))));
+        let show_more_center = vcx.debug_bounds("settled-show-more").expect("settled retry button rendered").center();
+        vcx.executor().advance_clock(shift_guard::GRACE);
         vcx.simulate_mouse_move(show_more_center, None::<MouseButton>, Default::default());
         vcx.simulate_event(MouseDownEvent {
             button: MouseButton::Left,
@@ -2690,6 +2687,7 @@ mod sb_sections_pane_tests {
             modifiers: Default::default(),
             click_count: 1,
         });
+        assert!(state.read_with(vcx, |s, _| s.settled_shelf_loading()), "clicking Retry starts a settled-page request");
         let (method, _, ok_reply) = fixture.next_request().await;
         assert_eq!(method, GET_OLDER_SETTLED_THREADS);
         let (ok_tx, ok_rx) = tokio::sync::oneshot::channel();
@@ -2775,8 +2773,8 @@ mod sb_sections_pane_tests {
             s.set_project_scope(ProjectScope::default(), cx);
         });
 
-        // Natural visible wake on cached SidebarPane renders `#woke-act-1` immediately without clock wait.
-        let (sent, woke) = tokio::sync::oneshot::channel();
+        // The wake timer must invalidate the cached pane and render the Woke badge.
+        let (sent, mut woke) = tokio::sync::oneshot::channel();
         let mut sent = Some(sent);
         let _woke_sub = state.update(vcx, |_, cx| {
             cx.subscribe(&state, move |s, _, event, _| {
@@ -2790,8 +2788,9 @@ mod sb_sections_pane_tests {
             })
         });
         let until = state.update(vcx, |s, cx| {
-            let now = now_ms();
+            let now = 1_800_000_000_000;
             let until = now + 120;
+            s.sidebar.now_override = Some(now);
             let t = s.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "act-1").unwrap();
             t.snoozed_at = Some(t3_core::sidebar::time::format_iso(now));
             t.snoozed_until = Some(t3_core::sidebar::time::format_iso(until));
@@ -2799,12 +2798,19 @@ mod sb_sections_pane_tests {
             cx.emit(AppEvent::Shell);
             until
         });
-        pane.update(vcx, |pane, _| pane.now = until - 5_000);
+        pane.update(vcx, |pane, _| {
+            pane.now = until - 5_000;
+            pane.clock = None;
+        });
         vcx.run_until_parked();
         fixture.take_commands();
         vcx.update(|window, cx| { window.draw(cx).clear(); });
         let before_wake = notifications.get();
-        woke.await.unwrap();
+        state.update(vcx, |s, _| s.sidebar.now_override = Some(until + 1));
+        vcx.executor().advance_clock(std::time::Duration::from_millis(121));
+        vcx.run_until_parked();
+        assert!(state.read_with(vcx, |s, _| s.sidebar.model.next_change_at.is_none()));
+        woke.try_recv().expect("wake timer emitted the updated sidebar");
         vcx.run_until_parked();
         assert!(notifications.get() > before_wake, "natural wake must notify the cached SidebarPane");
         assert!(
@@ -2812,20 +2818,17 @@ mod sb_sections_pane_tests {
             "natural wake must advance pane.now past snoozed_until so Woke badge renders immediately"
         );
         vcx.update(|window, cx| { window.draw(cx).clear(); });
-        let woke_badge_pos = pane.read_with(vcx, |pane, _| {
-            let idx = pane
-                .row_keys
-                .iter()
-                .position(|k| matches!(k, PaneRowKey::Thread(RowKey::Thread { id, .. }) if id == "act-1"))
-                .expect("act-1 row rendered");
-            let b = pane.list.bounds_for_item(idx).expect("act-1 row measured");
-            point(b.right() - px(24.), b.top() + px(14.))
-        });
+        let woke_badge_pos = vcx.debug_bounds("woke-act-1").expect("Woke badge rendered").center();
+        pane.update(vcx, |pane, _| pane.now_override = Some(pane.now));
+        vcx.executor().advance_clock(shift_guard::GRACE);
         vcx.simulate_mouse_move(woke_badge_pos, None::<MouseButton>, Default::default());
         vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: woke_badge_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
         vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: woke_badge_pos, modifiers: Default::default(), click_count: 1 });
-        let (ack_method, _, _) = fixture.next_request().await;
+        let (ack_method, payload, reply) = fixture.next_request().await;
         assert_eq!(ack_method, t3_core::commands::method::DISPATCH_COMMAND, "clicking #woke-act-1 dispatches acknowledge_woke");
+        assert_eq!(payload["type"], "thread.visit");
+        assert_eq!(payload["threadId"], "act-1");
+        reply.send(Ok(json!({"sequence": 2}))).unwrap();
 
         state.update(vcx, |s, _| s.stop_pump());
     }
@@ -2927,6 +2930,10 @@ mod sb_sections_pane_tests {
             super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        state.update(vcx, |state, cx| {
+            state.sidebar.collapsed = false;
+            cx.emit(AppEvent::SidebarVisibility);
+        });
         vcx.run_until_parked();
         assert!(
             pane.read_with(vcx, |p, _| p.clock.is_some()),
@@ -3438,13 +3445,15 @@ mod sb_sections_pane_tests {
         fix_b.take_commands();
 
         let woke_pos = vcx.debug_bounds("woke-env-b-th-env-b-woke").expect("remote woke badge rendered").center();
+        vcx.executor().advance_clock(shift_guard::GRACE);
         vcx.simulate_mouse_move(woke_pos, None::<MouseButton>, Default::default());
         vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
         vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: woke_pos, modifiers: Default::default(), click_count: 1 });
-        let (method, params, _) = fix_b.next_request().await;
+        let (method, params, reply) = fix_b.next_request().await;
         assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
         assert_eq!(params["type"], "thread.visit");
         assert_eq!(params["threadId"], "th-env-b-woke");
+        reply.send(Ok(json!({"sequence": 2}))).unwrap();
         assert!(fix_a.take_commands().is_empty(), "scoped acknowledge_woke must route to owning env-b, not active env-a");
 
         // Verify delete_scoped_threads removes deleted keys from fleet_selection and preserves others.
@@ -3459,8 +3468,18 @@ mod sb_sections_pane_tests {
         let (del_method, del_params, reply_del) = fix_b.next_request().await;
         assert_eq!(del_method, t3_core::commands::method::DISPATCH_COMMAND);
         assert_eq!(del_params["type"], "thread.delete");
-        let _ = reply_del.send(Ok(json!({})));
-        vcx.run_until_parked();
+        let (deleted, done) = tokio::sync::oneshot::channel();
+        let mut deleted = Some(deleted);
+        let deleted_key = key_del.clone();
+        let _deleted = state.update(vcx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
+            if *event == AppEvent::SidebarSelection && !state.sidebar.fleet_selection.contains(&deleted_key)
+                && let Some(deleted) = deleted.take()
+            {
+                let _ = deleted.send(());
+            }
+        }));
+        reply_del.send(Ok(json!({}))).unwrap();
+        done.await.unwrap();
         state.read_with(vcx, |s, _| {
             assert!(!s.sidebar.fleet_selection.contains(&key_del), "deleted scoped thread must be removed from selection");
             assert!(s.sidebar.fleet_selection.contains(&key_woke), "surviving selected thread must remain selected");
@@ -3887,16 +3906,18 @@ mod sb_sections_pane_tests {
         assert!(vcx.debug_bounds("snooze-env-ro-shared-th").is_none(), "read-only remote env stays hidden");
 
         // Snoozed row with has_queued_turn_start must still render Wake and dispatch thread.unsnooze on click.
+        vcx.executor().advance_clock(shift_guard::GRACE);
         vcx.simulate_mouse_move(queued_center, None::<MouseButton>, Default::default());
         vcx.run_until_parked();
         let wake_pos = vcx.debug_bounds("wake-env-op-snoozed-queued").expect("snoozed row with queued turn start must keep hover Wake button").center();
         vcx.simulate_mouse_move(wake_pos, None::<MouseButton>, Default::default());
         vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1, first_mouse: false });
         vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: wake_pos, modifiers: Default::default(), click_count: 1 });
-        let (method, params, _) = fix_op.next_request().await;
+        let (method, params, reply) = fix_op.next_request().await;
         assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
         assert_eq!(params["type"], "thread.unsnooze");
         assert_eq!(params["threadId"], "snoozed-queued");
+        reply.send(Ok(json!({"sequence": 2}))).unwrap();
         assert!(fix_ro.take_commands().is_empty());
 
         state.update(vcx, |s, _| s.stop_pump());
@@ -4779,6 +4800,9 @@ mod sb_379_tests {
     async fn sb_379_scoped_empty_rename_launch_settings_highlight_and_collapse_persist(
         cx: &mut gpui::TestAppContext,
     ) {
+        if crate::snapshot::run_test_in_isolated_home(concat!(module_path!(), "::sb_379_scoped_empty_rename_launch_settings_highlight_and_collapse_persist")) {
+            return;
+        }
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         // Ensure any leftover persisted collapse preference starts cleared.

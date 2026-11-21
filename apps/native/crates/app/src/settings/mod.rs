@@ -430,9 +430,18 @@ fn search_availability_for(state: &AppState) -> SearchAvailability {
     let has_thread_auto_settlement = active_config.is_some();
     let has_peer_link_host = active_config.is_some()
         || !state.environments.environments.is_empty();
-    let has_fast_worktree_checkout_environment = active_config
-        .and_then(|c| c.environment.platform.as_ref())
-        .is_some_and(|platform| platform.os == "darwin");
+    let has_fast_checkout = |config: &ServerConfig| {
+        config.environment.capabilities.fast_worktree_checkout == Some(true)
+    };
+    let has_fast_worktree_checkout_environment = if state.fleet.environments.is_empty() {
+        matches!(state.phase, crate::app_state::Phase::Online(ConnectionStatus::Connected))
+            && active_config.is_some_and(has_fast_checkout)
+    } else {
+        state.fleet.environments.iter().any(|entry| {
+            entry.status == ConnectionStatus::Connected
+                && entry.config.config.as_ref().is_some_and(has_fast_checkout)
+        })
+    };
     let has_text_generators_environment = active_config.is_some_and(|c| {
         c.managed_policy
             .as_ref()
@@ -2888,7 +2897,8 @@ mod shell_tests {
                         "environment": {
                             "environmentId": "env-mac",
                             "label": "Mac Studio",
-                            "platform": { "os": "darwin", "arch": "arm64" }
+                            "platform": { "os": "darwin", "arch": "arm64" },
+                            "capabilities": { "fastWorktreeCheckout": true }
                         },
                         "settings": {}
                     }))

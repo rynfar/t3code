@@ -2,7 +2,7 @@
 //! `ChatSettingsPanel` (`web/src/components/settings/SettingsPanels.tsx`),
 //! `NotificationSettings.tsx`, and `LabsSettingsPanel.tsx`. Copy and defaults match the web.
 
-use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Task, div};
+use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div};
 use gpui_component::h_flex;
 use t3_core::client_settings::{
     ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
@@ -11,7 +11,6 @@ use t3_core::client_settings::{
     screen_reader_announcements_value,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
-use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::i18n::{
     DEFAULT_LOCALE, SUPPORTED_LOCALES, SYSTEM_LANGUAGE, native_language_name, supported_language_value,
 };
@@ -60,18 +59,6 @@ fn device_default_patch(doc: &ClientSettingsDoc) -> serde_json::Map<String, serd
 #[derive(Default)]
 pub(crate) struct ChatState {
     advanced: bool,
-    fast_checkout: Option<FastCheckoutSupport>,
-}
-
-struct FastCheckoutSupport {
-    owners: Vec<EnvironmentOwner>,
-    connection: Option<u64>,
-    supported: bool,
-    _task: Task<()>,
-}
-
-fn advertised_fast_checkout(reply: &serde_json::Value) -> bool {
-    reply["environment"]["capabilities"]["fastWorktreeCheckout"].as_bool() == Some(true)
 }
 
 fn literal_options<T: Copy>(all: &[T], value: fn(T) -> &'static str, label: fn(T) -> &'static str) -> Vec<SelectOption> {
@@ -519,58 +506,24 @@ Reset personal preferences on this device. Saved environments, themes, and brows
         ]
     }
 
-    fn fast_checkout_supported(&mut self, cx: &mut Context<Self>) -> bool {
-        use t3_core::auth::ORCHESTRATION_READ_SCOPE;
-
+    fn fast_checkout_supported(&self, cx: &App) -> bool {
         if self.is_project_scope(cx) {
-            self.chat_ui.fast_checkout = None;
             return false;
         }
-        let owners = self.scoped_environment_owners(cx);
         let app = self.state.read(cx);
-        let connection = app.connection_id();
-        let fallback_allowed = self.scope.machine.is_none() && owners.is_empty() && self.connected_now(cx);
-        if owners.is_empty() && !fallback_allowed {
-            self.chat_ui.fast_checkout = None;
-            return false;
+        let supports = |config: &t3_core::server_config::ServerConfig| {
+            config.environment.capabilities.fast_worktree_checkout == Some(true)
+        };
+        let owners = self.scoped_environment_owners(cx);
+        if owners.is_empty() {
+            return self.scope.machine.is_none() && self.connected_now(cx)
+                && app.server_config.config.as_ref().is_some_and(supports);
         }
-        if let Some(probe) = self.chat_ui.fast_checkout.as_ref()
-            && probe.owners == owners && probe.connection == connection
-        {
-            return probe.supported;
-        }
-        // Read the advertised flag directly while the shared EnvironmentCapabilities type omits it.
-        let fallback = fallback_allowed.then(|| app.rpc("server.getConfig", serde_json::json!({})));
-        let lookups = owners.iter().map(|owner| app.connections.destination(owner, ORCHESTRATION_READ_SCOPE)).collect::<Vec<_>>();
-        let runtime = app.runtime().clone();
-        let captured = owners.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let supported = if let Some(request) = fallback {
-                request.await.is_ok_and(|reply| advertised_fast_checkout(&reply))
-            } else {
-                let reports = futures::future::join_all(lookups.into_iter().map(|lookup| {
-                    let runtime = runtime.clone();
-                    async move {
-                        let Ok(destination) = lookup.await else { return false };
-                        runtime.spawn(async move {
-                            destination.client.request("server.getConfig", serde_json::json!({})).await
-                                .is_ok_and(|reply| advertised_fast_checkout(&reply))
-                        }).await.unwrap_or(false)
-                    }
-                })).await;
-                reports.into_iter().all(|supported| supported)
-            };
-            let _ = this.update(cx, |this, cx| {
-                if let Some(probe) = this.chat_ui.fast_checkout.as_mut()
-                    && probe.owners == captured && probe.connection == connection
-                {
-                    probe.supported = supported;
-                    cx.notify();
-                }
-            });
-        });
-        self.chat_ui.fast_checkout = Some(FastCheckoutSupport { owners, connection, supported: false, _task: task });
-        false
+        owners.iter().all(|owner| {
+            app.scoped_environment(&owner.saved_id)
+                .and_then(|entry| entry.config.config.as_ref())
+                .is_some_and(supports)
+        })
     }
 
     pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
@@ -800,14 +753,6 @@ mod device_defaults_tests {
     use super::*;
 
     #[test]
-    fn fast_worktree_checkout_requires_an_explicit_capability() {
-        for capabilities in [serde_json::json!({}), serde_json::json!({"fastWorktreeCheckout": false})] {
-            assert!(!advertised_fast_checkout(&serde_json::json!({"environment": {"capabilities": capabilities}})));
-        }
-        assert!(advertised_fast_checkout(&serde_json::json!({"environment": {"capabilities": {"fastWorktreeCheckout": true}}})));
-    }
-
-    #[test]
     fn device_restore_only_patches_its_preferences() {
         let doc = ClientSettingsDoc::from_json(r#"{
             "wordWrap": true, "language": "de", "notificationMode": null,
@@ -858,7 +803,8 @@ mod tests {
                         "environment": {
                             "environmentId": "fixture-env",
                             "label": "Studio Mac",
-                            "platform": { "os": "darwin", "arch": "arm64" }
+                            "platform": { "os": "darwin", "arch": "arm64" },
+                            "capabilities": { "fastWorktreeCheckout": true }
                         },
                         "managedPolicy": {
                             "organization": "Acme Corp",
@@ -887,10 +833,10 @@ mod tests {
                 window.draw(cx).clear();
             });
         }
-        // Fast worktree checkout switch is present on macOS.
+        // Fast worktree checkout is advertised by the macOS fixture.
         assert!(vcx.debug_bounds("worktree-fast-checkout-switch").is_some());
 
-        // Switching platform to Linux hides the macOS-only Fast worktree checkout row.
+        // The Linux fixture does not advertise Fast worktree checkout.
         vcx.update(|_, cx| {
             state.update(cx, |state, cx| {
                 state.server_config.config = Some(
@@ -920,7 +866,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn managed_policy_notices_render_across_browser_connections_and_providers(
+    fn managed_policy_notices_render_across_browser_access_and_providers(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -987,7 +933,7 @@ mod tests {
             "Browser settings must render ManagedNotice when browserCookieImport is denied"
         );
 
-        vcx.update(|_, cx| crate::settings::open(Section::Connections, cx));
+        vcx.update(|_, cx| crate::settings::open(Section::Access, cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             window.refresh();
@@ -995,7 +941,7 @@ mod tests {
         });
         assert!(
             vcx.debug_bounds("managed-connect-notice").is_some(),
-            "Connections settings must render ManagedNotice when connect is denied"
+            "Access settings must render a managed T3 Connect notice when connect is denied"
         );
 
         vcx.update(|_, cx| crate::settings::open(Section::Providers, cx));

@@ -1090,6 +1090,7 @@ impl Preview {
 
     #[cfg(test)]
     pub(super) fn load_text_for_test(&mut self, target: Target, contents: &str, cx: &mut Context<Self>) {
+        self._fetch = None;
         let key = Key::of(&target);
         self.target = Some(target);
         self.key = Some(key.clone());

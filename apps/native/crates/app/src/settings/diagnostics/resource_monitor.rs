@@ -877,7 +877,7 @@ impl MonitorTable {
 
 #[cfg(all(test, feature = "snapshot"))]
 mod tests {
-    use gpui::{Focusable, Render, div, prelude::*};
+    use gpui::{Render, div, prelude::*};
     use serde_json::json;
     use t3_core::resource_telemetry::{Category, Identity, can_signal};
     use t3_core::settings::diagnostics::Signal;
@@ -899,131 +899,76 @@ mod tests {
     }
 
     #[gpui::test]
-    fn process_signal_actions_send_sigint_and_confirm_sigkill(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let drive = |vcx: &mut gpui::VisualTestContext| {
-            vcx.run_until_parked();
-            runtime.block_on(async {
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
-            });
-            vcx.run_until_parked();
-        };
+    async fn process_signal_actions_send_sigint_and_confirm_sigkill(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
-        fixture
-            .grants
-            .send(Some(
-                serde_json::from_value(json!({
-                    "authenticated": true,
-                    "permissions": ["orchestration:read", "environment:maintain"]
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        cx.run_until_parked();
+        fixture.grants.send(Some(serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "environment:maintain"]
+        })).unwrap())).unwrap();
         cx.update(|cx| {
             crate::composer::init(cx);
             crate::keymap::init(cx);
             crate::settings::init(state.clone(), cx);
             crate::updates::init(cx);
+            cx.set_global(serde_json::from_value::<Fixture>(json!({})).unwrap());
         });
         let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
         let frame_dialog = dialog.clone();
         let window = cx.add_window(|_, _| TestFrame { dialog: frame_dialog });
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
-        vcx.update(|_, cx| crate::settings::open(Section::Diagnostics, cx));
-        drive(&mut vcx);
-        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view open"));
+        let view = vcx.update(|window, cx| {
+            crate::settings::open(Section::Diagnostics, cx);
+            crate::settings::settings_view_for_test(window, cx).unwrap()
+        });
         let id = Identity { pid: 4242, start_time_ms: 1_731_888_000_000 };
 
         assert!(can_signal(Category::ProviderRoot));
         assert!(!can_signal(Category::Server));
 
-        // SIGINT dispatches immediately and guards in-flight signaling until settled.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.request_monitor_signal(id.clone(), Signal::Int, cx);
-                assert!(view.diagnostics.monitor.signaling.contains(&id));
-            });
+        view.update(&mut vcx, |view, cx| {
+            view.request_monitor_signal(id.clone(), Signal::Int, cx);
+            assert!(view.diagnostics.monitor.signaling.contains(&id));
         });
-        drive(&mut vcx);
-        let (requests, _) = fixture.take_requests();
-        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.signalProcess").expect("SIGINT RPC sent");
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method, model::SIGNAL_PROCESS);
         assert_eq!(payload["pid"], json!(4242));
         assert_eq!(payload["startTimeMs"], json!(1_731_888_000_000_i64));
         assert_eq!(payload["signal"], json!("SIGINT"));
-        let _ = reply.send(Ok(json!({ "ok": true })));
-        drive(&mut vcx);
-        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
+        reply.send(Ok(json!({ "ok": true }))).unwrap();
+        vcx.condition(&view, |view, _| !view.diagnostics.monitor.signaling.contains(&id)).await;
 
-        // SIGKILL opens confirmation dialog first; cancelling does not send RPC.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.request_monitor_signal(id.clone(), Signal::Kill, cx);
+        for confirm in [false, true] {
+            vcx.update(|window, cx| {
+                view.update(cx, |view, cx| view.request_monitor_signal(id.clone(), Signal::Kill, cx));
+                assert!(crate::dialog::is_open(cx));
+                window.focus(&dialog.read(cx).initial_focus_for_test(), cx);
+                window.refresh();
+                window.draw(cx).clear();
             });
-        });
-        drive(&mut vcx);
-        assert!(vcx.read(|cx| crate::dialog::is_open(cx)));
-        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
-        vcx.update(|window, cx| {
-            let focus = dialog.focus_handle(cx);
-            window.focus(&focus, cx);
-            window.refresh();
-            window.draw(cx).clear();
-        });
-        vcx.simulate_keystrokes("escape");
-        drive(&mut vcx);
-        assert!(!vcx.read(|cx| crate::dialog::is_open(cx)));
-        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
-        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
+            assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != model::SIGNAL_PROCESS));
+            crate::dialog::press_confirmation_key_for_test(&mut vcx, confirm);
+            assert!(!vcx.read(|cx| crate::dialog::is_open(cx)), "confirm={confirm}");
+            if confirm {
+                let (method, payload, reply) = fixture.next_request().await;
+                assert_eq!(method, model::SIGNAL_PROCESS);
+                assert_eq!(payload["signal"], json!("SIGKILL"));
+                reply.send(Ok(json!({ "ok": true }))).unwrap();
+            }
+            vcx.condition(&view, |view, _| !view.diagnostics.monitor.signaling.contains(&id)).await;
+            assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != model::SIGNAL_PROCESS));
+        }
 
-        // Confirming SIGKILL dispatches server.signalProcess with SIGKILL.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.request_monitor_signal(id.clone(), Signal::Kill, cx);
-            });
+        fixture.grants.send(Some(serde_json::from_value(json!({
+            "authenticated": true, "permissions": ["orchestration:read"]
+        })).unwrap())).unwrap();
+        view.update(&mut vcx, |view, cx| {
+            view.request_monitor_signal(id.clone(), Signal::Int, cx);
+            assert!(!view.diagnostics.monitor.signaling.contains(&id));
         });
-        drive(&mut vcx);
-        vcx.update(|window, cx| {
-            let focus = dialog.focus_handle(cx);
-            window.focus(&focus, cx);
-            window.refresh();
-            window.draw(cx).clear();
-        });
-        vcx.simulate_keystrokes("enter");
-        drive(&mut vcx);
-        let (requests, _) = fixture.take_requests();
-        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.signalProcess").expect("SIGKILL RPC sent");
-        assert_eq!(payload["signal"], json!("SIGKILL"));
-        let _ = reply.send(Ok(json!({ "ok": true })));
-        drive(&mut vcx);
-        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
-
-        // Missing environment:maintain never sends RPCs.
-        fixture
-            .grants
-            .send(Some(
-                serde_json::from_value(json!({
-                    "authenticated": true,
-                    "permissions": ["orchestration:read"]
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        drive(&mut vcx);
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.request_monitor_signal(id.clone(), Signal::Int, cx);
-            });
-        });
-        drive(&mut vcx);
-        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
+        assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != model::SIGNAL_PROCESS));
 
         state.update(&mut vcx, |state, _| state.stop_pump());
-        drop(vcx);
-        drop(fixture);
-        drop(runtime);
     }
 }

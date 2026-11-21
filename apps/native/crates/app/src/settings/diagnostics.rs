@@ -71,8 +71,8 @@ pub(crate) struct DiagnosticsState {
     processes: Query<ProcessDiagnostics>,
     history: Query<ResourceHistory>,
     trace: Query<TraceDiagnostics>,
-    /// The connection the queries were sent on.
-    loaded_for: Option<DiagnosticTarget>,
+    target: Option<DiagnosticTarget>,
+    loaded: bool,
     window: usize,
     collapsed: HashSet<u64>,
     signaling: Option<u64>,
@@ -109,7 +109,8 @@ impl DiagnosticsState {
             processes: Query::default(),
             history: Query::default(),
             trace: Query::default(),
-            loaded_for: None,
+            target: None,
+            loaded: false,
             window: model::DEFAULT_HISTORY_WINDOW,
             collapsed: HashSet::new(),
             signaling: None,
@@ -156,7 +157,8 @@ impl DiagnosticsState {
     /// Off the page: clocks and watchers stop, and nothing reloads until it shows again.
     pub(super) fn leave(&mut self) {
         self.monitor.leave();
-        self.loaded_for = None;
+        self.target = None;
+        self.loaded = false;
         self.ticker = None;
         self.grants = None;
     }
@@ -429,8 +431,9 @@ impl SettingsView {
         let session = self.scoped_session(cx);
         let access = resolve_usage_access(self.connection_phase(cx), session.as_ref(), false);
         let target = self.diagnostic_target(cx);
-        if self.diagnostics.loaded_for != target {
+        if self.diagnostics.target != target {
             self.diagnostics.reset();
+            self.diagnostics.target = target.clone();
         }
         if !access.can_read_diagnostics || target.is_none() {
             let text = if target.is_none() {
@@ -445,8 +448,8 @@ impl SettingsView {
             return vec![Block::new(&[], div().px(r(16.)).text_sm().text_color(hsla(p.muted_foreground)).child(text))];
         }
         self.watch_diagnostics(cx);
-        if self.diagnostics.loaded_for != target {
-            self.diagnostics.loaded_for = target;
+        if !self.diagnostics.loaded {
+            self.diagnostics.loaded = true;
             self.load_processes(cx);
             self.load_history(cx);
             self.load_trace(cx);

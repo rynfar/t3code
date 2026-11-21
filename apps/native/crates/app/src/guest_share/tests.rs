@@ -53,6 +53,11 @@ async fn guest_create_uses_existing_payload_and_refuses_stale_results(
         cx.update(|window, cx| {
             let owner = ThreadMenuOwner::capture(state.read(cx), "menu-thread").unwrap();
             open(owner, window.window_handle().into(), cx);
+        });
+        let (method, reply) = fixture.next_stream().await;
+        assert_eq!(method, t3_core::commands::method::SUBSCRIBE_THREAD);
+        assert!(reply.send(Err(RpcError::Closed)).is_ok());
+        cx.update(|window, cx| {
             dialog.update(cx, |dialog, cx| dialog.create(window, cx));
         });
         let task = dialog.update(cx, |dialog, _| dialog.task.take().unwrap());
@@ -111,6 +116,8 @@ async fn guest_create_uses_existing_payload_and_refuses_stale_results(
             _ => assert!(dialog.pending.is_none(), "stale result must discard its URL"),
         });
         assert!(fixture.take_commands().is_empty());
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|window, _| window.remove_window());
     }
 }
 

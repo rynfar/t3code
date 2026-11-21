@@ -918,9 +918,10 @@ mod tests {
             .unwrap();
 
         let (panel, vcx) = cx.add_window_view(|window, cx| FilesPanel::new(state.clone(), window, cx));
+        let environment = state.read_with(vcx, |state, _| state.environment().unwrap().to_owned());
         let make_target = |path: &str| preview::Target {
             root: Root {
-                environment: "fixture-env".into(),
+                environment: environment.clone(),
                 workspace: FileWorkspace {
                     thread_id: "menu-thread".into(),
                     cwd: "/fixture/b".into(),
@@ -933,27 +934,20 @@ mod tests {
         };
         let target_a = make_target("src/app.rs");
         let target_b = make_target("scripts/tool.py");
-        let save_target_a = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "src/app.rs");
-        let save_target_b = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "scripts/tool.py");
+        let save_target_a = t3_core::files::save::FileSaveTarget::new(&environment, "/fixture/b", "src/app.rs");
+        let save_target_b = t3_core::files::save::FileSaveTarget::new(&environment, "/fixture/b", "scripts/tool.py");
 
         let preview_entity = panel.read_with(vcx, |panel, _| panel.preview.clone());
         let explorer_entity = panel.read_with(vcx, |panel, _| panel.explorer.clone());
+        panel.update(vcx, |panel, _| panel.prefs.explorer_open = true);
+        state.update(vcx, |state, cx| {
+            state.select_thread("menu-thread", cx);
+            state.open_file(&target_a.path, None, cx);
+        });
 
         // Start an in-flight write on target A (`src/app.rs`), then switch to target B (`scripts/tool.py`)
         // and start a second concurrent write before target A's reply returns.
         let editor_a_id = vcx.update(|window, cx| {
-            panel.update(cx, |panel, cx| {
-                panel.root = Some(target_a.root.clone());
-                panel.shown = Some(Shown {
-                    surface_id: "s-1".into(),
-                    path: Some("src/app.rs".into()),
-                    reveal_line: None,
-                    reveal_request_id: 0,
-                    attachment: None,
-                    folder_trail: None,
-                });
-                cx.notify();
-            });
             preview_entity.update(cx, |preview, cx| {
                 preview.load_text_for_test(target_a.clone(), "fn before() {}\n", cx);
                 preview.enter_edit_mode(cx);
@@ -981,9 +975,9 @@ mod tests {
 
         // Switch to a Python file while target A's write is still in flight; verify language updates,
         // EditorState is recreated with the new grammar, and target B's write does not cancel target A's persist task.
+        state.update(vcx, |state, cx| state.open_file(&target_b.path, None, cx));
         let editor_b_id = vcx.update(|window, cx| {
             preview_entity.update(cx, |preview, cx| {
-                preview.release_active_editor_on_target_change(cx);
                 preview.load_text_for_test(target_b.clone(), "print('before')\n", cx);
                 preview.enter_edit_mode(cx);
                 assert_eq!(preview.editor.language, Some("python"));

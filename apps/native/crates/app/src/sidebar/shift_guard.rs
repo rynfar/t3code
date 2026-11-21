@@ -11,7 +11,7 @@ use gpui::{
 use super::PaneRowKey;
 use super::tree::TreeRow;
 
-const GRACE: Duration = Duration::from_millis(500);
+pub(super) const GRACE: Duration = Duration::from_millis(500);
 
 struct Position {
     row: TreeRow,
@@ -35,16 +35,15 @@ impl ShiftGuard {
         self.0.borrow_mut().layout_changed = true;
     }
 
-    pub(super) fn note_input(&self) {
-        self.0.borrow_mut().last_input = Some(Instant::now());
+    pub(super) fn note_input(&self, now: Instant) {
+        self.0.borrow_mut().last_input = Some(now);
     }
 
-    pub(super) fn press(&self, event: &MouseDownEvent) -> bool {
+    pub(super) fn press(&self, event: &MouseDownEvent, now: Instant) -> bool {
         let mut frame = self.0.borrow_mut();
         frame
             .blocked_buttons
             .retain(|button| *button != event.button);
-        let now = Instant::now();
         if frame.rows.iter().any(|entry| {
             entry.bounds.contains(&event.position)
                 && entry
@@ -58,7 +57,7 @@ impl ShiftGuard {
         false
     }
 
-    pub(super) fn release(&self, event: &MouseUpEvent) -> bool {
+    pub(super) fn release(&self, event: &MouseUpEvent, now: Instant) -> bool {
         let mut frame = self.0.borrow_mut();
         if let Some(index) = frame
             .blocked_buttons
@@ -68,7 +67,7 @@ impl ShiftGuard {
             frame.blocked_buttons.swap_remove(index);
             return true;
         }
-        frame.last_input = Some(Instant::now());
+        frame.last_input = Some(now);
         false
     }
 
@@ -110,9 +109,9 @@ impl LayoutFrame {
     pub(super) fn finish(self) -> impl IntoElement {
         canvas(
             |_, _, _| {},
-            move |_, _, _, _| {
+            move |_, _, _, cx| {
                 let mut frame = self.state.0.borrow_mut();
-                let now = Instant::now();
+                let now = cx.background_executor().now();
                 let layout_changed = frame.layout_changed && !frame.rows.is_empty();
                 let external_move = frame
                     .last_input
