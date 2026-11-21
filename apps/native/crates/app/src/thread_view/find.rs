@@ -39,6 +39,14 @@ pub struct FindUi {
 }
 
 impl FindUi {
+    pub(super) fn highlights(&self) -> Option<crate::transcript::highlights::FindHighlights<'_>> {
+        let query = self.query.trim();
+        (!query.is_empty()).then_some(crate::transcript::highlights::FindHighlights {
+            query,
+            active: self.active.as_ref().map(|(_, found)| (found.entry_id.as_str(), found.occurrence)),
+        })
+    }
+
     pub fn active_entry(&self) -> Option<&str> {
         self.active.as_ref().map(|(_, found)| found.entry_id.as_str())
     }
@@ -204,6 +212,7 @@ impl ThreadView {
             return;
         }
         find.query = query;
+        find.active = None;
         find.start = start;
         find.offset = 0;
         find.failed = false;

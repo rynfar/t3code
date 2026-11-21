@@ -29,10 +29,11 @@ pub(super) struct CitationUi {
     pub(super) selection_focus: FocusHandle,
     pending: Option<(Citation, rules::CitationProcedure)>,
     pub(super) highlighted: Option<String>,
+    pub(super) cited_excerpt: Option<Citation>,
 }
 impl CitationUi {
     pub fn new(cx: &mut Context<ThreadView>) -> Self {
-        Self { selection: None, selection_connection: None, focus: cx.focus_handle(), selection_focus: cx.focus_handle(), pending: None, highlighted: None }
+        Self { selection: None, selection_connection: None, focus: cx.focus_handle(), selection_focus: cx.focus_handle(), pending: None, highlighted: None, cited_excerpt: None }
     }
 }
 
@@ -60,7 +61,7 @@ impl ThreadView {
         selected: MarkdownState,
         message: String,
         source: Arc<str>,
-        (pointer, hint_bounds): (Point<Pixels>, Option<Bounds<Pixels>>),
+        (pointer, hint_bounds): (Option<Point<Pixels>>, Option<Bounds<Pixels>>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -85,8 +86,8 @@ impl ThreadView {
                 });
                 if !current { return; }
                 let quote = current_selection_quote(window, cx);
-                let (vertical_fraction, horizontal_fraction) = match hint_bounds {
-                    Some(bounds) if f32::from(bounds.size.height) > 1.0 => (
+                let (vertical_fraction, horizontal_fraction) = match (pointer, hint_bounds) {
+                    (Some(pointer), Some(bounds)) if f32::from(bounds.size.height) > 1.0 => (
                         Some(((f32::from(pointer.y) - f32::from(bounds.origin.y)) / f32::from(bounds.size.height)).clamp(0.0, 1.0)),
                         Some(((f32::from(pointer.x) - f32::from(bounds.origin.x)) / f32::from(bounds.size.width).max(1.0)).clamp(0.0, 1.0)),
                     ),
@@ -99,9 +100,13 @@ impl ThreadView {
                     horizontal_fraction,
                 };
                 let Some(citation) = Self::citation_from_markdown_selection_with_hint(&selected, &source, &quote, (environment, thread.unwrap_or_default(), message), &hint, cx) else { return };
-                this.citation_ui.selection = Some((citation, pointer));
+                let position = pointer.or_else(|| hint_bounds.map(|bounds| gpui::point(bounds.left(), bounds.bottom())));
+                let Some(position) = position else { return };
+                this.citation_ui.selection = Some((citation, position));
                 this.citation_ui.selection_connection = connection;
-                window.focus(&this.citation_ui.selection_focus, cx);
+                if pointer.is_some() {
+                    window.focus(&this.citation_ui.selection_focus, cx);
+                }
                 cx.notify();
             });
         });
@@ -111,6 +116,7 @@ impl ThreadView {
         close_sent_citation_popover(cx);
         let selection = self.citation_ui.selection.take().is_some();
         let highlighted = self.citation_ui.highlighted.take().is_some();
+        self.citation_ui.cited_excerpt = None;
         let pending = self.citation_ui.pending.take().is_some();
         if highlighted {
             self.rederive(cx);
@@ -360,6 +366,7 @@ impl ThreadView {
             HistoryAction::Found => {
                 self.citation_ui.pending = None;
                 self.citation_ui.highlighted = Some(citation.message_id.clone());
+                self.citation_ui.cited_excerpt = Some(citation.clone());
                 let matched_excerpt = self.entries_cache.entries().iter().find_map(|entry| match &entry.kind {
                     t3_core::timeline::EntryKind::Message(msg) if msg.id == citation.message_id => {
                         let rendered = rules::markdown_text(&msg.text);
@@ -400,6 +407,9 @@ impl ThreadView {
     fn cite_selection(&mut self, citation: &Citation, window: &mut Window, cx: &mut Context<Self>) {
         if !citation.valid() || self.thread_id.as_deref() != Some(&citation.thread_id)
             || self.citation_ui.selection_connection.is_none() || self.citation_ui.selection_connection != self.state.read(cx).connection_id() { return; }
+        if let Some((_, position)) = &self.citation_ui.selection {
+            crate::composer::remember_citation_anchor(citation, *position, window, cx);
+        }
         self.state.update(cx, |state, cx| { state.composer_citation = Some(citation.clone()); cx.emit(AppEvent::ComposerCitation); });
         TextSelection::clear(window, cx);
         crate::selectable_text::clear_active_selection(cx);
@@ -413,7 +423,7 @@ impl ThreadView {
             return;
         }
         if self.citation_ui.selection.is_none()
-            || !(self.citation_ui.selection_focus.is_focused(window) || self.citation_ui.focus.is_focused(window)) {
+            || !(self.citation_ui.selection_focus.contains_focused(window, cx) || self.citation_ui.focus.is_focused(window)) {
             return;
         }
         if event.key == "tab" && !event.modifiers.shift && !self.citation_ui.focus.is_focused(window)

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{AnyElement, App, Context, Focusable, FontWeight, IntoElement, ParentElement, ScrollHandle, SharedString, Styled, Task, Window, div, prelude::*, px, relative};
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::h_flex;
 use t3_core::composer::context as context_rules;
 use t3_core::composer::menu::{
     self as rules, ComposerPullRequest, MenuAction, MenuItem, PathEntry, PathKind, SkillSource, SlashCommand, SlashMenuOptions, ThreadContext,
@@ -942,7 +942,7 @@ impl Composer {
     }
 
     /// Replaces `start..end` the way typing would, so undo and IME state stay intact.
-    fn replace_prompt_range(&mut self, start: usize, end: usize, replacement: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn replace_prompt_range(&mut self, start: usize, end: usize, replacement: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| {
             input.set_selected_range(start..end, cx);
             input.replace(replacement.to_owned(), window, cx);
@@ -1014,9 +1014,7 @@ impl Composer {
                 let context = ThreadContext::new(&self.environment_id(cx), &thread_id, &title);
                 self.replace_trigger(&text, &trigger, &format!("{} ", context.reference()), window, cx);
                 if let Some(target) = self.snapshot.target.clone() {
-                    let threads = self.menu.threads.entry(target).or_default();
-                    threads.retain(|existing| existing.context_id != context.context_id);
-                    threads.push(context);
+                    self.remember_thread_context(target, context);
                 }
                 self.draft_changed(cx);
             }
@@ -1027,9 +1025,7 @@ impl Composer {
                 let context = ThreadContext::new(&environment_id, &thread_id, &title);
                 self.replace_trigger(&text, &trigger, &format!("{} ", context.reference()), window, cx);
                 if let Some(target) = self.snapshot.target.clone() {
-                    let threads = self.menu.threads.entry(target).or_default();
-                    threads.retain(|existing| existing.context_id != context.context_id);
-                    threads.push(context);
+                    self.remember_thread_context(target, context);
                 }
                 self.draft_changed(cx);
             }
@@ -1138,6 +1134,12 @@ impl Composer {
             + self.records_for(target).iter().filter(|record| linked.iter().any(|r| r.id == t3_core::composer::records::field(record, "contextId"))).count()
     }
 
+    pub(super) fn remember_thread_context(&mut self, target: Target, context: ThreadContext) {
+        let threads = self.menu.threads.entry(target).or_default();
+        threads.retain(|existing| existing.context_id != context.context_id);
+        threads.push(context);
+    }
+
     pub(super) fn mentions(&self, target: &Target) -> &[ThreadContext] {
         self.menu.threads.get(target).map(Vec::as_slice).unwrap_or_default()
     }
@@ -1175,8 +1177,6 @@ impl Composer {
     pub(super) fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let trigger = self.menu.triggers.trigger()?;
         let p = palette(cx);
-        let dark = cx.theme().is_dark();
-        let outline = hsla(p.composer_outline);
         let body = if self.menu.items.is_empty() {
             div()
                 .px(px(20.))
@@ -1205,14 +1205,10 @@ impl Composer {
                 }))
                 .into_any_element()
         };
-        let surface = v_flex()
+        let surface = super::controls::menu_surface(cx)
             .id("composer-menu")
             .occlude()
             .mb(px(-OVERLAP))
-            .rounded_t(px(16.))
-            .border_1()
-            .border_color(outline)
-            .bg(hsla(if dark { p.surface_raised } else { p.card }))
             .pb(px(OVERLAP))
             .child(body);
         let cover = crate::webview::occluder("composer-menu-cover", crate::webview::Layer::TranscriptChrome);
@@ -1224,8 +1220,12 @@ impl Composer {
         let muted = hsla(p.secondary_label);
         let icon: Option<AnyElement> = match &item.action {
             MenuAction::Path { kind: PathKind::Directory, .. } => Some(Icon::Folder.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
-            MenuAction::Path { .. } => Some(Icon::File.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
-            MenuAction::Environment { .. } => Some(Icon::Server.render(px(16.), muted).into_any_element()),
+            MenuAction::Path { path, .. } => Some(crate::files::file_icon(path).render(px(16.), hsla(p.muted_foreground)).into_any_element()),
+            MenuAction::Environment { environment_id, .. } => Some(
+                crate::context_chip::environment_machine_icon(self.state.read(cx), environment_id)
+                    .render(px(16.), muted)
+                    .into_any_element(),
+            ),
             MenuAction::Thread { .. } | MenuAction::LinkedThread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted).into_any_element()),
             MenuAction::Model { instance_id, .. } => self.state.read(cx).server_config.config.as_ref().and_then(|config| {
                 let entries = provider_rules::entries(config, self.target_project());

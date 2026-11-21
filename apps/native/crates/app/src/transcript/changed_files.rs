@@ -25,7 +25,7 @@ fn file_icon(path: &str) -> Icon {
     }
 }
 
-fn middle_truncate(name: &str, max_chars: usize) -> String {
+pub(crate) fn middle_truncate(name: &str, max_chars: usize) -> String {
     let count = name.chars().count();
     if count <= max_chars || max_chars < 5 {
         return name.to_owned();

@@ -333,6 +333,10 @@ impl MediaCache {
         self.dimensions.get(&self.key(source, cx)?).copied()
     }
 
+    pub(super) fn original_bytes(&self, source: &MediaSource, cx: &App) -> Option<Arc<[u8]>> {
+        self.encoded.get(&self.key(source, cx)?).map(|image| image.bytes.clone())
+    }
+
     /// Kept regardless of the budget while a surface outside the transcript shows it.
     pub fn pin(&mut self, source: &MediaSource, variant: Variant, cx: &App) {
         if let Some(key) = self.key(source, cx) {

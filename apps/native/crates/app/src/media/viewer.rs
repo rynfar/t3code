@@ -14,10 +14,14 @@ use gpui::{
     Point, Render, ScrollWheelEvent, SharedString, Styled, Task, WeakEntity, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
 };
 use t3_core::media::{MediaHints, MediaKind, MediaSource};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::h_flex;
 
 use super::video::{VideoPlayer, VideoPlayerOptions};
 use super::{ImageState, MediaScope, Variant};
+use crate::i18n::t;
 use crate::icons::Icon;
+use crate::toast::{Toast, ToastKind};
 
 const MAX_ZOOM: f32 = 8.;
 const CAPTION_HEIGHT: f32 = 24.;
@@ -329,6 +333,67 @@ fn media_button(id: &'static str, icon: Icon, size: f32, filled: bool) -> gpui::
         .child(icon.render(px(if filled { 16. } else { 20. }), gpui_hsla(0., 0., 1., if filled { 1. } else { 0.9 })))
 }
 
+fn media_actions(item: &ViewerItem, cx: &App) -> Option<AnyElement> {
+    let media = cx.try_global::<super::Media>()?;
+    let cache = media.cache.read(cx);
+    let bytes = (item.kind == MediaKind::Image).then(|| cache.original_bytes(&item.source, cx)).flatten();
+    let image = bytes.as_ref().and_then(|bytes| {
+        let format = image::guess_format(bytes).ok()?;
+        gpui::ImageFormat::from_mime_type(format.to_mime_type())
+    });
+    let source = item.source.clone();
+    let can_open = match &source {
+        MediaSource::Asset(_) => true,
+        MediaSource::Direct(url) => url.starts_with("https://") || url.starts_with("http://"),
+    };
+    if bytes.is_none() && !can_open {
+        return None;
+    }
+
+    let app = cache.state.clone();
+    let name = std::path::Path::new(item.name.as_ref()).file_name().and_then(|name| name.to_str()).unwrap_or("image").to_owned();
+    let action = |id, glyph, label| {
+        let label = t(cx, label);
+        media_button(id, glyph, 28., true).aria_label(label)
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+    };
+    Some(h_flex()
+        .id("media-viewer-actions")
+        .absolute().top(px(16.)).left(px(16.))
+        .gap(px(6.))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .children(bytes.as_ref().zip(image).map(|(bytes, format)| {
+            let bytes = bytes.clone();
+            action("media-viewer-copy", Icon::Copy, "Copy image").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(format, bytes.to_vec())));
+            })
+        }))
+        .children(bytes.map(|bytes| {
+            action("media-viewer-save", Icon::Download, "Save image").on_click(move |_, _, cx| {
+                let dir = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads"))
+                    .unwrap_or_else(std::env::temp_dir);
+                let prompt = cx.prompt_for_new_path(dir.as_path(), Some(&name));
+                let bytes = bytes.clone();
+                let app = app.clone();
+                cx.spawn(async move |cx| {
+                    let Ok(Ok(Some(path))) = prompt.await else { return };
+                    let result = cx.background_executor().spawn(async move { std::fs::write(path, bytes.as_ref()) }).await;
+                    if let Err(error) = result {
+                        app.update(cx, |app, cx| {
+                            app.show_toast(Toast::new(ToastKind::Error, t(cx, "Could not save image")).description(error.to_string()), cx);
+                        });
+                    }
+                }).detach();
+            })
+        }))
+        .when(can_open, |this| this.child(action("media-viewer-open", Icon::ExternalLink, "Open in browser")
+            .on_click(move |_, _, cx| match &source {
+                MediaSource::Asset(resource) => super::open_asset(resource, cx),
+                MediaSource::Direct(url) => cx.open_url(url),
+            })))
+        .into_any_element())
+}
+
 impl MediaViewer {
     fn video_entity(&mut self, item: &ViewerItem, viewport: gpui::Size<Pixels>, cx: &mut Context<Self>) -> Entity<VideoPlayer> {
         let scope = self.scope.clone().or_else(|| cx.try_global::<super::Media>().and_then(|media| media.scope.clone()));
@@ -487,6 +552,7 @@ impl MediaViewer {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(media)
             .children(observer)
+            .children(media_actions(&item, cx))
             .child(
                 div()
                     .h(px(CAPTION_HEIGHT))

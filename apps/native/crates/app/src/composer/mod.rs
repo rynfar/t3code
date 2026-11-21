@@ -16,6 +16,7 @@ pub(crate) use question_attachments::QuestionCommandSpy;
 pub(crate) use attachments::Fixture as AttachmentFixture;
 pub(crate) mod imports;
 mod citations;
+pub(crate) use citations::remember_citation_anchor;
 pub(crate) mod context;
 pub(crate) mod clipboard;
 pub(crate) mod controls;
@@ -31,6 +32,8 @@ pub(crate) use send::SendAndNewThreadCompleted;
 mod stash;
 pub(crate) use pending::{banner_surface, banner_surface_card};
 mod view;
+#[allow(unused_imports, reason = "The sidebar registers its private DraggedThread type")]
+pub(crate) use view::register_thread_drop;
 mod workspace;
 
 use std::collections::{HashMap, HashSet};
@@ -417,6 +420,13 @@ impl Composer {
     pub(crate) fn snapshot_voice(&self) -> Entity<crate::voice::VoiceSpeechController> {
         self.voice.clone()
     }
+}
+
+pub(crate) fn for_attachment_drop(thread_id: &str, cx: &App) -> Option<Entity<Composer>> {
+    cx.try_global::<RegisteredComposers>()?.0.iter().filter_map(|weak| weak.upgrade()).find(|entity| {
+        let composer = entity.read(cx);
+        composer.thread_id().as_deref() == Some(thread_id) && composer.can_attach(cx)
+    })
 }
 
 pub(crate) fn focus_for_thread(thread_id: &str, window: &mut Window, cx: &mut App) {

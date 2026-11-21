@@ -27,11 +27,7 @@ impl Render for TimelineRows {
 }
 
 impl ThreadView {
-    fn render_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        self.clock = Clock::now_for(self.state.read(cx).environment());
-        self.window_height = f32::from(window.viewport_size().height);
-        self.markdown.begin_frame();
-        self.media.update(cx, |media, cx| media.begin_frame(window, cx));
+    pub(super) fn set_media_scope(&self, cx: &mut Context<Self>) {
         let scope = crate::media::MediaScope {
             owner: cx.entity_id(),
             thread_id: self.thread_id.clone(),
@@ -42,6 +38,14 @@ impl ThreadView {
             viewer: self.viewer.downgrade(),
         };
         crate::media::set_scope(scope, cx);
+    }
+
+    fn render_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.clock = Clock::now_for(self.state.read(cx).environment());
+        self.window_height = f32::from(window.viewport_size().height);
+        self.markdown.begin_frame();
+        self.media.update(cx, |media, cx| media.begin_frame(window, cx));
+        self.set_media_scope(cx);
         let transcript = list(
             self.list.clone(),
             cx.processor(|this, ix: usize, window, cx| {

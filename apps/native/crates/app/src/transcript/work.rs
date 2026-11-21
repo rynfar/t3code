@@ -30,6 +30,7 @@ use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent
 use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, inline_button_with, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
 use crate::composer::controls::{Float, MenuItem, floating, menu_surface};
+use crate::components::motion::Shimmer;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
@@ -506,6 +507,8 @@ fn entry_row(
             div().min_w_0().truncate().text_color(color).child(answer)
         }))
         .into_any_element();
+    let live = env.working_timer.is_some() && entry.status == Some(ToolStatus::InProgress) && !failed;
+    let label = if live { Shimmer::new("work-entry-shimmer", true, label).into_any_element() } else { label };
     let entry_id = entry.id.clone();
     let mut frame = work_row_frame(SharedString::from(format!("work-entry:{}", entry.id)), grouped)
         .child(work_line(Some(icon_slot(icon, icon_color)), label, trailing, false, cx));
@@ -793,7 +796,10 @@ pub fn approval_card(
                 .text_xs()
                 .line_height(rem(20.))
                 .text_color(hsla(p.foreground))
-                .child(detail)
+                .child(crate::selectable_text::SelectableText::new(
+                    SharedString::from(format!("approval-select:{}", approval.request_id)),
+                    detail,
+                ))
                 .into_any_element(),
             trailing,
             true,
@@ -806,7 +812,12 @@ pub fn approval_card(
                 .pb(rem(4.))
                 .text_xs()
                 .children(approval.app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
-                .children(approval.reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
+                .children(approval.reason.clone().map(|reason| {
+                    div().text_color(hsla(p.muted_foreground)).child(crate::selectable_text::SelectableText::new(
+                        SharedString::from(format!("approval-reason:{}", approval.request_id)),
+                        reason,
+                    ))
+                }))
                 .child(
                     h_flex()
                         .flex_wrap()
@@ -886,7 +897,7 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
             ))
         })
         .child(live_activity(
-            div().truncate().text_color(hsla(p.secondary_label)).child(label).into_any_element(),
+            Shimmer::new("live-work-shimmer", active && !failed, div().truncate().text_color(hsla(p.secondary_label)).child(label)).into_any_element(),
             work_icon(work_entry_icon(entry)),
             failed,
             cx,
@@ -904,7 +915,8 @@ pub fn thinking_row(
 ) -> AnyElement {
     let p = palette(cx);
     let label = label.or(live_answer_preview).unwrap_or("Thinking").to_owned();
-    let activity = live_activity(div().text_color(hsla(p.secondary_label)).child(label).into_any_element(), Icon::WorkBrain, false, cx);
+    let label = Shimmer::new("thinking-shimmer", true, div().text_color(hsla(p.secondary_label)).child(label));
+    let activity = live_activity(label.into_any_element(), Icon::WorkBrain, false, cx);
     let frame = work_row_frame(SharedString::from(format!("thinking:{id}")), false).child(activity);
     match group_id {
         Some(group_id) => {

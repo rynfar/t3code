@@ -15,9 +15,10 @@ use super::controller::{VoiceSetupStep, VoiceSpeechController};
 use super::shortcuts::{
     active_floating_indicator_controller, active_setup_controller, dictation_shortcut_label,
 };
+use crate::components::motion::{Spinner, StatusDot};
 use crate::icons::Icon;
-use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
-use crate::theme::{hsla, palette};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant, Select, SelectOption};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceUiSize {
@@ -159,13 +160,7 @@ fn render_speech_recording_pill_inner(
     match state.phase {
         VoiceInputPhase::Preparing => {
             pill = pill
-                .child(
-                    svg()
-                        .path(Icon::LoaderCircle.path())
-                        .size(px(13.))
-                        .flex_none()
-                        .text_color(hsla(p.muted_foreground)),
-                )
+                .child(Spinner::new("speech-preparing", px(13.), hsla(p.muted_foreground)))
                 .child(
                     div()
                         .text_xs()
@@ -186,11 +181,12 @@ fn render_speech_recording_pill_inner(
         }
 
         VoiceInputPhase::Recording => {
-            let level = voice.level();
+            let levels = voice.recording_levels();
             let elapsed = format_elapsed_mm_ss(voice.elapsed_seconds());
             let finish_tip = format!("Finish dictation ({shortcut})");
             pill = pill
-                .child(render_waveform(level, compact, cx))
+                .child(StatusDot::new("speech-recording-dot", px(6.), hsla(p.destructive), false))
+                .child(render_sample_bars(levels, compact, cx))
                 .when(!compact, |el| {
                     el.child(
                         div()
@@ -226,13 +222,7 @@ fn render_speech_recording_pill_inner(
 
         VoiceInputPhase::Transcribing => {
             pill = pill
-                .child(
-                    svg()
-                        .path(Icon::LoaderCircle.path())
-                        .size(px(13.))
-                        .flex_none()
-                        .text_color(hsla(p.muted_foreground)),
-                )
+                .child(Spinner::new("speech-transcribing", px(13.), hsla(p.muted_foreground)))
                 .child(
                     div()
                         .text_xs()
@@ -443,29 +433,26 @@ fn render_pill_icon_action(
 }
 
 pub fn render_waveform(level: f32, compact: bool, cx: &App) -> AnyElement {
-    let p = palette(cx);
-    let bar_count = if compact { 12 } else { WAVEFORM_BAR_COUNT };
-    let max_h = if compact { 14.0 } else { 16.0 };
-    let active_level = level.clamp(0.0, 1.0);
+    render_sample_bars(std::iter::repeat_n(level, WAVEFORM_BAR_COUNT), compact, cx)
+}
 
-    let mut row = h_flex().items_center().gap(px(1.5)).h(px(max_h));
-    for idx in 0..bar_count {
-        let center = (bar_count as f32 - 1.0) / 2.0;
-        let dist = ((idx as f32 - center).abs() / center.max(1.0)).clamp(0.0, 1.0);
-        let envelope = 1.0 - dist * 0.65;
-        let harmonic = (((idx as f32) * 1.7 + active_level * 9.0).sin().abs()) * 0.35 + 0.65;
-        let scale = (WAVEFORM_REST_SCALE + active_level * envelope * harmonic * (1.0 - WAVEFORM_REST_SCALE))
-            .clamp(WAVEFORM_REST_SCALE, 1.0);
-        let h_px = (max_h * scale).max(3.0);
-        row = row.child(
+fn render_sample_bars(samples: impl Iterator<Item = f32>, compact: bool, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let max_h = if compact { 14. } else { 16. };
+    h_flex()
+        .items_center()
+        .gap(px(if compact { 1. } else { 1.5 }))
+        .h(px(max_h))
+        .children(samples.map(|sample| {
+            let level = sample.clamp(0., 1.);
+            let scale = WAVEFORM_REST_SCALE + level * (1. - WAVEFORM_REST_SCALE);
             div()
-                .w(px(2.))
-                .h(px(h_px))
+                .w(px(if compact { 1.5 } else { 2. }))
+                .h(px((max_h * scale).max(3.)))
                 .rounded(px(1.))
-                .bg(hsla(p.primary).opacity(0.55 + active_level * 0.45)),
-        );
-    }
-    row.into_any_element()
+                .bg(hsla(p.primary).opacity(0.55 + level * 0.45))
+        }))
+        .into_any_element()
 }
 
 pub fn render_voice_preview(
@@ -510,7 +497,7 @@ pub fn render_voice_preview(
         .id(SharedString::from(format!("{id_prefix}-speech-preview")))
         .w_full()
         .max_h(px(96.))
-        .overflow_hidden()
+        .overflow_y_scroll()
         .rounded(px(8.))
         .border_1()
         .border_color(hsla(p.border).opacity(0.6))
@@ -657,6 +644,20 @@ pub fn render_voice_setup_modal(
         .transcription_environment_label(cx)
         .unwrap_or_else(|| "this environment".to_owned());
 
+    let microphone = matches!(setup.step, VoiceSetupStep::Confirm | VoiceSetupStep::Ready).then(|| {
+        let mut devices = vec![SelectOption::new("", crate::i18n::t(cx, "System default"))];
+        devices.extend(voice.setup_microphones().iter()
+            .filter(|device| !t3_core::voice_input::is_system_default_device_id(&device.device_id) && !device.label.is_empty())
+            .map(|device| SelectOption::new(device.device_id.clone(), device.label.clone())));
+        let owner = controller.clone();
+        h_flex().justify_between().gap(px(8.))
+            .child(div().text_sm().child(crate::i18n::t(cx, "Microphone")))
+            .child(Select::new("voice-setup-microphone", devices)
+                .selected(voice.setup_microphone(cx))
+                .width(208.)
+                .show_check()
+                .on_change(move |value, _, cx| owner.update(cx, |voice, cx| voice.select_setup_microphone(&value, cx))))
+    });
     let close_entity = controller.clone();
     let download_entity = controller.clone();
     let cancel_dl_entity = controller.clone();
@@ -689,6 +690,7 @@ pub fn render_voice_setup_modal(
                     .max_w(px(420.))
                     .relative()
                     .rounded(px(16.))
+                    .theme_slot(ThemeSlot::DialogPopup, cx)
                     .child(crate::glass::backdrop(
                         16.,
                         hsla(p.dialog_surface),
@@ -717,7 +719,8 @@ pub fn render_voice_setup_modal(
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(hsla(p.foreground))
-                                            .child(match setup.step {
+                                            .children(microphone)
+                            .child(match setup.step {
                                                 VoiceSetupStep::Confirm => "Download voice model",
                                                 VoiceSetupStep::Downloading => "Downloading voice model…",
                                                 VoiceSetupStep::Ready => "Voice model ready",

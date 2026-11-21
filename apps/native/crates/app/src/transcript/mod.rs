@@ -2,6 +2,8 @@
 //! row spacing of `TimelineRowContent` and `WorkLogBlock` (`MessagesTimeline.tsx`, `WorkLog.tsx`).
 
 mod changed_files;
+pub(crate) mod highlights;
+pub(crate) use changed_files::middle_truncate;
 mod context;
 mod command_output;
 pub mod html_render;
@@ -108,6 +110,8 @@ pub struct RowEnv<'a> {
     pub working_timer: Option<&'a Entity<WorkingTimer>>,
     /// The entry holding find's active match, tinted where it draws.
     pub find_target: Option<&'a str>,
+    pub(crate) find: Option<highlights::FindHighlights<'a>>,
+    pub(crate) cited_excerpt: Option<&'a t3_core::assistant_citations::Citation>,
     /// Each turn's changed files, by the assistant message that ends it.
     pub turn_diffs: &'a HashMap<String, Arc<t3_core::diff::TurnDiffSummary>>,
     /// Fork capability by provider thread, and the runs a fork is being created from.
@@ -187,7 +191,16 @@ pub fn render_row(
         RowKind::McpApp(entry) => mcp_app::frame_row(id, entry, env.thread_id, env.embedded, cx),
         RowKind::HtmlRender(entry) => html_render::frame_row(id, entry, env.thread_id, cx),
     };
-    let found = env.find_target.is_some_and(|target| holds(row, target));
+    let found = env.find_target.is_some_and(|target| {
+        if !holds(row, target) {
+            return false;
+        }
+        match &row.kind {
+            RowKind::Message { message, .. } => !highlights::plain_markdown(&message.text),
+            RowKind::SentMessage(entry) => !highlights::plain_markdown(&entry.text),
+            _ => true,
+        }
+    });
     div()
         .w_full()
         .min_w_0()
@@ -204,7 +217,7 @@ fn holds(row: &TimelineRow, entry_id: &str) -> bool {
             entries.iter().any(|entry| entry.id == entry_id)
         }
         RowKind::Event { item, subagents, .. } => item.id == entry_id || subagents.iter().any(|member| member.id == entry_id),
-        RowKind::ProposedPlan(_) => row.id == entry_id,
+        RowKind::ProposedPlan(_) | RowKind::SentMessage(_) => row.id == entry_id,
         _ => false,
     }
 }

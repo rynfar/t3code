@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
+    AnyElement, App, Context, Entity, ExternalPaths, Focusable, Hsla, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
 use gpui_component::input::{Copy, Editor, Enter, Escape, IndentInline, MoveDown, MoveUp, Paste};
@@ -14,10 +14,11 @@ use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
 use t3_core::files::media_preview::DraggedFileMention;
 use t3_core::requests;
+use t3_core::sidebar::tag_filter::ThreadKey;
 use t3_core::traits;
 
 use super::controls::{
-    Button, ButtonSize, ButtonVariant, ComposerControl, EffortBars, Float, Pill, RoundButton, RoundKind, floating, menu_surface,
+    Button, ButtonSize, ButtonVariant, ComposerControl, EffortBars, Float, Pill, RoundButton, RoundKind, floating, kbd, menu_surface,
     resolve_effort_glyph,
 };
 use super::model_picker::permissions_section;
@@ -37,6 +38,25 @@ pub const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / comman
 /// A click that closed a popup must not reopen it through the trigger it landed on.
 const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
+type Card = gpui::Stateful<gpui::Div>;
+type InstallThreadDrop = dyn Fn(Card, Entity<Composer>, Hsla, Hsla) -> Card;
+struct ThreadDrop(std::rc::Rc<InstallThreadDrop>);
+impl gpui::Global for ThreadDrop {}
+
+#[allow(unused, reason = "The sidebar registers its private DraggedThread type")]
+pub(crate) fn register_thread_drop<T: 'static>(cx: &mut App, read: for<'a> fn(&'a T) -> (&'a str, Option<&'a ThreadKey>)) {
+    if cx.has_global::<ThreadDrop>() {
+        return;
+    }
+    cx.set_global(ThreadDrop(std::rc::Rc::new(move |card, composer, fill, ring| {
+        card.drag_over::<T>(move |style, _, _, _| style.bg(fill).border_color(ring))
+            .on_drop(move |drag: &T, window, cx| {
+                let (id, key) = read(drag);
+                composer.update(cx, |composer, cx| composer.drop_thread_reference(id, key, window, cx));
+            })
+    })));
+}
+
 impl Composer {
     /// `ChatComposer` placeholders, most specific first.
     fn placeholder(&self, cx: &App) -> String {
@@ -54,8 +74,8 @@ impl Composer {
                 t(cx, "Choose an option above").to_owned()
             };
         }
-        if let Some(suggestion) = self.offered_prompt_suggestion(cx) {
-            return format!("{suggestion}  (Tab)");
+        if self.offered_prompt_suggestion(cx).is_some() {
+            return String::new();
         }
         t(cx, DEFAULT_PLACEHOLDER).to_owned()
     }
@@ -74,6 +94,39 @@ impl Composer {
             && !self.voice.read(cx).freezes_editor()
             && self.snapshot.target.is_some()
             && self.answering.is_none()
+    }
+
+    fn drop_thread_reference(&mut self, id: &str, key: Option<&ThreadKey>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_drop_file_mention(cx) || self.editing_queued().is_some() {
+            return;
+        }
+        let target = self.snapshot.target.clone().unwrap();
+        let environment = self.environment_id(cx);
+        let state = self.state.read(cx);
+        let context = match key {
+            Some(key) if key.environment_id != environment => {
+                let thread_id = &key.thread_id;
+                let title = state.fleet.environments.iter().find(|entry| {
+                    entry.summary.owner.saved_id == key.environment_id
+                        || entry.summary.owner.canonical_id.as_deref() == Some(key.environment_id.as_str())
+                }).and_then(|entry| entry.summary.threads.iter().find(|thread| thread.thread.id == *thread_id))
+                    .map(|thread| thread.thread.title.as_str())
+                    .unwrap_or_else(|| t(cx, "Thread"));
+                t3_core::composer::menu::ThreadContext::new(&key.environment_id, thread_id, title)
+            }
+            _ => {
+                let Some(thread) = state.thread_shell(id) else { return };
+                t3_core::composer::menu::ThreadContext::new(&environment, id, &thread.title)
+            }
+        };
+        let prompt = self.prompt(cx);
+        let range = self.input.read(cx).selected_range();
+        let before = prompt.get(..range.start).and_then(|text| text.chars().next_back());
+        let separator = if before.is_some_and(|ch| !ch.is_whitespace()) { " " } else { "" };
+        self.replace_prompt_range(range.start, range.end, &format!("{separator}{} ", context.reference()), window, cx);
+        self.remember_thread_context(target, context);
+        self.draft_changed(cx);
+        self.focus(window, cx);
     }
 
     /// Drop target for one or more files dragged from the Files explorer (`composerMentionDragHandlers`).
@@ -247,10 +300,10 @@ impl Composer {
             .into_any_element()
     }
 
-    /// Renders the locked branch/worktree/environment strip below the composer for an active
+    /// Renders the branch/worktree/environment strip below the composer for an active
     /// thread when `persistComposerContextStrip` is enabled (`BranchToolbar.logic.ts`
     /// `shouldShowComposerContextStrip` + `ChatView.tsx:1791-1799`).
-    fn render_active_thread_context_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_active_thread_context_strip(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.fixed.is_some() {
             return None;
         }
@@ -263,8 +316,9 @@ impl Composer {
         let thread = state.thread_shell(thread_id)?;
         let project = state.shell.project(&thread.project_id)?;
         let is_scratch = state.is_scratch_project(&thread.project_id);
-        let git_status = crate::thread_details::details(cx)
-            .and_then(|details| details.read(cx).git.read(cx).status.clone());
+        let git = crate::thread_details::details(cx).map(|details| details.read(cx).git.clone());
+        let git = git.filter(|git| git.read(cx).target.as_ref().is_some_and(|target| target.thread_id == *thread_id));
+        let git_status = git.as_ref().and_then(|git| git.read(cx).status.clone());
         let is_git_repo = !is_scratch
             && git_status
                 .as_ref()
@@ -332,11 +386,28 @@ impl Composer {
             .flatten()
             .filter(|b| !b.is_empty())
             .map(|branch| {
-                ComposerControl::new("composer-active-branch")
+                let control = ComposerControl::new("composer-active-branch")
                     .icon(Icon::GitBranch)
-                    .label(branch.clone())
+                    .label(crate::transcript::middle_truncate(&branch, 28))
                     .max_label_width(224.)
-                    .tooltip(branch)
+                    .tooltip(branch);
+                let Some(git) = git.filter(|_| !self.is_rewinding(cx)) else {
+                    return control.into_any_element();
+                };
+                let key = SharedString::from(format!("composer-branch-picker:{thread_id}"));
+                let picker = window.use_keyed_state(key, cx, |window, cx| {
+                    cx.new(|cx| crate::git::BranchPicker::new(git, window, cx).above_trigger())
+                });
+                let picker = picker.read(cx).clone();
+                let on_click = picker.clone();
+                div()
+                    .relative()
+                    .min_w_0()
+                    .child(control
+                        .suffix(Icon::ChevronDown.render(px(12.), hsla(p.muted_foreground)))
+                        .on_click(move |_, window, cx| on_click.update(cx, |picker, cx| picker.toggle(window, cx))))
+                    .child(picker)
+                    .into_any_element()
             });
         Some(
             h_flex()
@@ -434,12 +505,17 @@ impl Composer {
             .attachment_target()
             .is_some_and(|target| self.attachments.preparations.count(&super::drafts::key(&target)) > 0);
         let current_prompt = self.prompt(cx);
-        let has_text = self.has_text
-            || !self.staged().is_empty()
-            || preparing
-            || self.current_reply_to().is_some()
-            || self.has_context_records(&current_prompt);
-        let editing_queued = self.editing_queued().is_some();
+        let queued_edit = self.editing_queued();
+        let editing_queued = queued_edit.is_some();
+        let has_text = if let Some(editing) = queued_edit {
+            !current_prompt.trim().is_empty() || editing.has_attachments()
+        } else {
+            self.has_text
+                || !self.staged().is_empty()
+                || preparing
+                || self.current_reply_to().is_some()
+                || self.has_context_records(&current_prompt)
+        };
         if (can_interrupt || stop_retained) && !has_text && !editing_queued && !voice_blocks {
             return with_voice(stop_button().into_any_element());
         }
@@ -453,6 +529,7 @@ impl Composer {
                 .unwrap_or_else(|| t(cx, "Resume thread").into());
             let resume_btn = RoundButton::new("send", RoundKind::Resume, resume_tooltip)
                 .disabled(self.sending || !can_operate || rewinding || runtime_mode_denial.is_some())
+                .busy(self.sending)
                 .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if this.stop_phase != StopPhase::Landed {
@@ -473,7 +550,9 @@ impl Composer {
             .map(|tokens| t3_core::usage::context_window::format_context_tokens(Some(tokens)));
         let keep_full_history = self.is_keep_full_history(cx);
         let compacts_before_send = compact_tokens.is_some() && !keep_full_history;
-        let attachment_block = if self.snapshot.pending.approvals.is_empty() {
+        let attachment_block = if editing_queued {
+            None
+        } else if self.snapshot.pending.approvals.is_empty() {
             t3_core::composer::attachments::send_block_reason(&self.staged_attachments())
         } else {
             t3_core::composer::attachments::approval_redirect_block_reason(&self.staged_attachments())
@@ -484,7 +563,7 @@ impl Composer {
         let dispatch = rules::dispatch_mode(running, false, follow_up, can_steer);
         let alternate = rules::dispatch_mode(running, true, follow_up, can_steer);
         let (kind, label) = match (editing_queued, compacts_before_send, running, dispatch) {
-            (true, _, _, _) => (RoundKind::Send, "Update queued message"),
+            (true, _, _, _) => (RoundKind::UpdateQueued, "Update queued message"),
             (false, true, _, _) => (RoundKind::Send, "Compact and send"),
             (false, false, true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
             (false, false, true, _) => (RoundKind::Steer, "Steer message"),
@@ -527,6 +606,7 @@ impl Composer {
         let submit_btn = div().flex_none().debug_selector(|| "send".to_owned()).child(
             RoundButton::new("send", kind, tooltip)
                 .disabled(disabled)
+                .busy(self.sending || self.pending_send.is_pending())
                 .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                     if this.stop_phase == StopPhase::Landed {
@@ -598,6 +678,7 @@ impl Render for Composer {
         let input_disabled = self.input_disabled(cx);
         let voice_frozen = self.voice.read(cx).freezes_editor();
         let can_drop_mention = self.can_drop_file_mention(cx);
+        let thread_drop = cx.try_global::<ThreadDrop>().filter(|_| can_drop_mention && self.editing_queued().is_none()).map(|drop| drop.0.clone());
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         let host_slot = slot_style(ThemeSlot::ComposerHost, cx);
         let host_focused = self.input.read(cx).focus_handle(cx).contains_focused(window, cx);
@@ -644,6 +725,18 @@ impl Render for Composer {
         } else {
             prompt_editor.into_any_element()
         };
+        let suggestion = self.offered_prompt_suggestion(cx)
+            .filter(|_| self.snapshot.pending.approvals.is_empty() && self.active_question().is_none())
+            .map(|text| SharedString::from(text.to_owned()));
+        let prompt_editor_el = div().relative().child(prompt_editor_el).children(suggestion.map(|text| {
+            h_flex()
+                .absolute().top_0().left_0().right_0().min_w_0().gap(px(6.))
+                .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
+                .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
+                .text_color(hsla(p.placeholder))
+                .child(div().min_w_0().truncate().child(text))
+                .child(kbd(t(cx, "Tab"), cx))
+        }));
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
@@ -885,12 +978,17 @@ impl Render for Composer {
                                     }))
                                 })
                         })
+                        .when_some(thread_drop, |card, install| install(card, cx.entity(), drop_fill, drop_ring))
                         .child(
                             div()
                                 .px(px(16.))
                                 .pt(px(16.))
                                 .pb(px(8.))
-                                .children(self.render_attachments(cx))
+                                .children(if self.editing_queued().is_some() {
+                                    self.render_queued_edit_attachments(cx)
+                                } else {
+                                    self.render_attachments(cx)
+                                })
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
                                 .child(prompt_editor_el),
@@ -936,7 +1034,7 @@ impl Render for Composer {
                     if matches!(self.snapshot.target, Some(Target::Draft(_))) {
                         self.render_workspace(cx)
                     } else {
-                        self.render_active_thread_context_strip(cx)
+                        self.render_active_thread_context_strip(window, cx)
                     }
                     .map(|control| {
                             h_flex()

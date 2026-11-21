@@ -11,19 +11,19 @@ use gpui::{
     prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::{h_flex, v_flex};
 use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers::{self, ProviderEntry, RefreshProviders};
 use t3_core::server_config::{OptionDescriptor, RuntimeMode, SelectDescriptor, ServerProvider, WorkspaceSnapshot};
 use t3_core::traits::{self, OptionSelection, OptionValue, Speed};
 
-use super::controls::{Float, Segment, floating, menu_surface, segmented_track};
+use super::controls::{Float, Segment, floating, kbd, menu_surface, segmented_track};
 use super::runtime_mode_icon;
 use crate::app_state::AppState;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette};
 
 actions!(
     model_picker,
@@ -549,18 +549,18 @@ impl ModelPicker {
         self.select_tab(next, cx);
     }
 
+    fn model_jump_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.rows.iter().enumerate().filter_map(|(index, row)| {
+            matches!(row, Row::Model { disabled: None, .. }).then_some(index)
+        })
+    }
+
     /// `modelPicker.jump.1..9`: activates the Nth enabled model row (`0`-based).
     pub(crate) fn jump_to_model(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some((row_index, _)) = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| matches!(row, Row::Model { disabled: None, .. }))
-            .nth(index)
-        else {
-            return;
-        };
-        self.activate(row_index, false, cx);
+        let row_index = self.model_jump_indices().nth(index);
+        if let Some(row_index) = row_index {
+            self.activate(row_index, false, cx);
+        }
     }
 
     fn activate(&mut self, index: usize, toggle: bool, cx: &mut Context<Self>) {
@@ -741,6 +741,12 @@ impl ModelPicker {
                 .into_any_element(),
             Row::Model { instance_id, slug, name, sub_provider, mark, badge_new, favorite, selected, disabled, unavailable } => {
                 let star_id = (instance_id.clone(), slug.clone(), *favorite);
+                let shortcut = self.model_jump_indices().take(9).position(|row_index| row_index == index)
+                    .and_then(|slot| crate::keymap::label_in(
+                        &format!("modelPicker.jump.{}", slot + 1),
+                        &t3_core::keybindings::ShortcutMatchContext::default().with("modelPickerOpen", true),
+                        cx,
+                    ));
                 base.when(disabled.is_none(), |this| this.cursor_pointer())
                     .when(disabled.is_some() || *unavailable, |this| this.opacity(0.64))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
@@ -817,6 +823,7 @@ impl ModelPicker {
                                 })
                             }),
                     )
+                    .children(shortcut.map(|key| kbd(key, cx)))
                     .child(div().size(px(14.)).flex_none().when(*selected, |this| this.child(Icon::Check.render(px(14.), hsla(p.foreground)))))
                     .when_some(disabled.clone(), |this, reason| {
                         this.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
@@ -894,8 +901,15 @@ impl ModelPicker {
         traits::selectable_choices(select)
             .map(|choice| {
                 let (id, value) = (select.id.clone(), choice.id.clone());
-                self.level_row(format!("{}-{}", select.id, choice.id), choice.label.clone().into(), current.as_deref() == Some(&choice.id), cx)
-                    .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Str(value.clone()), cx)))
+                let p = palette(cx);
+                let row = self.level_row(format!("{}-{}", select.id, choice.id), choice.label.clone().into(), current.as_deref() == Some(&choice.id), cx)
+                    .when(choice.is_default, |this| this.child(
+                        div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Default")),
+                    ))
+                    .when_some(choice.description.clone(), |this, description| this.tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(description.clone()).build(window, cx)
+                    }));
+                row.on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Str(value.clone()), cx)))
             })
             .collect()
     }
@@ -1134,17 +1148,10 @@ impl Render for ModelPicker {
             (rail, has_favorites, model_label, empty_message)
         };
         let rows = self.rows.len();
-        v_flex()
+        menu_surface(cx)
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .occlude()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(hsla(p.dropdown_border))
-            .bg(hsla(p.popover))
-            .text_color(hsla(p.popover_foreground))
-            .shadow(super::controls::floating_shadow(cx.theme().is_dark()))
-            .overflow_hidden()
             .on_action(cx.listener(|this, _: &HighlightPrevious, _, cx| this.move_highlight(-1, cx)))
             .on_action(cx.listener(|this, _: &HighlightNext, _, cx| this.move_highlight(1, cx)))
             .on_action(cx.listener(|this, _: &PickHighlighted, _, cx| {
@@ -1187,7 +1194,7 @@ impl Render for ModelPicker {
                                         .border_b_1()
                                         .border_color(hsla(p.border).opacity(0.7))
                                         .child(Icon::Search.render(px(16.), hsla(p.muted_foreground).opacity(0.55)))
-                                        .child(div().flex_1().h(px(26.)).child(Input::new(&self.search).appearance(false))),
+                                        .child(div().flex_1().h(px(26.)).theme_slot(ThemeSlot::Input, cx).child(Input::new(&self.search).appearance(false))),
                                 ),
                             )
                             .when(rows == 0, |this| {

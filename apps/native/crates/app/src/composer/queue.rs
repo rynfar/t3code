@@ -1,14 +1,18 @@
 //! Queued messages above the composer (`QueuedRunsControl.tsx`): dashed rows that send now,
-//! open in the composer for editing (`useQueuedRunEdit.ts`, text only, so the queued attachments
-//! stay), or leave the queue. Queue state and commands come from `t3_core::composer::queue`.
+//! open in the composer for editing (`useQueuedRunEdit.ts`), or leave the queue. Queue state and
+//! commands come from `t3_core::composer::queue`.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, rc::Rc};
 
-use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px, relative};
+use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px, relative};
 use gpui_component::{h_flex, v_flex};
 use t3_core::composer::attachments::text_for_send;
 use t3_core::composer::queue::{self as rules, QueuedRun};
+use t3_core::media::{self, AssetResource};
 use t3_core::timeline::Attribution;
+
+use crate::i18n::{t, t_fmt};
+use crate::media::{Media, MediaScope, ViewerItem};
 
 use super::Composer;
 use super::controls::{Button, ButtonSize, ButtonVariant};
@@ -23,9 +27,37 @@ pub(super) struct Editing {
     pub(super) thread_id: String,
     pub(super) run_id: String,
     original: String,
-    has_attachments: bool,
+    attachments: Vec<serde_json::Value>,
+    removed_attachment: bool,
     /// The thread's own draft, back in the prompt when the edit ends.
     pub(super) stash: String,
+}
+
+impl Editing {
+    pub(super) fn has_attachments(&self) -> bool {
+        !self.attachments.is_empty()
+    }
+
+    fn remove_attachment(&mut self, id: &str) {
+        let before = self.attachments.len();
+        self.attachments.retain(|attachment| attachment["id"].as_str() != Some(id));
+        self.removed_attachment |= self.attachments.len() != before;
+    }
+
+    fn command(&self, command_id: &str, prompt: &str) -> serde_json::Value {
+        let text = text_for_send(prompt, self.has_attachments());
+        let mut command = rules::edit_queued_run(command_id, &self.thread_id, &self.run_id, &text);
+        if self.removed_attachment {
+            command["attachments"] = serde_json::Value::Array(self.attachments.clone());
+        }
+        command
+    }
+}
+
+fn open_queued_image(items: &[ViewerItem], index: usize, scope: &MediaScope, window: &mut Window, cx: &mut App) {
+    if let Some(viewer) = scope.viewer.upgrade() {
+        viewer.update(cx, |viewer, cx| viewer.open_with_scope(items.to_vec(), index, Some(scope.clone()), window, cx));
+    }
 }
 
 #[derive(Default)]
@@ -138,7 +170,7 @@ impl Composer {
 
     /// Opens a queued message in the composer, setting the thread's draft aside.
     fn begin_queued_edit(&mut self, run: &QueuedRun, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) {
+        if self.sending || self.is_rewinding(cx) {
             return;
         }
         let Some(thread_id) = self.thread_id() else { return };
@@ -150,8 +182,14 @@ impl Composer {
             None => self.prompt(cx),
         };
         let text = rules::editable_text(&run.text);
-        self.queue.editing =
-            Some(Editing { thread_id, run_id: run.run_id.clone(), original: text.clone(), has_attachments: !run.attachments.is_empty(), stash });
+        self.queue.editing = Some(Editing {
+            thread_id,
+            run_id: run.run_id.clone(),
+            original: text.clone(),
+            attachments: run.attachments.clone(),
+            removed_attachment: false,
+            stash,
+        });
         self.queue.show_all = true;
         self.set_prompt(&text, window, cx);
         let end = text.len();
@@ -198,12 +236,11 @@ impl Composer {
         }
         let Some(editing) = self.queue.editing.clone() else { return };
         let prompt = self.prompt(cx).trim().to_owned();
-        if prompt.is_empty() && !editing.has_attachments {
+        if prompt.is_empty() && !editing.has_attachments() {
             return;
         }
         let steer_after = intent == t3_core::composer::SubmitIntent::Alternate && self.snapshot.running;
-        let text = text_for_send(&prompt, editing.has_attachments);
-        let command = rules::edit_queued_run(&uuid_v4(), &editing.thread_id, &editing.run_id, &text);
+        let command = editing.command(&uuid_v4(), &prompt);
         let request = self.state.read(cx).rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
         self.sending = true;
         cx.notify();
@@ -233,6 +270,101 @@ impl Composer {
         .detach();
     }
 
+    fn queued_media_scope(&self, cx: &App) -> Option<MediaScope> {
+        let scope = cx.try_global::<Media>()?.scope.as_ref()?;
+        (scope.thread_id.as_deref() == self.thread_id().as_deref()).then(|| scope.clone())
+    }
+
+    fn queued_images(&self, attachments: &[serde_json::Value], removable: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let images = media::image_attachments(attachments);
+        if images.is_empty() {
+            return None;
+        }
+        let p = palette(cx);
+        let scope = self.queued_media_scope(cx).map(|mut scope| {
+            scope.owner = cx.entity_id();
+            scope
+        });
+        let gallery: Rc<[ViewerItem]> = images.iter().map(|image| ViewerItem::image(image.source(), image.name.clone())).collect();
+        let edge = px(if removable { 56. } else { 32. });
+        let tiles = images.into_iter().enumerate().map(|(index, image)| {
+            let label = t_fmt(cx, "Preview {name}", &[("name", image.name.clone().into())]);
+            let thumbnail = div()
+                .id("preview")
+                .size_full()
+                .aria_label(label)
+                .when_some(scope.clone(), |this, scope| {
+                    let gallery = gallery.clone();
+                    this.cursor_pointer()
+                        .child(crate::media::scoped_image(&image.source(), &scope))
+                        .on_click(move |_, window, cx| open_queued_image(&gallery, index, &scope, window, cx))
+                });
+            let remove = removable.then(|| self.queued_attachment_remove(&image.id, &image.name, cx));
+            div()
+                .id(SharedString::from(image.id))
+                .relative()
+                .size(edge)
+                .flex_none()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(hsla(p.border).opacity(0.7))
+                .bg(hsla(p.muted).opacity(0.6))
+                .child(thumbnail)
+                .children(remove.map(|remove| div().absolute().top_0().right_0().child(remove)))
+        });
+        Some(h_flex().flex_wrap().gap(px(4.)).children(tiles).into_any_element())
+    }
+
+    fn queued_attachment_remove(&self, id: &str, name: &str, cx: &mut Context<Self>) -> Button {
+        let id = id.to_owned();
+        Button::new("remove", ButtonVariant::Ghost, ButtonSize::IconXs)
+            .icon(Icon::X)
+            .tooltip(t_fmt(cx, "Remove {name}", &[("name", name.to_owned().into())]))
+            .disabled(self.sending || self.is_rewinding(cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.sending && !this.is_rewinding(cx)
+                    && let Some(editing) = &mut this.queue.editing
+                {
+                    editing.remove_attachment(&id);
+                    cx.notify();
+                }
+            }))
+    }
+
+    pub(super) fn render_queued_edit_attachments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let attachments = &self.queue.editing.as_ref()?.attachments;
+        if attachments.is_empty() {
+            return None;
+        }
+        let p = palette(cx);
+        let images = self.queued_images(attachments, true, cx);
+        let files = attachments.iter().filter_map(|attachment| {
+            if media::is_image_attachment(attachment) {
+                return None;
+            }
+            let id = attachment["id"].as_str()?;
+            let name = attachment["name"].as_str().filter(|name| !name.is_empty()).unwrap_or_else(|| t(cx, "Attachment"));
+            let resource = AssetResource::Attachment { attachment_id: id.to_owned() };
+            let label = t_fmt(cx, "Preview {name}", &[("name", name.to_owned().into())]);
+            Some(h_flex()
+                .id(SharedString::from(id.to_owned()))
+                .gap(px(6.))
+                .text_xs()
+                .child(crate::files::file_icon(name).render(px(16.), hsla(p.muted_foreground)))
+                .child(div()
+                    .id("open")
+                    .flex_1()
+                    .truncate()
+                    .aria_label(label)
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .child(SharedString::from(name.to_owned()))
+                    .on_click(move |_, _, cx| crate::media::open_asset(&resource, cx)))
+                .child(self.queued_attachment_remove(id, name, cx)))
+        });
+        Some(v_flex().id("queued-edit-attachments").gap(px(4.)).mb(px(12.)).children(images).children(files).into_any_element())
+    }
+
     pub(super) fn render_queue(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let queue = &self.snapshot.queue;
         if queue.queued.is_empty() {
@@ -243,11 +375,10 @@ impl Composer {
         let visible = if collapsible && !self.queue.show_all { &queue.queued[..rules::VISIBLE_ROWS - 1] } else { &queue.queued[..] };
         let blocked = rules::edit_blocked_reason(self.snapshot.pending.user_inputs.len());
         let editing_run = self.queue.editing.as_ref().map(|editing| editing.run_id.as_str());
-        let busy = self.queue.busy.is_some() || self.is_rewinding(cx);
-        let rows = visible.iter().enumerate().map(|(position, run)| {
+        let busy = self.sending || self.queue.busy.is_some() || self.is_rewinding(cx);
+        let rows: Vec<_> = visible.iter().enumerate().map(|(position, run)| {
             let editing = editing_run == Some(run.run_id.as_str());
             let preview = rules::preview_text(run);
-            let images = run.image_count();
             let attribution = run.attribution;
             let is_fold = matches!(attribution, Some(Attribution::Automation | Attribution::Agent));
             let is_automation = attribution == Some(Attribution::Automation);
@@ -363,11 +494,7 @@ impl Composer {
                         .relative()
                         .gap(px(8.))
                         .when(is_fold, |this| this.px(px(12.)).pb(px(8.)))
-                        .when(images > 0, |this| {
-                            this.child(h_flex().flex_wrap().gap(px(4.)).children((0..images).map(|_| {
-                                div().size(px(32.)).rounded(px(6.)).border_1().border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.muted).opacity(0.6))
-                            })))
-                        })
+                        .when(!editing, |this| this.children(self.queued_images(&run.attachments, false, cx)))
                         .when(!preview.is_empty(), |this| this.child(div().whitespace_normal().child(SharedString::from(preview))));
                     this.child(body)
                 });
@@ -485,7 +612,7 @@ impl Composer {
                 })
                 .child(bubble)
                 .child(controls)
-        });
+        }).collect();
         let toggle = collapsible.then(|| {
             let label = if self.queue.show_all { "Show fewer".to_owned() } else { format!("Show all {} queued", queue.queued.len()) };
             h_flex()
@@ -507,5 +634,34 @@ impl Composer {
                 }))
         });
         Some(v_flex().w_full().gap(px(12.)).pb(px(16.)).children(rows).children(toggle).into_any_element())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn queued_edit_replaces_attachments_only_after_removal() {
+        let image = json!({"type": "image", "id": "image-1", "name": "shot.png"});
+        let file = json!({"type": "file", "id": "file-1", "name": "notes.md"});
+        let mut editing = Editing {
+            thread_id: "thread".into(),
+            run_id: "run".into(),
+            original: String::new(),
+            attachments: vec![image, file.clone()],
+            removed_attachment: false,
+            stash: String::new(),
+        };
+        assert!(editing.command("cmd", "edited").get("attachments").is_none());
+        editing.remove_attachment("image-1");
+        let command = editing.command("cmd", "");
+        assert_eq!(command["text"], text_for_send("", true));
+        assert_eq!(command["attachments"], json!([file]));
+        editing.remove_attachment("file-1");
+        assert_eq!(editing.command("cmd", "edited")["attachments"], json!([]));
+        assert!(!editing.has_attachments());
     }
 }
