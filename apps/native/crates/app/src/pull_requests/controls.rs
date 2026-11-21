@@ -3,7 +3,7 @@
 //! secondary, label, info), and the state, check and review glyphs of `pullRequestIcons.tsx`
 //! and `pullRequestPresentation.tsx`. Callers pick a variant and size; they never restyle.
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     AnyElement, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement, RenderOnce, SharedString,
@@ -16,9 +16,11 @@ use t3_core::pull_requests::wire::{CheckStatus, ChecksState, ReviewDecision};
 
 pub use crate::components::badge::{BadgeKind, badge};
 
+use crate::components::motion::Spinner;
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::right_panel::{focusable, tooltip_view};
-use crate::theme::{Palette, hsla, palette};
+use crate::theme::{Palette, ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -100,7 +102,7 @@ impl Button {
         self
     }
 
-    /// Shows a static loader in place of the icon while an action runs.
+    /// Shows a spinner in place of the icon while an action runs.
     pub fn busy(mut self, busy: bool) -> Self {
         self.busy = busy;
         self
@@ -216,7 +218,7 @@ impl RenderOnce for Button {
         let enabled = !self.disabled;
         let hover_fill = look.hover_fill;
         let hover_text = look.hover_text;
-        let icon = if self.busy { Some(Icon::LoaderCircle) } else { self.icon };
+
         let pill = hsla(p.muted);
         let pill_text = hsla(p.muted_foreground);
         focusable(self.base, self.id, enabled, window, cx)
@@ -238,7 +240,8 @@ impl RenderOnce for Button {
             .whitespace_nowrap()
             .when(!enabled, |this| this.opacity(0.64))
             .when(enabled, |this| this.cursor_pointer().hover(move |style| style.bg(hover_fill).text_color(hover_text)))
-            .when_some(icon, |this, icon| this.child(icon.sized(px(icon_size)).text_color(look.icon)))
+            .when(self.busy, |this| this.child(Spinner::new("pr-button-progress", px(icon_size), look.icon)))
+            .when_some(self.icon.filter(|_| !self.busy), |this, icon| this.child(icon.sized(px(icon_size)).text_color(look.icon)))
             .when_some(self.label, |this, label| this.child(label))
             .when_some(self.trailing, |this, count| this.child(div().px(px(6.)).rounded_full().bg(pill).text_xs().text_color(pill_text).child(count)))
             .when_some(self.tooltip, |this, text| this.tooltip(move |window, cx| tooltip_view(text.clone(), window, cx)))
@@ -344,4 +347,85 @@ pub fn diff_stat(additions: u64, deletions: u64, cx: &App) -> gpui::Div {
         .text_xs()
         .child(div().text_color(hsla(p.diff_addition_foreground)).child(format!("+{additions}")))
         .child(div().text_color(hsla(p.diff_deletion_foreground)).child(format!("−{deletions}")))
+}
+
+
+pub(super) fn anchored_picker(
+    id: &'static str,
+    trigger: impl IntoElement,
+    body: impl IntoElement,
+    width: f32,
+    dismiss: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let trigger_bounds = Rc::new(Cell::new(gpui::Bounds::default()));
+    let measured = trigger_bounds.clone();
+    div().relative().flex_none()
+        .on_children_prepainted(move |bounds, _, _| {
+            if let Some(first) = bounds.first() {
+                measured.set(*first);
+            }
+        })
+        .child(trigger)
+        .child(div().absolute().bottom_0().right_0().child(gpui::deferred(
+            gpui::anchored()
+                .anchor(gpui::Anchor::TopRight)
+                .snap_to_window_with_margin(px(8.))
+                .child(gpui_component::v_flex()
+                    .id(id)
+                    .relative()
+                    .occlude()
+                    .w(px(width))
+                    .mt(px(4.))
+                    .p(px(6.))
+                    .gap(px(4.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(hsla(p.dropdown_border))
+                    .bg(hsla(p.popover))
+                    .text_color(hsla(p.popover_foreground))
+                    .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
+                    .theme_slot(ThemeSlot::MenuPopup, cx)
+                    .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
+                    .on_mouse_down_out(move |event, window, cx| {
+                        if !trigger_bounds.get().contains(&event.position) {
+                            dismiss(window, cx);
+                        }
+                    })
+                    .child(body)),
+        ).with_priority(40)))
+        .into_any_element()
+}
+
+pub(crate) fn markdown_mode_buttons(
+    preview: bool,
+    disabled: bool,
+    on_write: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_preview: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    gpui_component::h_flex().gap(px(4.)).flex_none()
+        .child(Button::new("markdown-write", if preview { Variant::Ghost } else { Variant::Outline }, Size::Xs)
+            .label(t(cx, "Write")).disabled(disabled).on_click(on_write))
+        .child(Button::new("markdown-preview", if preview { Variant::Outline } else { Variant::Ghost }, Size::Xs)
+            .label(t(cx, "Preview")).disabled(disabled).on_click(on_preview))
+}
+
+pub(crate) fn markdown_preview(
+    text: &str,
+    markdown: &mut crate::transcript::markdown::MarkdownStore,
+    id: &str,
+    cx: &mut App,
+) -> AnyElement {
+    let p = palette(cx);
+    let body = if text.trim().is_empty() {
+        div().text_xs().text_color(hsla(p.muted_foreground)).child(t(cx, "Nothing to preview.")).into_any_element()
+    } else {
+        let text = std::sync::Arc::from(text);
+        let state = markdown.state(id, &text, cx);
+        crate::transcript::markdown::prose(&state, cx).into_any_element()
+    };
+    div().id("markdown-preview-content").min_h(px(46.)).max_h(px(220.)).overflow_y_scroll()
+        .rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.6)).px(px(10.)).py(px(8.)).child(body).into_any_element()
 }

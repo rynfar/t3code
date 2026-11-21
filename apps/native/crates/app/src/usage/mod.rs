@@ -6,6 +6,7 @@
 
 mod chart;
 mod controls;
+pub(crate) use controls::brand_mark;
 mod data;
 mod dialog;
 mod header;
@@ -154,11 +155,12 @@ pub struct UsageView {
     data: UsageData,
     menu: Option<MenuKind>,
     breakdown: Breakdown,
-    hover: Option<usize>,
+    hover: Option<chart::ChartHover>,
     selected_model: Option<String>,
-    dialog_hover: Option<usize>,
+    dialog_hover: Option<chart::ChartHover>,
     prices: Option<prices::PriceOverridesDialog>,
     segment: Option<SegmentKey>,
+    revealed_account_email: Option<String>,
     confirm_reset: Option<Redeem>,
     /// The account a reset credit is being used for, and what came of it.
     reset_status: Option<(String, Option<String>)>,
@@ -211,6 +213,7 @@ impl UsageView {
             dialog_hover: None,
             prices: None,
             segment: None,
+            revealed_account_email: None,
             confirm_reset: None,
             reset_status: None,
             open_top_model: false,

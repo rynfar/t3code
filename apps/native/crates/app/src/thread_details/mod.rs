@@ -5,9 +5,11 @@
 //! transcript lane still fits beside it, else a popover under the header's toggle.
 
 mod automations;
+pub(crate) mod changes;
 pub(crate) mod controls;
 mod issues;
 mod items;
+mod pull_requests;
 mod sections;
 mod servers;
 mod usage;

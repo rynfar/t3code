@@ -23,11 +23,12 @@ use t3_core::pull_requests::review::{can_submit_review, review_verdict_label};
 use t3_core::pull_requests::reviewers::reviewer_candidate_view;
 use t3_core::pull_requests::wire::{Action, Detail, PrState, Reaction, ReviewerKind, Stack, StackMembership};
 
-use super::controls::{Button, Size, Variant, avatar};
+use super::controls::{Button, Size, Variant, anchored_picker, avatar, markdown_mode_buttons, markdown_preview};
 use super::detail::DetailView;
 use crate::icons::Icon;
 use crate::right_panel::tooltip_view;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette};
+use crate::components::motion::Spinner;
 
 /// `PullRequestReactionBar`: shows reactions with optimistic pending overlay + "+" picker.
 pub(super) fn reaction_bar(
@@ -142,7 +143,9 @@ pub(super) fn reviewer_picker(view: &mut DetailView, detail: &Detail, window: &m
     );
     let pending_toggle = view.reviewer_request_pending.is_some();
     let list_body: AnyElement = if (view.reviewer_candidates.is_none() && load_err.is_none()) || reviewer_view.search_pending {
-        div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("Loading reviewers…").into_any_element()
+        h_flex().px(px(10.)).py(px(8.)).gap(px(6.)).text_xs().text_color(hsla(p.muted_foreground))
+            .child(Spinner::new("pr-reviewers-loading", px(12.), hsla(p.muted_foreground)))
+            .child(crate::i18n::t(cx, "Loading reviewers…")).into_any_element()
     } else if let Some(err) = load_err {
         h_flex()
             .justify_between()
@@ -196,30 +199,20 @@ pub(super) fn reviewer_picker(view: &mut DetailView, detail: &Detail, window: &m
             .child(trunc.label(reviewer_view.search_error.as_deref()))
     });
 
-    Some(
-        v_flex()
-            .gap(px(6.))
-            .child(trigger)
-            .child(
-                v_flex()
-                    .w(px(280.))
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(hsla(p.border))
-                    .bg(hsla(p.popover))
-                    .p(px(6.))
-                    .gap(px(4.))
-                    .child(
-                        h_flex()
-                            .gap(px(6.))
-                            .child(div().flex_1().child(Input::new(&search_input)))
-                            .child(Button::new("pr-reviewer-close", Variant::GhostMuted, Size::Xs).icon(Icon::X).on_click(cx.listener(|this, _, window, cx| this.toggle_reviewer_picker(window, cx)))),
-                    )
-                    .child(list_body)
-                    .children(truncation_note),
-            )
-            .into_any_element(),
-    )
+    let content = v_flex().gap(px(4.))
+        .child(h_flex().gap(px(6.))
+            .child(div().flex_1().child(Input::new(&search_input).theme_slot(ThemeSlot::Input, cx)))
+            .child(Button::new("pr-reviewer-close", Variant::GhostMuted, Size::Xs).icon(Icon::X)
+                .tooltip(crate::i18n::t(cx, "Close"))
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_reviewer_picker(window, cx)))))
+        .child(list_body)
+        .children(truncation_note);
+    let view = cx.weak_entity();
+    Some(anchored_picker("pr-reviewers-popup", trigger, content, 280., move |window, cx| {
+        let _ = view.update(cx, |view, cx| {
+            if view.reviewer_picker_open { view.toggle_reviewer_picker(window, cx); }
+        });
+    }, cx))
 }
 
 /// `PullRequestStackPopover`: shows `position/size` pill with layers icon and dropdown listing
@@ -408,6 +401,13 @@ pub(super) fn comment_form(view: &mut DetailView, detail: &Detail, window: &mut 
     };
     let close_armed = view.comment_close_armed;
 
+    let preview = view.comment_preview;
+    let editor = if preview {
+        markdown_preview(&body, &mut view.markdown, "pr-comment-preview", cx)
+    } else {
+        Textarea::new(&input).disabled(locked).theme_slot(ThemeSlot::Input, cx).into_any_element()
+    };
+
     Some(
         v_flex()
             .gap(px(8.))
@@ -415,7 +415,16 @@ pub(super) fn comment_form(view: &mut DetailView, detail: &Detail, window: &mut 
             .py(px(12.))
             .border_t_1()
             .border_color(hsla(p.border).opacity(0.7))
-            .child(Textarea::new(&input).disabled(locked))
+            .child(markdown_mode_buttons(preview, locked,
+                cx.listener(move |view, _, window, cx| {
+                    view.comment_preview = false;
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                }),
+                cx.listener(|view, _, _, cx| { view.comment_preview = true; cx.notify(); }),
+                cx,
+            ))
+            .child(editor)
             .child(
                 h_flex()
                     .justify_end()

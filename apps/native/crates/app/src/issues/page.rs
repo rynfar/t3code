@@ -94,6 +94,8 @@ pub struct IssuesPage {
     pub(super) selected: Option<IssueRef>,
     pub(super) selected_entry: Option<EnvironmentIssueEntry>,
     detail: Option<Entity<IssueDetailPanel>>,
+    detail_environment: Option<String>,
+    linked_pr: Option<Entity<crate::pull_requests::DetailView>>,
     pub(super) preview: IssueLinkPreviewController,
     pub(super) loading_more: Option<String>,
     loading_more_gen: u64,
@@ -165,6 +167,8 @@ impl IssuesPage {
             selected: None,
             selected_entry: None,
             detail: None,
+            detail_environment: None,
+            linked_pr: None,
             preview: IssueLinkPreviewController::default(),
             loading_more: None,
             loading_more_gen: 0,
@@ -797,6 +801,15 @@ impl IssuesPage {
         entry: Option<EnvironmentIssueEntry>,
         cx: &mut Context<Self>,
     ) {
+        self.linked_pr = None;
+        self.detail_environment = env_id.clone();
+        if self.state.read(cx).uses_shared_utility_panel() {
+            self.detail = None;
+            self.selected = Some(reference);
+            self.selected_entry = entry;
+            cx.notify();
+            return;
+        }
         let seed = entry.as_ref().map(|e| e.entry.clone());
         if let Some(detail) = &self.detail {
             detail.update(cx, |panel, cx| {
@@ -807,6 +820,10 @@ impl IssuesPage {
             let close_weak = page_weak.clone();
             let on_close = std::rc::Rc::new(move |cx: &mut App| {
                 let _ = close_weak.update(cx, |page, cx| page.clear_selection(cx));
+            });
+            let pr_weak = page_weak.clone();
+            let on_select_pr = std::rc::Rc::new(move |reference, cx: &mut App| {
+                let _ = pr_weak.update(cx, |page, cx| page.open_linked_pr(reference, cx));
             });
             let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
                 let _ = page_weak.update(cx, |page, cx| {
@@ -823,7 +840,7 @@ impl IssuesPage {
                     None,
                     seed,
                     Some(on_close),
-                    None,
+                    Some(on_select_pr),
                     Some(on_mutated),
                     cx,
                 )
@@ -831,6 +848,26 @@ impl IssuesPage {
         }
         self.selected = Some(reference);
         self.selected_entry = entry;
+        cx.notify();
+    }
+
+    fn open_linked_pr(&mut self, reference: t3_core::pull_requests::PrRef, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let environment = self.detail_environment.clone();
+        let page = cx.weak_entity();
+        let close = page.clone();
+        let on_close = std::rc::Rc::new(move |cx: &mut App| {
+            let _ = close.update(cx, |page, cx| {
+                page.linked_pr = None;
+                cx.notify();
+            });
+        });
+        let on_select = std::rc::Rc::new(move |reference, cx: &mut App| {
+            let _ = page.update(cx, |page, cx| page.open_linked_pr(reference, cx));
+        });
+        self.linked_pr = Some(cx.new(|cx| {
+            crate::pull_requests::DetailView::new_embedded_in_environment(state, environment, reference, on_close, on_select, cx)
+        }));
         cx.notify();
     }
 
@@ -855,10 +892,8 @@ impl IssuesPage {
         let reference = target.issue_ref();
         let env_id = target.environment_id.clone();
         if self.selected.as_ref() == Some(&reference)
-            && self
-                .detail
-                .as_ref()
-                .is_some_and(|panel| panel.read(cx).matches_target(env_id.as_deref(), &reference))
+            && (self.detail_environment == env_id && self.state.read(cx).uses_shared_utility_panel()
+                || self.detail.as_ref().is_some_and(|panel| panel.read(cx).matches_target(env_id.as_deref(), &reference)))
         {
             return;
         }
@@ -900,6 +935,8 @@ impl IssuesPage {
         self.selected = None;
         self.selected_entry = None;
         self.detail = None;
+        self.detail_environment = None;
+        self.linked_pr = None;
         self.state.update(cx, |state, cx| {
             if state.panels.panels.hide(ISSUES_PANEL_THREAD_KEY) {
                 state.save_panels(cx);
@@ -1059,7 +1096,7 @@ impl IssuesPage {
             .window_control_area(WindowControlArea::Drag)
             .h(px(crate::workspace::TITLEBAR_HEIGHT))
             .flex_none()
-            .pl(px(if collapsed { 130. } else { 20. }))
+            .pl(crate::workspace::traffic_light_inset(window, collapsed))
             .pr(px(12.))
             .gap(px(12.))
             .border_b_1()
@@ -1109,7 +1146,8 @@ impl Render for IssuesPage {
             .first_error()
             .filter(|_| !self.held_pages.is_empty())
             .map(str::to_owned);
-        let detail = self.detail.clone();
+        let detail = self.linked_pr.clone().map(IntoElement::into_any_element)
+            .or_else(|| self.detail.clone().map(IntoElement::into_any_element));
         let preview_card = self.preview.render_card(cx);
         let dialog = self
             .saved_view_editor
@@ -1173,6 +1211,9 @@ impl Render for IssuesPage {
                 if event.keystroke.key == "escape" {
                     if this.saved_view_editor.is_some() {
                         this.close_saved_view_editor(cx);
+                        cx.stop_propagation();
+                    } else if this.linked_pr.take().is_some() {
+                        cx.notify();
                         cx.stop_propagation();
                     } else if this.detail.is_some() {
                         this.clear_selection(cx);

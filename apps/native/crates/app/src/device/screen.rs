@@ -43,6 +43,8 @@ use t3_core::preview::stream::{dom_key, fit};
 use super::pane::{Stage, loading_view};
 use super::{Abort, Devices};
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::Spinner;
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
 use crate::settings::controls::{Button as ActionButton, ButtonSize, ButtonVariant};
@@ -1077,13 +1079,18 @@ impl DeviceScreen {
             [rail_divider(cx).into_any_element(), appearance.into_any_element(), text, tools.into_any_element()]
         });
         let screenshot = offers_screenshot(kind).then(|| {
+            if self.screenshot_pending {
+                return div().size(px(28.)).flex().items_center().justify_center()
+                    .child(Spinner::new("device-screenshot-progress", px(16.), hsla(p.muted_foreground))).into_any_element();
+            }
             Button::new("device-screenshot")
                 .variant(Variant::Ghost)
                 .size(Size::IconSm)
-                .icon(Icon::Image)
-                .tooltip(if self.screenshot_pending { "Capturing screenshot" } else { "Save screenshot" })
-                .disabled(self.status != StreamStatus::Streaming || self.screenshot_pending)
+                .icon(Icon::Camera)
+                .tooltip(t(cx, "Save screenshot"))
+                .disabled(self.status != StreamStatus::Streaming)
                 .on_click(cx.listener(|this, _, _, cx| this.save_screenshot(cx)))
+                .into_any_element()
         });
         let duo_controls = self.screen.filter(|screen| screen.supports_hinge_angle).map(|screen| self.render_duo_controls(screen, cx));
         div()
@@ -1148,7 +1155,7 @@ impl DeviceScreen {
 }
 
 impl Render for DeviceScreen {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let view = cx.entity();
         let platform = self.device.platform;
@@ -1266,10 +1273,41 @@ impl Render for DeviceScreen {
             .children(input_bar)
             .children(loading)
             .child(self.render_rail(cx));
+        let viewport = f32::from(window.viewport_size().width);
+        let state = self.state.read(cx);
+        let pane_width = if self.floating || state.panels.panels.panel(&self.thread_id).maximized {
+            viewport
+        } else if t3_core::right_panel::is_sheet_mode(viewport) {
+            t3_core::right_panel::sheet_width(viewport)
+        } else {
+            crate::right_panel::inline_panel_width(state, &self.thread_id, viewport)
+        };
+        let overlay = pane_width < 620.;
         let tools = (self.tools_open && self.runs_host_commands(cx)).then(|| self.render_tools(cx));
+        let tools = tools.map(|tools| {
+            if overlay {
+                gpui::deferred(
+                    div().id("device-tools-overlay").absolute().inset_0().occlude().flex().justify_end()
+                        .bg(hsla(p.dialog_backdrop))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, cx| view.toggle_tools(window, cx)))
+                        .child(div().id("device-tools-overlay-panel").h_full().max_w_full()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(tools)),
+                ).with_priority(30).into_any_element()
+            } else {
+                tools
+            }
+        });
         div()
+            .relative()
             .flex()
             .size_full()
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && view.tools_open {
+                    view.toggle_tools(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .child(div().flex().flex_col().flex_1().min_w_0().h_full().children(alert).child(screen))
             .children(tools)
     }

@@ -49,7 +49,8 @@ use crate::pull_requests::controls::{
     BadgeKind, Button, Size, Variant, avatar, badge, state_glyph as pr_state_glyph,
 };
 use crate::sidebar::controller::now_ms;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette};
+use crate::pull_requests::controls::{markdown_mode_buttons, markdown_preview};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::markdown::links::MarkdownActionContext;
 use crate::transcript::markdown::{MarkdownStore, prose};
@@ -92,6 +93,7 @@ pub struct IssueDetailPanel {
     comment_input: Option<Entity<TextareaState>>,
     comment_draft: String,
     comment_submitting: bool,
+    comment_preview: bool,
     _comment_sub: Option<Subscription>,
     _title_sub: Option<Subscription>,
     picker: Option<CandidatePickerKind>,
@@ -162,6 +164,7 @@ impl IssueDetailPanel {
             comment_input: None,
             comment_draft: String::new(),
             comment_submitting: false,
+            comment_preview: false,
             _comment_sub: None,
             _title_sub: None,
             picker: None,
@@ -243,6 +246,7 @@ impl IssueDetailPanel {
         self.comment_draft.clear();
         self.comment_input = None;
         self.comment_submitting = false;
+        self.comment_preview = false;
         self._comment_sub = None;
         self._fetch = None;
         self._older = None;
@@ -902,6 +906,7 @@ impl IssueDetailPanel {
                 match result {
                     Ok(_) => {
                         panel.comment_draft.clear();
+                        panel.comment_preview = false;
                         if let Some(input) = &panel.comment_input {
                             input.update(cx, |state, cx| state.set_value("", window, cx));
                         }
@@ -1080,7 +1085,7 @@ impl IssueDetailPanel {
         let on_select = self.on_select_pr.clone();
         let pr_ref = PrRef {
             project_id: self.reference.project_id.clone(),
-            host: self.reference.host.clone(),
+            host: t3_core::pull_requests::link::parse_change_request_url(&link.url).map(|link| link.host),
             repository: link.repository.clone(),
             number: link.number,
         };
@@ -1837,6 +1842,12 @@ impl Render for IssueDetailPanel {
             let placeholder = blocked_reason.unwrap_or_else(|| t(cx, "Leave a comment").to_owned());
             let input = self.ensure_comment_input(placeholder, window, cx);
             let submit_disabled = locked || self.comment_draft.trim().is_empty();
+            let preview = self.comment_preview;
+            let editor = if preview {
+                markdown_preview(&self.comment_draft, &mut self.markdown, "issue-comment-preview", cx)
+            } else {
+                Textarea::new(&input).disabled(locked).theme_slot(ThemeSlot::Input, cx).into_any_element()
+            };
             div()
                 .id("issue-comment-composer")
                 .flex_none()
@@ -1863,7 +1874,16 @@ impl Render for IssueDetailPanel {
                                 this.submit_comment(window, cx);
                             }
                         }))
-                        .child(Textarea::new(&input).disabled(locked))
+                        .child(markdown_mode_buttons(preview, locked,
+                            cx.listener(move |panel, _, window, cx| {
+                                panel.comment_preview = false;
+                                input.update(cx, |input, cx| input.focus(window, cx));
+                                cx.notify();
+                            }),
+                            cx.listener(|panel, _, _, cx| { panel.comment_preview = true; cx.notify(); }),
+                            cx,
+                        ))
+                        .child(editor)
                         .child(
                             h_flex().justify_end().child(
                                 Button::new(

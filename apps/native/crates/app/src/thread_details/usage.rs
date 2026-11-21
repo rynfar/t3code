@@ -128,9 +128,9 @@ fn usage_row(spec: UsageRowSpec, cx: &App) -> AnyElement {
         })
         .hover(|style| style.bg(super::controls::hover_fill(cx)))
         .tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
-        .child(div().max_w(px(112.)).flex_none().truncate().text_color(hsla(p.muted_foreground)).child(label))
+        .child(div().w(px(100.)).flex_none().truncate().text_color(hsla(p.muted_foreground)).child(label))
         .child(div().flex_1().min_w(px(48.)).children(bar.as_ref().map(|spec| usage_bar(spec, cx))))
-        .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(value_color).child(value))
+        .child(div().w(px(76.)).flex_none().text_right().truncate().font_weight(FontWeight::MEDIUM).text_color(value_color).child(value))
         .into_any_element()
 }
 

@@ -66,6 +66,7 @@ impl UsageView {
                     cx.notify();
                 })
             },
+            window,
             cx,
         );
         let mut shares: Vec<AnyElement> = Vec::new();

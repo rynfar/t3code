@@ -14,9 +14,11 @@ use serde_json::Value;
 use t3_core::thread_details::{DensityInputs, item_visible_at_density, resolve_card_density};
 
 use super::automations::AutomationsFeed;
+use super::changes::Comparison;
 use super::controls::Row;
 use super::issues::LinkedIssuesFeed;
 use super::items::ITEMS;
+use super::pull_requests::{Feed as PullRequestFeed, RequestRow};
 use super::sections::{self, Ctx};
 use super::servers::ServersFeed;
 use super::usage::{context_available, context_window_section, limit_row_count, usage_limits_section};
@@ -43,6 +45,7 @@ struct Inputs {
     scripts: Vec<Value>,
     no_runs_yet: bool,
     lineage: crate::lineage::Relationships,
+    pull_requests: Vec<t3_core::pull_requests::link::ThreadLink>,
     issues: Vec<t3_core::issues::wire::ThreadIssueLink>,
 }
 
@@ -58,6 +61,7 @@ fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option
             scripts: project.scripts.clone(),
             no_runs_yet: thread.latest_run_id.is_none(),
             lineage: crate::lineage::relationships_with_titles(state, thread, Some(titles)),
+            pull_requests: thread.pull_requests.clone(),
             issues: thread.issues.clone(),
         });
     }
@@ -72,22 +76,25 @@ fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option
         scripts: project.scripts.clone(),
         no_runs_yet: true,
         lineage: crate::lineage::Relationships::default(),
+        pull_requests: Vec::new(),
         issues: Vec::new(),
     })
 }
 
 pub struct DetailsView {
-    state: Entity<AppState>,
+    pub(super) state: Entity<AppState>,
     details: Entity<Details>,
-    git: Entity<GitStore>,
+    pub(super) git: Entity<GitStore>,
     dialogs: Entity<GitDialogs>,
     picker: Entity<BranchPicker>,
     terminal: Entity<TerminalDrawer>,
-    composer: Entity<Composer>,
+    pub(super) composer: Entity<Composer>,
     thread: Entity<ThreadView>,
     pub(super) servers: ServersFeed,
     pub(super) automations: AutomationsFeed,
     issues_feed: LinkedIssuesFeed,
+    pub(super) pull_requests: PullRequestFeed,
+    pub(super) comparison: Comparison,
     lineage_titles: crate::lineage::ThreadTitlesFeed,
     card_open: bool,
     inputs: Option<Inputs>,
@@ -125,6 +132,7 @@ impl DetailsView {
                 AppEvent::Selection => {
                     this.servers.reset_pagination();
                     this.issues_feed.reset();
+                    this.pull_requests.reset();
                     this.picker.update(cx, |picker, cx| picker.close(cx));
                     this.lineage_titles.allow_retry();
                     this.sync_lineage_titles(this.card_open, cx);
@@ -178,7 +186,10 @@ impl DetailsView {
             loop {
                 cx.background_executor().timer(Duration::from_secs(60)).await;
                 let keep_going = this.update(cx, |this, cx| {
-                    if this.should_tick_usage(cx) {
+                    if this.should_tick_usage(cx) || (this.card_open
+                        && this.details.read(cx).shows("branch")
+                        && this.pull_requests.due(&this.pr_rows(cx)))
+                    {
                         cx.notify();
                     }
                 });
@@ -201,6 +212,8 @@ impl DetailsView {
             servers: ServersFeed::new(),
             automations: AutomationsFeed::new(),
             issues_feed: LinkedIssuesFeed::new(),
+            pull_requests: PullRequestFeed::default(),
+            comparison: Comparison::default(),
             lineage_titles,
             card_open: false,
             inputs: initial,
@@ -214,6 +227,18 @@ impl DetailsView {
         }
     }
 
+    fn pr_rows(&self, cx: &App) -> Vec<RequestRow> {
+        let app = self.state.read(cx);
+        let git = self.git.read(cx);
+        let branch = git.active_branch();
+        let thread_branch = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id)).and_then(|thread| thread.branch.as_deref());
+        let pr = git.status.as_ref().filter(|status| {
+            status.local.is_repo && t3_core::vcs::pr_branch(thread_branch, branch.as_deref())
+                .is_some_and(|branch| status.local.ref_name.as_deref() == Some(branch))
+        }).and_then(|status| status.remote.pr.as_ref());
+        RequestRow::collect(app, pr)
+    }
+
     fn should_tick_usage(&self, cx: &App) -> bool {
         let Some(key) = panel_key(self.state.read(cx)) else { return false };
         let details = self.details.read(cx);
@@ -221,7 +246,7 @@ impl DetailsView {
     }
 
     fn ctx(&self) -> Ctx {
-        Ctx { row_menu_claim: self.row_menu_claim.clone(), state: self.state.clone(), details: self.details.clone(), git: self.git.clone(), dialogs: self.dialogs.clone(), picker: self.picker.clone() }
+        Ctx { row_menu_claim: self.row_menu_claim.clone(), state: self.state.clone(), composer: Some(self.composer.clone()), details: self.details.clone(), git: self.git.clone(), dialogs: self.dialogs.clone(), picker: self.picker.clone() }
     }
 
     fn close_popover(&mut self, cx: &mut Context<Self>) {
@@ -333,7 +358,7 @@ impl Render for DetailsView {
                 open_in: details.shows("openIn") && app.should_show_open_in_picker(has_active_project),
                 scripts: details.shows("scripts") && has_scripts,
                 branch: details.shows("branch") && is_repo,
-                pr_row: details.shows("branch") && if is_repo { git.status.as_ref().and_then(|s| s.remote.pr.as_ref()).is_some() } else { has_linked_pr },
+                pr_row: details.shows("branch") && (has_linked_pr || (is_repo && git.status.as_ref().and_then(|s| s.remote.pr.as_ref()).is_some())),
                 git_actions: details.shows("gitActions") && has_git_cwd,
                 changes: details.shows("changes") && is_repo,
                 servers_rows: if show_servers { thread_id.map_or(0, |id| self.servers.count_for(id)) } else { 0 },
@@ -350,7 +375,15 @@ impl Render for DetailsView {
         let ctx = self.ctx();
         let workspace = sections::workspace(&ctx, density, cx);
         let mut any_above = workspace.is_some();
-        let version_control = sections::version_control(&ctx, any_above, density, cx);
+        let show_prs = self.details.read(cx).shows("branch") && item_visible_at_density("branch", density);
+        let pr_rows = if show_prs {
+            let rows = self.pr_rows(cx);
+            self.pull_requests.sync(&self.state, &rows, cx);
+            self.pull_requests.render(&rows, &self.state, self.git.read(cx).can_write_source_control(), cx)
+        } else { None };
+        let show_changes = self.details.read(cx).shows("changes") && item_visible_at_density("changes", density);
+        self.comparison.sync(show_changes, &self.state, &self.git, cx);
+        let version_control = sections::version_control(&ctx, any_above, density, pr_rows, &self.comparison, cx);
         any_above |= version_control.is_some();
         let show_issues = self.details.read(cx).shows("branch") && item_visible_at_density("branch", density);
         let close_view = cx.entity().downgrade();

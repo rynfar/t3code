@@ -41,6 +41,7 @@ use super::{
 use crate::app_state::{AppState, RestoredAttachment};
 use crate::composer::controls::{MenuItem, popup_surface};
 use crate::icons::Icon;
+use crate::i18n::t;
 use crate::right_panel::{Button, Size, Variant};
 use crate::settings::controls::{Button as ActionButton, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
@@ -439,8 +440,35 @@ impl PreviewPane {
         };
         self.state.update(cx, |state, cx| {
             state.restore_composer_prompt(&thread_id, String::new(), vec![attachment], cx);
-            state.show_toast(Toast::new(ToastKind::Success, "Screenshot added to composer"), cx);
+            state.show_toast(Toast::new(ToastKind::Success, t(cx, "Screenshot added to composer")), cx);
         });
+    }
+
+    fn save_screenshot(&self, cx: &mut Context<Self>) {
+        let Some(frame) = self.frame.as_ref().and_then(|frame| frame.read(cx).screenshot_frame()) else {
+            return;
+        };
+        let directory = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let prompt = cx.prompt_for_new_path(&directory, Some("preview-screenshot.png"));
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = prompt.await else { return };
+            let result = cx.background_executor().spawn(async move {
+                let png = FrameView::encode_screenshot(&frame).map_err(|error| error.to_string())?;
+                std::fs::write(&path, png).map_err(|error| error.to_string())?;
+                Ok::<_, String>(path)
+            }).await;
+            state.update(cx, |state, cx| {
+                let toast = match result {
+                    Ok(path) => Toast::new(ToastKind::Success, t(cx, "Screenshot saved")).description(path.display().to_string()),
+                    Err(error) => Toast::new(ToastKind::Error, t(cx, "Could not save screenshot")).description(error),
+                };
+                state.show_toast(toast, cx);
+            });
+        }).detach();
     }
 
     fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -689,6 +717,11 @@ impl PreviewPane {
         let has_closed = !self.state.read(cx).panels.panels.closed_views().is_empty();
         let p = palette(cx);
 
+        let can_save = self.frame.as_ref().is_some_and(|frame| frame.read(cx).has_frame());
+        let unavailable = |id, icon, label, reason: &'static str| {
+            div().id(id).tooltip(move |window, cx| crate::right_panel::tooltip_view(t(cx, reason).into(), window, cx))
+                .child(MenuItem::new(label, t(cx, label)).icon(icon, hsla(p.muted_foreground)).disabled(true))
+        };
         Some(deferred(
             div()
                 .id("preview-more-menu-backdrop")
@@ -707,6 +740,18 @@ impl PreviewPane {
                         .w(px(236.))
                         .p(px(4.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(unavailable("preview-menu-find", Icon::Search, "Find on page", "Find on page isn't available for this page"))
+                        .child(unavailable("preview-menu-devtools", Icon::CodeXml, "Open DevTools", "DevTools are unavailable for streamed browser tabs"))
+                        .child(unavailable("preview-menu-pip", Icon::Monitor, "Picture in picture", "Picture in picture is unavailable for streamed browser tabs"))
+                        .child(unavailable("preview-menu-popout", Icon::ExternalLink, "Open separate preview window", "Separate preview windows are unavailable for streamed browser tabs"))
+                        .child(MenuItem::new("preview-menu-save-screenshot", t(cx, "Save screenshot"))
+                            .icon(Icon::Camera, hsla(p.muted_foreground))
+                            .disabled(!can_save)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.more_menu_open = false;
+                                this.save_screenshot(cx);
+                                cx.notify();
+                            })))
                         .child(
                             MenuItem::new("preview-menu-hard-reload", crate::i18n::t(cx, "Hard reload"))
                                 .disabled(!enabled)

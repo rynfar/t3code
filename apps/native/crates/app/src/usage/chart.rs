@@ -121,14 +121,21 @@ impl ChartColors {
     }
 }
 
-type HoverHandler = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChartHover {
+    index: usize,
+    y: Pixels,
+}
+
+type HoverHandler = Rc<dyn Fn(Option<ChartHover>, &mut Window, &mut App)>;
 
 /// The chart with its axes; `on_hover` hears the hovered period as it changes.
-pub fn provider_chart(
+pub(super) fn provider_chart(
     id: &'static str,
     data: Rc<ChartData>,
-    hover: Option<usize>,
-    on_hover: impl Fn(Option<usize>, &mut Window, &mut App) + 'static,
+    hover: Option<ChartHover>,
+    on_hover: impl Fn(Option<ChartHover>, &mut Window, &mut App) + 'static,
+    window: &Window,
     cx: &App,
 ) -> AnyElement {
     let p = palette(cx);
@@ -159,14 +166,25 @@ pub fn provider_chart(
         move |bounds, _, _| {
             paint_bounds.set(Some(bounds));
         },
-        move |bounds, _, window, _| paint_chart(bounds, &paint_data, hover, &colors, window),
+        move |bounds, _, window, _| paint_chart(bounds, &paint_data, hover.map(|hover| hover.index), &colors, window),
     )
     .size_full();
     let move_bounds = bounds_cell.clone();
     let move_handler = on_hover.clone();
-    let tooltip = hover.and_then(|index| tooltip(&data, index, cx));
-    let right_half = hover.is_some_and(|index| periods > 1 && index * 2 > periods - 1);
-    let hover_fraction = hover.map_or(0., |index| if periods < 2 { 0. } else { index as f32 / (periods - 1) as f32 });
+    let tooltip = hover.and_then(|hover| tooltip(&data, hover.index, cx));
+    let right_half = hover.is_some_and(|hover| periods > 1 && hover.index * 2 > periods - 1);
+    let hover_fraction = hover.map_or(0., |hover| if periods < 2 { 0. } else { hover.index as f32 / (periods - 1) as f32 });
+    let rem = window.rem_size();
+    let tooltip_height = rem * r(16. * (data.providers.len() as f32 + 2.) + 28.).0;
+    let tooltip_top = hover.map_or(px(0.), |hover| {
+        let gap = rem * r(8.).0;
+        let available = (rem * r(PLOT_HEIGHT).0 - tooltip_height).max(px(0.));
+        if hover.y + gap <= available {
+            hover.y + gap
+        } else {
+            (hover.y - gap - tooltip_height).clamp(px(0.), available)
+        }
+    });
     v_flex()
         .gap(r(4.))
         .child(
@@ -201,7 +219,12 @@ pub fn provider_chart(
                                 return;
                             }
                             let fraction = f64::from(event.position.x - bounds.origin.x) / width;
-                            let next = if bounds.contains(&event.position) { chart::hover_index(fraction, periods) } else { None };
+                            let next = if bounds.contains(&event.position) {
+                                chart::hover_index(fraction, periods).map(|index| {
+                                    let y = f32::from(event.position.y - bounds.origin.y);
+                                    ChartHover { index, y: px((y / 4.).round() * 4.) }
+                                })
+                            } else { None };
                             if next != hover {
                                 move_handler(next, window, cx);
                             }
@@ -212,7 +235,7 @@ pub fn provider_chart(
                             }
                         })
                         .children(tooltip.map(|tooltip| {
-                            let anchor = div().absolute().top(r(8.)).w(r(176.));
+                            let anchor = div().absolute().top(tooltip_top).w(r(176.));
                             let placed = if right_half {
                                 anchor.right(gpui::relative(1. - hover_fraction)).mr(r(12.))
                             } else {

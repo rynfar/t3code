@@ -9,7 +9,7 @@ mod detail;
 mod guide;
 mod interactions;
 mod link_dialog;
-mod mutations;
+pub(crate) mod mutations;
 mod page;
 mod preview;
 mod row;
@@ -36,7 +36,31 @@ use crate::app_state::{AppEvent, AppState};
 
 actions!(pull_requests, [OpenPullRequests, ClosePullRequests, LinkPullRequest, ShowLinkedPullRequests, CopyPullRequestNumber]);
 
+pub(crate) const PULL_REQUESTS_UTILITY_PANEL_KEY: &str = "pull-requests-panel";
+
 impl AppState {
+    pub(crate) fn details_utility_panel_key(&self) -> Option<&'static str> {
+        if self.pull_requests_open {
+            Some(PULL_REQUESTS_UTILITY_PANEL_KEY)
+        } else if self.issues_open {
+            Some(t3_core::right_panel::ISSUES_PANEL_THREAD_KEY)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn uses_shared_utility_panel(&self) -> bool {
+        self.details_utility_panel_key().is_some_and(|key| self.panel_thread().as_deref() == Some(key))
+    }
+
+    pub(crate) fn open_utility_pull_request(&mut self, target: t3_core::right_panel::PullRequestTarget, cx: &mut Context<Self>) -> bool {
+        let Some(key) = self.details_utility_panel_key().filter(|_| self.uses_shared_utility_panel()) else { return false };
+        if self.panels.panels.open_pull_request(key, target) {
+            self.save_panels(cx);
+        }
+        true
+    }
+
     /// Opens or leaves the pull requests page, which replaces the thread area while open.
     pub fn set_pull_requests_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.pull_requests_open != open {

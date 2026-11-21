@@ -18,6 +18,10 @@ use t3_core::vcs::{self, editor_label, editor_options};
 use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, section_with_action, section_with_options, split_row};
 use super::{Details, project_scripts, run_button_script};
 use crate::app_state::AppState;
+use crate::composer::Composer;
+use crate::i18n::{t, t_fmt};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+use t3_core::i18n::IcuArg;
 use crate::lineage::{DelegatedFromRow, LineageRow, MergeBack, Relationships, RemoteSubagentRow, StopAction, elapsed::agent_elapsed_element};
 use crate::git::{self, BranchPicker, GitDialogs, GitStore};
 use crate::icons::Icon;
@@ -32,6 +36,7 @@ pub struct Ctx {
     /// Set when a right-click lands on a row with its own menu, so the card's menu stays shut.
     pub row_menu_claim: Rc<Cell<bool>>,
     pub state: Entity<AppState>,
+    pub composer: Option<Entity<Composer>>,
     pub details: Entity<Details>,
     pub git: Entity<GitStore>,
     pub dialogs: Entity<GitDialogs>,
@@ -63,17 +68,41 @@ fn running_indicator(running: bool, cx: &App) -> impl IntoElement {
 /// checkout, whose path shows on hover and copies from the context menu.
 fn environment_row(ctx: &Ctx, worktree: Option<&str>, project_root: &str, cx: &App) -> AnyElement {
     let app = ctx.state.read(cx);
-    let label = app.server_config.config.as_ref().map(|config| config.environment.label.trim().to_owned()).filter(|label| !label.is_empty()).unwrap_or_else(|| "This device".to_owned());
+    let label = app.active_open_in_config()
+        .map(|config| config.environment.label.trim())
+        .filter(|label| !label.is_empty())
+        .or_else(|| app.active_environment().map(|environment| environment.label.as_str()))
+        .unwrap_or_else(|| t(cx, "This device")).to_owned();
+    let machine = app.environments.active.as_deref().or_else(|| app.environment())
+        .map_or(Icon::Server, |id| crate::context_chip::environment_machine_icon(app, id));
+    let draft = ctx.composer.as_ref().filter(|_| app.selected_thread.is_none() && app.draft_project.is_some());
+    let workspace_glyph = if worktree.is_some() { Icon::FolderGit2 } else { Icon::Folder };
     let path = worktree.unwrap_or(project_root).to_owned();
     let p = palette(cx);
     let workspace_icon = div()
         .id("details-workspace-icon")
         .flex_none()
-        .child((if worktree.is_some() { Icon::FolderGit2 } else { Icon::Folder }).sized(px(16.)).text_color(hsla(p.muted_foreground)))
+        .child(workspace_glyph.sized(px(16.)).text_color(hsla(p.muted_foreground)))
         .tooltip({
             let path: SharedString = path.clone().into();
             move |window, cx| crate::right_panel::tooltip_view(path.clone(), window, cx)
         });
+    let environment = if let Some(draft) = draft {
+        let host = draft.clone();
+        let workspace = draft.clone();
+        split_row(
+            "details-run-context",
+            Row::new("details-environment", label).icon(machine).select()
+                .tooltip(t(cx, "Choose environment"))
+                .on_click(move |_, window, cx| host.update(cx, |composer, cx| composer.open_host(window, cx))),
+            Button::new("details-workspace", ButtonVariant::Ghost, ButtonSize::IconSm)
+                .icon(workspace_glyph).tooltip(t(cx, "Choose workspace"))
+                .on_click(move |_, window, cx| workspace.update(cx, |composer, cx| composer.open_workspace(window, cx))),
+            cx,
+        ).into_any_element()
+    } else {
+        Row::new("details-environment", label).icon(machine).trailing(workspace_icon).into_any_element()
+    };
     let state = ctx.state.clone();
     let claim = ctx.row_menu_claim.clone();
     div()
@@ -83,7 +112,7 @@ fn environment_row(ctx: &Ctx, worktree: Option<&str>, project_root: &str, cx: &A
             let (state, path) = (state.clone(), path.clone());
             menu.item(PopupMenuItem::new("Copy full path").icon(menu_icon(Icon::Copy)).on_click(move |_, _, cx| copy_with_toast(path.clone(), "Path copied", &state, cx)))
         })
-        .child(Row::new("details-environment", label).icon(Icon::Server).trailing(workspace_icon))
+        .child(environment)
         .into_any_element()
 }
 
@@ -209,10 +238,10 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
     let can_import = git.can_write_settings();
     let primary = run_button_script(ctx.details.read(cx), &project_id, &scripts).cloned();
     let running: Vec<bool> = scripts.iter().map(|script| git.script_running(&script.id)).collect();
-    let menu = {
+    let build_menu = {
         let (details, git_entity, project_id, scripts, running, importable) =
             (ctx.details.clone(), ctx.git.clone(), project_id.clone(), scripts.clone(), running.clone(), importable.clone());
-        MenuTrigger::new("details-scripts-menu", "Script actions").dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
+        move |menu: gpui_component::menu::PopupMenu, _: &mut Window, cx: &mut gpui::Context<gpui_component::menu::PopupMenu>| {
             let handle = cx.entity().downgrade();
             let mut menu = scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
                 menu.item(script_menu_item(&details, handle.clone(), &project_id, script, running, can_run))
@@ -250,11 +279,17 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
             }
             let project_id = project_id.clone();
             menu.item(PopupMenuItem::new(ADD_PROJECT_SCRIPT).icon(menu_icon(Icon::Plus)).on_click(move |_, _, cx| git::open_script_editor(&project_id, None, cx)))
-        })
+        }
     };
-    let primary_row = match primary {
-        Some(script) => {
-            let details = ctx.details.clone();
+    let Some(script) = primary else {
+        return Some(Row::new("details-scripts", t(cx, "Actions")).icon(Icon::Wrench)
+            .select().opens_menu().tooltip(t(cx, "Project actions"))
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, build_menu).into_any_element());
+    };
+    let menu = MenuTrigger::new("details-scripts-menu", t(cx, "Script actions"))
+        .dropdown_menu_with_anchor(gpui::Anchor::TopRight, build_menu);
+    let primary_row = {
+        let details = ctx.details.clone();
             let running = git.script_running(&script.id);
             Row::new("details-run-script", script.name.clone())
                 .icon(script_icon(script.icon))
@@ -262,8 +297,6 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
                 .trailing(running_indicator(running, cx))
                 .tooltip(if can_run { format!("Run {}", script.name) } else { RUN_SCRIPT_UNAVAILABLE.to_owned() })
                 .on_click(move |_, _, cx| run_script(&details, &project_id, &script, cx))
-        }
-        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).tooltip("Project actions"),
     };
     Some(split_row("details-scripts", primary_row, menu, cx).into_any_element())
 }
@@ -291,7 +324,7 @@ pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement
     (!rows.is_empty()).then(|| section_with_options(false, None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
 }
 
-fn open_thread_pr_url(state: &Entity<AppState>, url: &str, cx: &mut App) {
+pub(super) fn open_thread_pr_url(state: &Entity<AppState>, url: &str, cx: &mut App) {
     if crate::settings::client_settings(cx).pull_request_links_open_in_app() {
         crate::pull_requests::open_context_link(state, url, cx);
     } else {
@@ -355,7 +388,7 @@ fn thread_pr_rows(ctx: &Ctx, thread: &t3_core::shell::ThreadShell, _cx: &App) ->
 
 /// The branch row and its picker, and the PR row under it while the checkout is the thread's
 /// branch (`BranchToolbarBranchSelector` in panel mode).
-fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
+fn branch_row(ctx: &Ctx, cx: &App) -> AnyElement {
     let git = ctx.git.read(cx);
     let active = git.active_branch();
     let label = vcs::branch_trigger_label(false, active.as_deref(), None, false);
@@ -369,7 +402,7 @@ fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
     let state = ctx.state.clone();
     let branch_for_menu = active.clone();
     let claim = ctx.row_menu_claim.clone();
-    let trigger = div()
+    div()
         .relative()
         .w_full()
         .capture_any_mouse_down(move |event, _, _| claim.set(event.button == gpui::MouseButton::Right))
@@ -381,34 +414,11 @@ fn branch_rows(ctx: &Ctx, thread_branch: Option<&str>, cx: &App) -> AnyElement {
                 menu.item(PopupMenuItem::new("Copy branch name").icon(menu_icon(Icon::Copy)).on_click(move |_, _, cx| copy_with_toast(branch.clone(), "Branch name copied", &state, cx)))
             }
             None => menu,
-        });
-    let status = git.status.as_ref();
-    let pr = vcs::pr_branch(thread_branch, active.as_deref())
-        .filter(|branch| status.and_then(|status| status.local.ref_name.as_deref()) == Some(*branch))
-        .and_then(|_| status.and_then(|status| status.remote.pr.clone()));
-    let terms = t3_core::git_actions::terminology(status.and_then(|status| status.provider_kind()));
-    let pr_state = ctx.state.clone();
-    v_flex()
-        .w_full()
-        .child(trigger)
-        .children(pr.map(|pr| {
-            let url = pr.url.clone();
-            let state = pr_state.clone();
-            let state_label = match pr.state.as_str() {
-                "merged" => "Merged",
-                "closed" => "Closed",
-                _ if pr.is_draft == Some(true) => "Draft",
-                _ => "Open",
-            };
-            Row::new("details-pr", format!("#{}: {}", pr.number, pr.title))
-                .icon(Icon::GitPullRequest)
-                .tooltip(format!("{} #{} - {}: {}", terms.short_label, pr.number, state_label, pr.title))
-                .on_click(move |_, _, cx| open_thread_pr_url(&state, &url, cx))
-        }))
+        })
         .into_any_element()
 }
 
-pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &App) -> Option<AnyElement> {
+pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, pull_requests: Option<AnyElement>, comparison: &super::changes::Comparison, cx: &App) -> Option<AnyElement> {
     let app = ctx.state.read(cx);
     let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
     let project_id = thread.map(|thread| thread.project_id.as_str()).or(app.draft_project.as_deref())?;
@@ -418,22 +428,77 @@ pub fn version_control(ctx: &Ctx, separated: bool, density: CardDensity, cx: &Ap
     let details = ctx.details.read(cx);
     let is_repo = offers_git && ctx.git.read(cx).status.as_ref().is_none_or(|status| status.local.is_repo);
     let no_runs_yet = thread.is_none_or(|thread| thread.latest_run_id.is_none());
-    let thread_branch = thread.and_then(|thread| thread.branch.as_deref());
     let compact_actions = !density.is_full();
     let show_branch = offers_git && is_repo && details.shows("branch") && item_visible_at_density("branch", density);
     let show_pull_requests = !(offers_git && is_repo) && details.shows("branch") && item_visible_at_density("branch", density);
     let show_git_actions = offers_git && details.shows("gitActions") && item_visible_at_density("gitActions", density);
     let show_changes = offers_git && is_repo && details.shows("changes") && item_visible_at_density("changes", density);
     let rows: Vec<AnyElement> = [
-        show_branch.then(|| branch_rows(ctx, thread_branch, cx)),
-        show_pull_requests.then(|| thread.and_then(|t| thread_pr_rows(ctx, t, cx))).flatten(),
+        show_branch.then(|| branch_row(ctx, cx)),
+        pull_requests.or_else(|| show_pull_requests.then(|| thread.and_then(|t| thread_pr_rows(ctx, t, cx))).flatten()),
         show_git_actions.then(|| git::git_actions_row(&ctx.git, &ctx.dialogs, no_runs_yet, compact_actions, cx)).flatten(),
-        show_changes.then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, cx)).flatten(),
+        show_changes.then(|| git::changes_row(&ctx.git, &ctx.state, no_runs_yet, comparison, cx)).flatten(),
     ]
     .into_iter()
     .flatten()
     .collect();
     (!rows.is_empty()).then(|| section_with_options(separated && density.is_full(), None, density.is_essential(), cx).child(v_flex().children(rows)).into_any_element())
+}
+
+fn lineage_icon(state: &AppState, environment: Option<&str>, thread_id: &str, fallback: Icon, cx: &App) -> AnyElement {
+    let fleet = environment.and_then(|environment| state.fleet.environments.iter().find(|entry| {
+        entry.summary.owner.canonical_id.as_deref() == Some(environment) || entry.summary.owner.saved_id == environment
+    }));
+    let provider = if let Some(entry) = fleet {
+        entry.summary.threads.iter().find(|thread| thread.thread.id == thread_id)
+            .and_then(|thread| entry.config.config.as_ref()?.provider(&thread.thread.model_selection.instance_id))
+    } else if environment.is_none() || state.server_config.config.as_ref().is_some_and(|config| {
+        Some(config.environment.environment_id.as_str()) == environment
+    }) {
+        state.thread_shell(thread_id).and_then(|thread| {
+            state.server_config.config.as_ref()?.provider(&thread.model_selection.instance_id)
+        })
+    } else {
+        None
+    };
+    let ink = hsla(palette(cx).muted_foreground);
+    match provider {
+        Some(provider) if crate::icons::provider_logo(&provider.driver).is_some() => crate::usage::brand_mark(&provider.driver, 16., ink, cx),
+        _ => fallback.render(px(16.), ink).into_any_element(),
+    }
+}
+
+fn stop_button(ctx: &Ctx, row: &LineageRow, action: StopAction, window: &mut Window, cx: &mut App) -> AnyElement {
+    let app = ctx.state.read(cx);
+    let (connection, selected) = (app.connection_id(), app.selected_thread.clone());
+    let group = SharedString::from(format!("lineage-split-{}-split", row.thread_id));
+    let workflow = matches!(action, StopAction::Workflow { .. });
+    let title = if workflow { "Stop entire workflow?" } else { "Stop subagent?" };
+    let label = t(cx, if workflow { "Stop workflow" } else { "Stop subagent" });
+    let name = row.title.clone();
+    let button_id = gpui::ElementId::Name(SharedString::from(format!("lineage-stop-{}", row.thread_id)));
+    let focus = crate::settings::controls::focus_handle(&button_id, window, cx);
+    let button = Button::new(button_id, ButtonVariant::GhostDestructive, ButtonSize::IconMicro)
+        .icon(Icon::Square).tooltip(label).focus_handle(focus.clone())
+        .on_click(move |_, _, cx| {
+            let (action, selected) = (action.clone(), selected.clone());
+            let message = t_fmt(cx, "Stop {name}?", &[("name", IcuArg::Text(name.as_str().into()))]);
+            crate::dialog::ask_with_options(
+                &format!("{}\n{message}", t(cx, title)),
+                t(cx, "Stop"), crate::dialog::ConfirmVariant::Destructive, crate::dialog::InitialFocus::Cancel,
+                move |app, cx| {
+                    if app.connection_id() == connection && app.selected_thread == selected {
+                        app.run_stop_action(&action, cx);
+                    }
+                },
+                None, cx,
+            );
+        });
+    div().id("lineage-stop-reveal").track_focus(&focus).opacity(0.)
+        .group_hover(group, |style| style.opacity(1.))
+        .focus(|style| style.opacity(1.))
+        .child(button)
+        .into_any_element()
 }
 
 /// One related thread: opens it (a side chat in its tab), with Merge back on the fork's source
@@ -459,21 +524,14 @@ fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, wind
         div().flex_none().into_any_element()
     };
     let primary = Row::new(SharedString::from(format!("lineage-{}", row.thread_id)), row.title.clone())
-        .icon(row.icon)
+        .leading(lineage_icon(ctx.state.read(cx), None, &row.thread_id, row.icon, cx))
         .trailing(trailing_label)
-        .tooltip(format!("{}\n{} · Open thread", row.title, row.relationship))
+        .tooltip(format!("{}\n{} · {}\n{}", row.title, t(cx, row.relationship), t(cx, row.status), t(cx, "Open thread")))
         .on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_related_thread(&id, cx)));
     if let Some(workflow) = &row.workflow {
         let expanded = window.use_keyed_state(SharedString::from(format!("details-wf-open:{}", row.thread_id)), cx, |_, _| false);
         let is_expanded = *expanded.read(cx);
-        let stop_btn = row.stop.clone().map(|action| {
-            let state = ctx.state.clone();
-            crate::right_panel::Button::new(SharedString::from(format!("lineage-stop-{}", row.thread_id)))
-                .icon(Icon::Square)
-                .icon_size(12.)
-                .tooltip("Stop entire workflow")
-                .on_click(move |_, _, cx| state.update(cx, |state, cx| state.run_stop_action(&action, cx)))
-        });
+        let stop_btn = row.stop.clone().map(|action| stop_button(ctx, row, action, window, cx));
         let toggle = crate::right_panel::Button::new(SharedString::from(format!("lineage-wf-toggle-{}", row.thread_id)))
             .icon(if is_expanded { Icon::ChevronDown } else { Icon::ChevronRight })
             .icon_size(12.)
@@ -570,14 +628,7 @@ fn relationship_row(ctx: &Ctx, row: &LineageRow, merge: Option<&MergeBack>, wind
         return split_row(format!("lineage-split-{}", row.thread_id), primary, button, cx).into_any_element();
     }
     if let Some(action) = row.stop.clone() {
-        let state = ctx.state.clone();
-        let label = if matches!(action, StopAction::Workflow { .. }) { "Stop workflow" } else { "Stop subagent" };
-        let button = crate::right_panel::Button::new(SharedString::from(format!("lineage-stop-{}", row.thread_id)))
-            .icon(Icon::Square)
-            .icon_size(12.)
-            .tooltip(label)
-            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.run_stop_action(&action, cx)));
-        return split_row(format!("lineage-split-{}", row.thread_id), primary, button, cx).into_any_element();
+        return split_row(format!("lineage-split-{}", row.thread_id), primary, stop_button(ctx, row, action, window, cx), cx).into_any_element();
     }
     primary.into_any_element()
 }
@@ -630,7 +681,7 @@ fn workflow_member_row(
 
 fn delegated_from_row(ctx: &Ctx, item: &DelegatedFromRow, cx: &App) -> AnyElement {
     let p = palette(cx);
-    let mut row = Row::new("lineage-delegated-from", item.title.clone()).icon(Icon::CornerLeftUp).disabled(!item.connected);
+    let mut row = Row::new("lineage-delegated-from", item.title.clone()).leading(lineage_icon(ctx.state.read(cx), Some(&item.environment_id), &item.thread_id, Icon::CornerLeftUp, cx)).disabled(!item.connected);
     if let Some(label) = &item.env_label {
         row = row.trailing(div().flex_none().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(format!("on {label}")));
     }
@@ -656,10 +707,10 @@ fn remote_subagent_row(ctx: &Ctx, item: &RemoteSubagentRow, cx: &App) -> AnyElem
         format!("Runs on {}. Connect to it to open the thread there.", item.env_label)
     };
     let mut row = Row::new(SharedString::from(format!("lineage-remote-{}", item.id)), item.title.clone())
-        .icon(Icon::Bot)
+        .leading(lineage_icon(ctx.state.read(cx), Some(&item.environment_id), &item.thread_id, Icon::Bot, cx))
         .disabled(!item.connected)
-        .trailing(div().flex_none().text_size(px(11.)).text_color(color).child(format!("on {} · {}", item.env_label, item.status)))
-        .tooltip(format!("{}\n{hint}", item.title));
+        .trailing(div().flex_none().text_size(px(11.)).text_color(color).child(t(cx, item.status)))
+        .tooltip(format!("{}\n{} · {}\n{hint}", item.title, item.env_label, t(cx, item.status)));
     if item.connected {
         let (state, env_id, thread_id) = (ctx.state.clone(), item.environment_id.clone(), item.thread_id.clone());
         row = row.on_click(move |_, _, cx| state.update(cx, |state, cx| state.open_linked_thread(&env_id, &thread_id, cx)));
@@ -692,12 +743,17 @@ pub fn lineage(
             move |_, _, cx| shown_state.update(cx, |count, cx| { *count += LINEAGE_PAGE; cx.notify(); })
         })
     });
-    let previous_block = (!rows.previous.is_empty()).then(|| {
+    let (remote_active, remote_previous): (Vec<_>, Vec<_>) = rows.remote_subagents.iter().partition(|item| {
+        matches!(item.status, "Starting" | "Running" | "Queued" | "Waiting")
+    });
+    let previous_count = rows.previous.len() + remote_previous.len();
+    let previous_block = (previous_count > 0).then(|| {
         let prev_open = window.use_keyed_state(SharedString::from(format!("details-prev-open:{key_thread}")), cx, |_, _| false);
         let prev_shown = window.use_keyed_state(SharedString::from(format!("details-prev-shown:{key_thread}")), cx, |_, _| LINEAGE_INITIAL);
         let is_open = *prev_open.read(cx);
         let shown_prev = *prev_shown.read(cx);
-        let failed_count = rows.previous.iter().filter(|row| row.failed).count();
+        let failed_count = rows.previous.iter().filter(|row| row.failed).count()
+            + remote_previous.iter().filter(|row| row.failed).count();
         let p = palette(cx);
         let trailing = h_flex()
             .flex_none()
@@ -707,7 +763,7 @@ pub fn lineage(
                 this.child(div().text_size(px(11.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.destructive)).child(format!("{failed_count} failed")))
             })
             .when(!is_open, |this| {
-                this.child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(rows.previous.len().to_string()))
+                this.child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(previous_count.to_string()))
             })
             .child((if is_open { Icon::ChevronDown } else { Icon::ChevronRight }).sized(px(14.)).text_color(hsla(p.muted_foreground)));
         let toggle = Row::new("lineage-previous-toggle", "Previous agents")
@@ -719,9 +775,10 @@ pub fn lineage(
             });
         let mut group = v_flex().w_full().child(toggle);
         if is_open {
-            let prev_hidden = rows.previous.len().saturating_sub(shown_prev);
-            let prev_items: Vec<AnyElement> =
+            let prev_hidden = previous_count.saturating_sub(shown_prev);
+            let mut prev_items: Vec<AnyElement> =
                 rows.previous.iter().take(shown_prev).map(|row| relationship_row(ctx, row, rows.merge.as_ref(), window, cx)).collect();
+            prev_items.extend(remote_previous.iter().take(shown_prev.saturating_sub(rows.previous.len())).map(|item| remote_subagent_row(ctx, item, cx)));
             let prev_more = (prev_hidden > 0).then(|| {
                 Row::new("lineage-previous-more", format!("Show {} more", prev_hidden.min(LINEAGE_PAGE))).icon(Icon::Plus).on_click({
                     let prev_shown = prev_shown.clone();
@@ -735,10 +792,10 @@ pub fn lineage(
     if let Some(more_row) = more {
         rendered.push(more_row.into_any_element());
     }
+    rendered.extend(remote_active.iter().map(|item| remote_subagent_row(ctx, item, cx)));
     if let Some(prev) = previous_block {
         rendered.push(prev);
     }
-    rendered.extend(rows.remote_subagents.iter().map(|item| remote_subagent_row(ctx, item, cx)));
     let heading = rows.show_heading.then(|| {
         if rows.running_count > 0 { format!("Lineage · {} running", rows.running_count) } else { "Lineage".to_owned() }.into()
     });
@@ -793,7 +850,7 @@ mod tests {
 
     impl Render for SectionHost {
         fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-            v_flex().w(px(300.)).children(version_control(&self.ctx, false, CardDensity::Full, cx))
+            v_flex().w(px(300.)).children(version_control(&self.ctx, false, CardDensity::Full, None, &super::super::changes::Comparison::default(), cx))
         }
     }
 
@@ -913,7 +970,7 @@ mod tests {
             let dialogs = cx.new(|cx| GitDialogs::new(git.clone(), window, cx));
             let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
             SectionHost {
-                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), details, git: git.clone(), dialogs, picker },
+                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), composer: None, details, git: git.clone(), dialogs, picker },
             }
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
@@ -994,7 +1051,7 @@ mod tests {
             let dialogs = cx.new(|cx| GitDialogs::new(git.clone(), window, cx));
             let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
             WorkspaceHost {
-                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), details: details.clone(), git: git.clone(), dialogs, picker },
+                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), composer: None, details: details.clone(), git: git.clone(), dialogs, picker },
             }
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
@@ -1092,14 +1149,14 @@ mod tests {
                 v_flex()
                     .w(px(300.))
                     .children(workspace(&self.ctx, CardDensity::Full, cx))
-                    .children(version_control(&self.ctx, false, CardDensity::Full, cx))
+                    .children(version_control(&self.ctx, false, CardDensity::Full, None, &super::super::changes::Comparison::default(), cx))
             }
         }
         let window = cx.add_window(|window, cx| {
             let dialogs = cx.new(|cx| GitDialogs::new(git.clone(), window, cx));
             let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
             CombinedHost {
-                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), details: details.clone(), git: git.clone(), dialogs, picker },
+                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), composer: None, details: details.clone(), git: git.clone(), dialogs, picker },
             }
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
