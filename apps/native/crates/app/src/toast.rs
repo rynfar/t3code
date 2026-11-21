@@ -1,8 +1,8 @@
 //! The app's top-right toast stack (design-system §6.6, `components/ui/toast.tsx`): each toast is
-//! its own entry with its own timer and close orb. Collapsed, the newest shows and up to two more
-//! peek beneath it; hovering expands the stack and holds every timer.
+//! its own entry with its own timer and close orb. Hovering the newest toast expands the stack
+//! and holds every timer.
 
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 
 use gpui::{
     AnyElement, App, BoxShadow, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
@@ -13,7 +13,9 @@ use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 
 use crate::app_state::{AppEvent, AppState, Phase};
+use crate::components::motion::{Spinner, prefers_reduced_motion, transition};
 use crate::icons::Icon;
+use crate::selectable_text::SelectableText;
 use crate::theme::{hsla, palette};
 
 /// Base UI's default `limit`: toasts past it stay queued but hidden.
@@ -26,8 +28,8 @@ pub const SLOW_RPC_TOAST_KEY: &str = "slow-rpc-requests";
 const WIDTH: f32 = 360.;
 const ANCHORED_MAX_WIDTH: f32 = 256.;
 const ANCHORED_SIDE_OFFSET: f32 = 4.;
-/// Stacked toasts sit 12px apart and peek 12px.
 const GAP: f32 = 12.;
+const TRANSITION_DURATION: Duration = Duration::from_millis(500);
 
 /// One slow pending RPC entry rendered inside the expandable slow-RPC toast
 /// (`SlowRequestDetails` in `SlowRpcRequestToastCoordinator.tsx`).
@@ -61,6 +63,8 @@ pub enum ToastKind {
     Error,
     Warning,
     Info,
+    #[allow(dead_code, reason = "Available to callers that show a pending operation")]
+    Loading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +105,7 @@ impl Toast {
             key: None,
             permission_update_env: None,
             slow_rpc_requests: Vec::new(),
-            persistent: false,
+            persistent: kind == ToastKind::Loading,
             github_star: false,
             replace_linked_prompt: None,
         }
@@ -180,6 +184,7 @@ impl Toast {
                 (_, Icon::MessageCircleQuestion) => p.info,
                 (ToastKind::Warning, _) => p.warning,
                 (ToastKind::Info, _) => p.info,
+                (ToastKind::Loading, _) => p.muted_foreground,
             };
             (custom, color)
         } else if self.github_star && self.kind != ToastKind::Success {
@@ -190,6 +195,7 @@ impl Toast {
                 ToastKind::Error => (Icon::CircleAlert, p.destructive),
                 ToastKind::Warning => (Icon::TriangleAlert, p.warning),
                 ToastKind::Info => (Icon::Info, p.info),
+                ToastKind::Loading => (Icon::LoaderCircle, p.muted_foreground),
             }
         };
         let show_copy = self.kind == ToastKind::Error && !self.hide_copy_button;
@@ -207,7 +213,13 @@ impl Toast {
             .py(px(12.))
             .text_sm()
             .text_color(hsla(p.popover_foreground))
-            .child(div().pt(px(2.)).child(icon.sized(px(16.)).text_color(hsla(color))))
+            .child(div().pt(px(2.)).map(|glyph| {
+                if self.kind == ToastKind::Loading {
+                    glyph.child(Spinner::new(("toast-loading", id), px(16.), hsla(color)))
+                } else {
+                    glyph.child(icon.sized(px(16.)).text_color(hsla(color)))
+                }
+            }))
             .child(
                 div()
                     .flex()
@@ -220,7 +232,13 @@ impl Toast {
                             .items_start()
                             .justify_between()
                             .gap(px(6.))
-                            .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(self.title.clone()))
+                            .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).map(|title| {
+                                if self.kind == ToastKind::Error {
+                                    title.child(SelectableText::new(("toast-error-title", id), self.title.clone()))
+                                } else {
+                                    title.child(self.title.clone())
+                                }
+                            }))
                             .when_some(copy_payload, |this, payload| {
                                 let label = if copied { "Copied error" } else { "Copy error" };
                                 let copy_id = if anchored {
@@ -284,12 +302,17 @@ impl Toast {
                                 .child(div().flex_1().min_w_0().text_color(hsla(p.muted_foreground)).child(text))
                                 .child(div().pt(px(2.)).flex_none().child(chevron.sized(px(14.)).text_color(hsla(p.muted_foreground).opacity(0.8))))
                                 .into_any_element()
-                        } else {
+                        } else if self.kind == ToastKind::Error {
                             div()
+                                .id(("toast-error-scroll", id))
+                                .min_h_0()
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
                                 .text_color(hsla(p.muted_foreground))
-                                .when(self.kind == ToastKind::Error && text.len() >= 180, |d| d.max_h(px(84.)).overflow_hidden())
-                                .child(text)
+                                .child(SelectableText::new(("toast-error-description", id), text))
                                 .into_any_element()
+                        } else {
+                            div().text_color(hsla(p.muted_foreground)).child(text).into_any_element()
                         }
                     }))
                     .when(has_slow_details && expanded, |this| {
@@ -961,73 +984,107 @@ fn render_anchored_toast(
         .into_any_element()
 }
 
-/// The stack, positioned by the window: top-right, inset 32, below the 52px header, plus any
-/// anchored copy-error / copy-confirmation popovers (`AnchoredToasts`). It paints over the
-/// settings modal and dialogs, as toasts sit above them on the web (layer 100).
+#[derive(Clone)]
+struct ToastPresentation {
+    id: u64,
+    toast: Toast,
+    copied: bool,
+    expanded: bool,
+}
+
+#[derive(Default)]
+struct ToastMotion {
+    visible: Vec<ToastPresentation>,
+    exiting: Vec<ToastPresentation>,
+}
+
+/// Top-right toast stack and trigger-anchored copy feedback.
 pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    let (visible, hovered, anchored) = {
+    let (visible, ids, hovered, anchored) = {
         let toasts = &state.read(cx).toasts;
+        let count = if toasts.hovered { VISIBLE_LIMIT } else { 1 };
         (
-            toasts
-                .entries
-                .iter()
-                .take(VISIBLE_LIMIT)
-                .map(|entry| (entry.id, entry.toast.clone(), entry.copied, entry.expanded))
-                .collect::<Vec<_>>(),
+            toasts.entries.iter().take(count).map(|entry| ToastPresentation {
+                id: entry.id,
+                toast: entry.toast.clone(),
+                copied: entry.copied,
+                expanded: entry.expanded,
+            }).collect::<Vec<_>>(),
+            toasts.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             toasts.hovered,
-            toasts
-                .anchored
-                .iter()
-                .map(|entry| AnchoredToastSnapshot {
-                    id: entry.id,
-                    anchor: entry.anchor,
-                    toast: entry.toast.clone(),
-                    tooltip_style: entry.tooltip_style,
-                    copied: entry.copied,
-                })
-                .collect::<Vec<_>>(),
+            toasts.anchored.iter().map(|entry| AnchoredToastSnapshot {
+                id: entry.id,
+                anchor: entry.anchor,
+                toast: entry.toast.clone(),
+                tooltip_style: entry.tooltip_style,
+                copied: entry.copied,
+            }).collect::<Vec<_>>(),
         )
     };
-    if visible.is_empty() && anchored.is_empty() {
+    let motion = window.use_keyed_state("toast-stack-motion", cx, |_, _| RefCell::new(ToastMotion::default()));
+    let reduced_motion = prefers_reduced_motion(cx);
+    let (previous, exiting) = {
+        let mut motion = motion.read(cx).borrow_mut();
+        let previous = std::mem::replace(&mut motion.visible, visible.clone());
+        if reduced_motion {
+            motion.exiting.clear();
+        } else {
+            motion.exiting.extend(previous.iter().filter(|entry| !ids.contains(&entry.id)).cloned());
+            let excess = motion.exiting.len().saturating_sub(VISIBLE_LIMIT);
+            motion.exiting.drain(..excess);
+        }
+        (previous, std::mem::take(&mut motion.exiting))
+    };
+    if visible.is_empty() && anchored.is_empty() && exiting.is_empty() {
         return None;
     }
     let mut layer = div().absolute().inset_0();
-    if let Some(front) = visible.first() {
-        let expanded_stack = hovered || visible.len() == 1;
-        let peeks = if expanded_stack { 0 } else { visible.len() - 1 };
+    if !visible.is_empty() {
         let hover_state = state.clone();
-        let container = div()
+        let mut container = div()
             .id("toast-stack")
             .absolute()
             .top(px(32. + 52.))
             .right(px(32.))
-            .w(px(WIDTH))
+            .w(px(WIDTH).min((window.viewport_size().width - px(64.)).max(px(0.))))
             .flex()
             .flex_col()
             .gap(px(GAP))
-            .pb(px(GAP * peeks as f32))
-            .on_hover(move |hovered, _, cx| hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx)));
-        let container = if expanded_stack {
-            container.children(visible.iter().map(|(id, toast, copied, expanded)| {
-                render_toast(*id, toast, *copied, *expanded, state, window, cx)
-            }))
-        } else {
-            // Back toasts first so the front one paints over them; each peeks 12px lower, 10% narrower.
-            container
-                .children((1..=peeks).rev().map(|index| {
-                    let inset = WIDTH * 0.05 * index as f32;
-                    surface(cx)
-                        .absolute()
-                        .left(px(inset))
-                        .right(px(inset))
-                        .bottom(px(GAP * (peeks - index) as f32))
-                        .h(px(GAP * 2.))
-                        .into_any_element()
-                }))
-                .child(render_toast(front.0, &front.1, front.2, front.3, state, window, cx))
-        };
+            .on_hover(move |hovered, _, cx| {
+                hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx))
+            });
+        for card in &visible {
+            let key = ("toast-enter-exit", card.id);
+            let progress = if reduced_motion || hovered && !previous.is_empty() {
+                transition(key, 1., Duration::ZERO, window, cx)
+            } else if previous.iter().any(|old| old.id == card.id) {
+                transition(key, 1., TRANSITION_DURATION, window, cx)
+            } else {
+                window.request_animation_frame();
+                transition(key, 0., Duration::ZERO, window, cx)
+            };
+            container = container.child(
+                div().relative().left(px((1. - progress) * 40.)).opacity(progress)
+                    .child(render_toast(card.id, &card.toast, card.copied, card.expanded, state, window, cx)),
+            );
+        }
         layer = layer.child(container);
     }
+    let mut retained = Vec::new();
+    for card in exiting {
+        let progress = transition(("toast-enter-exit", card.id), 0., TRANSITION_DURATION, window, cx);
+        if progress > 0. {
+            layer = layer.child(
+                div().absolute().top(px(32. + 52.)).right(px(32. - (1. - progress) * 40.))
+                    .w(px(WIDTH).min((window.viewport_size().width - px(64.)).max(px(0.))))
+                    .opacity(progress)
+                    .child(render_toast(card.id, &card.toast, card.copied, card.expanded, state, window, cx))
+                    .child(div().absolute().inset_0().occlude()),
+            );
+            retained.push(card);
+        }
+    }
+    motion.read(cx).borrow_mut().exiting = retained;
     for item in &anchored {
         layer = layer.child(render_anchored_toast(item, state, window, cx));
     }

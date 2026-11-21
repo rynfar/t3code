@@ -2,9 +2,11 @@
 //! `t3_core::thread_actions::build_menu`; actions the app can run go to `AppState`, the rest
 //! (rename, delete) are emitted for the sidebar and workspace.
 
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, BoxShadow, Context, MouseButton, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, Point, Render, SharedString, Styled, Window, anchored, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
+    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, Styled, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
 use t3_core::sidebar::grouping::{GroupingSettings, ProjectGroup, ProjectScope, build_project_groups};
 use t3_core::sidebar::selection::{BulkAction, build_bulk_menu};
@@ -22,6 +24,11 @@ use crate::theme::{
 
 const MENU_WIDTH: f32 = 220.;
 const ITEM_HEIGHT: f32 = 28.;
+const MENU_PADDING: f32 = 5.;
+const VIEWPORT_MARGIN: f32 = 8.;
+const SUBMENU_OVERLAP: f32 = 4.;
+
+type HeaderRename = Rc<dyn Fn(&mut App)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
@@ -307,6 +314,9 @@ pub struct ContextMenu {
     state: Entity<AppState>,
     open: Option<OpenMenu>,
     focus: FocusHandle,
+    main_scroll: ScrollHandle,
+    submenu_scroll: ScrollHandle,
+    header_rename: Option<HeaderRename>,
 }
 
 impl EventEmitter<ContextMenuEvent> for ContextMenu {}
@@ -320,7 +330,14 @@ impl Focusable for ContextMenu {
 
 impl ContextMenu {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        ContextMenu { state, open: None, focus: cx.focus_handle() }
+        ContextMenu {
+            state,
+            open: None,
+            focus: cx.focus_handle(),
+            main_scroll: ScrollHandle::new(),
+            submenu_scroll: ScrollHandle::new(),
+            header_rename: None,
+        }
     }
 
     pub fn open_for_thread(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,6 +346,10 @@ impl ContextMenu {
 
     pub fn open_for_header(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.open_thread(thread_id, position, false, window, cx);
+    }
+
+    pub(crate) fn on_header_rename(&mut self, handler: impl Fn(&mut App) + 'static) {
+        self.header_rename = self.open.as_ref().filter(|menu| menu.header).map(|_| Rc::new(handler) as HeaderRename);
     }
 
     fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -386,6 +407,7 @@ impl ContextMenu {
             }
             item
         }).collect();
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: state.thread_copy_scope(), project_filter, owner: ThreadMenuOwner::capture(state, thread_id), previous_focus: window.focused(cx), window: window.window_handle(), header: !sidebar, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -424,6 +446,7 @@ impl ContextMenu {
             snooze_presets: &presets, available: Available { new_thread_on_branch: true, custom_snooze: true, project_settings: true },
         }).into_iter().map(|item| item.map(&MenuAction::Thread)).collect();
         let request = SnoozeRequest::capture_scoped(state, vec![key.clone()], false, window.focused(cx));
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id:key.thread_id.clone(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets,selection:Vec::new(),snooze_request:Some(request),copy_scope:None,project_filter:None,owner:Some(owner),previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -438,6 +461,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let can_pin = group.registrations.iter().all(|project| state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) && state.scoped_environment(&project.owner.saved_id).and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(true)));
         let items = build_project_menu(group.pinned, can_pin).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id:group.representative.project_id.clone(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:Some(group),scoped_selection:Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -455,6 +479,7 @@ impl ContextMenu {
             items.push(MenuItem::new(MenuAction::Project(ProjectAction::Settings), "Project settings", Some("settings")));
         }
         items.push(discard);
+        self.reset_popup();
         self.open = Some(OpenMenu {target_id: project.into(), items, position, highlighted:None, submenu:None,sub_highlighted:None,presets:Vec::new(),selection:Vec::new(),snooze_request:None,copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:Vec::new()});
         window.focus(&self.focus,cx);
         cx.notify();
@@ -468,6 +493,7 @@ impl ContextMenu {
         let presets = owners.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).map(|settings| settled::resolve_snooze_presets(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &crate::sidebar::controller::time_label)).unwrap_or_default();
         let request = SnoozeRequest::capture_scoped(state, owners.iter().filter_map(ThreadMenuOwner::key).collect(), true, window.focused(cx));
         let items = build_bulk_menu(&summary, &presets).into_iter().map(|item| item.map(&MenuAction::Bulk)).collect();
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id:String::new(),items,position,highlighted:None,submenu:None,sub_highlighted:None,presets,selection:Vec::new(),snooze_request:Some(request),copy_scope:None,project_filter:None,owner:None,previous_focus:window.focused(cx),window:window.window_handle(),header:false,scoped_group:None,scoped_selection:owners });
         window.focus(&self.focus, cx); cx.notify();
     }
@@ -491,6 +517,7 @@ impl ContextMenu {
             }
             item
         }).collect();
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id: String::new(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection, snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -501,6 +528,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let Some(project) = state.shell.project(project_id) else { return };
         let items = build_project_menu(project.pinned_at.is_some(), state.can_pin_projects()).into_iter().map(|item| item.map(&MenuAction::Project)).collect();
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id: project_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets: Vec::new(), selection: Vec::new(), snooze_request: None, copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -528,6 +556,7 @@ impl ContextMenu {
         let mut custom = MenuItem::new(MenuAction::Thread(ThreadAction::SnoozeCustom), "Custom…", None);
         custom.separator_before = !presets.is_empty();
         items.push(custom);
+        self.reset_popup();
         self.open = Some(OpenMenu { target_id: thread_id.to_owned(), items, position, highlighted: None, submenu: None, sub_highlighted: None, presets, selection: Vec::new(), snooze_request: Some(snooze_request), copy_scope: None, project_filter: None, owner: None, previous_focus: window.focused(cx), window: window.window_handle(), header: false, scoped_group: None, scoped_selection: Vec::new() });
         window.focus(&self.focus, cx);
         cx.notify();
@@ -565,14 +594,39 @@ impl ContextMenu {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(open) = self.open.take() {
+            self.reset_popup();
             self.restore_focus(open.previous_focus, open.window, cx);
             cx.emit(DismissEvent);
             cx.notify();
         }
     }
 
+    fn reset_popup(&mut self) {
+        self.header_rename = None;
+        self.main_scroll = ScrollHandle::new();
+        self.submenu_scroll = ScrollHandle::new();
+    }
+
+    fn is_header_title_double_click(&self, event: &gpui::MouseDownEvent) -> bool {
+        self.header_rename.is_some() && event.click_count >= 2
+            && self.open.as_ref().is_some_and(|open| {
+                (open.position.x - event.position.x).abs() <= px(8.)
+                    && (open.position.y - event.position.y).abs() <= px(8.)
+            })
+    }
+
+    fn backdrop_clicked(&mut self, event: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        if self.is_header_title_double_click(event) {
+            self.activate(MenuAction::Thread(ThreadAction::Rename), cx);
+        } else {
+            self.close(cx);
+        }
+    }
+
     pub(crate) fn activate(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         let Some(open) = self.open.take() else { return };
+        let header_rename = self.header_rename.take();
+        self.reset_popup();
         self.restore_focus(open.previous_focus.clone(), open.window, cx);
         cx.emit(DismissEvent);
         cx.notify();
@@ -583,6 +637,10 @@ impl ContextMenu {
                 if !owner.allows(self.state.read(cx), thread_action)
                     || (open.header && self.state.read(cx).selected_thread.as_deref() != Some(open.target_id.as_str())) { return; }
             } else if !matches!(thread_action, ThreadAction::SnoozeCustom | ThreadAction::SnoozePreset(_) | ThreadAction::Unsnooze) { return; }
+        }
+        if action == MenuAction::Thread(ThreadAction::Rename) && let Some(rename) = header_rename {
+            cx.defer(move |cx| rename(cx));
+            return;
         }
         if !open.scoped_selection.is_empty() {
             if let MenuAction::Bulk(action) = action {
@@ -691,7 +749,8 @@ impl ContextMenu {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_mut() else { return };
         let key = event.keystroke.key.as_str();
-        let in_submenu = open.submenu.is_some();
+        let previous_submenu = open.submenu;
+        let in_submenu = previous_submenu.is_some();
         match key {
             "escape" if in_submenu => {
                 cx.stop_propagation();
@@ -734,6 +793,16 @@ impl ContextMenu {
             }
             _ => return,
         }
+        if previous_submenu != open.submenu {
+            self.submenu_scroll = ScrollHandle::new();
+        }
+        if let Some(parent) = open.submenu {
+            if let Some(index) = open.sub_highlighted {
+                self.submenu_scroll.scroll_to_item(menu_child_index(&open.items[parent].children, index));
+            }
+        } else if let Some(index) = open.highlighted {
+            self.main_scroll.scroll_to_item(menu_child_index(&open.items, index));
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -745,12 +814,25 @@ impl ContextMenu {
         let has_children = !item.children.is_empty();
         let action = item.action.clone();
         let disabled = item.disabled;
+        let preset_detail = match &item.action {
+            MenuAction::Thread(ThreadAction::SnoozePreset(id)) | MenuAction::Bulk(BulkAction::SnoozePreset(id)) => {
+                self.open.as_ref().and_then(|open| open.presets.iter().find(|preset| &preset.id == id)).map(|preset| preset.when_label.clone())
+            }
+            _ => None,
+        };
+        let shortcut = match &item.action {
+            MenuAction::Thread(ThreadAction::Find) => Some("chat.find"),
+            MenuAction::Thread(ThreadAction::Pin | ThreadAction::Unpin) => Some("thread.pin"),
+            MenuAction::Thread(ThreadAction::Settle | ThreadAction::Unsettle) => Some("thread.settle"),
+            _ => None,
+        }.and_then(|command| crate::keymap::label(command, cx));
         let id = SharedString::from(format!("menu-item-{}-{index}", submenu_parent.map_or(-1, |p| p as i64)));
         div()
             .id(id)
             .flex()
             .items_center()
-            .min_h(px(ITEM_HEIGHT))
+            .h(px(ITEM_HEIGHT))
+            .flex_none()
             .px(px(8.))
             .py(px(4.))
             .gap(px(8.))
@@ -764,6 +846,11 @@ impl ContextMenu {
             })
             .children(item.icon.and_then(Icon::from_name).map(|icon| div().opacity(0.8).child(icon.sized(px(16.)).text_color(hsla(icon_color)))))
             .child(div().flex_1().min_w_0().truncate().child(localize_context_menu_label(cx, &item.label)))
+            .children(preset_detail.map(|detail| div().flex_none().text_color(hsla(p.secondary_label)).child(detail)))
+            .children(shortcut.map(|keys| {
+                div().flex_none().rounded(px(4.)).px(px(3.)).text_xs().font_weight(FontWeight::MEDIUM)
+                    .bg(hsla(p.muted)).text_color(hsla(p.secondary_label)).child(keys)
+            }))
             .when(has_children, |this| this.child(Icon::ChevronRight.sized(px(14.)).text_color(hsla(p.muted_foreground))))
             .when(!disabled, |this| {
                 this.on_mouse_move(cx.listener(move |this, _, _, cx| {
@@ -772,7 +859,11 @@ impl ContextMenu {
                         Some(_) if open.sub_highlighted != Some(index) => open.sub_highlighted = Some(index),
                         None if open.highlighted != Some(index) || (has_children && open.submenu != Some(index)) => {
                             open.highlighted = Some(index);
-                            open.submenu = has_children.then_some(index);
+                            let submenu = has_children.then_some(index);
+                            if open.submenu != submenu {
+                                this.submenu_scroll = ScrollHandle::new();
+                            }
+                            open.submenu = submenu;
                             open.sub_highlighted = None;
                         }
                         _ => return,
@@ -788,14 +879,13 @@ impl ContextMenu {
             .into_any_element()
     }
 
-    fn panel(cx: &App) -> gpui::Div {
+    fn panel(width: Pixels, cx: &App) -> gpui::Div {
         let p = palette(cx);
         let has_custom_bg = slot_has_background(ThemeSlot::MenuPopup, cx);
         let backdrop_border = slot_border_color(ThemeSlot::MenuPopup, cx).unwrap_or_else(|| hsla(p.dropdown_border));
         div()
             .relative()
-            .w(px(MENU_WIDTH))
-            .p(px(5.))
+            .w(width)
             .rounded(px(8.))
             .when(!has_custom_bg, |this| {
                 this.child(crate::glass::backdrop(8., hsla(p.dropdown_surface), backdrop_border, cx))
@@ -819,7 +909,7 @@ impl ContextMenu {
         let mut children = Vec::new();
         for (index, item) in items.iter().enumerate() {
             if item.separator_before && index > 0 {
-                children.push(div().h(px(1.)).my(px(4.)).mx(px(-4.)).bg(hsla(p.border)).into_any_element());
+                children.push(div().flex_none().h(px(1.)).my(px(4.)).mx(px(4.)).bg(hsla(p.border)).into_any_element());
             }
             children.push(self.render_item(item, index, highlighted == Some(index), parent, cx));
         }
@@ -845,45 +935,91 @@ fn localize_context_menu_label(cx: &App, label: &str) -> String {
     label.to_owned()
 }
 
-/// The y offset of item `index` inside a panel, counting separators.
-fn item_offset(items: &[MenuItem<MenuAction>], index: usize) -> f32 {
-    let separators = items.iter().take(index + 1).enumerate().filter(|(i, item)| item.separator_before && *i > 0).count();
-    4. + index as f32 * ITEM_HEIGHT + separators as f32 * 9.
+fn separator_count(items: &[MenuItem<MenuAction>], end: usize) -> usize {
+    items.iter().take(end).skip(1).filter(|item| item.separator_before).count()
+}
+
+fn menu_child_index(items: &[MenuItem<MenuAction>], index: usize) -> usize {
+    index + separator_count(items, index + 1)
+}
+
+fn menu_height(items: &[MenuItem<MenuAction>]) -> f32 {
+    MENU_PADDING * 2. + items.len() as f32 * ITEM_HEIGHT + separator_count(items, items.len()) as f32 * 9.
+}
+
+fn submenu_left(parent_left: f32, width: f32, viewport: f32) -> f32 {
+    let right = parent_left + width - SUBMENU_OVERLAP;
+    let max_left = (viewport - width - VIEWPORT_MARGIN).max(VIEWPORT_MARGIN);
+    if right <= max_left {
+        right
+    } else {
+        (parent_left - width + SUBMENU_OVERLAP).clamp(VIEWPORT_MARGIN, max_left)
+    }
 }
 
 impl Render for ContextMenu {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(open) = self.open.as_ref() else { return div().into_any_element() };
+        let viewport = window.viewport_size();
+        let viewport_width = f32::from(viewport.width);
+        let viewport_height = f32::from(viewport.height);
+        let width = MENU_WIDTH.min((viewport_width - 2. * VIEWPORT_MARGIN).max(0.));
+        let max_height = (viewport_height - 2. * VIEWPORT_MARGIN).max(0.);
+        let left = f32::from(open.position.x).clamp(VIEWPORT_MARGIN, (viewport_width - width - VIEWPORT_MARGIN).max(VIEWPORT_MARGIN));
+        let top_at = |y: f32, items: &[MenuItem<MenuAction>]| {
+            let available = viewport_height - menu_height(items).min(max_height) - VIEWPORT_MARGIN;
+            y.clamp(VIEWPORT_MARGIN, available.max(VIEWPORT_MARGIN))
+        };
+        let top = top_at(f32::from(open.position.y), &open.items);
         let main = self.render_list(&open.items, open.highlighted, None, cx);
-        let submenu = open.submenu.map(|parent| {
+        let submenu = open.submenu.and_then(|parent| {
+            let offset = parent as f32 * ITEM_HEIGHT + separator_count(&open.items, parent + 1) as f32 * 9.;
+            let row_top = top + MENU_PADDING + offset + f32::from(self.main_scroll.offset().y);
+            if row_top + ITEM_HEIGHT <= top || row_top >= top + max_height {
+                return None;
+            }
             let items = &open.items[parent].children;
             let list = self.render_list(items, open.sub_highlighted, Some(parent), cx);
-            Self::panel(cx).id("thread-context-submenu").occlude().absolute().left(px(MENU_WIDTH - 4.)).top(px(item_offset(&open.items, parent) - 5.)).children(list)
+            Some(Self::panel(px(width), cx)
+                .id("thread-context-submenu")
+                .debug_selector(|| "thread-context-submenu".to_owned())
+                .occlude()
+                .absolute()
+                .left(px(submenu_left(left, width, viewport_width)))
+                .top(px(top_at(row_top - MENU_PADDING, items)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().id("context-submenu-list").max_h(px(max_height)).overflow_y_scroll()
+                    .track_scroll(&self.submenu_scroll).p(px(MENU_PADDING)).children(list)))
         });
-        let position = open.position;
         div()
             .id("thread-context-menu-backdrop")
             .absolute()
             .inset_0()
             .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event, _, cx| this.backdrop_clicked(event, cx)))
             .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| this.close(cx)))
             .child(
                 deferred(
-                    anchored().position(position).snap_to_window_with_margin(px(8.)).child(
-                        Self::panel(cx)
+                    div().absolute().inset_0().track_focus(&self.focus)
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
+                        .child(Self::panel(px(width), cx)
                             .id("thread-context-menu")
-                            .relative()
+                            .debug_selector(|| "thread-context-menu".to_owned())
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
                             .occlude()
-                            .track_focus(&self.focus)
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event, _, cx| {
+                                if this.is_header_title_double_click(event) {
+                                    this.activate(MenuAction::Thread(ThreadAction::Rename), cx);
+                                }
+                                cx.stop_propagation();
+                            }))
                             .font_weight(FontWeight::NORMAL)
-                            .children(main)
-                            .children(submenu),
-                    ),
-                )
-                .with_priority(130),
+                            .child(div().id("context-menu-list").max_h(px(max_height)).overflow_y_scroll()
+                                .track_scroll(&self.main_scroll).p(px(MENU_PADDING)).children(main)))
+                        .children(submenu),
+                ).with_priority(130),
             )
             .into_any_element()
     }
@@ -969,6 +1105,29 @@ pub(crate) mod project_filter_tests {
             }
             state.set_project_scope(scope, cx);
         });
+    }
+
+    #[gpui::test]
+    fn panel_chrome_submenu_flips_left_near_the_window_edge(cx: &mut gpui::TestAppContext) {
+        let (state, _fixture, _runtime) = install(cx);
+        let (menu, vcx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+        vcx.simulate_resize(gpui::size(px(800.), px(600.)));
+        vcx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.open_for_thread("menu-thread", point(px(790.), px(20.)), window, cx);
+                let open = menu.open.as_mut().unwrap();
+                open.submenu = open.items.iter().position(|item| !item.children.is_empty());
+                assert!(open.submenu.is_some());
+                cx.notify();
+            });
+            window.refresh();
+        });
+        vcx.refresh().unwrap();
+        let parent = vcx.debug_bounds("thread-context-menu").unwrap();
+        let child = vcx.debug_bounds("thread-context-submenu").unwrap();
+        assert!(child.left() < parent.left());
+        assert_eq!(child.right() - parent.left(), px(SUBMENU_OVERLAP));
+        state.update(vcx, |state, _| state.stop_pump());
     }
 
     #[gpui::test]

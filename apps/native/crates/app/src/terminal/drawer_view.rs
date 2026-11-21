@@ -3,11 +3,11 @@
 //! group (one terminal) or the 144px session list (several). Metrics are design-system §5.
 //! Without `terminal:operate` every action is disabled and rows lose their close button.
 
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, ElementId, EmptyView, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, ease_out_quint, prelude::*, px,
+    AnyElement, App, Context, DragMoveEvent, EmptyView, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::*, px,
 };
 use gpui_component::button::Button;
 use gpui_component::tooltip::Tooltip;
@@ -16,10 +16,12 @@ use t3_core::terminal::{self, MAX_TERMINALS_PER_GROUP, SplitDirection, TerminalG
 
 use super::drawer::{DrawerAnimation, TerminalDrawer};
 use super::with_shortcut;
+use crate::components::motion::AnimatedHeight;
 use crate::icons::Icon;
+use crate::workspace::{panel_animation_duration, terminal_drawer_geometry};
 use super::{CloseTerminal, NewTerminal, SplitTerminal, SplitTerminalVertical};
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt as _, ThemeSlotInteractiveExt as _, hsla, palette,
+    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette,
     theme_slot_background_layer,
 };
 
@@ -299,39 +301,29 @@ impl Render for TerminalDrawer {
         };
         let has_project = self.has_project(cx);
         let is_open = layout.terminal_open && has_project;
-        let animation_duration_ms = crate::settings::store::try_client(cx)
-            .map_or(t3_core::client_settings::DEFAULT_PANEL_ANIMATION_DURATION_MS, |doc| doc.panel_animation_duration_ms());
-        let same_thread_opened = matches!(
-            self.last_open_state.as_ref(),
-            Some((prev_thread, false)) if prev_thread == &thread_id
-        ) && is_open;
-        let same_thread_closed = matches!(
-            self.last_open_state.as_ref(),
-            Some((prev_thread, true)) if prev_thread == &thread_id
-        ) && !is_open;
-        let thread_switched = self.last_open_state.as_ref().is_some_and(|(prev, _)| prev != &thread_id);
+        let duration = panel_animation_duration(cx);
+        let same_thread = self.last_open_state.as_ref().is_some_and(|(id, _)| id == &thread_id);
+        let was_open = same_thread && self.last_open_state.as_ref().is_some_and(|(_, open)| *open);
         self.last_open_state = Some((thread_id.clone(), is_open));
-        if animation_duration_ms == 0 || thread_switched {
+        let animate = same_thread && !duration.is_zero();
+        if !animate || (is_open && !was_open) {
             self.drawer_animation = None;
             self._close_animation_task = None;
         }
-        let p = palette(cx);
-        if !is_open {
-            if same_thread_closed && animation_duration_ms > 0 {
-                let from_height = self.last_rendered_height.max(1.);
-                self.animation_seq = self.animation_seq.wrapping_add(1);
-                let seq = self.animation_seq;
-                self.drawer_animation = Some(DrawerAnimation {
-                    seq,
-                    duration_ms: animation_duration_ms,
-                    opening: false,
-                    from_height,
-                });
-                let wait = Duration::from_millis(u64::from(animation_duration_ms) + 16);
+        if animate && is_open != was_open {
+            self.animation_seq = self.animation_seq.wrapping_add(1);
+            let seq = self.animation_seq;
+            self.drawer_animation = Some(DrawerAnimation {
+                seq,
+                duration_ms: duration.as_millis() as u32,
+                opening: is_open,
+                from_height: if is_open { 0. } else { self.last_rendered_height },
+            });
+            if !is_open {
                 self._close_animation_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(wait).await;
+                    cx.background_executor().timer(duration + Duration::from_millis(16)).await;
                     let _ = this.update(cx, |drawer, cx| {
-                        if drawer.drawer_animation.is_some_and(|a| !a.opening && a.seq == seq) {
+                        if drawer.drawer_animation.is_some_and(|animation| animation.seq == seq) {
                             drawer.drawer_animation = None;
                             drawer._close_animation_task = None;
                             cx.notify();
@@ -339,43 +331,38 @@ impl Render for TerminalDrawer {
                     });
                 }));
             }
-            if let Some(anim) = self.drawer_animation.filter(|a| !a.opening) {
-                return div()
-                    .id("terminal-drawer-closing")
-                    .relative()
-                    .w_full()
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(hsla(p.background))
-                    .border_t_1()
-                    .border_color(hsla(p.border).opacity(0.8))
-                    .theme_slot(ThemeSlot::ThreadTerminalDrawer, cx)
-                    .children(theme_slot_background_layer(ThemeSlot::ThreadTerminalDrawer, cx))
-                    .with_animation(
-                        ElementId::Name(format!("terminal-drawer-close-{}", anim.seq).into()),
-                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                        move |el, delta| el.h(px(anim.from_height * (1. - delta))),
-                    )
-                    .into_any_element();
-            }
-            return div().into_any_element();
         }
+        if !is_open || !same_thread {
+            self.resize_from = None;
+        }
+        if !is_open && self.drawer_animation.is_none() {
+            return AnimatedHeight::new("terminal-drawer-clip", px(0.), false, Duration::ZERO, div()).into_any_element();
+        }
+        let p = palette(cx);
         let viewport = f32::from(window.viewport_size().height);
-        let height = terminal::clamp_drawer_height(layout.terminal_height, viewport);
+        let (width, max_height) = terminal_drawer_geometry(window, cx);
+        let clamp = move |height| terminal::clamp_drawer_height(height, viewport).min(max_height);
+        let drag_height = self.resize_from.filter(|_| cx.has_active_drag()).map(|(start_y, start_height)| {
+            start_height + start_y - f32::from(window.mouse_position().y)
+        });
+        let height = if is_open {
+            clamp(drag_height.unwrap_or(layout.terminal_height))
+        } else {
+            self.drawer_animation.filter(|animation| !animation.opening).map_or(self.last_rendered_height, |animation| animation.from_height)
+        };
         self.last_rendered_height = height;
-        if same_thread_opened && animation_duration_ms > 0 {
-            self._close_animation_task = None;
-            self.animation_seq = self.animation_seq.wrapping_add(1);
-            self.drawer_animation = Some(DrawerAnimation {
-                seq: self.animation_seq,
-                duration_ms: animation_duration_ms,
-                opening: true,
-                from_height: 0.,
-            });
-        } else if self.drawer_animation.is_some_and(|a| !a.opening) {
-            self.drawer_animation = None;
-            self._close_animation_task = None;
-        }
+        let finish_resize = Rc::new(cx.listener(move |drawer, event: &gpui::MouseUpEvent, _, cx| {
+            if let Some((start_y, start_height)) = drawer.resize_from {
+                let pointer_y = f32::from(event.position.y);
+                let height = clamp(start_height + start_y - pointer_y);
+                if cx.has_active_drag() && height != start_height {
+                    drawer.resize_to(start_y + start_height - height, viewport, cx);
+                }
+                drawer.resize_from = None;
+                cx.notify();
+            }
+        }));
+        let finish_outside = finish_resize.clone();
         let strip = div()
             .id("terminal-resize")
             .absolute()
@@ -386,7 +373,9 @@ impl Render for TerminalDrawer {
             .cursor_row_resize()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |drawer, event: &MouseDownEvent, _, _| drawer.begin_resize(f32::from(event.position.y), height)),
+                cx.listener(move |drawer, event: &MouseDownEvent, _, _| {
+                    drawer.begin_resize(f32::from(event.position.y), height);
+                }),
             )
             .on_drag(ResizeDrawer, |_, _, _, cx| cx.new(|_| EmptyView));
         let body = if layout.terminal_ids.is_empty() {
@@ -423,14 +412,14 @@ impl Render for TerminalDrawer {
                 .into_any_element()
         };
         let floating = (layout.terminal_ids.len() == 1).then(|| self.render_floating_actions(layout.has_reached_split_limit(), cx));
-        let opening_anim = self.drawer_animation.filter(|a| a.opening);
         let drawer_el = v_flex()
             .id("terminal-drawer")
             .relative()
             .w_full()
+            .when_some(width, |body, width| body.w(width))
             .h(px(height))
-            .when(opening_anim.is_none(), |this| this.min_h(px(terminal::MIN_DRAWER_HEIGHT)))
-            .flex_shrink(1.)
+            .flex_none()
+            .debug_selector(|| "terminal-drawer-content".to_owned())
             .min_w_0()
             .overflow_hidden()
             .bg(hsla(p.background))
@@ -441,22 +430,30 @@ impl Render for TerminalDrawer {
             .on_action(cx.listener(|drawer, _: &SplitTerminal, window, cx| drawer.split(SplitDirection::Horizontal, window, cx)))
             .on_action(cx.listener(|drawer, _: &SplitTerminalVertical, window, cx| drawer.split(SplitDirection::Vertical, window, cx)))
             .on_action(cx.listener(|drawer, _: &CloseTerminal, window, cx| drawer.close_active(window, cx)))
-            .on_drag_move(cx.listener(move |drawer, event: &DragMoveEvent<ResizeDrawer>, _, cx| {
-                drawer.resize_to(f32::from(event.event.position.y), viewport, cx)
-            }))
+            .when(is_open, |drawer| drawer
+                .on_mouse_up(MouseButton::Left, move |event, window, cx| finish_resize(event, window, cx))
+                .on_mouse_up_out(MouseButton::Left, move |event, window, cx| finish_outside(event, window, cx))
+                .on_drag_move(cx.listener(|drawer, _: &DragMoveEvent<ResizeDrawer>, _, cx| {
+                    if drawer.resize_from.is_some() {
+                        cx.notify();
+                    }
+                })))
             .children(theme_slot_background_layer(ThemeSlot::ThreadTerminalDrawer, cx))
             .child(body)
             .children(floating)
-            .child(strip);
-        match opening_anim {
-            Some(anim) => drawer_el
-                .with_animation(
-                    ElementId::Name(format!("terminal-drawer-open-{}", anim.seq).into()),
-                    Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
-                    move |el, delta| el.h(px(height * delta)),
-                )
-                .into_any_element(),
-            None => drawer_el.into_any_element(),
-        }
+            .when(is_open, |drawer| drawer.child(strip));
+        let duration = if animate && self.resize_from.is_none() {
+            self.drawer_animation.map_or(duration, |animation| Duration::from_millis(u64::from(animation.duration_ms)))
+        } else {
+            Duration::ZERO
+        };
+        AnimatedHeight::new(
+            "terminal-drawer-clip",
+            px(height),
+            is_open,
+            duration,
+            drawer_el.when(!is_open, |drawer| drawer.child(div().absolute().inset_0().occlude())),
+        )
+        .into_any_element()
     }
 }

@@ -89,12 +89,15 @@ impl PanelAction {
     }
 }
 
+type TerminalGroupState = (Vec<String>, String, SplitDirection);
+
 pub struct PanelTerminalView {
     app: Entity<AppState>,
     thread_id: String,
     surface_id: String,
     panes: HashMap<String, Entity<TerminalPane>>,
     visible: bool,
+    last_group: Option<TerminalGroupState>,
     connection: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
@@ -125,6 +128,7 @@ impl PanelTerminalView {
             surface_id,
             panes: HashMap::new(),
             visible: false,
+            last_group: None,
             connection: None,
             _subscriptions: subscriptions,
         };
@@ -144,7 +148,7 @@ impl PanelTerminalView {
         self.panes.len()
     }
 
-    fn surface_state(&self, cx: &App) -> Option<(Vec<String>, String, SplitDirection)> {
+    fn surface_state(&self, cx: &App) -> Option<TerminalGroupState> {
         let app = self.app.read(cx);
         let panel = app.panels.panels.panel(&self.thread_id);
         let surface = panel.surfaces.iter().find(|s| s.id == self.surface_id)?;
@@ -165,9 +169,15 @@ impl PanelTerminalView {
         };
         if current != self.connection {
             self.panes.clear();
+            self.last_group = None;
             self.connection = current;
         }
-        let Some((terminal_ids, _, _)) = self.surface_state(cx) else {
+        if let Some(group) = self.surface_state(cx) {
+            self.last_group = Some(group);
+        } else if !self.visible {
+            self.last_group = None;
+        }
+        let Some((terminal_ids, _, _)) = self.last_group.clone() else {
             self.panes.clear();
             return;
         };
@@ -368,6 +378,7 @@ impl PanelTerminalView {
         &self,
         terminal_ids: &[String],
         active_terminal_id: &str,
+        direction: SplitDirection,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let p = palette(cx);
@@ -391,6 +402,18 @@ impl PanelTerminalView {
             .px_1()
             .py_1()
             .gap(px(2.));
+        let (group_icon, label) = match direction {
+            SplitDirection::Horizontal => (Icon::SquareSplitHorizontal, "Side by side"),
+            SplitDirection::Vertical => (Icon::SquareSplitVertical, "Stacked"),
+        };
+        let count = crate::i18n::format_integer(cx, terminal_ids.len() as i64);
+        let label = crate::i18n::t(cx, label);
+        list = list.child(
+            h_flex().flex_none().h(px(22.)).gap_1().px(px(6.)).text_size(px(11.))
+                .text_color(hsla(p.muted_foreground))
+                .child(group_icon.render(px(12.), hsla(p.muted_foreground)))
+                .child(format!("{label} {count}")),
+        );
         for terminal_id in terminal_ids {
             let active = terminal_id == active_terminal_id;
             let label = terminal_label(&self.thread_id, terminal_id, cx);
@@ -497,7 +520,7 @@ impl PanelTerminalView {
 impl Render for PanelTerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let Some((terminal_ids, active_terminal_id, direction)) = self.surface_state(cx) else {
+        let Some((terminal_ids, active_terminal_id, direction)) = self.last_group.clone() else {
             return div().size_full().bg(hsla(p.terminal_background)).into_any_element();
         };
         let sidebar = terminal_ids.len() > 1;
@@ -523,7 +546,9 @@ impl Render for PanelTerminalView {
                     .h_full()
                     .child(self.render_panes(&terminal_ids, &active_terminal_id, direction, window, cx)),
             )
-            .when(sidebar, |this| this.child(self.render_sidebar(&terminal_ids, &active_terminal_id, cx)))
+            .when(sidebar, |this| {
+                this.gap(px(6.)).child(self.render_sidebar(&terminal_ids, &active_terminal_id, direction, cx))
+            })
             .children(floating)
             .into_any_element()
     }

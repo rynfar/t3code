@@ -3,11 +3,9 @@
 //! menu and double-click rename) and `PanelLayoutControls.tsx` (§7.4). A draft keeps the
 //! new-thread breadcrumb.
 
-use std::time::Duration;
-
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, SharedString, Styled,
-    Subscription, Task, TextRun, Window, div, point, prelude::*, px,
+    Subscription, TextRun, Window, div, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::h_flex;
@@ -23,14 +21,12 @@ use crate::icons::Icon;
 use crate::keymap;
 use crate::right_panel::{self, Button, Variant};
 use crate::theme::{
-    ThemeSlot, ThemeSlotHoverExt as _, hsla, palette, theme_slot_background_layer,
+    ThemeSlot, ThemeSlotExt as _, ThemeSlotHoverExt as _, hsla, palette, theme_slot_background_layer,
 };
 use crate::thread_details::{self, ToggleThreadPanel, canvas_width};
 use crate::toast::{Toast, ToastKind};
-use crate::workspace::sidebar_inline_width;
+use crate::workspace::{sidebar_inline_width, traffic_light_inset};
 
-/// `TITLE_MENU_OPEN_DELAY_MS`: the title's menu waits out a double-click that would rename.
-const TITLE_MENU_DELAY: Duration = Duration::from_millis(500);
 const PROJECT_CRUMB_MAX_WIDTH: f32 = 160.;
 const PARENT_CRUMB_MAX_WIDTH: f32 = 320.;
 
@@ -53,7 +49,6 @@ pub struct ChatHeader {
     rename_owner: Option<crate::context_menu::ThreadMenuOwner>,
     rename_previous_focus: Option<gpui::FocusHandle>,
     guest: Entity<crate::guest_share::GuestIndicator>,
-    pending_menu: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,10 +58,8 @@ impl ChatHeader {
         let subscriptions = vec![
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
                 AppEvent::Selection => {
-                    this.renaming = None;
-                    this.rename_initial = None;
+                    this.cancel_rename(cx);
                     this.rename_committed = false;
-                    this.pending_menu = None;
                     cx.notify();
                 }
                 AppEvent::Shell => cx.notify(),
@@ -100,7 +93,6 @@ impl ChatHeader {
             rename_owner: None,
             rename_previous_focus: None,
             guest,
-            pending_menu: None,
             _subscriptions: subscriptions,
         }
     }
@@ -112,7 +104,6 @@ impl ChatHeader {
         self.rename_initial = Some(title.clone());
         self.rename_committed = false;
         self.rename_previous_focus = window.focused(cx);
-        self.pending_menu = None;
         self.rename.update(cx, |input, cx| {
             input.set_value(title, window, cx);
             input.focus(window, cx);
@@ -146,25 +137,44 @@ impl ChatHeader {
     }
 
     fn open_menu(&mut self, thread_id: String, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.pending_menu = None;
-        self.menu.update(cx, |menu, cx| menu.open_for_header(&thread_id, position, window, cx));
+        let header = cx.weak_entity();
+        let window_handle = window.window_handle();
+        self.menu.update(cx, |menu, cx| {
+            menu.open_for_header(&thread_id, position, window, cx);
+            menu.on_header_rename(move |cx| {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    let _ = header.update(cx, |this, cx| {
+                        let state = this.state.read(cx);
+                        if state.selected_thread.as_deref() == Some(thread_id.as_str())
+                            && let Some(title) = state.thread_shell(&thread_id).map(|thread| thread.title.clone())
+                        {
+                            this.start_rename(thread_id.clone(), title, window, cx);
+                        }
+                    });
+                });
+            });
+        });
     }
 
-    /// A single click opens the thread menu after the double-click window; a double click renames.
-    fn title_clicked(&mut self, event: &ClickEvent, thread_id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
-        let position = point(event.position().x, event.position().y + px(4.));
-        if event.click_count() >= 2 {
-            return self.start_rename(thread_id, title, window, cx);
+    pub(crate) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            self.rename_initial = None;
+            self.rename_owner = None;
+            self.rename_previous_focus = None;
+            cx.notify();
         }
-        let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), &thread_id) else { return };
-        let window_handle = window.window_handle();
-        self.pending_menu = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TITLE_MENU_DELAY).await;
-            let _ = cx.update_window(window_handle, |_, window, cx| {
-                let _ = this.update(cx, |this, cx| { if owner.current(this.state.read(cx)) && this.state.read(cx).selected_thread.as_deref() == Some(thread_id.as_str()) { this.open_menu(thread_id, position, window, cx); } });
-            });
-        }));
     }
+
+    fn title_clicked(&mut self, event: &ClickEvent, thread_id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        if event.click_count() >= 2 {
+            self.menu.update(cx, |menu, cx| menu.close(cx));
+            self.start_rename(thread_id, title, window, cx);
+        } else {
+            let position = point(event.position().x, event.position().y + px(4.));
+            self.open_menu(thread_id, position, window, cx);
+        }
+    }
+
 }
 
 impl Render for ChatHeader {
@@ -245,7 +255,7 @@ impl Render for ChatHeader {
         let viewport_width = f32::from(window.viewport_size().width);
         let sidebar_w = sidebar_inline_width(app, viewport_width);
         let panel_open = app.panels.panels.is_open(&thread.id);
-        let titlebar_left = if sidebar_w == 0. { 130. } else { 20. };
+        let titlebar_left = f32::from(traffic_light_inset(window, sidebar_w == 0.));
         let controls_reserved = if panel_open { 40. } else { 104. };
         let available_header = (canvas_width(app, viewport_width) - titlebar_left - 12. - controls_reserved - 48.).max(0.);
         let font_sm = px(14.);
@@ -279,17 +289,20 @@ impl Render for ChatHeader {
         let menu_thread = thread_id.clone();
         let title_element = match self.renaming.as_deref() {
             Some(renaming) if renaming == thread_id => div()
+                .id("chat-header-rename")
                 .flex_1()
                 .min_w_0()
                 .h(px(24.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(hsla(p.ring).opacity(if self.rename.read(cx).focus_handle(cx).is_focused(window) { 1. } else { 0.5 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    this.renaming = None;
-                    this.rename_initial = None;
-                    if let Some(focus) = this.rename_previous_focus.take() { window.focus(&focus, cx); }
-                    cx.notify();
+                    let previous = this.rename_previous_focus.take();
+                    this.cancel_rename(cx);
+                    if let Some(focus) = previous { window.focus(&focus, cx); }
                     cx.stop_propagation();
                 }))
-                .child(Input::new(&self.rename).appearance(false).bordered(false))
+                .child(Input::new(&self.rename).appearance(false).bordered(false).theme_slot(ThemeSlot::Input, cx))
                 .into_any_element(),
             _ => {
                 let (click_id, click_title) = (thread_id.clone(), title.clone());
@@ -371,20 +384,25 @@ impl Render for ChatHeader {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn container(collapsed: bool, cx: &App) -> gpui::Div {
+    container_with_layout(px(if collapsed { 52. } else { 20. }), true, cx)
+}
+
 /// Outer chat header bar (`[data-chat-header]`): full-width titlebar strip carrying compiled
 /// `ThemeSlot::ChatHeader` overrides and any scoped `var(--theme-background-image)` layer painted
 /// behind the breadcrumb and panel controls.
-pub fn container(collapsed: bool, cx: &App) -> gpui::Div {
+pub(crate) fn container_with_layout(left: Pixels, border: bool, cx: &App) -> gpui::Div {
     h_flex()
         .relative()
         .overflow_hidden()
         .window_control_area(gpui::WindowControlArea::Drag)
         .h(px(crate::workspace::TITLEBAR_HEIGHT))
         .flex_none()
-        .pl(px(if collapsed { 130. } else { 20. }))
+        .pl(left)
         .pr(px(12.))
         .gap_3()
-        .border_b_1()
+        .when(border, |bar| bar.border_b_1())
         .border_color(cx.theme().border)
         .theme_slot_hover(ThemeSlot::ChatHeader, cx)
         .children(theme_slot_background_layer(ThemeSlot::ChatHeader, cx))

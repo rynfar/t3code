@@ -12,9 +12,9 @@ use gpui::{
 use t3_core::thread_actions::{archive_confirmation, unpin_confirmation};
 
 use crate::app_state::AppState;
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{
-    SlotState, ThemeSlot, ThemeSlotExt, WHITE, hsla, palette, refine_slot_active,
-    refine_slot_hover, slot_border_color, slot_has_active, slot_has_background,
+    SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, slot_border_color, slot_has_background,
     theme_slot_state_background_layer,
 };
 
@@ -44,7 +44,7 @@ pub enum InitialFocus {
 pub fn resolve_confirm_dialog_copy(message: &str) -> (String, String) {
     let normalized = message.trim();
     let lines: Vec<&str> = normalized.split('\n').collect();
-    if let Some(question_index) = lines.iter().position(|line| line.trim().ends_with('?')) {
+    if let Some(question_index) = lines.iter().position(|line| line.trim().ends_with(['?', '？'])) {
         let title = lines[question_index].trim().to_owned();
         let description = lines
             .iter()
@@ -57,9 +57,10 @@ pub fn resolve_confirm_dialog_copy(message: &str) -> (String, String) {
             .to_owned();
         return (title, description);
     }
-    if let Some(question_mark) = normalized.find('?') {
-        let title = normalized[..=question_mark].trim().to_owned();
-        let description = normalized[question_mark + 1..].trim().to_owned();
+    if let Some((index, mark)) = normalized.char_indices().find(|(_, mark)| matches!(mark, '?' | '？')) {
+        let after_question = index + mark.len_utf8();
+        let title = normalized[..after_question].trim().to_owned();
+        let description = normalized[after_question..].trim().to_owned();
         return (title, description);
     }
     let description = if normalized.is_empty() {
@@ -132,10 +133,11 @@ fn ask_inner(
             dialog.queued.push_back(entry);
             return None;
         }
-        dialog.focused_button = entry.initial_focus;
+        let entry_focus = entry.initial_focus;
+        dialog.focused_button = entry_focus;
         dialog.pending = Some(entry);
         cx.notify();
-        Some(dialog.focus.clone())
+        Some(dialog.button_focus(entry_focus).clone())
     });
     let Some(focus) = focus else { return };
     // The caller may be inside a window update; focus once it returns.
@@ -255,6 +257,8 @@ pub struct ConfirmDialog {
     queued: VecDeque<Pending>,
     focused_button: InitialFocus,
     focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    confirm_focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
 }
 
@@ -273,6 +277,8 @@ impl ConfirmDialog {
             queued: VecDeque::new(),
             focused_button: InitialFocus::Confirm,
             focus: cx.focus_handle(),
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            confirm_focus: cx.focus_handle().tab_stop(true),
             previous_focus: None,
         }
     }
@@ -302,8 +308,15 @@ impl ConfirmDialog {
         self.focused_button = entry.initial_focus;
         self.pending = Some(entry);
         self.previous_focus = window.focused(cx);
-        window.focus(&self.focus, cx);
+        window.focus(self.button_focus(self.focused_button), cx);
         cx.notify();
+    }
+
+    fn button_focus(&self, button: InitialFocus) -> &FocusHandle {
+        match button {
+            InitialFocus::Cancel => &self.cancel_focus,
+            InitialFocus::Confirm => &self.confirm_focus,
+        }
     }
 
     pub(crate) fn set_previous_focus(&mut self, focus: Option<FocusHandle>) { self.previous_focus = focus; }
@@ -325,8 +338,8 @@ impl ConfirmDialog {
         if let Some(next) = self.queued.pop_front() {
             self.focused_button = next.initial_focus;
             self.pending = Some(next);
-            window.focus(&self.focus, cx);
-        } else if self.focus.is_focused(window)
+            window.focus(self.button_focus(self.focused_button), cx);
+        } else if self.focus.contains_focused(window, cx)
             && let Some(focus) = self.previous_focus.take()
         {
             window.focus(&focus, cx);
@@ -339,46 +352,18 @@ impl Render for ConfirmDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(pending) = self.pending.as_ref() else { return div().into_any_element() };
         let p = palette(cx);
-        let ring = hsla(p.ring);
-        let focused_button = self.focused_button;
-        let confirm_variant = pending.variant;
-        let button = |id: &'static str, label: SharedString, role: InitialFocus| {
-            let (fill, text, border) = match (role, confirm_variant) {
-                (InitialFocus::Cancel, _) => (p.popover, p.foreground, p.input),
-                (InitialFocus::Confirm, ConfirmVariant::Destructive) => (p.destructive, WHITE, p.destructive),
-                (InitialFocus::Confirm, ConfirmVariant::Default) => (p.primary, p.primary_foreground, p.primary),
-            };
-            let is_focused = focused_button == role;
-            div()
-                .id(id)
-                .h(px(32.))
-                .px(px(11.))
-                .flex()
-                .items_center()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(hsla(border))
-                .bg(hsla(fill))
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(hsla(text))
-                .cursor_pointer()
-                .when(is_focused, |this| {
-                    this.shadow(vec![BoxShadow {
-                        color: ring,
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(2.),
-                        inset: false,
-                    }])
-                })
-                .theme_slot(ThemeSlot::Button, cx)
-                .hover(|this| refine_slot_hover(this.opacity(0.9), ThemeSlot::Button, cx))
-                .when(slot_has_active(ThemeSlot::Button, cx), |this| {
-                    this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
-                })
-                .child(label)
+        let confirm_variant = match pending.variant {
+            ConfirmVariant::Destructive => ButtonVariant::Destructive,
+            ConfirmVariant::Default => ButtonVariant::Default,
         };
+        let cancel = Button::new("confirm-dialog-cancel", ButtonVariant::Outline, ButtonSize::Default)
+            .label(crate::i18n::t(cx, "Cancel"))
+            .focus_handle(self.cancel_focus.clone())
+            .on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx)));
+        let confirm = Button::new("confirm-dialog-confirm", confirm_variant, ButtonSize::Default)
+            .label(crate::i18n::t(cx, pending.confirm_label.as_ref()).to_owned())
+            .focus_handle(self.confirm_focus.clone())
+            .on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)));
         let has_custom_bg = slot_has_background(ThemeSlot::DialogPopup, cx);
         let backdrop_border = slot_border_color(ThemeSlot::DialogPopup, cx).unwrap_or_else(|| hsla(p.dialog_border));
         deferred(
@@ -397,23 +382,20 @@ impl Render for ConfirmDialog {
                     div()
                         .id("confirm-dialog")
                         .track_focus(&self.focus)
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| match event.keystroke.key.as_str() {
+                        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| match event.keystroke.key.as_str() {
                             "escape" => {
                                 cx.stop_propagation();
                                 this.resolve(false, window, cx);
                             }
                             "tab" | "left" | "right" => {
                                 cx.stop_propagation();
-                                this.focused_button = match this.focused_button {
-                                    InitialFocus::Cancel => InitialFocus::Confirm,
-                                    InitialFocus::Confirm => InitialFocus::Cancel,
+                                this.focused_button = if this.cancel_focus.is_focused(window) {
+                                    InitialFocus::Confirm
+                                } else {
+                                    InitialFocus::Cancel
                                 };
+                                window.focus(this.button_focus(this.focused_button), cx);
                                 cx.notify();
-                            }
-                            "enter" | "space" => {
-                                cx.stop_propagation();
-                                let confirmed = this.focused_button == InitialFocus::Confirm;
-                                this.resolve(confirmed, window, cx);
                             }
                             _ => {}
                         }))
@@ -461,8 +443,8 @@ impl Render for ConfirmDialog {
                                 .border_color(hsla(p.border))
                                 .rounded_b(px(15.))
                                 .bg(hsla(p.muted))
-                                .child(button("confirm-dialog-cancel", crate::i18n::t(cx, "Cancel").into(), InitialFocus::Cancel).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
-                                .child(button("confirm-dialog-confirm", crate::i18n::t(cx, pending.confirm_label.as_ref()).to_owned().into(), InitialFocus::Confirm).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
+                                .child(cancel)
+                                .child(confirm),
                         ),
                 ),
         )
@@ -486,6 +468,10 @@ mod tests {
         assert_eq!(
             resolve_confirm_dialog_copy("Remove environment? It will disconnect."),
             ("Remove environment?".to_owned(), "It will disconnect.".to_owned())
+        );
+        assert_eq!(
+            resolve_confirm_dialog_copy("移除环境？连接将断开。"),
+            ("移除环境？".to_owned(), "连接将断开。".to_owned())
         );
         assert_eq!(
             resolve_confirm_dialog_copy("Archive this item"),
