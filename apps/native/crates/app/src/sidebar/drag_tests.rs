@@ -662,8 +662,15 @@ async fn omitted_thread_file_drop_selects_over_active_thread_or_draft_and_is_env
     let (tx1, rx1) = tokio::sync::oneshot::channel();
     let mut tx1 = Some(tx1);
     let sub1 = state.update(vcx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.omitted.mounts.generation_of(&t3_core::families::family_key("omitted-1")).is_some() {
-            if let Some(tx) = tx1.take() { let _ = tx.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .omitted
+                .mounts
+                .generation_of(&t3_core::families::family_key("omitted-1"))
+                .is_some()
+            && let Some(tx) = tx1.take()
+        {
+            let _ = tx.send(());
         }
     }));
     state.update(vcx, |s, cx| {
@@ -690,8 +697,15 @@ async fn omitted_thread_file_drop_selects_over_active_thread_or_draft_and_is_env
     let (tx2, rx2) = tokio::sync::oneshot::channel();
     let mut tx2 = Some(tx2);
     let sub2 = state.update(vcx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.omitted.mounts.generation_of(&t3_core::families::family_key("omitted-2")).is_some() {
-            if let Some(tx) = tx2.take() { let _ = tx.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .omitted
+                .mounts
+                .generation_of(&t3_core::families::family_key("omitted-2"))
+                .is_some()
+            && let Some(tx) = tx2.take()
+        {
+            let _ = tx.send(());
         }
     }));
     state.update(vcx, |s, cx| {
@@ -1103,7 +1117,7 @@ async fn sidebar_folder_drop_targets_local_environment_and_unarchives(cx: &mut g
     let _ = remote_fixture.take_commands();
 
     state.update(cx, |s, cx| {
-        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+        s.drop_folders_on_sidebar(std::slice::from_ref(&new_local_dir), false, cx);
     });
     cx.run_until_parked();
     assert_eq!(remote_fixture.take_commands(), Vec::<&'static str>::new());
@@ -1160,7 +1174,7 @@ async fn sidebar_folder_drop_targets_local_environment_and_unarchives(cx: &mut g
     let fleet_view = view.borrow_and_update().clone();
     state.update(cx, |s, cx| {
         s.apply_fleet_view(fleet_view, cx);
-        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+        s.drop_folders_on_sidebar(std::slice::from_ref(&new_local_dir), false, cx);
     });
     let (local_fixture, params, reply) = runtime.spawn(async move {
         loop {

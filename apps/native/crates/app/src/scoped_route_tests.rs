@@ -219,8 +219,12 @@ async fn watched_thread_navigation_preserves_same_scope_shelves(cx: &mut gpui::T
     let (send, selected) = tokio::sync::oneshot::channel();
     let mut send = Some(send);
     let _selected = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Selection && state.environments.active.as_deref() == Some("shelf-background") && state.selected_thread.as_deref() == Some("menu-thread") {
-            if let Some(send) = send.take() { let _ = send.send(()); }
+        if *event == AppEvent::Selection
+            && state.environments.active.as_deref() == Some("shelf-background")
+            && state.selected_thread.as_deref() == Some("menu-thread")
+            && let Some(send) = send.take()
+        {
+            let _ = send.send(());
         }
     }));
     state.update(cx, |state, cx| {
@@ -396,8 +400,11 @@ async fn scoped_deadline_wakes_rebuild_without_new_shell_facts(cx: &mut gpui::Te
     let (sent, loaded) = tokio::sync::oneshot::channel();
     let mut sent = Some(sent);
     let loaded_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.scoped_environment("saved-fixture").is_some()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", actor, shell, config, ConnectionStatus::Connected));
@@ -407,8 +414,12 @@ async fn scoped_deadline_wakes_rebuild_without_new_shell_facts(cx: &mut gpui::Te
     let (sent, activated) = tokio::sync::oneshot::channel();
     let mut sent = Some(sent);
     let activated_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("menu-thread").is_some() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.connection_id() != connection
+            && state.thread_shell("menu-thread").is_some()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
@@ -438,18 +449,31 @@ async fn scoped_deadline_wakes_rebuild_without_new_shell_facts(cx: &mut gpui::Te
     let mut sent = Some(sent);
     let armed_key = sleeper_key.clone();
     let armed_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.shell.sequence() == Some(2) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
-            && state.sidebar.fleet.section_of(&armed_key) == Some(ThreadSection::Snoozed) {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.shell.sequence() == Some(2)
+            && state
+                .scoped_environment("saved-fixture")
+                .is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
+            && state.sidebar.fleet.section_of(&armed_key) == Some(ThreadSection::Snoozed)
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let (sent, woke) = tokio::sync::oneshot::channel();
     let mut sent = Some(sent);
     let woke_key = sleeper_key.clone();
     let woke_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.shell.sequence() == Some(2) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
-            && state.sidebar.fleet.section_of(&woke_key) == Some(ThreadSection::Active) && state.sidebar.fleet.next_change_at.is_none() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.shell.sequence() == Some(2)
+            && state
+                .scoped_environment("saved-fixture")
+                .is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
+            && state.sidebar.fleet.section_of(&woke_key) == Some(ThreadSection::Active)
+            && state.sidebar.fleet.next_change_at.is_none()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let (snoozed, until) = state.read_with(cx, |state, _| {
@@ -494,18 +518,32 @@ async fn scoped_deadline_wakes_rebuild_without_new_shell_facts(cx: &mut gpui::Te
     let mut sent = Some(sent);
     let completed_key = worker_key.clone();
     let completed_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.shell.sequence() == Some(3) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
-            && state.sidebar.fleet.section_of(&completed_key) == Some(ThreadSection::Working) && state.sidebar.fleet.next_change_at.is_some() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.shell.sequence() == Some(3)
+            && state
+                .scoped_environment("saved-fixture")
+                .is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
+            && state.sidebar.fleet.section_of(&completed_key) == Some(ThreadSection::Working)
+            && state.sidebar.fleet.next_change_at.is_some()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let (sent, returned) = tokio::sync::oneshot::channel();
     let mut sent = Some(sent);
     let returned_key = worker_key.clone();
     let returned_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == AppEvent::Shell && state.shell.sequence() == Some(3) && state.scoped_environment("saved-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
-            && state.sidebar.fleet.section_of(&returned_key) == Some(ThreadSection::Active) && state.sidebar.fleet.next_change_at.is_none() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == AppEvent::Shell
+            && state.shell.sequence() == Some(3)
+            && state
+                .scoped_environment("saved-fixture")
+                .is_some_and(|entry| entry.summary.snapshot_sequence == Some(3))
+            && state.sidebar.fleet.section_of(&returned_key) == Some(ThreadSection::Active)
+            && state.sidebar.fleet.next_change_at.is_none()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let terminal = state.read_with(cx, |state, _| {

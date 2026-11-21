@@ -105,7 +105,7 @@ fn find_thread<'a>(state: &'a AppState, target: &HoverTarget) -> Option<&'a Side
 enum Checkout {
     #[cfg(feature = "snapshot")]
     Known(bool),
-    Read { compared: SidebarThread, read: AbortOnDrop<Option<t3_core::vcs::VcsLocalStatus>> },
+    Read(AbortOnDrop<Option<t3_core::vcs::VcsLocalStatus>>),
 }
 
 impl ThreadHoverCard {
@@ -174,7 +174,7 @@ impl ThreadHoverCard {
         match checkout {
             #[cfg(feature = "snapshot")]
             Some(Checkout::Known(mismatch)) => card.branch_mismatch = mismatch,
-            Some(Checkout::Read { compared, mut read }) => {
+            Some(Checkout::Read(mut read)) => {
                 card._checkout = Some(cx.spawn(async move |this, cx| {
                     let status = (&mut read.0).await.ok().flatten();
                     let _ = this.update(cx, |card, cx| {
@@ -183,7 +183,7 @@ impl ThreadHoverCard {
                             card.branch_mismatch = false;
                         } else {
                             let current = status.and_then(|status| status.ref_name);
-                            card.branch_mismatch = model::branch_mismatch(&compared, current.as_deref());
+                            card.branch_mismatch = model::branch_mismatch(&stripped, current.as_deref());
                         }
                         cx.notify();
                     });
@@ -256,7 +256,7 @@ impl ThreadHoverCard {
             let value = client.await?.request(t3_core::vcs::method::VCS_REFRESH_STATUS, t3_core::vcs::refresh_status(&cwd, true)).await.ok()?;
             serde_json::from_value::<t3_core::vcs::VcsLocalStatus>(value).ok()
         }));
-        Some(Checkout::Read { compared: thread.clone(), read })
+        Some(Checkout::Read(read))
     }
 }
 

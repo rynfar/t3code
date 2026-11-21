@@ -674,11 +674,13 @@ mod history_tests {
                     && let Some(thread) = state.side_threads.threads.get("side-1")
                     && !thread.history.loading
                     && !thread.history.is_loading_work("w-anchor-1")
-                    && thread.projection.as_ref().is_some_and(|p| p.has_entry("m-older") && p.has_entry("w-loaded"))
+                    && thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.has_entry("m-older") && p.has_entry("w-loaded"))
+                    && let Some(tx) = done_tx.lock().unwrap().take()
                 {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                    let _ = tx.send(());
                 }
             })
         });

@@ -949,7 +949,7 @@ mod tests {
             });
             assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != model::SIGNAL_PROCESS));
             crate::dialog::press_confirmation_key_for_test(&mut vcx, confirm);
-            assert!(!vcx.read(|cx| crate::dialog::is_open(cx)), "confirm={confirm}");
+            assert!(!vcx.read(crate::dialog::is_open), "confirm={confirm}");
             if confirm {
                 let (method, payload, reply) = fixture.next_request().await;
                 assert_eq!(method, model::SIGNAL_PROCESS);

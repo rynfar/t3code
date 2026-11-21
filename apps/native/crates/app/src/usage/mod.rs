@@ -590,7 +590,7 @@ mod tests {
         // Stepped refresh spinner starts when refreshing=true, steps, and resets when refreshing=false.
         view.update(vcx, |view, cx| view.set_refreshing(true, cx));
         view.read_with(vcx, |view, cx| {
-            assert_eq!(view.refresh_spinner.read(cx).state_for_test().0, true);
+            assert!(view.refresh_spinner.read(cx).state_for_test().0);
         });
         vcx.executor().advance_clock(std::time::Duration::from_millis(260));
         vcx.run_until_parked();

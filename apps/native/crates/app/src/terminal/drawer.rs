@@ -965,7 +965,7 @@ mod focus_tests {
         vcx.run_until_parked();
 
         // 1. Fresh entry into sibling with an open drawer focuses term-2, not the composer.
-        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("sibling", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             assert!(!composer.read(cx).has_focus(window, cx), "fresh open drawer should take focus");
@@ -984,14 +984,14 @@ mod focus_tests {
             assert_eq!(TerminalDrawer::last_focus_for_test("sibling", cx), Some(LastThreadFocus::Composer));
         });
 
-        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("menu-thread", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             let pane = drawer.read(cx).panes.get("term-1").expect("term-1 pane mounted");
             assert!(pane.focus_handle(cx).is_focused(window));
         });
 
-        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("sibling", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             assert!(composer.read(cx).has_focus(window, cx), "returning to sibling must restore composer focus over open drawer");
@@ -1000,10 +1000,10 @@ mod focus_tests {
         });
 
         // 3. Explicit terminal navigation overrides remembered composer focus.
-        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("menu-thread", cx));
         vcx.run_until_parked();
         vcx.update(|_, cx| request_terminal_focus_on_navigation("sibling", "term-2", cx));
-        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("sibling", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             let pane = drawer.read(cx).panes.get("term-2").expect("term-2 pane mounted");
@@ -1031,7 +1031,7 @@ mod focus_tests {
 
         // 6. Optional `confirmTerminalClose = false` (`pingdotgg/t3code#35305`) closes immediately
         // without opening a confirmation prompt.
-        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        state.update(vcx, |state, cx| state.select_thread("menu-thread", cx));
         vcx.update(|_, cx| {
             crate::settings::store::init(cx);
             crate::settings::store::install_committed_client(

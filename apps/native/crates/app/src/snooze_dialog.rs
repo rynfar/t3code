@@ -1432,7 +1432,7 @@ mod lifecycle {
         records.push(serde_json::json!({"inline":"denied click reaches row, not clock menu", "commands":denied_commands}));
         fixture.grants.send(Some(session(true))).unwrap();
         for denied in ["unsupported", "ineligible"] {
-            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities.clone());
+            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities);
             let model = state.read_with(&cx, |s, _| s.sidebar.model.clone());
             state.update(&mut cx, |s, _| {
                 if denied == "unsupported" { s.sidebar.capabilities.config_loaded = false; }
@@ -1442,7 +1442,7 @@ mod lifecycle {
             edit(&mut cx, &mut |window, cx| click(window, cx, 306., 16.));
             assert!(!menu.read_with(&cx, |m, _| m.is_open()));
             assert_eq!(state.read_with(&cx, |s, _| s.selected_thread.clone()).as_deref(), Some("menu-thread"));
-            state.update(&mut cx, |s, cx| { s.close_selected_thread(cx); s.sidebar.capabilities = caps.clone(); s.sidebar.model = model.clone(); });
+            state.update(&mut cx, |s, cx| { s.close_selected_thread(cx); s.sidebar.capabilities = caps; s.sidebar.model = model.clone(); });
             records.push(serde_json::json!({"inlineDenied":denied,"commands":fixture.take_commands(),"hit":"row, not snooze menu"}));
         }
         frame(&mut cx, "03-inline-restored");
@@ -1515,7 +1515,7 @@ mod lifecycle {
         for mode in ["revoked", "unknown-grants", "unauthenticated", "capability", "config-loading", "config-missing", "disconnected", "generation", "environment", "connection", "missing-shell", "missing-model", "approval", "valid"] {
             let shell = state.read_with(&cx, |s, _| s.shell.clone());
             let config = state.read_with(&cx, |s, _| s.server_config.clone());
-            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities.clone());
+            let caps = state.read_with(&cx, |s, _| s.sidebar.capabilities);
             let mut replacement_fixture = None;
             edit(&mut cx, &mut |window, cx| {
                 state.update(cx, |s, _| { s.sidebar.selection.toggle("menu-thread"); s.sidebar.selection.toggle("sibling"); });
@@ -1565,7 +1565,7 @@ mod lifecycle {
                 let (client, replacement) = t3_client::supervisor::ClientFixture::handle(session(true));
                 fixture = replacement;
                 s.install_active_environment(client, shell.clone(), config.clone(), ConnectionStatus::Connected, cx);
-                s.sidebar.capabilities = caps.clone();
+                s.sidebar.capabilities = caps;
             }));
             fixture.take_commands();
         }

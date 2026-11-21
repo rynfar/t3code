@@ -1394,7 +1394,7 @@ mod tests {
         });
         let (left, top, max_w) = anchored_toast_position(point(px(790.), px(580.)), size(px(800.), px(600.)), false);
         assert!(left + max_w <= 800.0 && left >= 8.0, "clamped horizontally: {left}, {max_w}");
-        assert!(top < 580.0 && top >= 8.0, "flipped above near bottom edge: {top}");
+        assert!((8.0..580.0).contains(&top), "flipped above near bottom edge: {top}");
 
         let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root(state.clone()));
         cx.update_window(window.into(), |_, window, cx| {

@@ -1970,11 +1970,14 @@ mod stream_and_stop_tests {
             let settled_tx = settled_tx.clone();
             cx.subscribe(&state, move |state, _, event, _| {
                 if matches!(event, AppEvent::Thread)
-                    && state.thread.projection.as_ref().is_some_and(|p| p.turn_items[0].status == "interrupted")
+                    && state
+                        .thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.turn_items[0].status == "interrupted")
+                    && let Some(tx) = settled_tx.lock().unwrap().take()
                 {
-                    if let Some(tx) = settled_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                    let _ = tx.send(());
                 }
             })
         });

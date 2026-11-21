@@ -2224,8 +2224,11 @@ mod grouping_frames {
         let (ready, loaded) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
         let _loaded = state.update(&mut cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.fleet.environments.len() == 2 {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.fleet.environments.len() == 2
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let mut fixtures = Vec::new();
@@ -4992,7 +4995,7 @@ mod sb_379_tests {
         state.update(vcx, |s, _| s.selected_thread = Some("act-a".into()));
         vcx.update(|_, cx| crate::settings::open(t3_core::settings::search::Section::General, cx));
         vcx.run_until_parked();
-        assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.as_deref() == Some("act-a")), true);
+        assert!(state.read_with(vcx, |s, _| s.selected_thread.as_deref() == Some("act-a")));
         pane.update(vcx, |_, cx| cx.notify());
         vcx.update(|window, cx| { window.draw(cx).clear(); });
         assert!(vcx.debug_bounds("thread-row-None-act-a").is_some());

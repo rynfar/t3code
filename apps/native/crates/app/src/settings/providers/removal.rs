@@ -208,7 +208,6 @@ impl SettingsView {
                 self.providers.notice =
                     Some((plan.failure_title(), "Synthetic settings failure.".into()));
             }
-            return;
         }
         #[cfg(not(feature = "snapshot"))]
         self.send_provider_removal(plan, cx);
