@@ -32,7 +32,7 @@ use gpui::{
     App, Context, DragMoveEvent, canvas, EmptyView, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString,
     Styled, Subscription, Task, Window, div, prelude::*, px,
 };
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 use serde_json::{Value, json};
 use t3_client::store;
 use t3_client::supervisor::ConnectionStatus;
@@ -49,7 +49,7 @@ pub fn init(cx: &mut App) {
 }
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::icons::Icon;
+use crate::icons::{Icon, editor_logo};
 use crate::right_panel::{Button, Variant};
 use crate::theme::{hsla, palette};
 use explorer::{Explorer, ExplorerEvent};
@@ -568,26 +568,39 @@ impl FilesPanel {
         };
         let open_favorite = open.clone();
         let label = crate::i18n::t(cx, "Open in");
+        let platform = std::env::consts::OS;
         let options = t3_core::vcs::editor_options(&editors).into_iter().map(|editor| {
-            let name = t3_core::vcs::editor_label(editor, cfg!(target_os = "macos"));
+            let name = t3_core::vcs::editor_label(editor, platform == "macos");
             crate::settings::controls::SelectOption::new(editor, name)
         }).collect();
         let picker = crate::settings::controls::Select::new("file-open-in-menu", options)
             .label(crate::i18n::t(cx, "Choose editor"))
+            .render_icon(move |editor, cx| {
+                let p = palette(cx);
+                Some(editor_logo(editor, platform).map_or_else(
+                    || Icon::Folder.sized(px(16.)).text_color(hsla(p.muted_foreground)).into_any_element(),
+                    |logo| logo.render(px(16.), hsla(p.foreground), cx.theme().is_dark()),
+                ))
+            })
             .disabled(disabled)
             .show_check()
             .on_change(move |editor, _, cx| open(editor.as_ref(), cx));
+        let logo = preferred.and_then(|editor| editor_logo(editor, platform));
+        let favorite = Button::new("file-open-in")
+            .when_none(&logo, |button| button.icon(if disabled { Icon::SquareArrowOutUpRight } else { Icon::Folder }))
+            .tooltip(label)
+            .disabled(disabled)
+            .on_click(move |_, _, cx| {
+                if let Some(editor) = preferred {
+                    open_favorite(editor, cx);
+                }
+            });
         Some(h_flex()
             .gap(px(2.))
-            .child(Button::new("file-open-in")
-                .icon(Icon::SquareArrowOutUpRight)
-                .tooltip(label)
-                .disabled(disabled)
-                .on_click(move |_, _, cx| {
-                    if let Some(editor) = preferred {
-                        open_favorite(editor, cx);
-                    }
-                }))
+            .child(div().relative().flex_none().child(favorite).children(logo.map(|logo| {
+                div().absolute().inset_0().flex().items_center().justify_center()
+                    .child(logo.render(px(16.), hsla(palette(cx).foreground), cx.theme().is_dark()))
+            })))
             .child(match preferred {
                 Some(editor) => picker.selected(editor),
                 None => picker,

@@ -10,12 +10,13 @@ use gpui::{
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use gpui_component::{ActiveTheme, h_flex};
 use t3_core::git_actions::terminology;
 use t3_core::vcs::change_request_reference::parse_pull_request_reference;
 use t3_core::vcs::refs::{RefChoice, RefHighlight};
 use t3_core::vcs::{RefFilter, VcsRef, branch_selection_target, ref_badge, sanitize_new_ref_name};
 
-use super::{GitDialogs, GitEvent, GitStore};
+use super::{GitDialogs, GitEvent, GitStore, actions::change_request_logo};
 use crate::composer::controls::{Float, branch_copy_menu, floating, menu_surface};
 use crate::icons::Icon;
 use crate::i18n::t;
@@ -230,9 +231,22 @@ impl BranchPicker {
         let id = ElementId::Name(format!("branch-picker-{index}").into());
         let (row, enabled) = match &item {
             Item::CheckoutPr(reference) => {
-                let terms = terminology(self.git.read(cx).status.as_ref().and_then(|s| s.provider_kind()));
-                let row = MenuRow::new(id, SharedString::from(format!("Checkout {} ({reference})", terms.singular)))
-                    .trailing(div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.6)).child(terms.short_label));
+                let provider_kind = self.git.read(cx).status.as_ref().and_then(|s| s.provider_kind());
+                let terms = terminology(provider_kind);
+                let label: SharedString = format!("Checkout {} ({reference})", terms.singular).into();
+                let muted = hsla(p.muted_foreground);
+                let logo = change_request_logo(provider_kind).render(px(14.), muted, cx.theme().is_dark());
+                let row = MenuRow::new(id, "").trailing(
+                    // Take back the gap after MenuRow's empty label to place the mark first.
+                    h_flex()
+                        .w_full()
+                        .flex_none()
+                        .ml(px(-8.))
+                        .gap(px(8.))
+                        .child(logo)
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .child(div().flex_none().text_size(px(10.)).text_color(muted.opacity(0.6)).child(terms.short_label)),
+                );
                 (row, true)
             }
             Item::Ref(target) => {

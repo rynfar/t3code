@@ -1,9 +1,50 @@
 //! Search community themes from `web/src/components/settings/ThemeSearchSection.tsx`.
 use super::super::controls::{Select, SelectOption};
 use super::*;
-use gpui::StyledImage;
+use crate::icons::{Icon, ProviderLogo, source_control_logo};
+use gpui::{StyledImage, http_client::Url};
 use gpui_component::input::InputState;
 use t3_core::themes::open_vsx::{self, Extension, MarketplaceImport, SearchSession};
+
+fn source_link_logo(url: &str) -> Option<ProviderLogo> {
+    let url = Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    [
+        ("github.com", "github"),
+        ("origin.cursor.com", "cursor-origin"),
+        ("gitlab.com", "gitlab"),
+        ("git.cafe", "gitcafe"),
+        ("codeberg.org", "forgejo"),
+        ("bitbucket.org", "bitbucket"),
+    ]
+    .into_iter()
+    .find(|(domain, _)| host == *domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
+    .and_then(|(_, kind)| source_control_logo(kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_links_use_public_provider_domains() {
+        for (url, kind) in [
+            ("https://GitHub.com/owner/theme", Some("github")),
+            ("https://www.gitlab.com/owner/theme", Some("gitlab")),
+            ("https://origin.cursor.com/owner/theme", Some("cursor-origin")),
+            ("https://staging.git.cafe/owner/theme", Some("gitcafe")),
+            ("https://codeberg.org/owner/theme", Some("forgejo")),
+            ("https://bitbucket.org/owner/theme", Some("bitbucket")),
+            ("https://notgithub.com/owner/theme", None),
+            ("https://github.com.example.org/owner/theme", None),
+            ("https://dev.azure.com/owner/theme", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(source_link_logo(url), kind.and_then(source_control_logo), "{url}");
+        }
+    }
+}
+
 struct Abort(tokio::task::AbortHandle);
 impl Drop for Abort {
     fn drop(&mut self) {
@@ -433,15 +474,20 @@ impl ThemeImportDialog {
                     let source = e.source_url.clone();
                     let mut actions = h_flex().justify_between();
                     if let Some(url) = source {
+                        let logo = source_link_logo(&url);
+                        let button = Button::new(
+                            gpui::ElementId::Name(format!("source-{}", e.id).into()),
+                            ButtonVariant::GhostMuted,
+                            ButtonSize::IconMicro,
+                        )
+                        .when_none(&logo, |button| button.icon(Icon::ExternalLink))
+                        .tooltip(format!("View source for {}", e.name))
+                        .on_click(move |_, _, cx| cx.open_url(&url));
                         actions = actions.child(
-                            Button::new(
-                                gpui::ElementId::Name(format!("source-{}", e.id).into()),
-                                ButtonVariant::GhostMuted,
-                                ButtonSize::IconMicro,
-                            )
-                            .icon(crate::icons::Icon::ExternalLink)
-                            .tooltip(format!("View source for {}", e.name))
-                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                            div().relative().flex_none().child(button).children(logo.map(|logo| {
+                                div().absolute().inset_0().flex().items_center().justify_center()
+                                    .child(logo.render(r(14.), hsla(p.muted_foreground), cx.theme().is_dark()))
+                            })),
                         );
                     } else {
                         actions = actions.child(div());

@@ -38,7 +38,7 @@ use super::worktrees::advanced;
 use super::{Block, SettingsView, store};
 use crate::components::secret_source::SecretSourceInput;
 use crate::i18n::t;
-use crate::icons::Icon;
+use crate::icons::{Icon, source_control_logo};
 use crate::theme::{hsla, palette};
 
 const STORED_SECRET: &str = "__stored__";
@@ -1274,6 +1274,28 @@ impl SettingsView {
             None => div().child(item.summary()).into_any_element(),
         };
         let dot = div().size(r(8.)).flex_none().rounded_full().bg(dot_color(item.dot(), cx));
+        let mark = if let Some(logo) = source_control_logo(&item.kind) {
+            div()
+                .relative()
+                .size(r(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(logo.render(r(18.), hsla(p.foreground).opacity(0.8), cx.theme().is_dark()))
+                .child(
+                    div()
+                        .absolute()
+                        .left(r(-4.))
+                        .top(r(-4.))
+                        .rounded_full()
+                        .p(r(2.))
+                        .bg(hsla(p.background))
+                        .child(dot),
+                )
+        } else {
+            dot
+        };
         let mut right = h_flex().gap(r(8.)).flex_none();
         if has_details {
             let toggle_kind = item.kind.clone();
@@ -1334,7 +1356,7 @@ impl SettingsView {
                     .child(
                         h_flex()
                             .gap(r(8.))
-                            .child(dot)
+                            .child(mark)
                             .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(item.label.clone()))
                             .children(item.version.clone().map(|version| div().text_xs().text_color(muted).child(version)))
                             .when(item.coming_soon(), |this| this.child(tone_badge("Coming Soon", Tone::Warning, cx)))

@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, ClipboardItem, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::lineage::{AgentTiming, PhaseState, WorkflowMember, relationship_status_label, subagent_display_title};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, menu_label};
 use t3_core::thread_details::{
@@ -24,7 +24,7 @@ use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use t3_core::i18n::IcuArg;
 use crate::lineage::{DelegatedFromRow, LineageRow, MergeBack, Relationships, RemoteSubagentRow, StopAction, elapsed::agent_elapsed_element};
 use crate::git::{self, BranchPicker, GitDialogs, GitStore};
-use crate::icons::Icon;
+use crate::icons::{Icon, editor_logo};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
@@ -135,13 +135,22 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
     let effective = effective_open_in_editors(&remote_state, &available, &remote_capable);
     let unavailable_reason = open_in_unavailable_reason(&remote_state, effective.len(), &env_label);
     let preferred = ctx.details.read(cx).preferred_editor(&effective);
-    let mac = cfg!(target_os = "macos");
-    let label = format!("Open in {}", preferred.map_or("editor", |id| editor_label(id, mac)));
+    let platform = std::env::consts::OS;
+    let label = format!("Open in {}", preferred.map_or("editor", |id| editor_label(id, platform == "macos")));
     let tooltip = unavailable_reason.clone().unwrap_or_else(|| label.clone());
     let details = ctx.details.clone();
     let state = ctx.state.clone();
+    let render_mark = move |id, cx: &App| {
+        let p = palette(cx);
+        editor_logo(id, platform).map_or_else(
+            || Icon::Folder.sized(px(16.)).text_color(hsla(p.muted_foreground)).into_any_element(),
+            |logo| logo.render(px(16.), hsla(p.foreground), cx.theme().is_dark()),
+        )
+    };
+    let mark = preferred.map(|id| render_mark(id, cx));
     let primary = Row::new("details-open-in", label)
-        .icon(Icon::SquareArrowOutUpRight)
+        .when_none(&mark, |row| row.icon(Icon::SquareArrowOutUpRight))
+        .when_some(mark, Row::leading)
         .tooltip(tooltip)
         .disabled(preferred.is_none() || !can_open_editor)
         .on_click(move |_, _, cx| {
@@ -162,11 +171,16 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
         }
         for id in options {
             let details = details.clone();
-            let label = editor_label(id, mac);
-            let item = match (Some(id) == preferred, shortcut.clone()) {
-                (true, Some(shortcut)) => PopupMenuItem::element(move |_, cx| h_flex().w_full().gap(px(8.)).child(div().flex_1().child(label)).child(menu_shortcut(shortcut.clone(), cx))),
-                _ => PopupMenuItem::new(label),
-            };
+            let label = editor_label(id, platform == "macos");
+            let shortcut = shortcut.as_ref().filter(|_| Some(id) == preferred).cloned();
+            let item = PopupMenuItem::element(move |_, cx| {
+                h_flex()
+                    .w_full()
+                    .gap(px(8.))
+                    .child(render_mark(id, cx))
+                    .child(div().id(label).aria_label(label).flex_1().child(label))
+                    .children(shortcut.as_ref().map(|shortcut| menu_shortcut(shortcut.clone(), cx)))
+            });
             menu = menu.item(item.disabled(!can_open_editor).on_click(move |_, _, cx| details.update(cx, |details, cx| details.set_last_editor(id, cx))));
         }
         menu
