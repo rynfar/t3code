@@ -7,6 +7,9 @@ app="target/T3 Code Native.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/t3-native "$app/Contents/MacOS/t3-native"
+mkdir -p "$app/Contents/Resources/bin"
+[ -z "${T3_NATIVE_T3_BIN:-}" ] || install -m 755 "$T3_NATIVE_T3_BIN" "$app/Contents/Resources/bin/t3"
+[ -z "${T3_NATIVE_LICENSE_MANIFEST:-}" ] || install -m 644 "$T3_NATIVE_LICENSE_MANIFEST" "$app/Contents/Resources/third-party-licenses.json"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

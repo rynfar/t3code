@@ -13,6 +13,7 @@ pub(crate) mod controls;
 mod devices;
 pub(crate) mod diagnostics;
 mod diffs_browser;
+pub(crate) use diffs_browser::{browser_auto_show_floating_preview, browser_profile_report_payload, maybe_float_agent_device};
 mod environments;
 mod general;
 mod keybindings;
@@ -1469,7 +1470,6 @@ impl SettingsView {
             .into_any_element()
     }
 
-    #[allow(dead_code, reason = "Provider page wiring lands during the native parity merge")]
     pub(super) fn take_onboarding_registry_request(&mut self) -> bool {
         if self.target.as_deref() != Some(ONBOARDING_ACP_REGISTRY) {
             return false;
