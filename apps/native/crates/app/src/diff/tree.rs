@@ -99,10 +99,12 @@ impl DiffPanel {
                     ChangeKind::RenamePure | ChangeKind::RenameChanged => ("R", p.diff_modified_icon),
                     ChangeKind::Modified => ("M", p.diff_modified_icon),
                 };
-                base.pl(px(8. + 12. * row.depth as f32 + 16.))
-                    .text_color(hsla(p.foreground).opacity(if viewed_state == Some(FileViewedState::Viewed) { 0.55 } else { 0.85 }))
+                let alpha = if viewed_state == Some(FileViewedState::Viewed) { 0.55 } else { 0.85 };
+                base.text_color(hsla(p.foreground).opacity(alpha))
                     .when(selected, |this| this.bg(hsla(p.foreground).opacity(0.12)))
                     .on_click(cx.listener(move |this, _, _, cx| this.reveal_file(file, cx)))
+                    .child(file_path.map_or(Icon::File, crate::files::file_icon)
+                        .render(px(12.), hsla(p.icon_muted).opacity(alpha)))
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .when(open_review_count > 0, |this| {
                         this.child(

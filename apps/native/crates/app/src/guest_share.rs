@@ -1,5 +1,7 @@
 //! Guest links and promotion: `GuestShareControls.tsx`, `guestShareAvailability.ts`,
 //! `useThreadActions.ts` and the existing `guestShare.create`/`projects.createFromThread` RPCs.
+use std::collections::HashSet;
+
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::{
     app_state::{AppEvent, AppState},
@@ -9,10 +11,14 @@ use crate::{
     theme::{hsla, palette},
     toast::{Toast, ToastKind},
 };
+use crate::theme::slots::{
+    ThemeSlot, ThemeSlotExt, slot_border_color, slot_has_background,
+    theme_slot_clipped_background_layer,
+};
 use gpui::{
-    App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement,
+    AnyElement, App, AppContext, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement,
     KeyDownEvent, MouseButton, ParentElement, Render, Styled, Subscription, Task, WeakEntity,
-    Window, deferred, div, point, prelude::*, px,
+    Window, deferred, div, point, prelude::*, px, relative,
 };
 use gpui_component::input::{Escape, Input, InputState};
 use gpui_component::{h_flex, v_flex};
@@ -141,6 +147,156 @@ impl AppState {
             .guest_share
             .as_ref()
     }
+
+    // The transcript merge adds the tail row and empty-state checks.
+    #[allow(dead_code)]
+    pub(crate) fn has_pending_guest_messages(&self, id: &str) -> bool {
+        self.guest_share(id).is_some_and(|share| share.pending_messages().next().is_some())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingMessageKey {
+    share: String,
+    message: String,
+}
+
+#[derive(Default)]
+struct GuestMessageRequests(HashSet<PendingMessageKey>);
+impl Global for GuestMessageRequests {}
+
+// The transcript merge installs this in the virtualized tail row.
+#[allow(dead_code)]
+pub(crate) fn render_pending_guest_messages(
+    thread_id: Option<&str>,
+    app: &Entity<AppState>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let thread_id = thread_id?;
+    let state = app.read(cx);
+    let share = state.guest_share(thread_id)?;
+    share.pending_messages().next()?;
+    let owner = ThreadMenuOwner::capture(state, thread_id).filter(|owner| owner.can_operate_owner(state));
+    let scope = state.thread_copy_scope();
+    let media_scope = cx.try_global::<crate::media::Media>().and_then(|media| media.scope.as_ref());
+    let requests = cx.try_global::<GuestMessageRequests>();
+    let guest = share.guest_name.as_deref().unwrap_or_else(|| crate::i18n::t(cx, "Guest"));
+    let p = palette(cx);
+    Some(v_flex()
+        .w_full()
+        .gap(px(16.))
+        .pb(px(16.))
+        .children(share.pending_messages().map(|message| {
+            let key = PendingMessageKey { share: share.id.clone(), message: message.id.clone() };
+            let busy = requests.is_some_and(|requests| requests.0.contains(&key));
+            let attachments = message.attachments.as_deref().unwrap_or_default();
+            v_flex()
+                .id(gpui::SharedString::from(format!("pending-guest:{}", message.id)))
+                .w_full()
+                .items_end()
+                .gap(px(4.))
+                .child(h_flex().gap(px(4.)).text_xs().text_color(hsla(p.guest_foreground))
+                    .child(Icon::UserRound.render(px(12.), hsla(p.guest_foreground)))
+                    .child(crate::i18n::t_fmt(cx, "{name} (guest)", &[("name", guest.into())])))
+                .child(v_flex().min_w_0().max_w(relative(0.8)).gap(px(8.)).rounded(px(16.)).p(px(12.))
+                    .bg(hsla(p.guest_surface))
+                    .children(attachments.iter().enumerate().map(|(ix, attachment)| {
+                        let target = t3_core::right_panel::FileAttachment {
+                            id: attachment.id.clone(),
+                            name: attachment.name.clone(),
+                            mime_type: attachment.mime_type.clone(),
+                            size_bytes: attachment.size_bytes,
+                            url: None,
+                        };
+                        let thumb = media_scope.filter(|_| attachment.kind == "image").map(|scope| {
+                            let source = t3_core::media::MediaSource::Asset(t3_core::media::AssetResource::Attachment {
+                                attachment_id: attachment.id.clone(),
+                            });
+                            div().h(px(96.)).child(crate::media::scoped_image(&source, scope))
+                        });
+                        let app = app.clone();
+                        let scope = scope.clone();
+                        v_flex()
+                            .id(("guest-attachment", ix))
+                            .min_w_0()
+                            .children(thumb)
+                            .child(Button::new("open", ButtonVariant::Ghost, ButtonSize::Xs)
+                                .icon(Icon::Paperclip)
+                                .label(attachment.name.clone())
+                                .on_click(move |_, _, cx| {
+                                    if scope.is_some() && app.read(cx).thread_copy_scope() == scope {
+                                        app.update(cx, |state, cx| state.open_attachment(target.clone(), cx));
+                                    }
+                                }))
+                    }))
+                    .when(!message.text.is_empty(), |bubble| bubble.child(
+                        div().text_sm().text_color(hsla(p.foreground)).child(message.text.clone()),
+                    )))
+                .children(owner.as_ref().map(|owner| {
+                    h_flex().gap(px(4.)).pr(px(4.)).children([
+                        ("dismiss", "Dismiss", ButtonVariant::GhostMuted, rules::GuestMessageDecision::Dismiss),
+                        ("send", "Send", ButtonVariant::Default, rules::GuestMessageDecision::Send),
+                    ].into_iter().map(|(id, label, variant, decision)| {
+                        let app = app.clone();
+                        let owner = owner.clone();
+                        let key = key.clone();
+                        Button::new(id, variant, ButtonSize::Xs)
+                            .label(label)
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| resolve_guest_message(&app, &owner, &key, decision, cx))
+                    }))
+                }))
+        }))
+        .into_any_element())
+}
+
+fn resolve_guest_message(
+    app: &Entity<AppState>,
+    owner: &ThreadMenuOwner,
+    key: &PendingMessageKey,
+    decision: rules::GuestMessageDecision,
+    cx: &mut App,
+) {
+    let state = app.read(cx);
+    if !owner.current(state)
+        || !owner.can_operate_owner(state)
+        || !state.guest_share(&owner.thread).is_some_and(|share| {
+            share.id == key.share && share.pending_messages().any(|message| message.id == key.message)
+        })
+    {
+        return;
+    }
+    let command = rules::resolve_guest_message(&uuid::Uuid::new_v4().to_string(), &owner.thread, &key.message, decision);
+    let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
+    if !cx.has_global::<GuestMessageRequests>() {
+        cx.set_global(GuestMessageRequests::default());
+    }
+    if !cx.global_mut::<GuestMessageRequests>().0.insert(key.clone()) {
+        return;
+    }
+    cx.refresh_windows();
+    let owner = owner.clone();
+    let key = key.clone();
+    app.update(cx, |_, cx| {
+        cx.spawn(async move |app, cx| {
+            let result = request.await;
+            let _ = app.update(cx, |state, cx| {
+                cx.global_mut::<GuestMessageRequests>().0.remove(&key);
+                cx.refresh_windows();
+                if let Err(error) = result
+                    && !interrupted(&error)
+                    && owner.response_current(state)
+                    && state.guest_share(&owner.thread).is_some_and(|share| share.id == key.share)
+                {
+                    state.show_toast(
+                        Toast::new(ToastKind::Error, crate::i18n::t(cx, "Could not resolve guest message").to_owned())
+                            .description(error.to_string()),
+                        cx,
+                    );
+                }
+            });
+        }).detach();
+    });
 }
 
 fn interrupted(error: &t3_client::session::RpcError) -> bool {
@@ -479,24 +635,32 @@ impl Render for GuestShareDialog {
         let available = pending
             .owner
             .allows(self.state.read(cx), &ThreadAction::ShareGuest);
+        let dialog_custom = slot_has_background(ThemeSlot::DialogPopup, cx);
+        let dialog_border = slot_border_color(ThemeSlot::DialogPopup, cx).unwrap_or_else(|| hsla(p.dialog_border));
         let panel = match &pending.state {
-            CreateState::Created(_, copied) => h_flex()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&self.link).readonly(true)),
-                )
-                .child(
-                    Button::new("guest-copy", ButtonVariant::Outline, ButtonSize::Sm)
-                        .focus_handle(self.footer_focus[0].clone())
-                        .icon(if *copied { Icon::Check } else { Icon::Copy })
-                        .label(if *copied { "Copied" } else { "Copy" })
-                        .disabled(!available)
-                        .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
-                )
-                .into_any_element(),
+            CreateState::Created(_, copied) => {
+                let input_background = theme_slot_clipped_background_layer(ThemeSlot::Input, px(8.), cx);
+                let input_custom = input_background.is_some();
+                h_flex()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .children(input_background)
+                            .child(Input::new(&self.link).readonly(true).appearance(!input_custom).theme_slot(ThemeSlot::Input, cx)),
+                    )
+                    .child(
+                        Button::new("guest-copy", ButtonVariant::Outline, ButtonSize::Sm)
+                            .focus_handle(self.footer_focus[0].clone())
+                            .icon(if *copied { Icon::Check } else { Icon::Copy })
+                            .label(if *copied { "Copied" } else { "Copy" })
+                            .disabled(!available)
+                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
+                    )
+                    .into_any_element()
+            }
             _ => v_flex()
                 .gap(px(16.))
                 .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(
@@ -520,7 +684,10 @@ impl Render for GuestShareDialog {
         deferred(div().id("guest-share-backdrop").absolute().inset_0().occlude().flex().items_center().justify_center().p(px(16.)).bg(hsla(p.dialog_backdrop))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(v_flex().id("guest-share-dialog").track_focus(&self.focus).w_full().max_w(px(512.)).rounded(px(16.)).relative()
-                .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                .when(!dialog_custom, |this| this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), dialog_border, cx)))
+                .when(dialog_custom, |this| this.bg(hsla(p.dialog_surface)).border_1().border_color(dialog_border))
+                .children(theme_slot_clipped_background_layer(ThemeSlot::DialogPopup, px(16.), cx))
+                .theme_slot(ThemeSlot::DialogPopup, cx)
                 .shadow(vec![BoxShadow { color:gpui::black().opacity(0.65), offset:point(px(0.), px(24.)), blur_radius:px(64.), spread_radius:px(-24.), inset:false }])
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| { this.close(window, cx); cx.stop_propagation(); }))

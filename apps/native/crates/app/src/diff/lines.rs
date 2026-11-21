@@ -14,13 +14,14 @@ use gpui_component::{h_flex, v_flex};
 use t3_core::composer::review::Side;
 use t3_core::diff::{
     ChangeKind, DEFAULT_EXPAND_LINES, DiffLine, DiffRow, ExpandDirection, FileContextMenuAction,
-    FileDiff, FileViewedState, LineKind, RecordedContent, compact_count, cut_line_note_start,
+    FileDiff, FileViewedState, LineKind, RecordedContent, compact_count,
     separator_label,
 };
 
 use super::{DiffPanel, WithheldFileStatus};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant, tooltip_view};
+use crate::selectable_text::SelectableText;
 use crate::theme::{Palette, hsla, palette};
 
 pub const LINE_HEIGHT: f32 = 20.;
@@ -102,8 +103,10 @@ impl DiffPanel {
                 this.cancel_navigation_on_interaction();
                 this.scroll_horizontally(event, window, cx);
             }))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| {
-                this.cancel_navigation_on_interaction();
+            .capture_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
+                if event.button == gpui::MouseButton::Left {
+                    this.cancel_navigation_on_interaction();
+                }
             }))
             .on_mouse_move(cx.listener(Self::drag_comment_selection))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
@@ -162,23 +165,26 @@ impl DiffPanel {
             }
             DiffRow::Separator { file, hunk, hidden } => self.render_separator(file, hunk, hidden, cx),
             DiffRow::Line { file, hunk, line } => {
-                let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
+                let Some((content, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
                 let p = palette(cx);
-                let highlighted = self.is_revealed_line(file, &line, None);
-                self.code_row(line_colors(line.kind, p).row, cx)
-                    .child(self.half(file, Some(&line), digits, true, highlighted, cx))
+                let highlighted = self.is_revealed_line(file, &content, None);
+                self.code_row(line_colors(content.kind, p).row, cx)
+                    .child(self.half((file, hunk), Some((&content, line)), digits, true, highlighted, cx))
                     .into_any_element()
             }
             DiffRow::Split { file, hunk, left, right } => {
-                let left = left.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
-                let right = right.and_then(|line| self.line(file, hunk, line)).map(|(line, digits)| (line.clone(), digits));
+                let resolve = |index| self.line(file, hunk, index).map(|(line, digits)| ((line.clone(), index), digits));
+                let left = left.and_then(resolve);
+                let right = right.and_then(resolve);
                 let digits = left.as_ref().or(right.as_ref()).map_or(3, |(_, digits)| *digits);
                 let p = palette(cx);
-                let left_hi = left.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Deletions)));
-                let right_hi = right.as_ref().is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(t3_core::composer::review::Side::Additions)));
+                let left = left.as_ref().map(|((line, index), _)| (line, *index));
+                let right = right.as_ref().map(|((line, index), _)| (line, *index));
+                let left_hi = left.is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(Side::Deletions)));
+                let right_hi = right.is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(Side::Additions)));
                 self.code_row(hsla(p.background), cx)
-                    .child(self.half(file, left.as_ref().map(|(line, _)| line), digits, false, left_hi, cx))
-                    .child(self.half(file, right.as_ref().map(|(line, _)| line), digits, true, right_hi, cx))
+                    .child(self.half((file, hunk), left, digits, false, left_hi, cx))
+                    .child(self.half((file, hunk), right, digits, true, right_hi, cx))
                     .into_any_element()
             }
             DiffRow::NoNewline { file, hunk, line } => {
@@ -223,7 +229,8 @@ impl DiffPanel {
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the
     /// stacked layout deletions show their old number and everything else its new one.
-    fn half(&self, file: usize, line: Option<&DiffLine>, digits: usize, new_side: bool, highlighted: bool, cx: &mut Context<Self>) -> Div {
+    fn half(&self, (file, hunk): (usize, usize), entry: Option<(&DiffLine, usize)>, digits: usize, new_side: bool, highlighted: bool, cx: &mut Context<Self>) -> Div {
+        let line = entry.map(|(line, _)| line);
         let p = palette(cx);
         let char_width = self.char_width.unwrap_or(px(7.8));
         let colors = line.map_or_else(|| line_colors(LineKind::Context, p), |line| line_colors(line.kind, p));
@@ -234,7 +241,13 @@ impl DiffPanel {
             (LineKind::Deletion, _) | (LineKind::Context, false) => line.old_line,
             _ => line.new_line,
         });
-        let text: Option<SharedString> = line.map(display_text);
+        let text = entry.and_then(|(line, index)| {
+            let diff = self.view.as_ref()?.parsed.files().get(file)?;
+            let old = line.kind == LineKind::Deletion || !new_side;
+            let (text, highlights) = self.highlighted_lines.borrow_mut().line(diff, hunk, index, old, cx)?;
+            let id = format!("diff-line:{file}:{hunk}:{index}:{new_side}");
+            Some(SelectableText::new(SharedString::from(id), text).highlights(highlights))
+        });
         let resolved_cluster = if !self.review_threads.is_empty() {
             line.and_then(|line| {
                 let side = if line.kind == LineKind::Deletion || !new_side {
@@ -273,19 +286,19 @@ impl DiffPanel {
                     .children(number.map(|number| SharedString::from(number.to_string())))
                     .map(|gutter| self.comment_gutter(gutter, file, line, new_side, cx)),
             )
-            .child(
-                div()
+            .child({
+                let column = div()
                     .flex_1()
                     .min_w_0()
                     .px(px(CODE_PADDING))
-                    .text_color(hsla(p.code_foreground))
-                    .when(!self.wrap, |this| {
-                        this.overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(div().ml(-self.h_offset).children(text.as_ref().map(|t| render_code_text(t, p))))
-                    })
-                    .when(self.wrap, |this| this.children(text.as_ref().map(|t| render_code_text(t, p)))),
-            )
+                    .text_color(hsla(p.code_foreground));
+                if self.wrap {
+                    column.children(text)
+                } else {
+                    column.overflow_hidden().whitespace_nowrap()
+                        .child(div().ml(-self.h_offset).children(text))
+                }
+            })
             .children(resolved_cluster.map(|(side, line_number, cluster)| {
                 let label = cluster.label.clone();
                 let expanded = cluster.expanded;
@@ -727,40 +740,6 @@ pub(crate) fn code_row(fill: Hsla, wrap: bool, cx: &App) -> Div {
         .when(wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
         .bg(fill).font_family(cx.theme().mono_font_family.clone())
         .text_size(cx.theme().mono_font_size).line_height(px(crate::theme::code_line_height(cx)))
-}
-
-/// Renders one line's text, styling a server-appended `…[N more characters]` truncation note
-/// distinctly from code (`cutLineNotes.ts`, `pingdotgg/t3code#37007`).
-fn render_code_text(text: &SharedString, p: Palette) -> AnyElement {
-    if let Some(offset) = cut_line_note_start(text.as_ref()) {
-        let prefix = text[..offset].to_owned();
-        let note = text[offset..].to_owned();
-        return h_flex()
-            .items_center()
-            .gap(px(4.))
-            .child(prefix)
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(4.))
-                    .rounded(px(3.))
-                    .bg(hsla(p.warning).opacity(0.14))
-                    .text_size(px(11.))
-                    .text_color(hsla(p.warning_foreground))
-                    .child(note),
-            )
-            .into_any_element();
-    }
-    text.clone().into_any_element()
-}
-
-/// A line as shown: a trailing `\r` (CRLF content) is invisible on the web too, so it is kept
-/// in the model but not painted.
-fn display_text(line: &DiffLine) -> SharedString {
-    match line.text.strip_suffix('\r') {
-        Some(text) => SharedString::from(text.to_owned()),
-        None => SharedString::from(line.text.clone()),
-    }
 }
 
 /// Pierre's change icons with the app's tokens (`[data-change-icon]` in `diffRendering.ts`).

@@ -22,6 +22,22 @@ use crate::theme::{hsla, palette};
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 12.;
 
+pub(crate) fn file_icon(path: &str) -> Icon {
+    use t3_core::files::{binary_container_kind, delimited_separator, image_kind, is_audio, is_font, is_markdown, is_mermaid, is_notebook, is_pdf, office_kind, syntax_language};
+    match () {
+        _ if image_kind(path).is_some() => Icon::Image,
+        _ if is_audio(path) => Icon::Mic,
+        _ if t3_core::media::is_workspace_video_preview_path(path) => Icon::Play,
+        _ if is_font(path) => Icon::Type,
+        _ if is_mermaid(path) => Icon::Workflow,
+        _ if delimited_separator(path).is_some() => Icon::Rows3,
+        _ if is_markdown(path) || is_pdf(path) || office_kind(path).is_some() => Icon::FileText,
+        _ if binary_container_kind(path).is_some() => Icon::Archive,
+        _ if syntax_language(path).is_some() || is_notebook(path) => Icon::FileBraces,
+        _ => Icon::File,
+    }
+}
+
 /// Floating pill rendered under the cursor while dragging a file tree item (`fileTreeDragMention.ts`).
 struct DragMentionGhost {
     label: SharedString,
@@ -31,7 +47,7 @@ struct DragMentionGhost {
 impl Render for DragMentionGhost {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let icon = if self.kind == EntryKind::Directory { Icon::Folder } else { Icon::File };
+        let icon = if self.kind == EntryKind::Directory { Icon::Folder } else { file_icon(&self.label) };
         h_flex()
             .px(px(10.))
             .py(px(5.))
@@ -101,7 +117,7 @@ impl Explorer {
             (EntryKind::Directory, _, true) => Icon::LoaderCircle,
             (EntryKind::Directory, true, false) => Icon::ChevronDown,
             (EntryKind::Directory, false, false) => Icon::ChevronRight,
-            (EntryKind::File, ..) => Icon::File,
+            (EntryKind::File, ..) => file_icon(&row.path),
         };
         let path = row.path.clone();
         let drag_path = row.path.clone();

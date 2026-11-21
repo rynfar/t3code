@@ -2,13 +2,28 @@
 //! launcher's "Files" (`addFilesSurface`), `openFile` for links, pickers and the explorer, folder
 //! navigation from breadcrumbs, and the explorer's mention actions (`FileBrowserPanel.tsx`).
 
-use gpui::{ClipboardItem, Context};
+use gpui::{App, ClipboardItem, Context};
 use t3_core::files::{absolute_path, clipboard_path, composer_file_link, file_surface_path};
 use t3_core::markdown::links::open_in_editor_request_with_root;
 use t3_core::project_search::{OPEN_IN_EDITOR, editor_target, preferred_editor};
+use t3_core::thread_details::{RemoteOpenState, build_remote_open_url, effective_open_in_editors};
 
 use crate::app_state::AppState;
 use crate::toast::{Toast, ToastKind};
+
+pub(super) fn file_editors(state: &AppState, cx: &App) -> Vec<String> {
+    let remote = state.active_remote_open_state();
+    if matches!(remote, RemoteOpenState::LocalExec)
+        && state.active_session_grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) != Some(true)
+    {
+        return Vec::new();
+    }
+    let available = state.active_open_in_config().map_or(&[][..], |config| &config.available_editors);
+    let remote_capable = crate::thread_details::details(cx)
+        .map(|details| details.read(cx).remote_capable_editors())
+        .unwrap_or_default();
+    effective_open_in_editors(&remote, available, &remote_capable)
+}
 
 /// Where the open thread's files live (`RightPanelFileProps`): its worktree, else its project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,5 +124,45 @@ impl AppState {
         })
         .detach();
         true
+    }
+
+    pub(super) fn open_file_in_editor(
+        &mut self,
+        root: &super::Root,
+        path: &str,
+        line: Option<u64>,
+        editor: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.environment() != Some(&root.environment)
+            || self.file_workspace().as_ref() != Some(&root.workspace)
+            || !file_editors(self, cx).iter().any(|available| available == editor)
+        {
+            return;
+        }
+        match self.active_remote_open_state() {
+            RemoteOpenState::RemoteUnavailable => return,
+            RemoteOpenState::RemoteLinks(host) => {
+                let Some(url) = build_remote_open_url(editor, &host, &absolute_path(path, &root.workspace.cwd), true) else {
+                    return;
+                };
+                cx.open_url(&url);
+            }
+            RemoteOpenState::LocalExec => {
+                let label = t3_core::vcs::editor_label(editor, cfg!(target_os = "macos"));
+                let target = editor_target(&root.workspace.cwd, path, line);
+                let request = self.rpc(OPEN_IN_EDITOR, open_in_editor_request_with_root(&target, editor, Some(&root.workspace.cwd)));
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = request.await {
+                        let _ = this.update(cx, |state, cx| {
+                            state.show_toast(Toast::new(ToastKind::Error, format!("Could not open in {label}")).description(error.to_string()), cx);
+                        });
+                    }
+                }).detach();
+            }
+        }
+        if let Some(details) = crate::thread_details::details(cx) {
+            details.update(cx, |details, cx| details.set_last_editor(editor, cx));
+        }
     }
 }
