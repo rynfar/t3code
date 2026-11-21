@@ -306,6 +306,8 @@ mod tests {
         let mut server = FakeServer::start().await;
         let (client, _events) = supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
         let mut socket = server.connection().await;
+        let config = socket.request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG).await;
+        socket.chunk(&config, json!([{"type": "snapshot", "config": {}}])).await;
         let target = Target {
             thread_id: "source-thread".into(),
             item_id: "source-item".into(),

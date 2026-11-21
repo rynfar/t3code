@@ -8,7 +8,9 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::{LazyLock, Mutex};
 
 use gpui::{
     AbsoluteLength, AlignItems, AnyElement, App, BorderStyle, Bounds, BoxShadow, Corners,
@@ -68,23 +70,37 @@ struct GradientCache {
     pending_drop: Vec<Arc<RenderImage>>,
 }
 
+#[cfg(not(test))]
 static GRADIENT_CACHE: LazyLock<Mutex<GradientCache>> =
     LazyLock::new(|| Mutex::new(GradientCache::default()));
 
-/// Clears cached rasterized gradient textures whenever the active theme slot stylesheet changes.
-pub(super) fn clear_gradient_cache() {
-    if let Ok(mut cache) = GRADIENT_CACHE.lock() {
-        let evicted: Vec<_> = cache.entries.drain().map(|(_, v)| v.image).collect();
-        cache.pending_drop.extend(evicted);
+#[cfg(test)]
+thread_local! {
+    // Independent GPUI test windows paint on their test's thread.
+    static GRADIENT_CACHE: std::cell::RefCell<GradientCache> = std::cell::RefCell::default();
+}
+
+fn with_gradient_cache<R>(access: impl FnOnce(&mut GradientCache) -> R) -> Option<R> {
+    #[cfg(not(test))]
+    {
+        GRADIENT_CACHE.lock().ok().map(|mut cache| access(&mut cache))
+    }
+    #[cfg(test)]
+    {
+        Some(GRADIENT_CACHE.with(|cache| access(&mut cache.borrow_mut())))
     }
 }
 
+/// Clears cached rasterized gradient textures whenever the active theme slot stylesheet changes.
+pub(super) fn clear_gradient_cache() {
+    with_gradient_cache(|cache| {
+        let evicted: Vec<_> = cache.entries.drain().map(|(_, v)| v.image).collect();
+        cache.pending_drop.extend(evicted);
+    });
+}
+
 fn drain_dropped_gradients(window: &mut Window) {
-    let pending = match GRADIENT_CACHE.lock() {
-        Ok(mut cache) if !cache.pending_drop.is_empty() => std::mem::take(&mut cache.pending_drop),
-        _ => return,
-    };
-    for image in pending {
+    for image in with_gradient_cache(|cache| std::mem::take(&mut cache.pending_drop)).unwrap_or_default() {
         let _ = window.drop_image(image);
     }
 }
@@ -202,10 +218,8 @@ fn rasterize_gradient_for_size(
 ) -> Option<RasterizedGradient> {
     let (bucket, q_ratio, inner_w, inner_h) = aspect_bucket_and_dims(width_px, height_px);
     let key = gradient_cache_key(bg, bucket)?;
-    if let Ok(cache) = GRADIENT_CACHE.lock()
-        && let Some(hit) = cache.entries.get(&key)
-    {
-        return Some(hit.clone());
+    if let Some(hit) = with_gradient_cache(|cache| cache.entries.get(&key).cloned()).flatten() {
+        return Some(hit);
     }
 
     // GPUI packs sprite tiles with 0 atlas padding and linear sampling across [0, 1], so surround
@@ -261,13 +275,13 @@ fn rasterize_gradient_for_size(
         inner_w,
         inner_h,
     };
-    if let Ok(mut cache) = GRADIENT_CACHE.lock() {
+    with_gradient_cache(|cache| {
         if cache.entries.len() >= MAX_CACHED_GRADIENTS {
             let evicted: Vec<_> = cache.entries.drain().map(|(_, v)| v.image).collect();
             cache.pending_drop.extend(evicted);
         }
         cache.entries.insert(key, rendered.clone());
-    }
+    });
     Some(rendered)
 }
 
@@ -2336,7 +2350,7 @@ mod tests {
         visual_cx.update(|_, cx| {
             theme::preview_with_css(Some((&colors, Some(kraken_kinetic_css), true)), cx);
             assert!(
-                !GRADIENT_CACHE.lock().unwrap().pending_drop.is_empty(),
+                with_gradient_cache(|cache| !cache.pending_drop.is_empty()).unwrap(),
                 "cache invalidation queues old textures for window.drop_image cleanup"
             );
             assert!(!slot_has_floating_inset(ThemeSlot::SidebarInner, cx));
@@ -2359,7 +2373,7 @@ mod tests {
         });
         visual_cx.refresh().unwrap();
         assert!(
-            GRADIENT_CACHE.lock().unwrap().pending_drop.is_empty(),
+            with_gradient_cache(|cache| cache.pending_drop.is_empty()).unwrap(),
             "paint pass drains queued gradient textures via window.drop_image"
         );
 
