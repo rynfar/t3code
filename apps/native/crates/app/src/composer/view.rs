@@ -177,7 +177,22 @@ impl Composer {
         let multi = !resolved.multi_models.is_empty();
         let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
         let surface = hsla(if cx.theme().is_dark() { p.surface_raised } else { p.card });
-        let mark = resolved.mark.clone().map(|mark| ProviderIcon::new(mark).badge(BadgeSize::Compact, surface));
+        let mark = if multi {
+            let remaining = resolved.multi_models.len().saturating_sub(3);
+            Some(h_flex().flex_none()
+                .children(resolved.multi_model_marks.iter().enumerate().map(|(index, mark)| {
+                    div().flex_none().size(px(18.)).rounded_full().bg(surface)
+                        .items_center().justify_center().flex()
+                        .when(index > 0, |this| this.ml(px(-4.)))
+                        .child(ProviderIcon::new(mark.clone()).size(px(16.)))
+                }))
+                .when(remaining > 0, |this| this.child(div().ml(px(-4.)).size(px(18.))
+                    .flex_none().rounded_full().bg(surface).text_size(px(9.))
+                    .flex().items_center().justify_center().child(format!("+{remaining}"))))
+                .into_any_element())
+        } else {
+            resolved.mark.clone().map(|mark| ProviderIcon::new(mark).badge(BadgeSize::Compact, surface).into_any_element())
+        };
         let label = if let Some(multi_label) = &resolved.multi_model_label {
             multi_label.clone()
         } else if resolved.model_label.is_empty() {
