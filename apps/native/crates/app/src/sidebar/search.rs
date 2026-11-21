@@ -1051,8 +1051,11 @@ mod tests {
         let (sent, loaded) = tokio::sync::oneshot::channel();
         let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("search-scope-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("search-scope-fixture").is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture(
@@ -1166,8 +1169,13 @@ mod tests {
         let (sent, loaded) = tokio::sync::oneshot::channel();
         let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("search-lifetime-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state
+                    .scoped_environment("search-lifetime-fixture")
+                    .is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture(
@@ -1258,8 +1266,11 @@ mod tests {
         let mut grant_tx = Some(grant_tx);
         let owner_for_sub = owner.clone();
         let _grant_sub = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && !state.scoped_ready(&owner_for_sub, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
-                if let Some(tx) = grant_tx.take() { let _ = tx.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && !state.scoped_ready(&owner_for_sub, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && let Some(tx) = grant_tx.take()
+            {
+                let _ = tx.send(());
             }
         }));
         fixture.grants.send(Some(serde_json::from_value(json!({"authenticated": true, "permissions": []})).unwrap())).unwrap();
@@ -1343,8 +1354,11 @@ mod tests {
             let (sent, loaded) = tokio::sync::oneshot::channel();
             let mut sent = Some(sent);
             let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == crate::app_state::AppEvent::Shell && state.scoped_environment(env_id).is_some() {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == crate::app_state::AppEvent::Shell
+                    && state.scoped_environment(env_id).is_some()
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let install = state.update(cx, |state, _| state.connections.install_fixture(
@@ -1494,8 +1508,11 @@ mod tests {
         let (sent, loaded) = tokio::sync::oneshot::channel();
         let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("saved-fixture").is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture(
@@ -1646,10 +1663,9 @@ mod tests {
                 if *event == crate::app_state::AppEvent::Shell
                     && state.scoped_environment("saved-local").is_some()
                     && state.scoped_environment("saved-remote").is_some()
+                    && let Some(sent) = sent.take()
                 {
-                    if let Some(sent) = sent.take() {
-                        let _ = sent.send(());
-                    }
+                    let _ = sent.send(());
                 }
             })
         });
@@ -1981,10 +1997,11 @@ mod tests {
         let mut ready_tx = Some(ready_tx);
         let _sub = state.update(&mut cx, |_, cx| {
             cx.subscribe(&state, move |state, _, event, _| {
-                if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("saved-local").is_some() {
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(());
-                    }
+                if *event == crate::app_state::AppEvent::Shell
+                    && state.scoped_environment("saved-local").is_some()
+                    && let Some(tx) = ready_tx.take()
+                {
+                    let _ = tx.send(());
                 }
             })
         });

@@ -4009,7 +4009,7 @@ mod tests {
 
         drop(_obs);
         drop(view);
-        vcx.update(|window, cx| crate::settings::finish_close(window, cx));
+        vcx.update(crate::settings::finish_close);
         state.update(&mut vcx, |state, _| state.stop_pump());
         vcx.run_until_parked();
         drop(vcx);

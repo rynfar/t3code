@@ -3075,11 +3075,14 @@ mod tests {
         let _sub = state.update(cx, |_, cx| {
             cx.subscribe(&state, move |state, _, event, _| {
                 if matches!(event, AppEvent::Thread | AppEvent::History)
-                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded") && p.has_entry("msg-old"))
+                    && state
+                        .thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.has_entry("w-loaded") && p.has_entry("msg-old"))
+                    && let Some(sent) = sent.take()
                 {
-                    if let Some(sent) = sent.take() {
-                        let _ = sent.send(());
-                    }
+                    let _ = sent.send(());
                 }
             })
         });
@@ -3089,11 +3092,14 @@ mod tests {
         let _work_sub = state.update(cx, |_, cx| {
             cx.subscribe(&state, move |state, _, event, _| {
                 if matches!(event, AppEvent::Thread | AppEvent::History)
-                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded"))
+                    && state
+                        .thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.has_entry("w-loaded"))
+                    && let Some(sent) = work_sent.take()
                 {
-                    if let Some(sent) = work_sent.take() {
-                        let _ = sent.send(());
-                    }
+                    let _ = sent.send(());
                 }
             })
         });
@@ -3155,10 +3161,10 @@ mod tests {
                         None
                     } else {
                         let step = pages_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        if step == 8 {
-                            if let Some(tx) = eight_tx.lock().unwrap().take() {
-                                let _ = tx.send(());
-                            }
+                        if step == 8
+                            && let Some(tx) = eight_tx.lock().unwrap().take()
+                        {
+                            let _ = tx.send(());
                         }
                         Some(format!("c{}", step + 1))
                     };
@@ -3243,10 +3249,9 @@ mod tests {
                 if matches!(event, AppEvent::History | AppEvent::Thread)
                     && state.thread.history.history_cursor.as_deref() == Some("c9")
                     && !state.thread.history.loading
+                    && let Some(tx) = done_tx.lock().unwrap().take()
                 {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                    let _ = tx.send(());
                 }
             })
         });
@@ -3420,11 +3425,14 @@ mod tests {
             let sent = sent.clone();
             cx.subscribe(&state, move |state, _, event, _| {
                 if matches!(event, AppEvent::Thread | AppEvent::History)
-                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w1-loaded") && p.has_entry("w2-loaded"))
+                    && state
+                        .thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.has_entry("w1-loaded") && p.has_entry("w2-loaded"))
+                    && let Some(tx) = sent.lock().unwrap().take()
                 {
-                    if let Some(tx) = sent.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                    let _ = tx.send(());
                 }
             })
         });
@@ -3585,17 +3593,21 @@ mod tests {
         let _sub = state.update(cx, |_, cx| {
             let (err_tx, done_tx) = (err_tx.clone(), done_tx.clone());
             cx.subscribe(&state, move |state, _, event, _| {
-                if matches!(event, AppEvent::History) && state.thread.history.work_error("w-anchor-1").is_some() {
-                    if let Some(tx) = err_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                if matches!(event, AppEvent::History)
+                    && state.thread.history.work_error("w-anchor-1").is_some()
+                    && let Some(tx) = err_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
                 }
                 if matches!(event, AppEvent::Thread | AppEvent::History)
-                    && state.thread.projection.as_ref().is_some_and(|p| p.has_entry("w-loaded"))
+                    && state
+                        .thread
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| p.has_entry("w-loaded"))
+                    && let Some(tx) = done_tx.lock().unwrap().take()
                 {
-                    if let Some(tx) = done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                    let _ = tx.send(());
                 }
             })
         });

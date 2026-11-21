@@ -550,8 +550,11 @@ mod tests {
             config.config.as_mut().unwrap().environment.environment_id = format!("server-{id}");
             let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Shell && state.scoped_environment(id).is_some() {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Shell
+                    && state.scoped_environment(id).is_some()
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let install = state.update(cx, |state, _| state.connections.install_fixture(id,client,shell,config,ConnectionStatus::Connected));
@@ -575,8 +578,15 @@ mod tests {
         let page = (0..25).map(|index| settled(&format!("a-{index:02}"),90_000-index*1000)).collect::<Vec<_>>();
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.iter().any(|(owner,omitted)| owner.saved_id == "a" && omitted.pages.reads.len() == 1) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .iter()
+                    .any(|(owner, omitted)| owner.saved_id == "a" && omitted.pages.reads.len() == 1)
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
@@ -611,8 +621,11 @@ mod tests {
         config.config.as_mut().unwrap().environment.environment_id = "collapse-server".into();
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("collapse-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("collapse-fixture").is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let mut next_snapshot = shell.snapshot.as_ref().unwrap().clone();
@@ -632,8 +645,13 @@ mod tests {
         }).collect::<Vec<_>>();
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.iter().any(|(owner,omitted)| owner.saved_id == "collapse-fixture" && omitted.pages.reads.len() == 1) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.sidebar.owner_omitted.iter().any(|(owner, omitted)| {
+                    owner.saved_id == "collapse-fixture" && omitted.pages.reads.len() == 1
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
@@ -670,8 +688,17 @@ mod tests {
         let _ = old_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[stale]})));
         let (sent, fresh_applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _fresh_applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.values().any(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "fresh-page"))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.sidebar.owner_omitted.values().any(|omitted| {
+                    omitted
+                        .pages
+                        .reads
+                        .iter()
+                        .any(|read| read.threads.iter().any(|thread| thread.id == "fresh-page"))
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         new_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[fresh]}))).unwrap(); fresh_applied.await.unwrap();
@@ -683,8 +710,13 @@ mod tests {
         state.update(cx, |state, cx| state.toggle_shelf(t3_core::sidebar::Shelf::Settled,cx));
         let (sent, snapshotted) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _snapshotted = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("collapse-fixture").is_some_and(|entry| entry.summary.snapshot_sequence == Some(2)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("collapse-fixture")
+                    .is_some_and(|entry| entry.summary.snapshot_sequence == Some(2))
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::Snapshot { snapshot:Box::new(next_snapshot),resolved_repository_identity_roots:None })).await.unwrap(); snapshotted.await.unwrap();
@@ -725,8 +757,11 @@ mod tests {
         config.config.as_mut().unwrap().environment.environment_id = "pending-server".into();
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("pending-fixture").is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("pending-fixture",client,shell,config,ConnectionStatus::Connected));
@@ -744,8 +779,19 @@ mod tests {
         let denied_owner = owner.clone();
         let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("pending-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == denied_owner
+                            && entry
+                                .grants
+                                .as_ref()
+                                .is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         fixture.grants.send_replace(Some(session(false))); denied.await.unwrap();
@@ -768,8 +814,27 @@ mod tests {
         let restored_owner = owner.clone();
         let (sent, restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(state.sidebar.owner_omitted.get(&restored_owner).unwrap().pages.status); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("pending-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == restored_owner
+                            && entry
+                                .grants
+                                .as_ref()
+                                .is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(
+                    state
+                        .sidebar
+                        .owner_omitted
+                        .get(&restored_owner)
+                        .unwrap()
+                        .pages
+                        .status,
+                );
             }
         }));
         fixture.grants.send_replace(Some(session(true)));
@@ -783,8 +848,21 @@ mod tests {
         let applied_owner = owner.clone();
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&applied_owner).is_some_and(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "resumed-page"))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&applied_owner)
+                    .is_some_and(|omitted| {
+                        omitted.pages.reads.iter().any(|read| {
+                            read.threads
+                                .iter()
+                                .any(|thread| thread.id == "resumed-page")
+                        })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         resumed_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[fresh]}))).unwrap(); applied.await.unwrap();
@@ -809,8 +887,19 @@ mod tests {
         let denied_owner = owner.clone();
         let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _early_denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("pending-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == denied_owner
+                            && entry
+                                .grants
+                                .as_ref()
+                                .is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let consumer = state.update(cx, |state, cx| {
@@ -837,8 +926,27 @@ mod tests {
         let restored_owner = owner.clone();
         let (sent, restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _early_restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("pending-fixture").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(state.sidebar.owner_omitted.get(&restored_owner).unwrap().pages.status); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("pending-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == restored_owner
+                            && entry
+                                .grants
+                                .as_ref()
+                                .is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE))
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(
+                    state
+                        .sidebar
+                        .owner_omitted
+                        .get(&restored_owner)
+                        .unwrap()
+                        .pages
+                        .status,
+                );
             }
         }));
         fixture.grants.send_replace(Some(session(true)));
@@ -888,8 +996,13 @@ mod tests {
         state.update(cx, |state, _| state.selected_thread = None);
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("tail-fixture").is_some_and(|entry| entry.summary.threads.len() == 70) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("tail-fixture")
+                    .is_some_and(|entry| entry.summary.threads.len() == 70)
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("tail-fixture",client,shell,config,ConnectionStatus::Connected));
@@ -961,8 +1074,13 @@ mod tests {
         state.update(cx, |state, _| state.selected_thread = None);
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("physical-fixture").is_some_and(|entry| entry.summary.threads.len() == 35) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("physical-fixture")
+                    .is_some_and(|entry| entry.summary.threads.len() == 35)
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("physical-fixture",client,shell,config,ConnectionStatus::Connected));
@@ -986,8 +1104,18 @@ mod tests {
         let applied_owner = owner.clone();
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&applied_owner).is_some_and(|omitted| omitted.pages.reads.len() == 1 && omitted.mounts.generation_of(PAGES_KEY) == Some(applied_owner.shell_generation)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&applied_owner)
+                    .is_some_and(|omitted| {
+                        omitted.pages.reads.len() == 1
+                            && omitted.mounts.generation_of(PAGES_KEY) == Some(applied_owner.shell_generation)
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":page}))).unwrap(); applied.await.unwrap();
@@ -1026,8 +1154,21 @@ mod tests {
         let fresh_owner = owner.clone();
         let (sent, fresh_applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _fresh_applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.sidebar.owner_omitted.get(&fresh_owner).is_some_and(|omitted| omitted.pages.reads.iter().any(|read| read.threads.iter().any(|thread| thread.id == "fresh-scope-page"))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&fresh_owner)
+                    .is_some_and(|omitted| {
+                        omitted.pages.reads.iter().any(|read| {
+                            read.threads
+                                .iter()
+                                .any(|thread| thread.id == "fresh-scope-page")
+                        })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         fresh_reply.send(Ok(serde_json::json!({"snapshotSequence":1,"threads":[settled("fresh-scope-page".into(),"checkout-b",90_000)]}))).unwrap(); fresh_applied.await.unwrap();
@@ -1112,11 +1253,25 @@ mod tests {
         let (client, mut fixture) = ClientFixture::handle(session(true));
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let loaded_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
-                entry.status == ConnectionStatus::Connected && entry.summary.synchronized && entry.summary.snapshot_sequence == Some(100)
-                && entry.summary.threads.len() == 25 && state.scoped_ready(&entry.summary.owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && entry.config.config.as_ref().is_some_and(|config| config.shell_thread_families && config.shell_older_settled)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.status == ConnectionStatus::Connected
+                            && entry.summary.synchronized
+                            && entry.summary.snapshot_sequence == Some(100)
+                            && entry.summary.threads.len() == 25
+                            && state.scoped_ready(
+                                &entry.summary.owner,
+                                t3_core::auth::ORCHESTRATION_READ_SCOPE,
+                            )
+                            && entry.config.config.as_ref().is_some_and(|config| {
+                                config.shell_thread_families && config.shell_older_settled
+                            })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("family-fixture",client,shell,config,ConnectionStatus::Connected));
@@ -1147,11 +1302,28 @@ mod tests {
         let (sent, paged) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let page_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Shell
-                && state.scoped_environment("family-fixture").is_some_and(|entry| entry.summary.owner == page_owner && Arc::ptr_eq(&entry.summary,&page_summary) && entry.summary.snapshot_sequence == Some(100))
-                && state.scoped_ready(&page_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && state.sidebar.owner_omitted.get(&page_owner).is_some_and(|omitted| omitted.pages.reads.len() == 1 && omitted.mounts.generation_of(PAGES_KEY) == Some(page_owner.shell_generation))
-                && state.scoped_thread(&ThreadKey::new("family-fixture","family-parent")).is_some_and(|row| row.thread.title == "page-parent") {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == page_owner
+                            && Arc::ptr_eq(&entry.summary, &page_summary)
+                            && entry.summary.snapshot_sequence == Some(100)
+                    })
+                && state.scoped_ready(&page_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&page_owner)
+                    .is_some_and(|omitted| {
+                        omitted.pages.reads.len() == 1
+                            && omitted.mounts.generation_of(PAGES_KEY) == Some(page_owner.shell_generation)
+                    })
+                && state
+                    .scoped_thread(&ThreadKey::new("family-fixture", "family-parent"))
+                    .is_some_and(|row| row.thread.title == "page-parent")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"snapshotSequence":100,"threads":[parent_wire.clone()],"counts":[]}))).unwrap();
@@ -1173,17 +1345,48 @@ mod tests {
         let (sent, mounted) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let family_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Shell
-                && state.scoped_ready(&mounted_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && state.scoped_environment("family-fixture").is_some_and(|entry| entry.summary.owner == mounted_owner && Arc::ptr_eq(&entry.summary,&mounted_summary) && entry.summary.snapshot_sequence == Some(100)
-                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent" && row.thread.id != "family-child"))
-                && state.sidebar.owner_omitted.get(&mounted_owner).is_some_and(|omitted| omitted.mounts.generation_of(PAGES_KEY) == Some(mounted_owner.shell_generation)
-                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(mounted_owner.shell_generation))
-                && state.sidebar.owner_extra_threads.get(&mounted_owner).is_some_and(|rows| rows.iter().any(|row|
-                    row.thread.id == "family-child" && row.owner == mounted_owner && row.thread.has_pending_approvals
-                    && row.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("family-run"))
-                    && row.lineage.parent_thread_id.as_deref() == Some("family-parent") && row.lineage.root_thread_id == "family-parent"
-                    && row.lineage.relationship_to_parent.as_deref() == Some("subagent") && !row.thread.listed)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                && state.scoped_ready(&mounted_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == mounted_owner
+                            && Arc::ptr_eq(&entry.summary, &mounted_summary)
+                            && entry.summary.snapshot_sequence == Some(100)
+                            && entry.summary.threads.iter().all(|row| {
+                                row.thread.id != "family-parent" && row.thread.id != "family-child"
+                            })
+                    })
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&mounted_owner)
+                    .is_some_and(|omitted| {
+                        omitted.mounts.generation_of(PAGES_KEY) == Some(mounted_owner.shell_generation)
+                            && omitted.mounts.generation_of(&family_key("family-parent"))
+                                == Some(mounted_owner.shell_generation)
+                    })
+                && state
+                    .sidebar
+                    .owner_extra_threads
+                    .get(&mounted_owner)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.thread.id == "family-child"
+                                && row.owner == mounted_owner
+                                && row.thread.has_pending_approvals
+                                && row.thread.runtime.as_ref().is_some_and(|runtime| {
+                                    runtime.status == "running"
+                                        && runtime.active_run_id.as_deref() == Some("family-run")
+                                })
+                                && row.lineage.parent_thread_id.as_deref() == Some("family-parent")
+                                && row.lineage.root_thread_id == "family-parent"
+                                && row.lineage.relationship_to_parent.as_deref() == Some("subagent")
+                                && !row.thread.listed
+                        })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         state.update(cx, |state, cx| state.read_scoped_family(&owner,"family-parent",cx));
@@ -1208,19 +1411,49 @@ mod tests {
         let (sent, child_first) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let child_first_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Shell
-                && state.scoped_ready(&child_first_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && state.scoped_environment("family-fixture").is_some_and(|entry|
-                    entry.summary.owner == child_first_owner && entry.summary.snapshot_sequence == Some(101)
-                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
-                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
-                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals))
-                && state.sidebar.owner_omitted.get(&child_first_owner).is_some_and(|omitted|
-                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_first_owner.shell_generation)
-                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_first_owner.shell_generation))
-                && state.sidebar.owner_extra_threads.get(&child_first_owner).is_some_and(|rows|
-                    rows.iter().any(|row| row.owner == child_first_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
-                    && rows.iter().all(|row| row.thread.id != "family-child")) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                && state.scoped_ready(&child_first_owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == child_first_owner
+                            && entry.summary.snapshot_sequence == Some(101)
+                            && entry
+                                .summary
+                                .older_settled
+                                .as_ref()
+                                .is_some_and(|cut| cut.as_of_sequence == 100)
+                            && entry
+                                .summary
+                                .threads
+                                .iter()
+                                .all(|row| row.thread.id != "family-parent")
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-child" && row.thread.has_pending_approvals
+                            })
+                    })
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&child_first_owner)
+                    .is_some_and(|omitted| {
+                        omitted.mounts.generation_of(PAGES_KEY) == Some(child_first_owner.shell_generation)
+                            && omitted.mounts.generation_of(&family_key("family-parent"))
+                                == Some(child_first_owner.shell_generation)
+                    })
+                && state
+                    .sidebar
+                    .owner_extra_threads
+                    .get(&child_first_owner)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.owner == child_first_owner
+                                && row.thread.id == "family-parent"
+                                && row.thread.title == "page-parent"
+                        }) && rows.iter().all(|row| row.thread.id != "family-child")
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let child_first_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":101,"location":"active","thread":live_child_wire.clone()})).unwrap();
@@ -1256,19 +1489,54 @@ mod tests {
         let (sent, child_cleared) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let child_cleared_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Shell
-                && state.scoped_ready(&child_cleared_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && state.scoped_environment("family-fixture").is_some_and(|entry|
-                    entry.summary.owner == child_cleared_owner && entry.summary.snapshot_sequence == Some(102)
-                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
-                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
-                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && !row.thread.has_pending_runtime_request && !row.thread.has_pending_approvals))
-                && state.sidebar.owner_omitted.get(&child_cleared_owner).is_some_and(|omitted|
-                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_cleared_owner.shell_generation)
-                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_cleared_owner.shell_generation))
-                && state.sidebar.owner_extra_threads.get(&child_cleared_owner).is_some_and(|rows|
-                    rows.iter().any(|row| row.owner == child_cleared_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
-                    && rows.iter().all(|row| row.thread.id != "family-child")) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                && state.scoped_ready(
+                    &child_cleared_owner,
+                    t3_core::auth::ORCHESTRATION_READ_SCOPE,
+                )
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == child_cleared_owner
+                            && entry.summary.snapshot_sequence == Some(102)
+                            && entry
+                                .summary
+                                .older_settled
+                                .as_ref()
+                                .is_some_and(|cut| cut.as_of_sequence == 100)
+                            && entry
+                                .summary
+                                .threads
+                                .iter()
+                                .all(|row| row.thread.id != "family-parent")
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-child"
+                                    && !row.thread.has_pending_runtime_request
+                                    && !row.thread.has_pending_approvals
+                            })
+                    })
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&child_cleared_owner)
+                    .is_some_and(|omitted| {
+                        omitted.mounts.generation_of(PAGES_KEY) == Some(child_cleared_owner.shell_generation)
+                            && omitted.mounts.generation_of(&family_key("family-parent"))
+                                == Some(child_cleared_owner.shell_generation)
+                    })
+                && state
+                    .sidebar
+                    .owner_extra_threads
+                    .get(&child_cleared_owner)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.owner == child_cleared_owner
+                                && row.thread.id == "family-parent"
+                                && row.thread.title == "page-parent"
+                        }) && rows.iter().all(|row| row.thread.id != "family-child")
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let mut cleared_child_wire = live_child_wire.clone();
@@ -1307,19 +1575,52 @@ mod tests {
         let (sent, child_restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let child_restored_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
             if *event == AppEvent::Shell
-                && state.scoped_ready(&child_restored_owner,t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                && state.scoped_environment("family-fixture").is_some_and(|entry|
-                    entry.summary.owner == child_restored_owner && entry.summary.snapshot_sequence == Some(103)
-                    && entry.summary.older_settled.as_ref().is_some_and(|cut| cut.as_of_sequence == 100)
-                    && entry.summary.threads.iter().all(|row| row.thread.id != "family-parent")
-                    && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals))
-                && state.sidebar.owner_omitted.get(&child_restored_owner).is_some_and(|omitted|
-                    omitted.mounts.generation_of(PAGES_KEY) == Some(child_restored_owner.shell_generation)
-                    && omitted.mounts.generation_of(&family_key("family-parent")) == Some(child_restored_owner.shell_generation))
-                && state.sidebar.owner_extra_threads.get(&child_restored_owner).is_some_and(|rows|
-                    rows.iter().any(|row| row.owner == child_restored_owner && row.thread.id == "family-parent" && row.thread.title == "page-parent")
-                    && rows.iter().all(|row| row.thread.id != "family-child")) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                && state.scoped_ready(
+                    &child_restored_owner,
+                    t3_core::auth::ORCHESTRATION_READ_SCOPE,
+                )
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == child_restored_owner
+                            && entry.summary.snapshot_sequence == Some(103)
+                            && entry
+                                .summary
+                                .older_settled
+                                .as_ref()
+                                .is_some_and(|cut| cut.as_of_sequence == 100)
+                            && entry
+                                .summary
+                                .threads
+                                .iter()
+                                .all(|row| row.thread.id != "family-parent")
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-child" && row.thread.has_pending_approvals
+                            })
+                    })
+                && state
+                    .sidebar
+                    .owner_omitted
+                    .get(&child_restored_owner)
+                    .is_some_and(|omitted| {
+                        omitted.mounts.generation_of(PAGES_KEY) == Some(child_restored_owner.shell_generation)
+                            && omitted.mounts.generation_of(&family_key("family-parent"))
+                                == Some(child_restored_owner.shell_generation)
+                    })
+                && state
+                    .sidebar
+                    .owner_extra_threads
+                    .get(&child_restored_owner)
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.owner == child_restored_owner
+                                && row.thread.id == "family-parent"
+                                && row.thread.title == "page-parent"
+                        }) && rows.iter().all(|row| row.thread.id != "family-child")
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let child_restored_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":103,"location":"active","thread":live_child_wire.clone()})).unwrap();
@@ -1354,11 +1655,24 @@ mod tests {
         let caught_owner = owner.clone();
         let (sent, caught_up) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let catchup_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
-                entry.summary.owner == caught_owner && entry.summary.snapshot_sequence == Some(104)
-                && entry.summary.threads.iter().any(|row| row.thread.id == "family-parent" && row.thread.title == "family-parent-new" && row.thread.pending_subagent_request == Some(SubagentRequest::Approval))
-                && entry.summary.threads.iter().any(|row| row.thread.id == "family-child" && row.thread.has_pending_approvals)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == caught_owner
+                            && entry.summary.snapshot_sequence == Some(104)
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-parent"
+                                    && row.thread.title == "family-parent-new"
+                                    && row.thread.pending_subagent_request == Some(SubagentRequest::Approval)
+                            })
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-child" && row.thread.has_pending_approvals
+                            })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let parent_delta: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.updated","sequence":104,"location":"active","thread":family_parent_wire})).unwrap();
@@ -1384,12 +1698,26 @@ mod tests {
         let removed_owner = owner.clone();
         let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let removal_subscription = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("family-fixture").is_some_and(|entry|
-                entry.summary.owner == removed_owner && entry.summary.snapshot_sequence == Some(106)
-                && entry.summary.removed_at.get("family-child") == Some(&106)
-                && entry.summary.threads.iter().all(|row| row.thread.id != "family-child")
-                && entry.summary.threads.iter().any(|row| row.thread.id == "family-parent" && row.thread.pending_subagent_request.is_none())) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_environment("family-fixture")
+                    .is_some_and(|entry| {
+                        entry.summary.owner == removed_owner
+                            && entry.summary.snapshot_sequence == Some(106)
+                            && entry.summary.removed_at.get("family-child") == Some(&106)
+                            && entry
+                                .summary
+                                .threads
+                                .iter()
+                                .all(|row| row.thread.id != "family-child")
+                            && entry.summary.threads.iter().any(|row| {
+                                row.thread.id == "family-parent"
+                                    && row.thread.pending_subagent_request.is_none()
+                            })
+                    })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let removal: ShellStreamItem = serde_json::from_value(serde_json::json!({"kind":"thread.removed","sequence":106,"location":"active","threadId":"family-child"})).unwrap();

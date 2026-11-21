@@ -3167,16 +3167,23 @@ mod deletion_tests {
         let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
         let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("saved-fixture").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
         let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
         let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.connection_id() != connection
+                && state.thread_shell("deleted").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
@@ -3194,8 +3201,11 @@ mod deletion_tests {
         assert_eq!(command["threadId"],"deleted");
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.thread_shell("deleted").is_none()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let mut payload = deleted;
@@ -3211,8 +3221,11 @@ mod deletion_tests {
         });
         let (sent, routed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _routed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Selection && state.selected_thread.as_deref() == Some("survivor") {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Selection
+                && state.selected_thread.as_deref() == Some("survivor")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
@@ -3256,16 +3269,23 @@ mod deletion_tests {
         let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
         let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("saved-fixture").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
         let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
         let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.connection_id() != connection
+                && state.thread_shell("deleted").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
@@ -3284,8 +3304,11 @@ mod deletion_tests {
         if failed_reply {
             let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Shell
+                    && state.thread_shell("deleted").is_none()
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let mut payload = deleted.clone();
@@ -3316,7 +3339,9 @@ mod deletion_tests {
             let finished = if failed_reply {
                 *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete")
             } else { *event == AppEvent::SidebarSelection && !state.hold_pending_thread_deletion() };
-            if finished { if let Some(sent) = sent.take() { let _ = sent.send(()); } }
+            if finished && let Some(sent) = sent.take() {
+                let _ = sent.send(());
+            }
         }));
         reply.send(if failed_reply {
             Err(RpcError::Failure(t3_core::rpc::RpcFailure { tag:Some("OperationError".into()),message:"cannot delete".into(),error:serde_json::json!({"_tag":"OperationError"}) }))
@@ -3330,8 +3355,11 @@ mod deletion_tests {
         if mode == "reply-first" {
             let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Shell
+                    && state.thread_shell("deleted").is_none()
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let mut payload = deleted.clone();
@@ -3380,16 +3408,23 @@ mod deletion_tests {
         let deleted = serde_json::to_value(&shell.snapshot.as_ref().unwrap().threads[0]).unwrap();
         let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("saved-fixture").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected));
         let events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
         let (ready, activated) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.connection_id() != connection && state.thread_shell("deleted").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.connection_id() != connection
+                && state.thread_shell("deleted").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
@@ -3412,8 +3447,11 @@ mod deletion_tests {
         assert_eq!(command["threadId"],"deleted");
         let (sent, applied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.thread_shell("deleted").is_none() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.thread_shell("deleted").is_none()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let mut payload = deleted;
@@ -3429,8 +3467,11 @@ mod deletion_tests {
         });
         let (sent, routed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _routed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Selection && state.selected_thread.as_deref() == Some("survivor") {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Selection
+                && state.selected_thread.as_deref() == Some("survivor")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"sequence":2}))).unwrap();
@@ -3450,8 +3491,14 @@ mod deletion_tests {
         assert_eq!(command["threadId"],"also-doomed");
         let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Notice
+                && state
+                    .toasts
+                    .latest()
+                    .is_some_and(|toast| toast.title == "Thread deletion incomplete")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Err(RpcError::Failure(t3_core::rpc::RpcFailure {
@@ -3479,8 +3526,11 @@ mod deletion_tests {
         let (shell, config) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone()));
         let (ready, loaded) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("bulk-fixture").is_some() {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("bulk-fixture").is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("bulk-fixture", client, shell, config, ConnectionStatus::Connected));
@@ -3501,8 +3551,14 @@ mod deletion_tests {
             state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
             let (sent, mut finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Notice
+                    && state
+                        .toasts
+                        .latest()
+                        .is_some_and(|toast| toast.title == "Thread deletion incomplete")
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             state.update(cx, |state, cx| state.run_scoped_bulk_action(owners, t3_core::sidebar::selection::BulkAction::Delete, cx));
@@ -3554,8 +3610,14 @@ mod deletion_tests {
             state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
             let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Notice
+                    && state
+                        .toasts
+                        .latest()
+                        .is_some_and(|toast| toast.title == "Thread deletion incomplete")
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
@@ -3570,8 +3632,11 @@ mod deletion_tests {
                     "target" => state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture","menu-thread")).is_some_and(|row| row.created_at == "2026-06-01T00:00:00Z"),
                     _ => state.scoped_environment("bulk-fixture").is_some_and(|entry| entry.summary.owner != observed),
                 };
-                if *event == AppEvent::Shell && changed {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Shell
+                    && changed
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let mut replacement_fixture = None;
@@ -3619,8 +3684,11 @@ mod deletion_tests {
         config.config.as_mut().unwrap().environment.environment_id = "second-env".into();
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_environment("second-fixture").is_some() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state.scoped_environment("second-fixture").is_some()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("second-fixture",client,shell,config,ConnectionStatus::Connected));
@@ -3640,8 +3708,14 @@ mod deletion_tests {
         });
         let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Notice
+                && state
+                    .toasts
+                    .latest()
+                    .is_some_and(|toast| toast.title == "Thread deletion incomplete")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
@@ -3681,8 +3755,16 @@ mod deletion_tests {
             thread.latest_run_id = Some("running-run".into());
             let (sent, running) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _running = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Shell && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture","menu-thread")).is_some_and(|row| row.thread.runtime.is_some()) {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Shell
+                    && state
+                        .scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(
+                            "bulk-fixture",
+                            "menu-thread",
+                        ))
+                        .is_some_and(|row| row.thread.runtime.is_some())
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             events.send(t3_client::supervisor::ClientEvent::Shell(ShellStreamItem::ThreadUpdated { sequence:2,location:"active".into(),thread:Box::new(thread) })).await.unwrap(); running.await.unwrap();
@@ -3691,8 +3773,14 @@ mod deletion_tests {
             state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
             let (sent, mut finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread deletion incomplete") {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == AppEvent::Notice
+                    && state
+                        .toasts
+                        .latest()
+                        .is_some_and(|toast| toast.title == "Thread deletion incomplete")
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             state.update(cx, |state, cx| state.run_scoped_bulk_action(owners,t3_core::sidebar::selection::BulkAction::Delete,cx));
@@ -3702,8 +3790,11 @@ mod deletion_tests {
             if revoke {
                 let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
                 let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                    if *event == AppEvent::Shell && !state.scoped_ready(&destination,t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) {
-                        if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                    if *event == AppEvent::Shell
+                        && !state.scoped_ready(&destination, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                        && let Some(sent) = sent.take()
+                    {
+                        let _ = sent.send(());
                     }
                 }));
                 fixture.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap())); denied.await.unwrap();
@@ -3741,8 +3832,16 @@ mod deletion_tests {
         state.update(cx, |state, _| state.sidebar.fleet_selection.extend(keys.clone()));
         let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _removed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture", "menu-thread")).is_none() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::Shell
+                && state
+                    .scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(
+                        "bulk-fixture",
+                        "menu-thread",
+                    ))
+                    .is_none()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         events.send(t3_client::supervisor::ClientEvent::Shell(ShellStreamItem::ThreadRemoved { sequence:2, thread_id:"menu-thread".into() })).await.unwrap();
@@ -3759,8 +3858,11 @@ mod deletion_tests {
         assert_eq!(command["threadId"], "sibling");
         let (sent, completed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _completed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::SidebarSelection && state.sidebar.fleet_selection.is_empty() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == AppEvent::SidebarSelection
+                && state.sidebar.fleet_selection.is_empty()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         reply.send(Ok(serde_json::json!({"sequence":3}))).unwrap(); completed.await.unwrap();
@@ -4321,10 +4423,11 @@ mod deletion_tests {
         let mut ready = Some(ready);
         let _loaded = state.update(cx, |_, cx| {
             cx.subscribe(&state, move |state, _, event, _| {
-                if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(());
-                    }
+                if *event == AppEvent::Shell
+                    && state.scoped_environment("saved-fixture").is_some()
+                    && let Some(ready) = ready.take()
+                {
+                    let _ = ready.send(());
                 }
             })
         });
@@ -4341,11 +4444,14 @@ mod deletion_tests {
                 if matches!(*event, AppEvent::Shell | AppEvent::ServerConfig)
                     && state.connection_id() != connection
                     && state.thread_shell("parent-only-side").is_some()
-                    && state.server_config.config.as_ref().is_some_and(|c| c.shell_thread_families)
+                    && state
+                        .server_config
+                        .config
+                        .as_ref()
+                        .is_some_and(|c| c.shell_thread_families)
+                    && let Some(ready) = ready.take()
                 {
-                    if let Some(ready) = ready.take() {
-                        let _ = ready.send(());
-                    }
+                    let _ = ready.send(());
                 }
             })
         });
@@ -4396,10 +4502,10 @@ mod deletion_tests {
         let mut opened_tx = Some(opened_tx);
         let _dialog_obs = cx.update(|cx| {
             cx.observe(&dialog, move |dialog, cx| {
-                if dialog.read(cx).is_open() {
-                    if let Some(tx) = opened_tx.take() {
-                        let _ = tx.send(());
-                    }
+                if dialog.read(cx).is_open()
+                    && let Some(tx) = opened_tx.take()
+                {
+                    let _ = tx.send(());
                 }
             })
         });

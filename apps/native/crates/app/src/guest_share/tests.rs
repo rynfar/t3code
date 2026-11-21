@@ -52,7 +52,7 @@ async fn guest_create_uses_existing_payload_and_refuses_stale_results(
             cx.add_window_view(|window, cx| GuestShareDialog::new(state.clone(), window, cx));
         cx.update(|window, cx| {
             let owner = ThreadMenuOwner::capture(state.read(cx), "menu-thread").unwrap();
-            open(owner, window.window_handle().into(), cx);
+            open(owner, window.window_handle(), cx);
         });
         let (method, reply) = fixture.next_stream().await;
         assert_eq!(method, t3_core::commands::method::SUBSCRIBE_THREAD);

@@ -604,10 +604,11 @@ fn restored_menu_seed_never_falls_through_launch_defaults() {
         let _observer = state.update(&mut cx, |_, cx| {
             cx.observe(&composer, move |_, composer, cx| {
                 let (sending, error) = composer.read(cx).menu_launch_outcome();
-                if !sending && error.is_some() {
-                    if let Some(send) = send.take() {
-                        let _ = send.send(());
-                    }
+                if !sending
+                    && error.is_some()
+                    && let Some(send) = send.take()
+                {
+                    let _ = send.send(());
                 }
             })
         });
@@ -714,12 +715,11 @@ async fn archive_completion_preserves_undo_after_the_shell_removes_its_row(
         cx.subscribe(
             &state,
             move |state, _, event: &crate::app_state::AppEvent, _| {
-                if *event == crate::app_state::AppEvent::Notice {
-                    if let Some(notice) = state.sidebar.undo.notice() {
-                        if let Some(send) = send.take() {
-                            let _ = send.send(notice);
-                        }
-                    }
+                if *event == crate::app_state::AppEvent::Notice
+                    && let Some(notice) = state.sidebar.undo.notice()
+                    && let Some(send) = send.take()
+                {
+                    let _ = send.send(notice);
                 }
             },
         )
@@ -972,13 +972,23 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     config.config.as_mut().unwrap().environment.capabilities.project_organization=Some(true);
     let (ready,loaded)=tokio::sync::oneshot::channel(); let mut ready=Some(ready);
     let _loaded=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
-        if *event==crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some() { if let Some(ready)=ready.take() { let _=ready.send(()); } }
+        if *event == crate::app_state::AppEvent::Shell
+            && state.scoped_environment("background").is_some()
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
+        }
     }));
     let install=state.update(cx,|state,_| state.connections.install_fixture("background",client,shell,config,t3_client::supervisor::ConnectionStatus::Connected));
     let events=runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
     let (shown,notice)=tokio::sync::oneshot::channel(); let mut shown=Some(shown);
     let _notice=state.update(cx,|_,cx| cx.subscribe(&state,move |state,_,event,_| {
-        if *event==crate::app_state::AppEvent::Notice && state.sidebar.undo.notice().is_some() { if let Some(shown)=shown.take() { let _=shown.send(()); } }
+        if *event == crate::app_state::AppEvent::Notice
+            && state.sidebar.undo.notice().is_some()
+            && let Some(shown) = shown.take()
+        {
+            let _ = shown.send(());
+        }
     }));
     let key=t3_core::sidebar::tag_filter::ThreadKey::new("background","menu-thread");
     state.update(cx,|state,cx| state.run_scoped_thread_action(&key,ThreadAction::Settle,&[],cx));
@@ -1010,9 +1020,16 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let (sent, finished) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let failed = mode == "failure";
         let _finished = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if (!failed && *event == crate::app_state::AppEvent::SidebarSelection)
-                || (failed && *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Thread action stopped")) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if ((!failed && *event == crate::app_state::AppEvent::SidebarSelection)
+                || (failed
+                    && *event == crate::app_state::AppEvent::Notice
+                    && state
+                        .toasts
+                        .latest()
+                        .is_some_and(|toast| toast.title == "Thread action stopped")))
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         state.update(cx, |state, cx| state.run_scoped_drop_steps(vec![(owner, t3_core::thread_actions::settle(&crate::sidebar::controller::uuid(), &key.thread_id))], cx));
@@ -1047,12 +1064,24 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
             config.config.as_mut().unwrap().environment.environment_id = id.into();
             let (sent, published) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _published = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == crate::app_state::AppEvent::Shell && state.scoped_environment(id).is_some_and(|entry|
-                    entry.summary.owner.canonical_id.as_deref() == Some(id) && entry.config.config.is_some()
-                        && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
-                            && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) != settled))
-                    && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(id, "menu-thread")).is_some_and(|row| row.thread.is_settled() == settled) {
-                    if let Some(sent) = sent.take() { let _ = sent.send(()); }
+                if *event == crate::app_state::AppEvent::Shell
+                    && state.scoped_environment(id).is_some_and(|entry| {
+                        entry.summary.owner.canonical_id.as_deref() == Some(id)
+                            && entry.config.config.is_some()
+                            && entry.grants.as_ref().is_some_and(|grants| {
+                                grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                    && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE) != settled
+                            })
+                    })
+                    && state
+                        .scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new(
+                            id,
+                            "menu-thread",
+                        ))
+                        .is_some_and(|row| row.thread.is_settled() == settled)
+                    && let Some(sent) = sent.take()
+                {
+                    let _ = sent.send(());
                 }
             }));
             let install = state.update(cx, |state, _| state.connections.install_fixture(id, client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
@@ -1106,8 +1135,14 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let expected_undo_count = state.read_with(bulk_cx, |state, _| state.sidebar.undo.notice().filter(|notice| notice.action == t3_core::thread_actions::UndoAction::Settled).map_or(1, |notice| notice.count + 1));
         let (sent, completed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _completed = state.update(bulk_cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Notice && state.sidebar.undo.notice().is_some_and(|notice| notice.action == t3_core::thread_actions::UndoAction::Settled && notice.count == expected_undo_count) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Notice
+                && state.sidebar.undo.notice().is_some_and(|notice| {
+                    notice.action == t3_core::thread_actions::UndoAction::Settled
+                        && notice.count == expected_undo_count
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         bulk_cx.update(|_, cx| bulk_menu.update(cx, |menu, cx| menu.activate(MenuAction::Bulk(t3_core::sidebar::selection::BulkAction::Settle), cx)));
@@ -1133,8 +1168,12 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         assert!(operate.take_commands().is_empty(), "one admitted target produces only its one completed command");
         let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _removed = state.update(bulk_cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bulk-settled").is_none() && state.scoped_environment("bulk-operate").is_none() {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("bulk-settled").is_none()
+                && state.scoped_environment("bulk-operate").is_none()
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         state.update(bulk_cx, |state, _| {
@@ -1326,11 +1365,20 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let denied_owner = destination.clone();
         let (sent, denied) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry|
-                entry.summary.owner == denied_owner && entry.summary.synchronized && entry.config.config.is_some()
-                    && entry.status == t3_client::supervisor::ConnectionStatus::Connected
-                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && !grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("background").is_some_and(|entry| {
+                    entry.summary.owner == denied_owner
+                        && entry.summary.synchronized
+                        && entry.config.config.is_some()
+                        && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                        && entry.grants.as_ref().is_some_and(|grants| {
+                            grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                && !grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                        })
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()));
@@ -1367,11 +1415,20 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let restored_owner = destination.clone();
         let (sent, restored) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry|
-                entry.summary.owner == restored_owner && entry.summary.synchronized && entry.config.config.is_some()
-                    && entry.status == t3_client::supervisor::ConnectionStatus::Connected
-                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("background").is_some_and(|entry| {
+                    entry.summary.owner == restored_owner
+                        && entry.summary.synchronized
+                        && entry.config.config.is_some()
+                        && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                        && entry.grants.as_ref().is_some_and(|grants| {
+                            grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                        })
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
@@ -1435,14 +1492,47 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let published_key = working_key.clone();
         let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bounded-working").is_some_and(|entry|
-                entry.summary.owner.canonical_id.as_deref() == Some("bounded-working-env")
-                    && state.connections.view().borrow().environment("bounded-working").is_some_and(|actor| actor.summary.owner == entry.summary.owner)
-                    && entry.summary.synchronized && entry.config.config.is_some() && entry.status == t3_client::supervisor::ConnectionStatus::Connected
-                    && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)))
-                && state.scoped_thread(&published_key).is_some_and(|row| row.owner == state.scoped_environment("bounded-working").unwrap().summary.owner
-                    && row.thread.runtime.as_ref().is_some_and(|runtime| runtime.status == "running" && runtime.active_run_id.as_deref() == Some("bounded-working-run"))) {
-                if let Some(sent) = sent.take() { let _ = sent.send(state.scoped_environment("bounded-working").unwrap().summary.owner.clone()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state
+                    .scoped_environment("bounded-working")
+                    .is_some_and(|entry| {
+                        entry.summary.owner.canonical_id.as_deref() == Some("bounded-working-env")
+                            && state
+                                .connections
+                                .view()
+                                .borrow()
+                                .environment("bounded-working")
+                                .is_some_and(|actor| actor.summary.owner == entry.summary.owner)
+                            && entry.summary.synchronized
+                            && entry.config.config.is_some()
+                            && entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                            && entry.grants.as_ref().is_some_and(|grants| {
+                                grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                    && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                            })
+                    })
+                && state.scoped_thread(&published_key).is_some_and(|row| {
+                    row.owner
+                        == state
+                            .scoped_environment("bounded-working")
+                            .unwrap()
+                            .summary
+                            .owner
+                        && row.thread.runtime.as_ref().is_some_and(|runtime| {
+                            runtime.status == "running"
+                                && runtime.active_run_id.as_deref() == Some("bounded-working-run")
+                        })
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(
+                    state
+                        .scoped_environment("bounded-working")
+                        .unwrap()
+                        .summary
+                        .owner
+                        .clone(),
+                );
             }
         }));
         let install = state.update(cx, |state, _| state.connections.install_fixture("bounded-working", client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
@@ -1500,10 +1590,21 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let (sent, removed) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
         let retained = original_owners.clone();
         let _removed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("bounded-working").is_none()
-                && state.fleet.environments.iter().all(|entry| entry.summary.owner != published_owner)
-                && retained.iter().all(|owner| state.scoped_environment(&owner.saved_id).is_some_and(|entry| entry.summary.owner == *owner)) {
-                if let Some(sent) = sent.take() { let _ = sent.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("bounded-working").is_none()
+                && state
+                    .fleet
+                    .environments
+                    .iter()
+                    .all(|entry| entry.summary.owner != published_owner)
+                && retained.iter().all(|owner| {
+                    state
+                        .scoped_environment(&owner.saved_id)
+                        .is_some_and(|entry| entry.summary.owner == *owner)
+                })
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
             }
         }));
         state.update(cx, |state, cx| {
@@ -1559,8 +1660,16 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let (ready, applied) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(supported)) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state
+                    .scoped_environment("background")
+                    .and_then(|entry| entry.config.config.as_ref())
+                    .is_some_and(|config| {
+                        config.environment.capabilities.project_organization == Some(supported)
+                    })
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let changed_events = events.clone();
@@ -1594,8 +1703,15 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     replacement.created_at="replacement".into();
     let (send, replaced)=tokio::sync::oneshot::channel(); let mut send=Some(send);
     let _replaced=state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event==crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.projects.iter().any(|project| project.project.id=="checkout-b" && project.project.created_at=="replacement")) {
-            if let Some(send)=send.take() { let _=send.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state.scoped_environment("background").is_some_and(|entry| {
+                entry.summary.projects.iter().any(|project| {
+                    project.project.id == "checkout-b" && project.project.created_at == "replacement"
+                })
+            })
+            && let Some(send) = send.take()
+        {
+            let _ = send.send(());
         }
     }));
     let replacement_events = events.clone();
@@ -1644,8 +1760,13 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (ready, renamed) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
     let renamed_ref = representative.clone();
     let _renamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&renamed_ref).is_some_and(|project| project.project.title == "Harmless title change") {
-            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .scoped_project(&renamed_ref)
+                .is_some_and(|project| project.project.title == "Harmless title change")
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
         }
     }));
     let title_events = events.clone();
@@ -1672,8 +1793,13 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let reference = reference.clone();
         let (ready, applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&reference).is_some_and(|project| project.project.pinned_at.is_some()) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state
+                    .scoped_project(&reference)
+                    .is_some_and(|project| project.project.pinned_at.is_some())
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let pin_events = events.clone();
@@ -1701,8 +1827,16 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     for completed in [0, 1] {
         let (ready, stopped) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _stopped = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.title == "Project pin stopped" && toast.description.as_ref().is_some_and(|description| description.starts_with(&format!("{completed} checkout(s) changed;")))) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Notice
+                && state.toasts.latest().is_some_and(|toast| {
+                    toast.title == "Project pin stopped"
+                        && toast.description.as_ref().is_some_and(|description| {
+                            description.starts_with(&format!("{completed} checkout(s) changed;"))
+                        })
+                })
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         state.update(cx, |state, cx| state.pin_scoped_project_group(&stable, true, cx));
@@ -1735,8 +1869,16 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         changed_config.environment.capabilities.project_organization = Some(supported);
         let (ready, applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _applied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").and_then(|entry| entry.config.config.as_ref()).is_some_and(|config| config.environment.capabilities.project_organization == Some(supported)) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state
+                    .scoped_environment("background")
+                    .and_then(|entry| entry.config.config.as_ref())
+                    .is_some_and(|config| {
+                        config.environment.capabilities.project_organization == Some(supported)
+                    })
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let config_events = events.clone();
@@ -1745,8 +1887,15 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         if !supported {
             let (ready, stopped) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
             let _stopped = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                if *event == crate::app_state::AppEvent::Notice && state.toasts.latest().is_some_and(|toast| toast.description.as_ref().is_some_and(|description| description.starts_with("1 checkout(s) changed before"))) {
-                    if let Some(ready) = ready.take() { let _ = ready.send(()); }
+                if *event == crate::app_state::AppEvent::Notice
+                    && state.toasts.latest().is_some_and(|toast| {
+                        toast.description.as_ref().is_some_and(|description| {
+                            description.starts_with("1 checkout(s) changed before")
+                        })
+                    })
+                    && let Some(ready) = ready.take()
+                {
+                    let _ = ready.send(());
                 }
             }));
             first_reply.take().unwrap().send(Ok(serde_json::json!({"sequence":4}))).unwrap();
@@ -1763,8 +1912,17 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let denied_owner = original_owner.clone();
         let (ready, denied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _denied = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == denied_owner && entry.grants.as_ref().is_some_and(|grants| !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("background").is_some_and(|entry| {
+                    entry.summary.owner == denied_owner
+                        && entry.grants.as_ref().is_some_and(|grants| {
+                            !grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                        })
+                })
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:operate"]})).unwrap()));
@@ -1799,8 +1957,17 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
         let restored_owner = original_owner.clone();
         let (ready, restored) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
         let _restored = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("background").is_some_and(|entry| entry.summary.owner == restored_owner && entry.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE) && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))) {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == crate::app_state::AppEvent::Shell
+                && state.scoped_environment("background").is_some_and(|entry| {
+                    entry.summary.owner == restored_owner
+                        && entry.grants.as_ref().is_some_and(|grants| {
+                            grants.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                                && grants.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                        })
+                })
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         background.grants.send_replace(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate"]})).unwrap()));
@@ -1816,8 +1983,17 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (ready, split_applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
     let split_key = split_ref.clone();
     let _split = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&split_key).is_some_and(|project| project.project.repository_identity.as_ref().is_some_and(|identity| identity["canonicalKey"] == "different-repository")) {
-            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state.scoped_project(&split_key).is_some_and(|project| {
+                project
+                    .project
+                    .repository_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity["canonicalKey"] == "different-repository")
+            })
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
         }
     }));
     let split_events = events.clone();
@@ -1847,8 +2023,13 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (ready, representative_applied) = tokio::sync::oneshot::channel(); let mut ready = Some(ready);
     let replaced_ref = representative.clone();
     let _representative = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_project(&replaced_ref).is_some_and(|project| project.project.created_at == "replaced-representative") {
-            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .scoped_project(&replaced_ref)
+                .is_some_and(|project| project.project.created_at == "replaced-representative")
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
         }
     }));
     runtime.spawn(async move { events.send(t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ProjectUpdated { sequence:next_sequence, project:Box::new(replaced_representative) })).await.unwrap(); }).await.unwrap();
@@ -1864,16 +2045,23 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     let (shell, config, connection) = state.read_with(cx, |state, _| (state.shell.clone(), state.server_config.clone(), state.connection_id()));
     let (sent, loaded) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
     let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state.scoped_environment("saved-fixture").is_some()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     let install = state.update(cx, |state, _| state.connections.install_fixture("saved-fixture", client, shell, config, t3_client::supervisor::ConnectionStatus::Connected));
     let local_events = runtime.spawn(install).await.unwrap(); loaded.await.unwrap();
     let (sent, activated) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
     let _activated = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.connection_id() != connection && state.thread_shell("other-thread").is_some() {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state.connection_id() != connection
+            && state.thread_shell("other-thread").is_some()
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
@@ -1895,8 +2083,12 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
     });
     let (sent, selected) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
     let _selected = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Selection && state.environments.active.as_deref() == Some("saved-fixture") && state.selected_thread.as_deref() == Some("other-thread") {
-            if let Some(sent) = sent.take() { let _ = sent.send(()); }
+        if *event == crate::app_state::AppEvent::Selection
+            && state.environments.active.as_deref() == Some("saved-fixture")
+            && state.selected_thread.as_deref() == Some("other-thread")
+            && let Some(sent) = sent.take()
+        {
+            let _ = sent.send(());
         }
     }));
     state.update(cx, |state, cx| state.navigate_scoped(owner.clone(), crate::app_state::ScopedRouteAction::Thread("other-thread".into()), cx));
@@ -1937,8 +2129,13 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
     let (ready, loaded) = tokio::sync::oneshot::channel();
     let mut ready = Some(ready);
     let _loaded = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("arriving").is_some_and(|entry| entry.summary.owner.canonical_id.is_none()) {
-            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .scoped_environment("arriving")
+                .is_some_and(|entry| entry.summary.owner.canonical_id.is_none())
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
         }
     }));
     let install = state.update(cx, |state, _| state.connections.install_fixture("arriving", client, shell, config.clone(), ConnectionStatus::Connected));
@@ -1953,8 +2150,13 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
     let (ready, changed) = tokio::sync::oneshot::channel();
     let mut ready = Some(ready);
     let _changed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event == crate::app_state::AppEvent::Shell && state.scoped_environment("arriving").is_some_and(|entry| entry.summary.owner.canonical_id.as_deref() == Some("arrived-env")) {
-            if let Some(ready) = ready.take() { let _ = ready.send(()); }
+        if *event == crate::app_state::AppEvent::Shell
+            && state
+                .scoped_environment("arriving")
+                .is_some_and(|entry| entry.summary.owner.canonical_id.as_deref() == Some("arrived-env"))
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
         }
     }));
     config.config.as_mut().unwrap().environment.environment_id = "arrived-env".into();
@@ -1989,8 +2191,12 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
     });
     let (send, selected)=tokio::sync::oneshot::channel(); let mut send=Some(send);
     let _selected=state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-        if *event==crate::app_state::AppEvent::Selection && state.environments.active.as_deref()==Some("arriving") && state.selected_thread.as_deref()==Some("menu-thread") {
-            if let Some(send)=send.take() { let _=send.send(()); }
+        if *event == crate::app_state::AppEvent::Selection
+            && state.environments.active.as_deref() == Some("arriving")
+            && state.selected_thread.as_deref() == Some("menu-thread")
+            && let Some(send) = send.take()
+        {
+            let _ = send.send(());
         }
     }));
     state.update(cx, |state, cx| {

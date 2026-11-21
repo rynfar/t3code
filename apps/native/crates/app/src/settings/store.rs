@@ -1012,7 +1012,7 @@ mod tests {
             assert_sidebar(cx, enabled, folders, step);
             if changed { assert!(shell_events.get() > before, "{step}: settings edit invalidates cached sidebar without a shell update"); }
         }
-        assert!(!fixture.take_commands().iter().any(|method| *method == t3_core::commands::method::DISPATCH_COMMAND), "preference changes never dispatch thread mutations");
+        assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND), "preference changes never dispatch thread mutations");
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| { cx.shutdown(); cx.clear_globals(); });
         drop(fixture); drop(runtime); cx.run_until_parked();
@@ -1065,8 +1065,11 @@ mod tests {
         let (ready, loaded) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
         let _loaded = state.update(&mut cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-            if *event == AppEvent::Shell && state.fleet.environments.len() == 1 {
-                if let Some(ready) = ready.take() { let _ = ready.send(()); }
+            if *event == AppEvent::Shell
+                && state.fleet.environments.len() == 1
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
             }
         }));
         let (actor, mut fixture) = ClientFixture::handle(serde_json::from_value(json!({
@@ -1298,8 +1301,13 @@ mod tests {
                 let (streamed, applied) = tokio::sync::oneshot::channel();
                 let mut streamed = Some(streamed);
                 let _streamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                    if *event == AppEvent::ServerConfig && state.scoped_environment("a").is_some_and(|entry| entry.keybindings_revision == expected_revision) {
-                        if let Some(streamed) = streamed.take() { let _ = streamed.send(()); }
+                    if *event == AppEvent::ServerConfig
+                        && state
+                            .scoped_environment("a")
+                            .is_some_and(|entry| entry.keybindings_revision == expected_revision)
+                        && let Some(streamed) = streamed.take()
+                    {
+                        let _ = streamed.send(());
                     }
                 }));
                 events[0].send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({
@@ -1343,9 +1351,18 @@ mod tests {
                     let (streamed, applied) = tokio::sync::oneshot::channel();
                     let mut streamed = Some(streamed);
                     let _streamed = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
-                        if *event == AppEvent::ServerConfig && state.scoped_environment("b").and_then(|entry| entry.config.config.as_ref())
-                            .is_some_and(|config| config.settings.project_settings_overrides["same"].raw.contains_key("concurrent")) {
-                            if let Some(streamed) = streamed.take() { let _ = streamed.send(()); }
+                        if *event == AppEvent::ServerConfig
+                            && state
+                                .scoped_environment("b")
+                                .and_then(|entry| entry.config.config.as_ref())
+                                .is_some_and(|config| {
+                                    config.settings.project_settings_overrides["same"]
+                                        .raw
+                                        .contains_key("concurrent")
+                                })
+                            && let Some(streamed) = streamed.take()
+                        {
+                            let _ = streamed.send(());
                         }
                     }));
                     events[1].send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(serde_json::from_value(json!({

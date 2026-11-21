@@ -3560,7 +3560,7 @@ mod shell_tests {
         }
         assert!(!saw_settings_write_on_vps, "env-vps must not receive provider project override writes");
 
-        vcx.update(|window, cx| finish_close(window, cx));
+        vcx.update(finish_close);
         state.update(&mut vcx, |state, _| state.stop_pump());
         vcx.run_until_parked();
         drop(events);

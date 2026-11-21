@@ -2335,11 +2335,11 @@ mod tests {
         state.update(&mut vcx, |state, cx| {
             let local_id = state.environments.environments[0].id.clone();
             state.environments.active = Some(local_id);
-            if let Some(snapshot) = state.shell.snapshot.as_mut() {
-                if let Some(thread) = snapshot.threads.first_mut() {
-                    thread.branch = None;
-                    thread.worktree_path = None;
-                }
+            if let Some(snapshot) = state.shell.snapshot.as_mut()
+                && let Some(thread) = snapshot.threads.first_mut()
+            {
+                thread.branch = None;
+                thread.worktree_path = None;
             }
             cx.emit(crate::app_state::AppEvent::Shell);
         });
