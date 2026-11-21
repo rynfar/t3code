@@ -6,7 +6,10 @@ use crate::{
         controls::{Button, ButtonSize, ButtonVariant, Switch, r},
         store,
     },
-    theme::{self, hsla, palette},
+    theme::{
+        self, ThemeSlot, ThemeSlotExt, hsla, palette, slot_has_background,
+        theme_slot_clipped_background_layer,
+    },
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -14,7 +17,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     v_flex,
 };
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 use t3_core::{
     client_settings::typography::FontRole,
     themes::{
@@ -97,6 +100,8 @@ struct Editor {
     syncing: bool,
     preview: themes::editor::Preview,
     swatches: BTreeMap<&'static str, FocusHandle>,
+    swatch_bounds: BTreeMap<&'static str, Rc<Cell<Bounds<Pixels>>>>,
+    panel_bounds: Rc<Cell<Bounds<Pixels>>>,
     picker_epoch: usize,
     minimized: bool,
     picker: Option<color_picker::Picker>,
@@ -199,7 +204,15 @@ impl Editor {
             subscriptions,
             syncing: false,
             preview,
-            swatches: FAMILIES.iter().map(|f| (f.role, cx.focus_handle().tab_stop(true))).collect(),
+            swatches: FAMILIES
+                .iter()
+                .map(|f| (f.role, cx.focus_handle().tab_stop(true)))
+                .collect(),
+            swatch_bounds: FAMILIES
+                .iter()
+                .map(|f| (f.role, Rc::new(Cell::new(Bounds::default()))))
+                .collect(),
+            panel_bounds: Rc::default(),
             picker_epoch: 0,
             minimized: false,
             picker: None,
@@ -328,16 +341,29 @@ impl Editor {
     fn field(&self, role: &'static str, label: &'static str, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let invalid = picker::hex(&self.session.colors()[role]).is_none();
+        let swatch_bounds = self.swatch_bounds[role].clone();
         h_flex()
             .gap(r(8.))
             .px(r(8.))
             .py(r(6.))
             .rounded(r(8.))
-            .when(self.selected == Some(role), |d| d.bg(hsla(p.accent).opacity(0.6)))
-            .child(div().flex_1().min_w_0().text_sm().text_color(hsla(p.muted_foreground)).child(label))
+            .when(self.selected == Some(role), |d| {
+                d.bg(hsla(p.accent).opacity(0.6))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(hsla(p.muted_foreground))
+                    .child(crate::i18n::t(cx, label).to_owned()),
+            )
             .child(
                 div()
                     .id(ElementId::Name(format!("choose-{role}").into()))
+                    .relative()
+                    .role(Role::Button)
+                    .aria_label(crate::i18n::t(cx, label).to_owned())
                     .track_focus(&self.swatches[role])
                     .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
                         if crate::settings::controls::activates(e) {
@@ -349,18 +375,33 @@ impl Editor {
                     .rounded_full()
                     .border_1()
                     .border_color(hsla(p.foreground).opacity(0.3))
-                    .when(self.swatches[role].is_focused(window) && window.last_input_was_keyboard(), |d| {
-                        d.border_2().border_color(hsla(p.ring))
-                    })
-                    .bg(hsla(picker::swatch(&self.session.colors()[role]).unwrap_or(p.background)))
+                    .when(
+                        self.swatches[role].is_focused(window) && window.last_input_was_keyboard(),
+                        |d| d.border_2().border_color(hsla(p.ring)),
+                    )
+                    .bg(hsla(
+                        picker::swatch(&self.session.colors()[role]).unwrap_or(p.background),
+                    ))
+                    .child(
+                        canvas(
+                            move |bounds, _, _| swatch_bounds.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| this.open_picker(role, window, cx))),
             )
             .child(
                 div()
                     .w(r(112.))
-                    .when(invalid, |d| d.border_1().rounded(r(6.)).border_color(hsla(p.destructive)))
-                    .child(Input::new(&self.fields[role]).small()),
+                    .when(invalid, |d| {
+                        d.border_1()
+                            .rounded(r(6.))
+                            .border_color(hsla(p.destructive))
+                    })
+                    .child(theme_input(&self.fields[role], true, cx)),
             )
             .into_any_element()
     }
@@ -378,35 +419,64 @@ impl Render for Editor {
         let p = palette(cx);
         let viewport = window.viewport_size();
         let weak = cx.entity().downgrade();
-        let panel_size = self.dimensions.unwrap_or(size(
-            px(416.),
-            px(if self.minimized {
-                40.
-            } else if self.session.advanced {
-                672.
-            } else {
-                320.
-            })
-            .min(viewport.height - px(96.)),
-        ));
-        let width = panel_size.width.min(viewport.width - px(16.)).max(px(280.));
-        let height = panel_size
-            .height
-            .min(viewport.height - px(16.))
-            .max(px(if self.minimized { 40. } else { 220. }));
-        let pos = self
+        let previous_bounds = self.panel_bounds.get();
+        let width = self
+            .dimensions
+            .map_or(px(416.), |size| size.width)
+            .min((viewport.width - px(16.)).max(px(0.)));
+        let default_left = (viewport.width - width - px(16.)).max(px(8.));
+        let desired_left = self
             .position
-            .unwrap_or(point(viewport.width - width - px(16.), viewport.height - height - px(16.)));
-        let pos = point(
-            pos.x.max(px(8.)).min((viewport.width - width - px(8.)).max(px(8.))),
-            pos.y.max(px(8.)).min((viewport.height - px(48.)).max(px(8.))),
+            .map_or(default_left, |point| point.x)
+            .clamp(px(8.), (viewport.width - width - px(8.)).max(px(8.)));
+        let picker_margin = px(236.);
+        let needs_space_for_picker = self.picker.is_some()
+            && desired_left < picker_margin
+            && viewport.width - desired_left - width < picker_margin;
+        let (left, width) = if needs_space_for_picker {
+            (
+                picker_margin,
+                width.min((viewport.width - picker_margin - px(8.)).max(px(0.))),
+            )
+        } else {
+            (desired_left, width)
+        };
+        let top = self.position.map(|point| {
+            point
+                .y
+                .clamp(px(8.), (viewport.height - px(72.)).max(px(8.)))
+        });
+        let max_height = (viewport.height - top.unwrap_or(px(16.)) - px(16.)).max(px(0.));
+        let height = self
+            .dimensions
+            .map(|size| size.height)
+            .or_else(|| self.session.advanced.then_some(px(672.)))
+            .map(|height| height.min(max_height));
+        let panel_bounds = self.panel_bounds.clone();
+        let title = crate::i18n::t(
+            cx,
+            if self.session.is_editing() {
+                "Edit theme"
+            } else {
+                "Create theme"
+            },
         );
-        let title = crate::i18n::t(cx, if self.session.is_editing() { "Edit theme" } else { "Create theme" });
         let mut body = v_flex().gap(r(12.)).px(r(12.)).py(r(12.)).child(
             h_flex()
                 .gap(r(12.))
-                .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Theme name")))
-                .child(div().flex_1().child(Input::new(&self.name).small())),
+                .child(
+                    div()
+                        .w(r(116.))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(crate::i18n::t(cx, "Theme name")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(theme_input(&self.name, false, cx)),
+                ),
         );
         if let Some(e) = &self.session.error {
             body = body.child(div().text_sm().text_color(hsla(p.destructive)).child(e.clone()));
@@ -415,28 +485,42 @@ impl Render for Editor {
             .child(
                 h_flex()
                     .gap(r(12.))
-                    .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Appearance")))
-                    .child(h_flex().gap(r(2.)).children([false, true].into_iter().map(|dark| {
-                        let reason = self.session.lock_reason(dark, store::client(cx));
-                        Button::new(
-                            if dark { "editor-dark" } else { "editor-light" },
-                            if dark == self.session.dark {
-                                ButtonVariant::Secondary
-                            } else {
-                                ButtonVariant::GhostMuted
-                            },
-                            ButtonSize::Xs,
-                        )
-                        .label(if dark { "Dark" } else { "Light" })
-                        .disabled(reason.is_some() || self.saving)
-                        .tooltip(reason.unwrap_or_default())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.end_picker(false, window, cx);
-                            this.session.set_appearance(dark, store::client(cx));
-
-                            this.sync(window, cx);
-                        }))
-                    }))),
+                    .child(
+                        div()
+                            .w(r(116.))
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(crate::i18n::t(cx, "Appearance")),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(r(2.))
+                            .p(r(2.))
+                            .rounded(r(8.))
+                            .bg(hsla(p.muted))
+                            .children([false, true].into_iter().map(|dark| {
+                                let reason = self.session.lock_reason(dark, store::client(cx));
+                                let button = Button::new(
+                                    if dark { "editor-dark" } else { "editor-light" },
+                                    if dark == self.session.dark {
+                                        ButtonVariant::Secondary
+                                    } else {
+                                        ButtonVariant::GhostMuted
+                                    },
+                                    ButtonSize::Xs,
+                                )
+                                .label(if dark { "Dark" } else { "Light" })
+                                .icon(if dark { Icon::Moon } else { Icon::Sun })
+                                .disabled(reason.is_some() || self.saving);
+                                button
+                                    .when_some(reason, |button, reason| button.tooltip(reason))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.end_picker(false, window, cx);
+                                        this.session.set_appearance(dark, store::client(cx));
+                                        this.sync(window, cx);
+                                    }))
+                            })),
+                    ),
             )
             .child(
                 h_flex()
@@ -468,7 +552,7 @@ impl Render for Editor {
                     ),
             );
         if self.session.advanced {
-            body = body.child(Input::new(&self.query).small());
+            body = body.child(theme_input(&self.query, false, cx));
         }
         let query = self.query.read(cx).value().to_string();
         let mut group = "";
@@ -531,10 +615,17 @@ impl Render for Editor {
                 None
             };
             let editor_box = v_flex()
+                .relative()
                 .rounded(r(8.))
                 .border_1()
                 .border_color(if diag.exceeds_max_length { hsla(p.destructive) } else { hsla(p.input) })
                 .bg(hsla(p.code_background))
+                .theme_slot(ThemeSlot::Input, cx)
+                .children(theme_slot_clipped_background_layer(
+                    ThemeSlot::Input,
+                    r(8.),
+                    cx,
+                ))
                 .overflow_hidden()
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if this.saving
@@ -657,7 +748,7 @@ impl Render for Editor {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            this.drag = Some((e.position, pos, false));
+                            this.drag = Some((e.position, this.panel_bounds.get().origin, false));
                             cx.notify();
                         }),
                     ),
@@ -670,7 +761,8 @@ impl Render for Editor {
                     } else {
                         "Minimize the theme editor"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.end_picker(false, window, cx);
                         this.minimized = !this.minimized;
                         cx.notify();
                     })),
@@ -685,7 +777,8 @@ impl Render for Editor {
         let footer = h_flex()
             .justify_end()
             .gap(r(8.))
-            .px(r(12.))
+            .pl(r(12.))
+            .pr(r(24.))
             .py(r(8.))
             .border_t_1()
             .border_color(hsla(p.border).opacity(0.7))
@@ -706,37 +799,87 @@ impl Render for Editor {
             .key_context("ThemeEditor")
             .track_focus(&self.focus)
             .absolute()
-            .left(pos.x)
-            .top(pos.y)
+            .left(left)
+            .map(|panel| {
+                if let Some(top) = top {
+                    panel.top(top)
+                } else {
+                    panel.bottom(px(16.))
+                }
+            })
             .w(width)
-            .when(!self.minimized, |d| d.h(height))
+            .max_h(max_height)
+            .when_some(height.filter(|_| !self.minimized), |panel, height| {
+                panel.h(height)
+            })
             .rounded(r(12.))
             .overflow_hidden()
             .occlude()
             .text_sm()
             .text_color(hsla(p.popover_foreground))
-            .child(crate::glass::backdrop(12., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+            .when(!slot_has_background(ThemeSlot::DialogPopup, cx), |panel| {
+                panel.child(crate::glass::backdrop(
+                    12.,
+                    hsla(p.dialog_surface),
+                    hsla(p.dialog_border),
+                    cx,
+                ))
+            })
+            .when(slot_has_background(ThemeSlot::DialogPopup, cx), |panel| {
+                panel
+                    .bg(hsla(p.dialog_surface))
+                    .border_1()
+                    .border_color(hsla(p.dialog_border))
+            })
+            .theme_slot(ThemeSlot::DialogPopup, cx)
+            .children(theme_slot_clipped_background_layer(
+                ThemeSlot::DialogPopup,
+                r(12.),
+                cx,
+            ))
+            .child(
+                canvas(
+                    move |bounds, _, _| panel_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(header)
             .when(!self.minimized, |d| {
-                d.child(div().id("theme-editor-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
-                    .child(footer)
-                    .child(
-                        div()
-                            .id("theme-editor-resize")
-                            .absolute()
-                            .bottom_0()
-                            .right_0()
-                            .size(px(18.))
-                            .cursor_crosshair()
-                            .child("◢")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                                    this.drag = Some((e.position, point(width, height), true));
-                                    cx.notify();
-                                }),
-                            ),
-                    )
+                d.child(
+                    div()
+                        .id("theme-editor-scroll")
+                        .flex_auto()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(body),
+                )
+                .child(footer)
+                .child(
+                    div()
+                        .id("theme-editor-resize")
+                        .absolute()
+                        .bottom_0()
+                        .right_0()
+                        .size(r(18.))
+                        .cursor(CursorStyle::ResizeUpLeftDownRight)
+                        .child(resize_grip(hsla(p.muted_foreground)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                let bounds = this.panel_bounds.get();
+                                this.drag = Some((
+                                    e.position,
+                                    point(bounds.size.width, bounds.size.height),
+                                    true,
+                                ));
+                                this.position = Some(bounds.origin);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
             })
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 if e.keystroke.key == "escape" {
@@ -753,7 +896,7 @@ impl Render for Editor {
             .absolute()
             .inset_0()
             .child(panel)
-            .children(self.render_picker(window, cx))
+            .children(self.render_picker(left, width, window, cx))
             .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
                 if e.pressed_button != Some(MouseButton::Left) {
                     this.drag = None;
@@ -763,10 +906,13 @@ impl Render for Editor {
                     let delta = e.position - start;
                     if resize {
                         this.dimensions = Some(size(
-                            (original.x + delta.x).max(px(280.)).min(viewport.width - pos.x - px(8.)),
-                            (original.y + delta.y).max(px(220.)).min(viewport.height - pos.y - px(8.)),
+                            (original.x + delta.x)
+                                .max(px(280.))
+                                .min(viewport.width - previous_bounds.left() - px(8.)),
+                            (original.y + delta.y)
+                                .max(px(220.))
+                                .min(viewport.height - previous_bounds.top() - px(8.)),
                         ));
-                        this.position = Some(pos);
                     } else {
                         this.position = Some(original + delta);
                     }
@@ -775,6 +921,48 @@ impl Render for Editor {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
     }
+}
+
+fn theme_input(state: &Entity<InputState>, mono: bool, cx: &App) -> gpui::Div {
+    let layer = theme_slot_clipped_background_layer(ThemeSlot::Input, r(8.), cx);
+    let custom = layer.is_some();
+    div()
+        .relative()
+        .w_full()
+        .when(mono, |field| {
+            field.font_family(theme::font_family(FontRole::Code, cx))
+        })
+        .children(layer)
+        .child(
+            Input::new(state)
+                .appearance(!custom)
+                .small()
+                .theme_slot(ThemeSlot::Input, cx),
+        )
+}
+
+fn resize_grip(ink: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let scale = window.rem_size() / 16.;
+            let mut path = PathBuilder::stroke(scale);
+            for offset in [7., 11.] {
+                path.move_to(point(
+                    bounds.right() - scale * offset,
+                    bounds.bottom() - scale * 3.,
+                ));
+                path.line_to(point(
+                    bounds.right() - scale * 3.,
+                    bounds.bottom() - scale * offset,
+                ));
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, ink);
+            }
+        },
+    )
+    .size_full()
 }
 
 #[cfg(feature = "snapshot")]

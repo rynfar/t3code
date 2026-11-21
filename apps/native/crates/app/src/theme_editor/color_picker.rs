@@ -1,6 +1,5 @@
 //! Native controls for `ThemeColorPicker.tsx`; conversion and rollback live in core.
 use super::*;
-use std::{cell::Cell, rc::Rc};
 pub(super) struct Picker {
     role: &'static str,
     hsv: picker::Hsv,
@@ -157,66 +156,127 @@ impl Editor {
         self.picker.as_mut().unwrap().hsv = picker::Hsv { h: 125., s: 1., v: 0.4 };
         self.schedule_picker_commit(window, cx);
     }
-    pub(super) fn render_picker(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_picker(
+        &self,
+        editor_left: Pixels,
+        editor_width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let picker = self.picker.as_ref()?;
         let p = palette(cx);
         let hsv = picker.hsv;
-        let color = |h, s, v| hsla(picker::swatch(&picker::from_hsv(picker::Hsv { h, s, v }, "")).expect("HSV"));
+        let color = |h, s, v| {
+            hsla(picker::swatch(&picker::from_hsv(picker::Hsv { h, s, v }, "")).expect("HSV"))
+        };
+        let selected_color = color(hsv.h, hsv.s, hsv.v);
+        let thumb = |diameter, ink| {
+            div()
+                .absolute()
+                .size(px(diameter))
+                .ml(px(-diameter / 2.))
+                .mt(px(-diameter / 2.))
+                .rounded_full()
+                .bg(ink)
+                .border_2()
+                .border_color(hsla(p.picker_thumb_border))
+                .shadow(vec![BoxShadow {
+                    color: black().opacity(0.68),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.75),
+                    inset: false,
+                }])
+        };
+        let plane_radius = window.rem_size() * (6. / 16.);
+        let saturation = linear_gradient(
+            90.,
+            linear_color_stop(color(0., 0., 1.), 0.),
+            linear_color_stop(color(hsv.h, 1., 1.), 1.),
+        );
+        let value = linear_gradient(
+            180.,
+            linear_color_stop(black().opacity(0.), 0.),
+            linear_color_stop(black(), 1.),
+        );
         let plane = div()
             .relative()
             .w_full()
-            .h(px(160.))
-            .rounded(r(6.))
-            .overflow_hidden()
-            .bg(linear_gradient(
-                90.,
-                linear_color_stop(color(0., 0., 1.), 0.),
-                linear_color_stop(color(hsv.h, 1., 1.), 1.),
-            ))
-            .child(div().absolute().inset_0().bg(linear_gradient(
-                180.,
-                linear_color_stop(color(0., 0., 0.).opacity(0.), 0.),
-                linear_color_stop(color(0., 0., 0.), 1.),
-            )))
+            .h(r(160.))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        window.paint_quad(fill(bounds, saturation).corner_radii(plane_radius));
+                        window.paint_quad(fill(bounds, value).corner_radii(plane_radius));
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
             .child(
                 div().absolute().inset(px(6.)).child(
-                    div()
-                        .absolute()
+                    thumb(12., selected_color)
                         .left(relative(hsv.s as f32))
-                        .top(relative(1. - hsv.v as f32))
-                        .ml(px(-6.))
-                        .mt(px(-6.))
-                        .size(px(12.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(hsla(p.picker_thumb_border)),
+                        .top(relative(1. - hsv.v as f32)),
                 ),
             );
-        let hue = h_flex()
+        let hue_rim = window.rem_size() * (5. / 16.);
+        let hue_gradients = std::array::from_fn::<_, 6, _>(|i| {
+            linear_gradient(
+                90.,
+                linear_color_stop(color(i as f64 * 60., 1., 1.), 0.),
+                linear_color_stop(color((i + 1) as f64 * 60., 1., 1.), 1.),
+            )
+        });
+        let hue = div()
             .relative()
             .w_full()
-            .h(px(16.))
-            .rounded_full()
-            .overflow_hidden()
-            .children((0..6).map(|i| {
-                div().h_full().flex_1().bg(linear_gradient(
-                    90.,
-                    linear_color_stop(color(f64::from(i) * 60., 1., 1.), 0.),
-                    linear_color_stop(color(f64::from(i + 1) * 60., 1., 1.), 1.),
-                ))
-            }))
+            .h(r(10.))
             .child(
-                div().absolute().left(px(8.)).right(px(8.)).top_0().h_full().child(
-                    div()
-                        .absolute()
-                        .left(relative((hsv.h / 360.) as f32))
-                        .ml(px(-8.))
-                        .size(px(16.))
-                        .rounded_full()
-                        .bg(color(hsv.h, 1., 1.))
-                        .border_2()
-                        .border_color(hsla(p.picker_thumb_border)),
-                ),
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        let width = bounds.size.width / 6.;
+                        for (i, gradient) in hue_gradients.into_iter().enumerate() {
+                            let left = if i == 0 { hue_rim } else { px(0.) };
+                            let right = if i == 5 { hue_rim } else { px(0.) };
+                            let radii = Corners {
+                                top_left: left,
+                                top_right: right,
+                                bottom_left: left,
+                                bottom_right: right,
+                            };
+                            let segment = Bounds::new(
+                                point(bounds.left() + width * i as f32, bounds.top()),
+                                size(width, bounds.size.height),
+                            );
+                            window.paint_quad(quad(
+                                segment,
+                                radii,
+                                gradient,
+                                px(0.),
+                                transparent_black(),
+                                BorderStyle::Solid,
+                            ));
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(7.))
+                    .right(px(7.))
+                    .top_0()
+                    .h_full()
+                    .child(
+                        thumb(14., color(hsv.h, 1., 1.))
+                            .left(relative((hsv.h / 360.) as f32))
+                            .top(relative(0.5)),
+                    ),
             );
         let areas = [plane.into_any_element(), hue.into_any_element()]
             .into_iter()
@@ -270,40 +330,88 @@ impl Editor {
                     )
             });
         let viewport = window.viewport_size();
-        let pos = self.position.unwrap_or(point(
-            viewport.width - px(432.),
-            viewport.height - px(if self.session.advanced { 688. } else { 336. }),
-        ));
-        let label = FAMILIES.iter().find(|f| f.role == picker.role).map_or("Color", |f| f.label);
-        let panel = v_flex()
+        let editor_right = editor_left + editor_width;
+        let left_room = editor_left - px(20.);
+        let right_room = viewport.width - editor_right - px(20.);
+        let preferred_width = window.rem_size() * (288. / 16.);
+        let place_left = left_room >= preferred_width || left_room >= right_room;
+        let room = if place_left { left_room } else { right_room };
+        let width = preferred_width.min(room.max(px(1.)));
+        let left = if place_left {
+            editor_left - px(12.) - width
+        } else {
+            editor_right + px(12.)
+        };
+        let anchor = self.swatch_bounds[picker.role].get();
+        let preferred_height = window.rem_size() * (310. / 16.);
+        let top = anchor.top().clamp(
+            px(8.),
+            (viewport.height - preferred_height - px(8.)).max(px(8.)),
+        );
+        let label = crate::i18n::t(
+            cx,
+            FAMILIES
+                .iter()
+                .find(|f| f.role == picker.role)
+                .map_or("Color", |f| f.label),
+        );
+        let swatch = |diameter| {
+            div()
+                .flex_none()
+                .size(r(diameter))
+                .rounded_full()
+                .bg(selected_color)
+                .border_1()
+                .border_color(hsla(p.foreground).opacity(0.16))
+        };
+        let panel = crate::composer::controls::popup_surface(cx)
+            .id("theme-color-picker")
             .absolute()
-            .left((pos.x - px(300.)).max(px(8.)))
-            .top(pos.y.max(px(8.)).min((viewport.height - px(350.)).max(px(8.))))
-            .w(px(288.))
-            .rounded(r(8.))
-            .overflow_hidden()
+            .left(left)
+            .top(top)
+            .w(width)
+            .max_h((viewport.height - top - px(8.)).max(px(0.)))
+            .overflow_y_scroll()
             .occlude()
-            .text_color(hsla(p.popover_foreground))
-            .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
             .child(
                 h_flex()
-                    .justify_between()
-                    .p(r(12.))
+                    .gap(r(8.))
+                    .p(r(8.))
                     .border_b_1()
                     .border_color(hsla(p.border))
+                    .child(swatch(28.))
                     .child(
                         v_flex()
-                            .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(label))
-                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Choose a color")),
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(label.to_owned()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child(crate::i18n::t(cx, "Choose a color")),
+                            ),
                     )
                     .child(
-                        Button::new("close-color-picker", ButtonVariant::Ghost, ButtonSize::IconXs)
-                            .icon(Icon::X)
-                            .on_click(cx.listener(|this, _, window, cx| this.end_picker(false, window, cx))),
+                        Button::new(
+                            "close-color-picker",
+                            ButtonVariant::Ghost,
+                            ButtonSize::IconXs,
+                        )
+                        .icon(Icon::X)
+                        .tooltip("Close")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.end_picker(false, window, cx)),
+                        ),
                     ),
             )
             .child(
-                v_flex().p(r(12.)).gap(r(12.)).children(areas).child(
+                v_flex().p(r(8.)).gap(r(12.)).children(areas).child(
                     h_flex()
                         .gap(r(8.))
                         .child(
@@ -311,14 +419,20 @@ impl Editor {
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().text_xs().child("HEX"))
-                                .child(Input::new(&picker.hex).small()),
+                                .child(h_flex().gap(r(4.)).child(swatch(14.)).child(
+                                    div().flex_1().min_w_0().child(theme_input(
+                                        &picker.hex,
+                                        true,
+                                        cx,
+                                    )),
+                                )),
                         )
                         .child(
                             v_flex()
                                 .flex_1()
                                 .min_w_0()
                                 .child(div().text_xs().child("RGB"))
-                                .child(Input::new(&picker.rgb).small()),
+                                .child(theme_input(&picker.rgb, true, cx)),
                         ),
                 ),
             );
