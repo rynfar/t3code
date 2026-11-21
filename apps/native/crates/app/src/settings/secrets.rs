@@ -183,7 +183,7 @@ impl SettingsView {
             PageState::Providers { editable } => editable && !is_project_scope,
         };
         let providers = providers.0;
-        let rows: Vec<AnyElement> = if providers.is_empty() {
+        let mut rows: Vec<AnyElement> = if providers.is_empty() {
             vec![Row::new("secret-providers-empty", secrets::EMPTY_TITLE).description(secrets::EMPTY_DESCRIPTION).into_any_element()]
         } else {
             providers
@@ -216,6 +216,12 @@ impl SettingsView {
                 })
                 .collect()
         };
+        if is_project_scope {
+            rows.insert(0, div().px(r(16.)).py(r(12.)).bg(hsla(p.muted))
+                .text_xs().text_color(hsla(p.muted_foreground))
+                .child(crate::i18n::t(cx, "Environment-wide setting. Select an environment to change it."))
+                .into_any_element());
+        }
         let header = h_flex().justify_between().gap(r(16.)).child(section_title("Secret providers")).when(editable, |this| {
             this.child(
                 div().pr(r(16.)).child(
@@ -303,7 +309,7 @@ impl SettingsView {
                         .label("Cancel")
                         .on_click(cx.listener(|this, _, window, cx| this.close_secret_dialog(window, cx)))
                         .into_any_element(),
-                    Button::new("secret-provider-remove-confirm", ButtonVariant::DestructiveOutline, ButtonSize::Default)
+                    Button::new("secret-provider-remove-confirm", ButtonVariant::Destructive, ButtonSize::Default)
                         .label("Remove provider")
                         .on_click(cx.listener(|this, _, window, cx| this.confirm_remove_secret_provider(window, cx)))
                         .into_any_element(),

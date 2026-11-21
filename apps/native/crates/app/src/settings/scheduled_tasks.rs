@@ -1,5 +1,5 @@
 //! Scheduled tasks: `ScheduledTasksSettings` in `web/src/components/settings/ScheduledTasksSettings.tsx`
-//! for the connected environment. Follows `scheduledTasks.subscribe` (including server `timeZone`),
+//! for the selected settings environment and project. Follows `scheduledTasks.subscribe` (including server `timeZone`),
 //! supports thread modes (`new_thread` / `continue` / `fresh_session`, `pingdotgg/t3code#30326`),
 //! clickable thread links and move-to-thread destination picking, delete confirmation, webhook
 //! URL rotation, signature verification, max delivery age, filters, dedupe keys, and the webhook
@@ -9,31 +9,37 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{Local, NaiveDateTime, TimeZone, Timelike};
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::calendar::{Calendar, CalendarEvent, CalendarState, Date};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::Value;
+use t3_client::environments::EnvironmentView;
+use t3_client::session::RpcError;
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::model::ModelSelection;
 use t3_core::providers;
 use t3_core::server_config::ServerConfig;
+use t3_core::sidebar::{grouping::EnvironmentOwner, tag_filter::ThreadKey};
 use t3_core::settings::scheduled_tasks::{
     self, DAY_TOGGLES, Draft, Invalid, MAX_WEBHOOK_FILTERS, RunStatus, ScheduleMode, ScheduledTask, SignatureEncoding, ThreadMode,
     WebhookDelivery, WebhookDeliverySummary, WebhookFilterOp, WorkspaceMode, decode_webhook_deliveries, decode_webhook_delivery,
     destination_threads, get_delivery_payload, list_deliveries_payload, method, schedule_time_zone_label, webhook_address, webhook_delivery_label,
 };
 
-use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, muted_text, r, section_title};
-use super::providers::{Stream, failure_text};
+use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, muted_text, r, section_title};
+use super::providers::failure_text;
 use super::source_control::{Tone, tone_badge};
 use super::threads::{model_options, parse_selection, selection_label, selection_value};
 use super::{Block, SettingsView, store};
 use crate::composer::controls::floating_shadow;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::i18n::t;
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer};
 
+const READ_SCOPE: &str = "orchestration:read";
 const LOCAL_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 /// `Intl.DateTimeFormat` medium date, short time.
@@ -108,11 +114,32 @@ struct DeliveriesView {
     seq: u64,
 }
 
+pub(super) struct TaskStream {
+    owner: EnvironmentOwner,
+    driver: tokio::task::JoinHandle<()>,
+    _pump: Task<()>,
+}
+
+impl Drop for TaskStream {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
 pub(crate) struct ScheduledTasksState {
     tasks: Option<Result<Vec<ScheduledTask>, String>>,
     time_zone: Option<String>,
-    pub(super) stream: Option<(u64, Stream)>,
-    busy: HashSet<String>,
+    pub(super) stream: Option<TaskStream>,
+    environment: Option<String>,
+    dialog_environment: Option<String>,
+    dialog_focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+    calendar: Entity<CalendarState>,
+    calendar_open: bool,
+    branch_refs: Option<Result<Vec<SelectOption>, String>>,
+    branch_request: Option<Task<()>>,
+    delivery_revision: u64,
+    busy: HashSet<(String, String)>,
     menu: Option<String>,
     editor: Option<Draft>,
     editor_error: Option<Invalid>,
@@ -133,11 +160,47 @@ impl ScheduledTasksState {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
         let thread_search = input("Search threads in this project…", window, cx);
-        let subscriptions = vec![cx.subscribe(&thread_search, |_, _, event: &InputEvent, cx| {
+        let mut subscriptions = vec![cx.subscribe(&thread_search, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         })];
+        let calendar = cx.new(|cx| CalendarState::new(window, cx));
+        subscriptions.push(cx.subscribe_in(&calendar, window, |view, _, event: &CalendarEvent, window, cx| {
+            let CalendarEvent::Selected(Date::Single(Some(day))) = event else { return };
+            let input = &view.scheduled.inputs.run_at;
+            let time = NaiveDateTime::parse_from_str(input.read(cx).value().as_ref(), LOCAL_FORMAT)
+                .map_or_else(|_| "09:00".to_owned(), |date| date.format("%H:%M").to_string());
+            input.update(cx, |input, cx| input.set_value(format!("{day} {time}"), window, cx));
+            view.scheduled.calendar_open = false;
+            input.focus_handle(cx).focus(window, cx);
+            cx.notify();
+        }));
+        let view = cx.entity().downgrade();
+        subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.key != "escape" {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                if view.section != t3_core::settings::search::Section::ScheduledTasks
+                    || crate::dialog::is_open(cx)
+                {
+                    return;
+                }
+                if view.scheduled.calendar_open {
+                    view.scheduled.calendar_open = false;
+                    view.scheduled.inputs.run_at.focus_handle(cx).focus(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if view.scheduled.menu.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if view.scheduled.editor.is_some() || view.scheduled.deliveries.is_some() {
+                    cx.stop_propagation();
+                    view.close_task_dialog(window, cx);
+                }
+            });
+        }));
         let inputs = EditorInputs {
             title: input("e.g. Check for Sentry issues", window, cx),
             prompt: cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 10).placeholder("What should the agent do each time this runs?")),
@@ -159,6 +222,15 @@ impl ScheduledTasksState {
             tasks: None,
             time_zone: None,
             stream: None,
+            environment: None,
+            dialog_environment: None,
+            dialog_focus: cx.focus_handle(),
+            previous_focus: None,
+            calendar,
+            calendar_open: false,
+            branch_refs: None,
+            branch_request: None,
+            delivery_revision: 0,
             busy: HashSet::new(),
             menu: None,
             editor: None,
@@ -209,63 +281,124 @@ fn project_options(config_projects: &[t3_core::shell::ProjectShell], selected: &
 }
 
 impl SettingsView {
+    fn task_environment<'a>(&'a self, cx: &'a App) -> Option<&'a EnvironmentView> {
+        let app = self.state.read(cx);
+        let chosen = self.scheduled.dialog_environment.as_ref().or(self.scheduled.environment.as_ref())?;
+        app.fleet.environment(chosen)
+    }
+
     fn can_operate_tasks(&self, cx: &App) -> bool {
-        self.may(ORCHESTRATION_OPERATE_SCOPE, cx)
+        self.task_environment(cx).is_some_and(|entry| {
+            entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                && entry.summary.synchronized
+                && entry.grants.as_ref().is_some_and(|grants| grants.grants(ORCHESTRATION_OPERATE_SCOPE))
+        })
+    }
+
+    fn task_request(
+        &self, scope: &'static str, method: &'static str, payload: Value, cx: &App,
+    ) -> impl std::future::Future<Output = Result<Value, RpcError>> + use<> {
+        let app = self.state.read(cx);
+        let lookup = self.task_environment(cx).map(|entry| {
+            app.connections.destination(&entry.summary.owner, scope)
+        });
+        let runtime = app.runtime().clone();
+        let fleet = app.connections.view();
+        async move {
+            let target = lookup.ok_or(RpcError::Closed)?.await.map_err(|_| RpcError::Closed)?;
+            if !target.is_current(&fleet.borrow()) {
+                return Err(RpcError::Closed);
+            }
+            runtime.spawn(async move { target.client.request(method, payload).await })
+                .await.unwrap_or(Err(RpcError::Closed))
+        }
     }
 
     fn webhook_denial(&self, cx: &App) -> Option<String> {
         t3_core::managed_policy::capability_denial(
-            self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()),
+            self.task_environment(cx).and_then(|entry| entry.config.config.as_ref()).and_then(|config| config.managed_policy.as_ref()),
             t3_core::managed_policy::Capability::WebhookTasks,
         )
     }
 
+    fn scoped_task_project_ids(&self, owner: &EnvironmentOwner, cx: &App) -> Option<HashSet<String>> {
+        self.scope.project.as_ref()?;
+        Some(self.scoped_project_members(cx).into_iter()
+            .filter(|member| member.owner.saved_id == owner.saved_id)
+            .map(|member| member.project.id)
+            .collect())
+    }
+
     fn shell_projects(&self, cx: &App) -> Vec<t3_core::shell::ProjectShell> {
-        self.state.read(cx).shell.snapshot.as_ref().map(|snapshot| snapshot.projects.clone()).unwrap_or_default()
+        let Some(entry) = self.task_environment(cx) else { return Vec::new() };
+        let projects = self.scoped_task_project_ids(&entry.summary.owner, cx);
+        entry.summary.projects.iter()
+            .filter(|member| projects.as_ref().is_none_or(|ids| ids.contains(&member.project.id)))
+            .map(|member| member.project.clone())
+            .collect()
     }
 
     fn thread_title_for(&self, thread_id: &str, cx: &App) -> Option<String> {
-        self.state
-            .read(cx)
-            .shell
-            .snapshot
-            .as_ref()?
-            .threads
-            .iter()
-            .find(|thread| thread.id == thread_id)
-            .map(|thread| thread.title.clone())
+        self.task_environment(cx)?.summary.threads.iter()
+            .find(|thread| thread.thread.id == thread_id)
+            .map(|thread| thread.thread.title.clone())
     }
 
     fn open_task_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
+        let Some(target) = self.task_environment(cx).map(|entry| ThreadKey::new(&entry.summary.owner.saved_id, &thread_id))
+        else { return };
+        self.state.update(cx, |state, cx| state.open_notification_target(target, cx));
         window.dispatch_action(Box::new(super::CloseSettings), cx);
     }
 
-    /// Follows `scheduledTasks.subscribe` while the page is open on a connection.
     fn ensure_task_stream(&mut self, cx: &mut Context<Self>) {
-        let Some(connection) = self.state.read(cx).connection_id() else {
-            self.scheduled.stream = None;
-            return;
-        };
-        if self.scheduled.stream.as_ref().is_some_and(|(id, _)| *id == connection) {
+        let owner = self.task_environment(cx)
+            .filter(|entry| entry.status == t3_client::supervisor::ConnectionStatus::Connected && entry.summary.synchronized)
+            .map(|entry| entry.summary.owner.clone());
+        if owner.as_ref().is_some_and(|owner| self.scheduled.stream.as_ref().is_some_and(|stream| &stream.owner == owner)) {
             return;
         }
+        self.scheduled.stream = None;
         self.scheduled.tasks = None;
         self.scheduled.time_zone = None;
-        let stream = self.subscribe(method::SUBSCRIBE, serde_json::json!({}), cx, |this, item, _| {
-            match item {
-                Ok(value) => {
-                    if let Some(list) = scheduled_tasks::decode_list_with_timezone(&value) {
-                        this.scheduled.time_zone = list.time_zone;
-                        this.scheduled.tasks = Some(Ok(list.tasks));
+        let Some(owner) = owner else { return };
+        let app = self.state.read(cx);
+        let lookup = app.connections.destination(&owner, READ_SCOPE);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let driver = app.runtime().spawn(async move {
+            let failure = async {
+                let target = lookup.await.map_err(|_| RpcError::Closed)?;
+                let mut stream = target.client.stream(method::SUBSCRIBE, serde_json::json!({})).await?;
+                while let Some(item) = stream.receiver.recv().await {
+                    if let Some(list) = scheduled_tasks::decode_list_with_timezone(&item?)
+                        && tx.send(Ok(list)).await.is_err()
+                    {
+                        return Ok::<_, RpcError>(());
                     }
                 }
-                Err(message) => {
-                    this.scheduled.tasks = Some(Err(message));
+                Err(RpcError::Closed)
+            }.await;
+            if let Err(error) = failure {
+                let _ = tx.send(Err(failure_text(&error, "Reconnect to the environment to try again."))).await;
+            }
+        });
+        let pump = cx.spawn(async move |view, cx| {
+            while let Some(result) = rx.recv().await {
+                if view.update(cx, |view, cx| {
+                    match result {
+                        Ok(list) => {
+                            view.scheduled.tasks = Some(Ok(list.tasks));
+                            view.scheduled.time_zone = list.time_zone;
+                        }
+                        Err(error) => view.scheduled.tasks = Some(Err(error)),
+                    }
+                    cx.notify();
+                }).is_err() {
+                    break;
                 }
             }
         });
-        self.scheduled.stream = stream.map(|stream| (connection, stream));
+        self.scheduled.stream = Some(TaskStream { owner, driver, _pump: pump });
     }
 
     fn task_rpc(&mut self, id: &str, rpc: &'static str, payload: Value, cx: &mut Context<Self>) {
@@ -279,14 +412,17 @@ impl SettingsView {
         {
             return;
         }
-        let task = self.state.read(cx).rpc(rpc, payload);
-        let id = id.to_owned();
-        self.scheduled.busy.insert(id.clone());
+        let Some(environment) = self.task_environment(cx) else { return };
+        let busy = (environment.summary.owner.saved_id.clone(), id.to_owned());
+        if !self.scheduled.busy.insert(busy.clone()) {
+            return;
+        }
+        let task = self.task_request(ORCHESTRATION_OPERATE_SCOPE, rpc, payload, cx);
         self.scheduled.menu = None;
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                this.scheduled.busy.remove(&id);
+                this.scheduled.busy.remove(&busy);
                 if let Err(error) = result {
                     store::show_error(format!("Could not update scheduled task: {}", failure_text(&error, "Try again.")), cx);
                 }
@@ -300,18 +436,21 @@ impl SettingsView {
     fn confirm_delete_task(&mut self, id: String, title: String, cx: &mut Context<Self>) {
         self.scheduled.menu = None;
         let view = cx.entity().downgrade();
+        let chosen = self.scheduled.environment.clone();
         crate::dialog::ask(
-            format!("Delete \"{title}\"?"),
+            crate::i18n::t_fmt(cx, "Delete “{title}”?", &[("title", title.as_str().into())]),
             "This scheduled task will stop running and cannot be recovered.",
             "Delete",
-            move |_, cx| {
-                let id = id.clone();
+            move |_, cx| cx.defer(move |cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.task_rpc(&id, method::DELETE, scheduled_tasks::id_payload(&id), cx);
+                    if this.scheduled.environment == chosen {
+                        this.task_rpc(&id, method::DELETE, scheduled_tasks::id_payload(&id), cx);
+                    }
                 });
-            },
+            }),
             cx,
         );
+        cx.notify();
     }
 
     fn confirm_rotate_webhook_url(&mut self, task_id: String, cx: &mut Context<Self>) {
@@ -323,12 +462,11 @@ impl SettingsView {
             "Rotate webhook URL?",
             "Any external service calling the old URL will stop working until you update it with the new URL.",
             "Rotate URL",
-            move |_, cx| {
-                let task_id = task_id.clone();
+            move |_, cx| cx.defer(move |cx| {
                 let _ = view.update(cx, |this, cx| {
                     this.scheduled.rotating_url = true;
                     cx.notify();
-                    let rpc = this.state.read(cx).rpc(method::ROTATE_WEBHOOK_TOKEN, scheduled_tasks::id_payload(&task_id));
+                    let rpc = this.task_request(ORCHESTRATION_OPERATE_SCOPE, method::ROTATE_WEBHOOK_TOKEN, scheduled_tasks::id_payload(&task_id), cx);
                     cx.spawn(async move |this, cx| {
                         let result = rpc.await;
                         let _ = this.update(cx, |this, cx| {
@@ -341,14 +479,15 @@ impl SettingsView {
                     })
                     .detach();
                 });
-            },
+            }),
             cx,
         );
     }
 
-    fn open_deliveries(&mut self, task_id: String, task_title: String, cx: &mut Context<Self>) {
+    fn open_deliveries(&mut self, task_id: String, task_title: String, window: &mut Window, cx: &mut Context<Self>) {
         self.scheduled.menu = None;
         self.scheduled.editor = None;
+        self.focus_task_dialog(window, cx);
         self.scheduled.deliveries = Some(DeliveriesView {
             task_id: task_id.clone(),
             task_title,
@@ -365,22 +504,15 @@ impl SettingsView {
 
     fn refresh_deliveries(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.scheduled.deliveries.as_mut() else { return };
-        view.seq += 1;
-        let seq = view.seq;
+        self.scheduled.delivery_revision += 1;
+        let seq = self.scheduled.delivery_revision;
+        view.seq = seq;
         let task_id = view.task_id.clone();
         view.loading = true;
-        let Some(rpc) = self
-            .state
-            .read(cx)
-            .request(method::LIST_WEBHOOK_DELIVERIES, list_deliveries_payload(&task_id), |reply| decode_webhook_deliveries(&reply))
-        else {
-            view.loading = false;
-            view.list = Err("Not connected to server.".into());
-            cx.notify();
-            return;
-        };
+        view.loading_detail = false;
+        let rpc = self.task_request(ORCHESTRATION_OPERATE_SCOPE, method::LIST_WEBHOOK_DELIVERIES, list_deliveries_payload(&task_id), cx);
         cx.spawn(async move |this, cx| {
-            let result = rpc.await.unwrap_or_else(|e| Err(e.to_string()));
+            let result = rpc.await.map_err(|error| failure_text(&error, "Try again.")).and_then(|reply| decode_webhook_deliveries(&reply));
             let _ = this.update(cx, |this, cx| {
                 if let Some(view) = this.scheduled.deliveries.as_mut()
                     && view.seq == seq
@@ -397,24 +529,17 @@ impl SettingsView {
 
     fn select_delivery(&mut self, delivery_id: String, cx: &mut Context<Self>) {
         let Some(view) = self.scheduled.deliveries.as_mut() else { return };
-        view.seq += 1;
-        let seq = view.seq;
+        self.scheduled.delivery_revision += 1;
+        let seq = self.scheduled.delivery_revision;
+        view.seq = seq;
         let task_id = view.task_id.clone();
         view.selected_id = Some(delivery_id.clone());
         view.loading_detail = true;
         view.detail = None;
-        let Some(rpc) = self
-            .state
-            .read(cx)
-            .request(method::GET_WEBHOOK_DELIVERY, get_delivery_payload(&task_id, &delivery_id), |reply| decode_webhook_delivery(&reply))
-        else {
-            view.loading_detail = false;
-            view.detail = Some(Err("Not connected to server.".into()));
-            cx.notify();
-            return;
-        };
+        view.loading = false;
+        let rpc = self.task_request(ORCHESTRATION_OPERATE_SCOPE, method::GET_WEBHOOK_DELIVERY, get_delivery_payload(&task_id, &delivery_id), cx);
         cx.spawn(async move |this, cx| {
-            let result = rpc.await.unwrap_or_else(|e| Err(e.to_string()));
+            let result = rpc.await.map_err(|error| failure_text(&error, "Try again.")).and_then(|reply| decode_webhook_delivery(&reply));
             let _ = this.update(cx, |this, cx| {
                 if let Some(view) = this.scheduled.deliveries.as_mut()
                     && view.seq == seq
@@ -465,13 +590,16 @@ impl SettingsView {
         self.scheduled.inputs.prompt.clone().update(cx, |input, cx| input.set_value(prompt, window, cx));
         self.scheduled.filter_inputs.clear();
         self.sync_filter_inputs(&draft, window, cx);
+        self.focus_task_dialog(window, cx);
         self.scheduled.editor = Some(draft);
         self.scheduled.deliveries = None;
         self.scheduled.thread_picker_open = false;
         self.scheduled.editor_error = None;
         self.scheduled.save_error = None;
         self.scheduled.menu = None;
-        self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.scheduled.inputs.title.focus_handle(cx).focus(window, cx);
+        self.scheduled.branch_refs = None;
+        self.scheduled.branch_request = None;
         cx.notify();
     }
 
@@ -491,7 +619,7 @@ impl SettingsView {
 
     /// The project's default model, then the environment's, then the first usable provider's.
     fn default_task_model(&self, project: Option<&t3_core::shell::ProjectShell>, cx: &App) -> Option<ModelSelection> {
-        let config = self.thread_settings(cx)?;
+        let config = self.task_environment(cx)?.config.config.as_ref()?;
         project
             .and_then(|project| project.default_model_selection.clone())
             .or_else(|| config.settings.default_model_selection.clone())
@@ -559,11 +687,16 @@ impl SettingsView {
             return;
         }
         self.read_editor_inputs(cx);
-        let Some(config) = self.thread_settings(cx) else { return };
+        let Some(config) = self.task_environment(cx).and_then(|entry| entry.config.config.as_ref()) else { return };
         let once = config.environment.capabilities.one_time_schedules == Some(true);
         let thread_modes = config.environment.capabilities.scheduled_task_thread_modes == Some(true);
         let ceiling = scheduled_tasks::max_runtime_mode(config.managed_policy.as_ref()).map(str::to_owned);
         let Some(draft) = self.scheduled.editor.clone() else { return };
+        let projects = self.shell_projects(cx);
+        if !projects.iter().any(|project| project.id == draft.project_id) {
+            self.scheduled.save_error = Some(t(cx, "Select a project").to_owned());
+            return cx.notify();
+        }
         if draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some() {
             return;
         }
@@ -577,13 +710,13 @@ impl SettingsView {
         self.scheduled.editor_error = None;
         self.scheduled.save_error = None;
         self.scheduled.saving = true;
-        let task = self.state.read(cx).rpc(method::UPSERT, input);
+        let task = self.task_request(ORCHESTRATION_OPERATE_SCOPE, method::UPSERT, input, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.scheduled.saving = false;
                 match result {
-                    Ok(_) => this.scheduled.editor = None,
+                    Ok(_) => this.close_task_dialog(window, cx),
                     Err(error) => this.scheduled.save_error = Some(failure_text(&error, "Try again.")),
                 }
                 cx.notify();
@@ -601,7 +734,13 @@ impl SettingsView {
     fn apply_pending_scheduled_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self.scheduled.pending_task.as_deref() else { return };
         let Some(Ok(tasks)) = &self.scheduled.tasks else { return };
-        let found = tasks.iter().find(|task| task.id == task_id).cloned();
+        if self.scheduled.editor.is_some() {
+            return;
+        }
+        let found = self.task_environment(cx).and_then(|entry| {
+            let projects = self.scoped_task_project_ids(&entry.summary.owner, cx);
+            tasks.iter().find(|task| task.id == task_id && projects.as_ref().is_none_or(|ids| ids.contains(&task.project_id)))
+        }).cloned();
         self.scheduled.pending_task = None;
         if let Some(task) = found {
             self.open_editor(Draft::from_task(&task, local_field), window, cx);
@@ -609,35 +748,114 @@ impl SettingsView {
     }
 
     pub(super) fn scheduled_tasks_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
+        let owners = self.scoped_environment_owners(cx);
+        if self.scheduled.dialog_environment.is_none()
+            && self.scheduled.environment.as_ref().is_none_or(|id| !owners.iter().any(|owner| &owner.saved_id == id))
+        {
+            self.scheduled.environment = self.scoped_primary_owner(cx).map(|owner| owner.saved_id);
+        }
         self.ensure_task_stream(cx);
         self.apply_pending_scheduled_task(window, cx);
-        let Some(config) = self.thread_settings(cx).cloned() else {
-            return vec![Block::new(&[], self.task_empty("No environments available", "Connect an environment to manage scheduled tasks.", cx))];
-        };
-        if self.scheduled.deliveries.is_some() {
-            return vec![Block::new(&[], self.deliveries_panel(cx))];
-        }
-        if self.scheduled.editor.is_some() {
-            return vec![Block::new(&[], self.task_editor(&config, window, cx))];
-        }
         let can_operate = self.can_operate_tasks(cx);
         let new_task = Button::new("new-scheduled-task", ButtonVariant::Outline, ButtonSize::Sm)
             .icon(Icon::Plus)
             .label("New task")
             .disabled(!can_operate)
             .on_click(cx.listener(|this, _, window, cx| this.new_task(window, cx)));
+        let environment_picker = (owners.len() > 1).then(|| {
+            let app = self.state.read(cx);
+            let options = owners.iter().filter_map(|owner| {
+                let entry = app.fleet.environment(&owner.saved_id)?;
+                let label = &entry.config.config.as_ref()?.environment.label;
+                Some(SelectOption::new(owner.saved_id.clone(), label.clone()))
+            }).collect();
+            let view = cx.entity().downgrade();
+            Row::new("scheduled-tasks-environment", "Environment").control(
+                Select::new("scheduled-tasks-environment-select", options)
+                    .selected(self.scheduled.environment.clone().unwrap_or_default())
+                    .show_check()
+                    .on_change(move |id, _, cx| {
+                        let _ = view.update(cx, |view, cx| {
+                            view.scheduled.environment = Some(id.to_string());
+                            view.scheduled.stream = None;
+                            view.scheduled.menu = None;
+                            cx.notify();
+                        });
+                    }),
+            ).into_any_element()
+        });
         let header = h_flex().justify_between().pr(r(8.)).child(section_title("Scheduled tasks")).child(new_task);
-        let body = match &self.scheduled.tasks {
-            None => self.task_empty("Loading scheduled tasks\u{2026}", "", cx),
-            Some(Err(error)) => self.task_empty("Could not load scheduled tasks", &error.clone(), cx),
-            Some(Ok(tasks)) if tasks.is_empty() => self.task_empty("No scheduled tasks", "No tasks match this environment and project selection.", cx),
-            Some(Ok(tasks)) => {
-                let tasks = tasks.clone();
-                let now = now_ms();
-                group(tasks.iter().map(|task| self.task_row(task, now, can_operate, cx)).collect(), cx).into_any_element()
+        let task_owner = self.task_environment(cx).map(|environment| environment.summary.owner.clone());
+        let body = if let Some(owner) = task_owner {
+            match &self.scheduled.tasks {
+                None => self.task_empty("Loading scheduled tasks…", "", cx),
+                Some(Err(error)) => self.task_empty("Could not load scheduled tasks", error, cx),
+                Some(Ok(tasks)) => {
+                    let now = now_ms();
+                    let projects = self.scoped_task_project_ids(&owner, cx);
+                    let rows: Vec<_> = tasks.iter().filter(|task| projects.as_ref().is_none_or(|ids| ids.contains(&task.project_id)))
+                        .map(|task| self.task_row(task, now, can_operate, cx)).collect();
+                    if rows.is_empty() {
+                        self.task_empty("No scheduled tasks", "No tasks match this environment and project selection.", cx)
+                    } else {
+                        group(rows, cx).into_any_element()
+                    }
+                }
             }
+        } else {
+            self.task_empty("No environments available", "Connect an environment to manage scheduled tasks.", cx)
         };
-        vec![Block::new(&[], v_flex().gap(r(10.)).child(header).child(body))]
+        let dialog = self.scheduled_dialog(window, cx);
+        vec![Block::new(&["scheduled-tasks"], v_flex().gap(r(10.)).child(header).children(environment_picker).child(body).children(dialog))]
+    }
+
+    fn focus_task_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.scheduled.dialog_environment = self.scheduled.environment.clone();
+        self.scheduled.previous_focus = window.focused(cx);
+        self.scheduled.dialog_focus.focus(window, cx);
+    }
+
+    fn close_task_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scheduled.saving || self.scheduled.rotating_url {
+            return;
+        }
+        self.scheduled.editor = None;
+        self.scheduled.deliveries = None;
+        self.scheduled.dialog_environment = None;
+        self.scheduled.calendar_open = false;
+        self.scheduled.branch_request = None;
+        if let Some(focus) = self.scheduled.previous_focus.take() {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn scheduled_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (id, title, description, body, footer) = if let Some(deliveries) = &self.scheduled.deliveries {
+            let title = crate::i18n::t_fmt(cx, "Webhook deliveries · {title}", &[("title", deliveries.task_title.as_str().into())]);
+            let body = self.deliveries_panel(cx);
+            let close = Button::new("deliveries-close", ButtonVariant::Outline, ButtonSize::Sm)
+                .label("Close")
+                .on_click(cx.listener(|view, _, window, cx| view.close_task_dialog(window, cx)));
+            ("webhook-deliveries-dialog", title, "", body, dialog_footer(false, vec![close.into_any_element()], cx).into_any_element())
+        } else {
+            let editing = self.scheduled.editor.as_ref()?.editing_id.is_some();
+            let config = self.task_environment(cx).and_then(|entry| entry.config.config.clone());
+            let (body, footer) = if let Some(config) = config.as_ref() {
+                self.task_editor(config, window, cx)
+            } else {
+                (self.task_empty("Could not load scheduled tasks", "Reconnect this environment before saving.", cx), div().into_any_element())
+            };
+            ("scheduled-task-editor-dialog", t(cx, if editing { "Edit task" } else { "New task" }).to_owned(),
+             "Run a prompt automatically on an interval, at a fixed time, once at a set date, or when a webhook is called.", body, footer)
+        };
+        let view = cx.entity().downgrade();
+        Some(DialogFrame {
+            id, title: title.into(), description: description.into(), max_width: 640.,
+            body, footer, focus: self.scheduled.dialog_focus.clone(),
+        }.render_modal(window, 1, move |window, cx| {
+            let _ = view.update(cx, |view, cx| view.close_task_dialog(window, cx));
+        }, cx))
     }
 
     fn task_empty(&self, title: &str, description: &str, cx: &App) -> AnyElement {
@@ -651,14 +869,15 @@ impl SettingsView {
             .border_1()
             .border_color(hsla(p.border).opacity(0.6))
             .child(crate::settings::controls::icon(Icon::CalendarClock, 20., hsla(p.muted_foreground)))
-            .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title.to_owned()))
-            .when(!description.is_empty(), |this| this.child(div().text_xs().text_center().text_color(hsla(p.muted_foreground)).child(description.to_owned())))
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(t(cx, title).to_owned()))
+            .when(!description.is_empty(), |this| this.child(div().text_xs().text_center().text_color(hsla(p.muted_foreground)).child(t(cx, description).to_owned())))
             .into_any_element()
     }
 
     fn task_row(&self, task: &ScheduledTask, now: i64, can_operate: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let busy = self.scheduled.busy.contains(&task.id);
+        let busy = self.scheduled.environment.as_ref()
+            .is_some_and(|id| self.scheduled.busy.contains(&(id.clone(), task.id.clone())));
         let schedule_text = task.schedule.label_with_timezone(
             self.scheduled.time_zone.as_deref(),
             task.next_run_at.as_deref(),
@@ -759,6 +978,7 @@ impl SettingsView {
                 gpui::deferred(
                     gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
                         v_flex()
+                            .relative()
                             .occlude()
                             .mt(r(4.))
                             .min_w(r(160.))
@@ -768,6 +988,8 @@ impl SettingsView {
                             .border_color(hsla(p.dropdown_border))
                             .bg(hsla(p.popover))
                             .shadow(floating_shadow(cx.theme().is_dark()))
+                            .theme_slot(ThemeSlot::MenuPopup, cx)
+                            .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                 this.scheduled.menu = None;
                                 cx.notify();
@@ -778,8 +1000,8 @@ impl SettingsView {
                                 })))
                             })
                             .when(webhook, |this| {
-                                this.child(item("Deliveries", false).on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_deliveries(deliv_id.clone(), deliv_title.clone(), cx)
+                                this.child(item("Deliveries", false).on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_deliveries(deliv_id.clone(), deliv_title.clone(), window, cx)
                                 })))
                             })
                             .when(!webhook && can_operate, |this| {
@@ -805,32 +1027,14 @@ impl SettingsView {
         let Some(view) = self.scheduled.deliveries.as_ref() else {
             return div().into_any_element();
         };
-        let title = format!("Webhook deliveries · {}", view.task_title);
         let loading = view.loading;
-        let header = h_flex()
-            .justify_between()
-            .gap(r(8.))
-            .child(
-                h_flex()
-                    .gap(r(8.))
-                    .child(
-                        Button::new("deliveries-back", ButtonVariant::GhostMuted, ButtonSize::Sm)
-                            .icon(Icon::ChevronLeft)
-                            .label("Back")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.scheduled.deliveries = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(title)),
-            )
-            .child(
-                Button::new("deliveries-refresh", ButtonVariant::Outline, ButtonSize::Sm)
-                    .icon(Icon::RefreshCw)
-                    .label("Refresh")
-                    .disabled(loading)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_deliveries(cx))),
-            );
+        let header = h_flex().justify_end().child(
+            Button::new("deliveries-refresh", ButtonVariant::Outline, ButtonSize::Sm)
+                .icon(Icon::RefreshCw)
+                .label("Refresh")
+                .disabled(loading)
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_deliveries(cx))),
+        );
 
         let list_el: AnyElement = if view.loading && view.list.as_ref().is_ok_and(Vec::is_empty) {
             self.task_empty("Loading deliveries…", "", cx)
@@ -989,13 +1193,13 @@ impl SettingsView {
         v_flex().gap(r(12.)).child(header).child(list_el).children(detail_el).into_any_element()
     }
 
-    fn task_editor(&mut self, config: &ServerConfig, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn task_editor(&mut self, config: &ServerConfig, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
         let p = palette(cx);
-        let Some(draft) = self.scheduled.editor.clone() else { return div().into_any_element() };
+        let Some(draft) = self.scheduled.editor.clone() else { return (div().into_any_element(), div().into_any_element()) };
         self.sync_filter_inputs(&draft, window, cx);
         let projects = self.shell_projects(cx);
         let inputs = &self.scheduled.inputs;
-        let field = |input: &Entity<InputState>, width: f32| div().w(r(width)).child(Input::new(input).small());
+        let field = |input: &Entity<InputState>, width: f32| div().w(r(width)).max_w_full().child(Input::new(input).small().theme_slot(ThemeSlot::Input, cx));
         let once_supported = config.environment.capabilities.one_time_schedules == Some(true);
         let thread_modes_supported = config.environment.capabilities.scheduled_task_thread_modes == Some(true);
         let editing = draft.editing_id.is_some();
@@ -1006,7 +1210,11 @@ impl SettingsView {
             .label(projects.iter().find(|project| project.id == draft.project_id).map_or_else(|| "Select a project".to_owned(), |project| project.title.clone()))
             .width(240.)
             .on_change(move |value, _, cx| {
-                let _ = project_state.update(cx, |this, cx| this.edit_draft(|draft| draft.change_project(value.to_string()), cx));
+                let _ = project_state.update(cx, |this, cx| {
+                    this.scheduled.branch_refs = None;
+                    this.scheduled.branch_request = None;
+                    this.edit_draft(|draft| draft.change_project(value.to_string()), cx);
+                });
             });
 
         // Destination: thread mode selector + optional destination thread picker.
@@ -1065,17 +1273,18 @@ impl SettingsView {
             }
             if self.scheduled.thread_picker_open {
                 let query = inputs.thread_search.read(cx).value().to_string();
-                let threads = self.state.read(cx).shell.snapshot.as_ref().map(|s| s.threads.clone()).unwrap_or_default();
+                let threads: Vec<_> = self.task_environment(cx).into_iter().flat_map(|entry| &entry.summary.threads)
+                    .filter(|row| row.thread.project_id == draft.project_id)
+                    .map(|row| {
+                        let updated = row.thread.updated_at.and_then(chrono::DateTime::from_timestamp_millis)
+                            .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)).unwrap_or_default();
+                        (row, updated)
+                    }).collect();
                 let candidates = destination_threads(
-                    threads.iter().map(|t| {
-                        (
-                            t.id.as_str(),
-                            t.project_id.as_str(),
-                            t.title.as_str(),
-                            t.updated_at.as_str(),
-                            t.archived_at.is_some(),
-                            &t.lineage,
-                        )
+                    threads.iter().map(|(row, updated)| {
+                        let thread = &row.thread;
+                        (thread.id.as_str(), thread.project_id.as_str(), thread.title.as_str(),
+                         updated.as_str(), thread.archived, &row.lineage)
                     }),
                     &draft.project_id,
                     draft.thread_id.as_deref(),
@@ -1114,7 +1323,7 @@ impl SettingsView {
                         .border_1()
                         .border_color(hsla(p.border).opacity(0.7))
                         .bg(hsla(p.card).opacity(0.5))
-                        .child(Input::new(&inputs.thread_search).small())
+                        .child(Input::new(&inputs.thread_search).small().theme_slot(ThemeSlot::Input, cx))
                         .child(list),
                 );
             }
@@ -1136,9 +1345,13 @@ impl SettingsView {
                 Row::new("scheduled-task-base-branch", "Base branch")
                     .description("Start from remote")
                     .control(
-                        h_flex().gap(r(8.)).child(field(&inputs.base_ref, 160.)).child(
+                        h_flex().gap(r(8.)).child(field(&inputs.base_ref, 150.)).child(self.base_branch_picker(&draft, cx)).child(
                             Switch::new("scheduled-task-start-from-origin", draft.start_from_origin).on_change(move |on, _, cx| {
-                                let _ = origin_state.update(cx, |this, cx| this.edit_draft(|draft| draft.start_from_origin = on, cx));
+                                let _ = origin_state.update(cx, |this, cx| {
+                                    this.scheduled.branch_refs = None;
+                                    this.scheduled.branch_request = None;
+                                    this.edit_draft(|draft| draft.start_from_origin = on, cx);
+                                });
                             }),
                         ),
                     )
@@ -1148,11 +1361,10 @@ impl SettingsView {
             WorkspaceMode::Root => None,
         };
 
-        let bound_model = draft.thread_id.as_deref().and_then(|thread_id| {
-            self.state
-                .read(cx)
-                .thread_shell(thread_id)
-                .map(|thread| thread.model_selection.clone())
+        let bound_model = draft.thread_id.as_deref().and_then(|id| {
+            self.task_environment(cx)?.summary.threads.iter()
+                .find(|row| row.thread.id == id)
+                .map(|row| row.thread.model_selection.clone())
         });
         let model_locked_to_thread = draft.thread_id.is_some();
         // Bound runs use the thread's current model, so the locked picker shows that one
@@ -1247,7 +1459,7 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _, _, cx| this.edit_draft(|draft| draft.toggle_weekday(day), cx)))
                 }))
                 .into_any_element(),
-            ScheduleMode::Once => h_flex().gap(r(8.)).text_sm().child("Run on").child(field(&inputs.run_at, 180.)).into_any_element(),
+            ScheduleMode::Once => self.once_schedule(cx),
             ScheduleMode::Interval => h_flex().gap(r(8.)).text_sm().child("Run every").child(field(&inputs.interval, 72.)).child("minutes").into_any_element(),
             ScheduleMode::Webhook => self.webhook_editor_detail(&draft, cx),
         };
@@ -1311,18 +1523,8 @@ impl SettingsView {
             .clone()
             .map(|invalid| (invalid.title, invalid.description))
             .or_else(|| self.scheduled.save_error.clone().map(|message| ("Could not save scheduled task".to_owned(), message)));
-        let connected = self.state.read(cx).connection_id().is_some();
-        v_flex()
-            .gap(r(10.))
-            .child(
-                v_flex()
-                    .px(r(16.))
-                    .gap(r(4.))
-                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(if editing { "Edit task" } else { "New task" }))
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                        "Run a prompt automatically on an interval, at a fixed time, once at a set date, or when a webhook is called.",
-                    )),
-            )
+        let connected = self.can_operate_tasks(cx);
+        let body = v_flex().gap(r(10.))
             .child(group(rows, cx))
             .children(error.map(|(title, description)| {
                 v_flex()
@@ -1338,29 +1540,108 @@ impl SettingsView {
                     .child(div().opacity(0.8).child(description))
             }))
             .when(!connected, |this| this.child(div().px(r(16.)).child(muted_text("Reconnect this environment before saving.", cx))))
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap(r(8.))
-                    .child(Button::new("scheduled-task-cancel", ButtonVariant::Ghost, ButtonSize::Sm).label("Cancel").on_click(cx.listener(|this, _, _, cx| {
-                        this.scheduled.editor = None;
-                        cx.notify();
-                    })))
-                    .child(
-                        Button::new("scheduled-task-save", ButtonVariant::Default, ButtonSize::Sm)
-                            .label(if editing { "Save task" } else { "Create task" })
-                            .disabled(
-                                self.scheduled.saving
-                                    || !connected
-                                    || (draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some()),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| this.save_task(window, cx))),
-                    ),
+            .into_any_element();
+        let cancel = Button::new("scheduled-task-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+            .label("Cancel")
+            .disabled(self.scheduled.saving || self.scheduled.rotating_url)
+            .on_click(cx.listener(|view, _, window, cx| view.close_task_dialog(window, cx)));
+        let save = Button::new("scheduled-task-save", ButtonVariant::Default, ButtonSize::Sm)
+            .label(if editing { "Save task" } else { "Create task" })
+            .disabled(self.scheduled.saving || self.scheduled.rotating_url || !connected
+                || (draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some()))
+            .on_click(cx.listener(|view, _, window, cx| view.save_task(window, cx)));
+        (body, dialog_footer(false, vec![cancel.into_any_element(), save.into_any_element()], cx).into_any_element())
+    }
+
+    fn once_schedule(&self, cx: &Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let input = self.scheduled.inputs.run_at.clone();
+        let button = Button::new("scheduled-task-calendar", ButtonVariant::Outline, ButtonSize::IconSm)
+            .icon(Icon::CalendarClock)
+            .tooltip("Choose a date")
+            .on_click(cx.listener(move |view, _, window, cx| {
+                view.scheduled.calendar_open = !view.scheduled.calendar_open;
+                if view.scheduled.calendar_open
+                    && let Ok(current) = NaiveDateTime::parse_from_str(input.read(cx).value().as_ref(), LOCAL_FORMAT)
+                {
+                    view.scheduled.calendar.update(cx, |calendar, cx| {
+                        calendar.set_date(Date::Single(Some(current.date())), window, cx);
+                    });
+                }
+                cx.notify();
+            }));
+        let popup = self.scheduled.calendar_open.then(|| {
+            div().absolute().bottom_0().right_0().child(
+                gpui::deferred(gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                    div().id("scheduled-task-calendar-popup").relative().occlude().mt(r(4.))
+                        .rounded(r(8.)).border_1().border_color(hsla(p.dropdown_border)).bg(hsla(p.popover))
+                        .theme_slot(ThemeSlot::MenuPopup, cx)
+                        .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
+                        .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                            view.scheduled.calendar_open = false;
+                            cx.notify();
+                        }))
+                        .child(Calendar::new(&self.scheduled.calendar).with_size(gpui_component::Size::Small)),
+                )).with_priority(5)
             )
+        });
+        h_flex().gap(r(8.)).text_sm()
+            .child(t(cx, "Run on"))
+            .child(div().w(r(180.)).child(Input::new(&self.scheduled.inputs.run_at).small().theme_slot(ThemeSlot::Input, cx)))
+            .child(div().relative().child(button).children(popup))
             .into_any_element()
     }
 
-    fn webhook_editor_detail(&self, draft: &Draft, cx: &mut Context<Self>) -> AnyElement {
+    fn base_branch_picker(&self, draft: &Draft, cx: &Context<Self>) -> AnyElement {
+        let loading = self.scheduled.branch_request.is_some();
+        let input = self.scheduled.inputs.base_ref.clone();
+        match &self.scheduled.branch_refs {
+            Some(Ok(options)) if !options.is_empty() => Select::new("scheduled-task-branch-select", options.clone())
+                .label("Choose a branch")
+                .selected(input.read(cx).value())
+                .show_check()
+                .on_change(move |value, window, cx| {
+                    input.update(cx, |input, cx| input.set_value(value, window, cx));
+                })
+                .into_any_element(),
+            result => {
+                let project_id = draft.project_id.clone();
+                Button::new("scheduled-task-branch-fetch", ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(if loading { "Loading branches…" } else { "Choose a branch" })
+                    .tooltip(match result {
+                        Some(Ok(_)) => t(cx, "No branches found").to_owned(),
+                        Some(Err(error)) => error.clone(),
+                        None => t(cx, "Choose a branch").to_owned(),
+                    })
+                    .disabled(loading || project_id.is_empty())
+                    .on_click(cx.listener(move |view, _, _, cx| view.load_task_branches(&project_id, cx)))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn load_task_branches(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.shell_projects(cx).into_iter().find(|project| project.id == project_id) else { return };
+        let remote = self.scheduled.editor.as_ref().is_some_and(|draft| draft.start_from_origin);
+        let kind = if remote { t3_core::diff::BaseRefKind::Remote } else { t3_core::diff::BaseRefKind::Local };
+        let payload = t3_core::diff::list_base_refs_request(&project.workspace_root, kind, None);
+        let request = self.task_request(READ_SCOPE, t3_core::vcs::method::VCS_LIST_REFS, payload, cx);
+        self.scheduled.branch_request = Some(cx.spawn(async move |view, cx| {
+            let result = request.await.map_err(|error| failure_text(&error, "Could not load branches"))
+                .and_then(t3_core::diff::decode_list_refs_result)
+                .map(|reply| reply.refs.into_iter().map(|branch| {
+                    SelectOption::new(branch.name.clone(), branch.name)
+                }).collect());
+            let _ = view.update(cx, |view, cx| {
+                view.scheduled.branch_refs = Some(result);
+                view.scheduled.branch_request = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn webhook_editor_detail(&self, draft: &Draft, cx: &Context<Self>) -> AnyElement {
         let p = palette(cx);
         let inputs = &self.scheduled.inputs;
         let task = draft
@@ -1368,7 +1649,9 @@ impl SettingsView {
             .as_ref()
             .and_then(|id| self.scheduled.tasks.as_ref()?.as_ref().ok()?.iter().find(|task| &task.id == id).cloned());
         let rotate_task_id = draft.editing_id.clone();
-        let address = task.and_then(|task| task.webhook).map(|hook| webhook_address(&hook, self.state.read(cx).environment()));
+        let address = task.and_then(|task| task.webhook).map(|hook| webhook_address(&hook, self.task_environment(cx)
+            .and_then(|entry| self.state.read(cx).environments.get(&entry.summary.owner.saved_id))
+            .map(|env| env.http_base.as_str())));
         let rotating = self.scheduled.rotating_url;
 
         let address_el: AnyElement = match address {

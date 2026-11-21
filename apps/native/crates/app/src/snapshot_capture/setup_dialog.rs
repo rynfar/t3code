@@ -2,9 +2,11 @@
 //! two-step setup wizard (Access permissions + Shortcut setup) rendered as a workspace modal
 //! overlay above Settings, plus shared SnapShot shortcut keycap and recording helpers.
 
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, InteractiveElement, IntoElement, Keystroke,
-    MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    AnyElement, App, Context, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, Keystroke,
+    ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div,
     prelude::*,
 };
 use gpui_component::{h_flex, v_flex};
@@ -23,12 +25,14 @@ use t3_core::settings::snapshot::{
 use super::SnapShotCoordinator;
 use crate::app_state::AppState;
 use crate::icons::Icon;
-use crate::settings::controls::{Button, ButtonSize, ButtonVariant, icon, r};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, dialog_footer, icon, r};
 use crate::settings::store;
 use crate::theme::{hsla, palette};
 
 const MAC: bool = cfg!(target_os = "macos");
 const WINDOWS: bool = cfg!(target_os = "windows");
+const PERMISSION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PERMISSION_POLL_LIMIT: usize = 180;
 
 /// Renders keycap pills for a `SnapShotShortcut` (`SnapShotShortcutKeys.tsx`).
 pub fn render_shortcut_keycaps(shortcut: &SnapShotShortcut, cx: &App) -> AnyElement {
@@ -114,6 +118,11 @@ pub struct SnapShotSetupDialog {
     error: Option<String>,
     candidate: SnapShotShortcut,
     recording: bool,
+    advanced: bool,
+    focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
+    focus_pending: bool,
+    permission_poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -121,12 +130,24 @@ impl SnapShotSetupDialog {
     pub fn new(
         state: Entity<AppState>,
         coordinator: Entity<SnapShotCoordinator>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = cx.entity().downgrade();
-        let key_sub = cx.intercept_keystrokes(move |event, _, cx| {
-            let _ = view.update(cx, |this, cx| this.handle_intercepted_keystroke(&event.keystroke, cx));
+        let handle = window.window_handle();
+        let key_sub = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != handle || crate::dialog::is_open(cx) {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                if this.open && event.keystroke.key == "tab" && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt {
+                    this.cycle_focus(!event.keystroke.modifiers.shift, window, cx);
+                    cx.stop_propagation();
+                } else {
+                    this.handle_intercepted_keystroke(&event.keystroke, cx);
+                }
+            });
         });
         let coord_sub = cx.observe(&coordinator, |_, _, cx| cx.notify());
         let saved = store::client(cx).snap_shot_shortcut();
@@ -140,6 +161,11 @@ impl SnapShotSetupDialog {
             error: None,
             candidate: saved,
             recording: false,
+            advanced: false,
+            focus: cx.focus_handle(),
+            previous_focus: None,
+            focus_pending: false,
+            permission_poll: None,
             _subscriptions: vec![key_sub, coord_sub],
         }
     }
@@ -166,7 +192,10 @@ impl SnapShotSetupDialog {
         self.error = None;
         self.candidate = doc.snap_shot_shortcut();
         self.stop_recording(cx);
+        self.focus_pending = !self.open;
         self.open = true;
+        self.advanced = false;
+        self.start_permission_poll(cx);
         cx.notify();
     }
 
@@ -180,6 +209,7 @@ impl SnapShotSetupDialog {
             store::update_client(&self.state, ClientSettingChange::SnapShotEnabled(false), cx);
         }
         self.open = false;
+        self.permission_poll = None;
         self.error = None;
         self.checked = false;
         self.coordinator.update(cx, |c, cx| {
@@ -198,6 +228,47 @@ impl SnapShotSetupDialog {
         }
         self.close(false, cx);
         true
+    }
+
+    fn start_permission_poll(&mut self, cx: &mut Context<Self>) {
+        self.permission_poll = None;
+        if self.step != CaptureSetupStep::Access
+            || self.coordinator.read(cx).backend_state().mac_permissions.is_none()
+        {
+            return;
+        }
+        self.permission_poll = Some(cx.spawn(async move |dialog, cx| {
+            for _ in 0..PERMISSION_POLL_LIMIT {
+                cx.background_executor().timer(PERMISSION_POLL_INTERVAL).await;
+                let keep_polling = dialog.update(cx, |dialog, cx| {
+                    if !dialog.open || dialog.step != CaptureSetupStep::Access {
+                        return false;
+                    }
+                    let permissions = super::platform(cx).mac_permissions();
+                    if permissions != dialog.coordinator.read(cx).backend_state().mac_permissions {
+                        dialog.coordinator.update(cx, |coordinator, cx| coordinator.refresh_state(cx));
+                    }
+                    true
+                });
+                if !matches!(keep_polling, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn cycle_focus(&self, forward: bool, window: &mut Window, cx: &mut App) {
+        for _ in 0..512 {
+            if forward {
+                window.focus_next(cx);
+            } else {
+                window.focus_prev(cx);
+            }
+            if self.focus.contains_focused(window, cx) && !self.focus.is_focused(window) {
+                return;
+            }
+        }
+        window.focus(&self.focus, cx);
     }
 
     fn start_recording(&mut self, cx: &mut Context<Self>) {
@@ -251,6 +322,8 @@ impl SnapShotSetupDialog {
         let next = self.coordinator.update(cx, |c, cx| c.refresh_state(cx));
         if capture_setup_access_ready(&next) {
             self.step = CaptureSetupStep::Shortcut;
+            self.permission_poll = None;
+            self.advanced = false;
             self.checked = false;
         } else if let Some(msg) = next.message {
             self.error = Some(msg);
@@ -370,9 +443,16 @@ impl SnapShotSetupDialog {
 }
 
 impl Render for SnapShotSetupDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
+            if let Some(previous) = self.previous_focus.take() {
+                window.focus(&previous, cx);
+            }
             return div().into_any_element();
+        }
+        if std::mem::take(&mut self.focus_pending) {
+            self.previous_focus = window.focused(cx);
+            window.focus(&self.focus, cx);
         }
         let p = palette(cx);
         let doc = store::client(cx).clone();
@@ -420,7 +500,6 @@ impl Render for SnapShotSetupDialog {
         };
 
         let close_entity = cx.entity().downgrade();
-        let close_btn_entity = cx.entity().downgrade();
         let back_entity = cx.entity().downgrade();
         let finish_later_entity = cx.entity().downgrade();
         let primary_entity = cx.entity().downgrade();
@@ -716,174 +795,85 @@ impl Render for SnapShotSetupDialog {
             }
         };
 
-        div()
-            .id("snapshot-setup-dialog-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(hsla(p.dialog_backdrop))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                let _ = close_entity.update(cx, |this, cx| this.close(false, cx));
-            })
-            .child(
-                v_flex()
-                    .id("snapshot-setup-dialog")
-                    .w(r(480.))
-                    .max_w_full()
-                    .rounded(r(16.))
-                    .border_1()
-                    .border_color(hsla(p.dialog_border))
-                    .bg(hsla(p.dialog_surface))
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        v_flex()
-                            .gap(r(10.))
-                            .p(r(20.))
-                            .border_b_1()
-                            .border_color(hsla(p.border))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_base()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(hsla(p.foreground))
-                                            .child(
-                                                crate::i18n::t(cx, "Set up snapshots").to_owned(),
-                                            ),
-                                    )
-                                    .child(
-                                        Button::new(
-                                            "snapshot-setup-close-x",
-                                            ButtonVariant::GhostMuted,
-                                            ButtonSize::IconXs,
-                                        )
-                                        .icon(Icon::X)
-                                        .on_click(move |_, _, cx| {
-                                            let _ = close_btn_entity
-                                                .update(cx, |this, cx| this.close(false, cx));
-                                        }),
-                                    ),
-                            )
-                            .child(step_pills),
-                    )
-                    .child(
-                        v_flex()
-                            .gap(r(14.))
-                            .p(r(20.))
-                            .child(
-                                v_flex()
-                                    .gap(r(4.))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(hsla(p.foreground))
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(hsla(p.muted_foreground))
-                                            .child(description),
-                                    ),
-                            )
-                            .child(body)
-                            .when_some(self.error.clone(), |el, err| {
-                                el.child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap(r(6.))
-                                        .p(r(10.))
-                                        .rounded(r(8.))
-                                        .bg(hsla(p.error_surface))
-                                        .text_xs()
-                                        .text_color(hsla(p.destructive_foreground))
-                                        .child(icon(
-                                            Icon::CircleAlert,
-                                            14.,
-                                            hsla(p.destructive_foreground),
-                                        ))
-                                        .child(err),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_end()
-                            .gap(r(8.))
-                            .px(r(20.))
-                            .py(r(14.))
-                            .border_t_1()
-                            .border_color(hsla(p.border))
-                            .bg(hsla(p.muted).opacity(0.5))
-                            .when(self.step != CaptureSetupStep::Access, |el| {
-                                el.child(
-                                    Button::new(
-                                        "snapshot-setup-back",
-                                        ButtonVariant::Ghost,
-                                        ButtonSize::Sm,
-                                    )
-                                    .label("Back")
-                                    .on_click(move |_, _, cx| {
-                                        let _ = back_entity.update(cx, |this, cx| {
-                                            this.stop_recording(cx);
-                                            this.step = CaptureSetupStep::Access;
-                                            this.checked = false;
-                                            cx.notify();
-                                        });
-                                    }),
-                                )
-                            })
-                            .child(
-                                Button::new(
-                                    "snapshot-setup-cancel",
-                                    ButtonVariant::Ghost,
-                                    ButtonSize::Sm,
-                                )
-                                .label(if self.was_enabled { "Close" } else { "Finish later" })
-                                .on_click(move |_, _, cx| {
-                                    let _ = finish_later_entity
-                                        .update(cx, |this, cx| this.close(false, cx));
-                                }),
-                            )
-                            .child(
-                                Button::new(
-                                    "snapshot-setup-primary",
-                                    ButtonVariant::Default,
-                                    ButtonSize::Sm,
-                                )
-                                .label(primary_label)
-                                .disabled(primary_disabled)
-                                .on_click(move |_, _, cx| {
-                                    let _ = primary_entity.update(cx, |this, cx| match this.step {
-                                        CaptureSetupStep::Access => {
-                                            this.test_capture_and_continue(cx);
-                                        }
-                                        CaptureSetupStep::Shortcut => {
-                                            let saved = store::client(cx).snap_shot_shortcut();
-                                            let changed = !same_snap_shot_shortcut(
-                                                &this.candidate,
-                                                &saved,
-                                                MAC,
-                                            );
-                                            if !changed || this.save_shortcut(cx) {
-                                                this.close(true, cx);
-                                            }
-                                        }
-                                    });
-                                }),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        let advanced_details: Vec<_> = self.error.iter()
+            .chain(backend.message.iter().filter(|_| self.step == CaptureSetupStep::Access))
+            .chain(backend.shortcut_message.iter().filter(|_| self.step == CaptureSetupStep::Shortcut))
+            .map(String::as_str)
+            .collect();
+        let mut panel = v_flex().gap(r(14.))
+            .child(step_pills)
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(description))
+            .child(body);
+        if self.error.is_some() {
+            panel = panel.child(h_flex().gap(r(6.)).text_xs().text_color(hsla(p.destructive_foreground))
+                .child(icon(Icon::CircleAlert, 14., hsla(p.destructive_foreground)))
+                .child(crate::i18n::t(cx, "Couldn't finish this step. Try again or check Advanced for help.")));
+        }
+        if !advanced_details.is_empty() {
+            panel = panel.child(Button::new("snapshot-setup-advanced", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                .icon(if self.advanced { Icon::ChevronDown } else { Icon::ChevronRight })
+                .label("Advanced")
+                .justify_between()
+                .on_click(cx.listener(|dialog, _, _, cx| {
+                    dialog.advanced = !dialog.advanced;
+                    cx.notify();
+                })));
+            if self.advanced {
+                let mut displayed = Vec::new();
+                for detail in advanced_details {
+                    if !displayed.contains(&detail) {
+                        panel = panel.child(div().text_xs().text_color(hsla(p.muted_foreground))
+                            .child(crate::i18n::t(cx, detail).to_owned()));
+                        displayed.push(detail);
+                    }
+                }
+            }
+        }
+        let mut buttons = Vec::new();
+        if self.step == CaptureSetupStep::Shortcut {
+            buttons.push(Button::new("snapshot-setup-back", ButtonVariant::Ghost, ButtonSize::Sm)
+                .label("Back")
+                .on_click(move |_, _, cx| {
+                    let _ = back_entity.update(cx, |this, cx| {
+                        this.stop_recording(cx);
+                        this.step = CaptureSetupStep::Access;
+                        this.checked = false;
+                        this.advanced = false;
+                        this.error = None;
+                        this.start_permission_poll(cx);
+                        cx.notify();
+                    });
+                }).into_any_element());
+        }
+        buttons.push(Button::new("snapshot-setup-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+            .label(if self.was_enabled { "Close" } else { "Finish later" })
+            .on_click(move |_, _, cx| {
+                let _ = finish_later_entity.update(cx, |this, cx| this.close(false, cx));
+            }).into_any_element());
+        buttons.push(Button::new("snapshot-setup-primary", ButtonVariant::Default, ButtonSize::Sm)
+            .label(primary_label)
+            .disabled(primary_disabled)
+            .on_click(move |_, _, cx| {
+                let _ = primary_entity.update(cx, |this, cx| match this.step {
+                    CaptureSetupStep::Access => this.test_capture_and_continue(cx),
+                    CaptureSetupStep::Shortcut => {
+                        let saved = store::client(cx).snap_shot_shortcut();
+                        if same_snap_shot_shortcut(&this.candidate, &saved, MAC) || this.save_shortcut(cx) {
+                            this.close(true, cx);
+                        }
+                    }
+                });
+            }).into_any_element());
+        DialogFrame {
+            id: "snapshot-setup-dialog", title: "Set up snapshots".into(), description: "".into(),
+            max_width: 480., body: panel.into_any_element(),
+            footer: dialog_footer(false, buttons, cx).into_any_element(),
+            focus: self.focus.clone(),
+        }.render_modal(window, 40, move |_, cx| {
+            let _ = close_entity.update(cx, |dialog, cx| dialog.close(false, cx));
+        }, cx)
+
     }
 }
 
