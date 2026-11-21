@@ -329,6 +329,7 @@ pub struct Composer {
     input: Entity<EditorState>,
     rich_text: rich_text::RichTextState,
     picker: Entity<ModelPicker>,
+    viewer: Entity<crate::media::MediaViewer>,
     picker_open: bool,
     permissions_open: bool,
     choices: HashMap<Target, Choices>,
@@ -540,6 +541,7 @@ impl Composer {
         });
         let decorations = input.update(cx, |input, cx| input.create_decorations_collection(Vec::new(), cx));
         let picker = cx.new(|cx| ModelPicker::new(state.clone(), window, cx));
+        let viewer = cx.new(crate::media::MediaViewer::new);
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let composer_weak = cx.entity().downgrade();
         let composer_weak_hints = composer_weak.clone();
@@ -759,6 +761,7 @@ impl Composer {
             input,
             rich_text: rich_text::RichTextState::new(decorations),
             picker,
+            viewer,
             picker_open: false,
             permissions_open: false,
             choices: HashMap::new(),

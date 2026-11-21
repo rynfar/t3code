@@ -737,6 +737,12 @@ impl DetailView {
     }
 
     /// "Refresh from host": this pull request's host reads are dropped
+    fn emit_mutated_to_shared_list(&self, cx: &mut App) {
+        if self.page.upgrade().is_none() {
+            self.state.update(cx, |_, cx| cx.emit(AppEvent::PullRequestsMutated));
+        }
+    }
+
     /// (`pullRequests.invalidate({ reference })`), then everything re-read.
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
         let task = self.read_pr(method::INVALIDATE, invalidate_input(Some(&self.reference)), |_| Ok(()), cx);
@@ -888,6 +894,8 @@ impl DetailView {
                 let reference = this.reference.clone();
                 if let Some(page) = this.page.upgrade() {
                     page.update(cx, |page, cx| page.acted(&reference, action, reply.as_ref(), cx));
+                } else {
+                    this.emit_mutated_to_shared_list(cx);
                 }
                 if action_needs_host_refresh(action) {
                     this.refresh_from_host(cx);
@@ -925,6 +933,8 @@ impl DetailView {
                 this.refresh(cx);
                 if let Some(page) = this.page.upgrade() {
                     page.update(cx, |page, cx| page.refetch(cx));
+                } else if result.is_ok() {
+                    this.emit_mutated_to_shared_list(cx);
                 }
             });
         })
@@ -1043,6 +1053,8 @@ impl DetailView {
                 this.description_draft = settle_description_save(this.description_draft.take(), &key, saved);
                 if !saved {
                     this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not save the description"), cx));
+                } else {
+                    this.emit_mutated_to_shared_list(cx);
                 }
                 if this.description_saves == 0 {
                     this.refresh(cx);
@@ -1065,7 +1077,10 @@ impl DetailView {
             let _ = this.update(cx, |this, cx| {
                 this.resolving.remove(&thread_id);
                 match result {
-                    Ok(()) => this.refresh(cx),
+                    Ok(()) => {
+                        this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
+                    }
                     Err(_) => this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The conversation could not be updated"), cx)),
                 }
                 cx.notify();
@@ -1203,6 +1218,8 @@ impl DetailView {
                     this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not update labels").description(description), cx));
                     this.refresh(cx);
                     this.retry_label_candidates(cx);
+                } else {
+                    this.emit_mutated_to_shared_list(cx);
                 }
                 cx.notify();
             });
@@ -1423,6 +1440,7 @@ impl DetailView {
                 match res {
                     Ok(()) => {
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         if let (Some(prev), Some(detail)) = (previous_title, this.detail.as_mut())
@@ -1486,6 +1504,7 @@ impl DetailView {
                         }
                         this.hold(cx);
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not update maintainer edits").description(err), cx));
@@ -1698,6 +1717,7 @@ impl DetailView {
                     None => {
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, "Reviewers updated"), cx));
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Some(err) => {
                         if let (Some(prev_reviewers), Some(detail)) = (previous_reviewers, this.detail.as_mut()) {
@@ -1790,6 +1810,7 @@ impl DetailView {
                         this.review_form_open = false;
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, review_verdict_sent_label(verdict, term)), cx));
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         let desc = if err.trim().is_empty() { "The host refused the review. Your draft is still here to try again.".to_owned() } else { err };
@@ -1842,6 +1863,7 @@ impl DetailView {
                             input.update(cx, |input, cx| input.set_value("", window, cx));
                         });
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not post the comment").description(err), cx));
@@ -1901,6 +1923,8 @@ impl DetailView {
                         this.apply_reply(reply.as_ref(), cx);
                         if let Some(page) = this.page.upgrade() {
                             page.update(cx, |page, cx| page.acted(&reference, action, reply.as_ref(), cx));
+                        } else {
+                            this.emit_mutated_to_shared_list(cx);
                         }
                         this.refresh(cx);
                     }
@@ -1949,6 +1973,7 @@ impl DetailView {
                     Ok(()) => {
                         this.editing_comment = None;
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         if let Some(edit) = this.editing_comment.as_mut() {
@@ -2009,6 +2034,7 @@ impl DetailView {
                         });
                         this.replying_thread = None;
                         this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
                     }
                     Err(err) => {
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not post the reply").description(err), cx));
@@ -2084,7 +2110,10 @@ impl DetailView {
             let res = settle(task).await;
             let _ = this.update(cx, |this, cx| {
                 match res {
-                    Ok(()) => this.refresh(cx),
+                    Ok(()) => {
+                        this.refresh(cx);
+                        this.emit_mutated_to_shared_list(cx);
+                    }
                     Err(_) => {
                         // Only clear this failed write if no newer toggle superseded it (`pingdotgg/t3code#37853`).
                         if let Some(overlay) = this.pending_reactions.get_mut(&subject_key)

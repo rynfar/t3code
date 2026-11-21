@@ -815,10 +815,9 @@ impl SettingsView {
             .and_then(|d| d.secret_checks.get(&(provider.to_owned(), reference.to_owned())));
         let checking = matches!(status, Some(SecretCheckStatus::Checking));
         let (glyph, color) = match status {
-            Some(SecretCheckStatus::Checking) => (Icon::LoaderCircle, hsla(p.muted_foreground)),
             Some(SecretCheckStatus::Resolved) => (Icon::Check, hsla(p.success_foreground)),
             Some(SecretCheckStatus::Failed(_)) => (Icon::TriangleAlert, hsla(p.destructive)),
-            None => (Icon::RefreshCw, hsla(p.muted_foreground)),
+            Some(SecretCheckStatus::Checking) | None => (Icon::RefreshCw, hsla(p.muted_foreground)),
         };
         let description: SharedString = if !can_check {
             "You cannot check secrets on this environment".into()
@@ -840,6 +839,7 @@ impl SettingsView {
                     Button::new("usage-source-secret-check", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                         .icon(glyph)
                         .icon_color(color)
+                        .loading(checking)
                         .tooltip(description)
                         .disabled(disabled || !can_check || checking)
                         .on_click(cx.listener(move |this, _, _, cx| {

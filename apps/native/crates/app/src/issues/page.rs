@@ -147,6 +147,8 @@ impl IssuesPage {
                     this.sync(cx);
                 } else if matches!(event, AppEvent::RightPanel) {
                     this.sync_detail_from_panel(cx);
+                } else if matches!(event, AppEvent::IssuesMutated) {
+                    this.fetch_all(IssueListRefreshMode::Background, cx);
                 }
             }),
         ];
@@ -1215,7 +1217,11 @@ impl Render for IssuesPage {
                     } else if this.linked_pr.take().is_some() {
                         cx.notify();
                         cx.stop_propagation();
-                    } else if this.detail.is_some() {
+                    } else if this.detail.is_some()
+                        || (this.state.read(cx).uses_shared_utility_panel()
+                            && (this.selected.is_some()
+                                || this.state.read(cx).panels.panels.is_open(ISSUES_PANEL_THREAD_KEY)))
+                    {
                         this.clear_selection(cx);
                         cx.stop_propagation();
                     }

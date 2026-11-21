@@ -1173,7 +1173,8 @@ impl SettingsView {
 
     fn rescan_button(&self, cx: &mut Context<Self>) -> AnyElement {
         Button::new("rescan-source-control", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
-            .icon(if self.source_control.scanning { Icon::LoaderCircle } else { Icon::RefreshCw })
+            .icon(Icon::RefreshCw)
+            .loading(self.source_control.scanning)
             .tooltip("Rescan Git and hosting integrations")
             .disabled(self.source_control.scanning)
             .on_click(cx.listener(|this, _, _, cx| this.scan_source_control(true, cx)))

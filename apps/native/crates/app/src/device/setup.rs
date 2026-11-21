@@ -16,6 +16,7 @@ use t3_core::right_panel::{Surface, SurfaceKind};
 use super::{HostRetry, host_updates};
 use super::{Devices, DevicesEvent, devices};
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant, Switch};
 use crate::theme::{hsla, palette};
@@ -221,7 +222,11 @@ impl DeviceSetupDialog {
 pub(crate) fn setup_status(status: Option<SetupStatus>, cx: &App) -> Option<AnyElement> {
     let status = status?;
     let p = palette(cx);
-    let icon = if status.pending { Icon::LoaderCircle.svg().size(px(12.)).text_color(hsla(p.muted_foreground)) } else { Icon::Check.svg().size(px(12.)).text_color(hsla(p.success)) };
+    let icon = if status.pending {
+        Spinner::new("device-setup-status-spinner", px(12.), hsla(p.muted_foreground)).into_any_element()
+    } else {
+        Icon::Check.svg().size(px(12.)).text_color(hsla(p.success)).into_any_element()
+    };
     Some(h_flex().gap(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child(icon).child(status.text).into_any_element())
 }
 
@@ -294,9 +299,9 @@ impl Render for DeviceSetupDialog {
             let checking = pending == Some(Pending::Check);
             let check = Button::new("device-setup-check", ButtonVariant::Outline, ButtonSize::Compact)
                 .label(crate::i18n::t(cx, if checking { "Checking…" } else { "Check again" }))
+                .loading(checking)
                 .disabled(!enabled || locked)
                 .on_click(cx.listener(|this, _, _, cx| this.check_again(cx)));
-            let check = if checking { check.icon(Icon::LoaderCircle) } else { check };
             body = body.child(
                 section("Check simulator support", cx)
                     .child(platform_status(Platform::Ios, service.platform_setup_status(Platform::Ios), cx))

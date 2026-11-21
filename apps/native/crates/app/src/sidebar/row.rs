@@ -779,6 +779,7 @@ impl SidebarPane {
         };
         let value = if count == 1 { first.display_key.clone() } else { crate::i18n::format_integer(cx, count as i64) };
         let id = thread.id.clone();
+        let first_url = first.url.clone();
         let key = key.cloned();
         Some(div()
             .id(SharedString::from(scoped_id("issue-badge-", key.as_ref(), &id)))
@@ -793,8 +794,14 @@ impl SidebarPane {
             .child(div().min_w_0().truncate().text_color(muted).child(value))
             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 cx.stop_propagation();
+                let mods = event.modifiers();
+                let supported = crate::issues::issues_supported_for(this.state.read(cx), target.environment_id.as_deref(), cx);
+                if mods.platform || mods.control || mods.shift || mods.alt || !supported {
+                    cx.open_url(&first_url);
+                    return;
+                }
                 this.state.update(cx, |state, cx| {
                     match &key {
                         Some(key) => state.click_scoped_sidebar_thread(key, gpui::Modifiers::default(), cx),
@@ -803,7 +810,7 @@ impl SidebarPane {
                     if state.selected_thread.as_deref() == Some(&id)
                         && key.as_ref().is_none_or(|key| state.active_sidebar_row_key().as_ref() == Some(key))
                     {
-                        state.add_pull_requests_surface(cx);
+                        state.open_issue_surface(target.clone(), cx);
                     }
                 });
             }))

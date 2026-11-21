@@ -128,6 +128,10 @@ pub fn open(section: Section, cx: &mut App) {
     open_at(section, None, cx);
 }
 
+pub(crate) fn open_access_environment(saved_id: String, cx: &mut App) {
+    open_at(Section::Access, Some(format!("access-env:{saved_id}")), cx);
+}
+
 pub(crate) fn open_provider_setup(target: crate::composer::ProviderTarget, cx: &mut App) {
     let state = cx.global::<Host>().state.read(cx);
     let Some(instance) = target.instance.as_deref() else {
@@ -985,6 +989,13 @@ impl SettingsView {
         self.section = section;
         let target = if section == Section::Voice {
             target.map(|id| self.resolve_voice_target(&id, cx))
+        } else if section == Section::Access {
+            if let Some(env_id) = target.as_deref().and_then(|id| id.strip_prefix("access-env:")) {
+                self.access.selected_env = Some(env_id.to_owned());
+                None
+            } else {
+                target
+            }
         } else {
             target
         };

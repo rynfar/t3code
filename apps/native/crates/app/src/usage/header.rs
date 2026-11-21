@@ -95,6 +95,7 @@ impl UsageView {
     fn toggle_menu(&mut self, menu: MenuKind, cx: &mut Context<Self>) {
         self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
         self.segment = None;
+        self.segment_pinned = false;
         cx.notify();
     }
 

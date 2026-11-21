@@ -148,6 +148,7 @@ pub struct Preview {
     handled_reveal: Option<(String, u64)>,
     /// A reveal shows the source; the rendered view returns once the user asks for it.
     rendered_after_reveal: Option<(String, u64)>,
+    _activation: Option<gpui::Subscription>,
 }
 
 impl Preview {
@@ -186,6 +187,7 @@ impl Preview {
             viewer,
             handled_reveal: None,
             rendered_after_reveal: None,
+            _activation: None,
         };
         cx.on_release(|this: &mut Preview, cx| {
             let prev = std::mem::replace(&mut this.content, Content::Empty);
@@ -1249,6 +1251,13 @@ impl Preview {
         use crate::webview::{Layer, Page, WebView, web_view};
 
         let dark = cx.theme().is_dark();
+        if self._activation.is_none() {
+            self._activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() && this.html.is_none() {
+                    cx.notify();
+                }
+            }));
+        }
         if self.html.as_ref().is_some_and(|(current, _)| !Rc::ptr_eq(current, file)) {
             self.html = None;
         }

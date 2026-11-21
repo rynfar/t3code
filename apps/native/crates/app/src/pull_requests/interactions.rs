@@ -415,7 +415,7 @@ pub(super) fn comment_form(view: &mut DetailView, detail: &Detail, window: &mut 
             .py(px(12.))
             .border_t_1()
             .border_color(hsla(p.border).opacity(0.7))
-            .child(markdown_mode_buttons(preview, locked,
+            .child(markdown_mode_buttons("pr-comment-mode", preview, locked,
                 cx.listener(move |view, _, window, cx| {
                     view.comment_preview = false;
                     input.update(cx, |input, cx| input.focus(window, cx));

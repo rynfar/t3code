@@ -125,7 +125,7 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
         let focus = input.clone();
         return v_flex()
             .gap(px(8.))
-            .child(markdown_mode_buttons(preview, saving,
+            .child(markdown_mode_buttons("pr-description-mode", preview, saving,
                 cx.listener(move |view, _, window, cx| {
                     view.description_preview = false;
                     focus.update(cx, |input, cx| input.focus(window, cx));
@@ -382,7 +382,11 @@ fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
             .line_height(px(20.))
             .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
             .when(url.is_some(), |this| this.cursor_pointer())
-            .child(div().mt(px(3.)).child(icon.sized(px(14.)).text_color(color)))
+            .child(div().mt(px(3.)).child(if icon == Icon::LoaderCircle {
+                Spinner::new(("pr-check-spin", index), px(14.), color).into_any_element()
+            } else {
+                icon.sized(px(14.)).text_color(color).into_any_element()
+            }))
             .child(div().flex_1().min_w_0().text_color(hsla(p.foreground)).child(check.name.clone()))
             .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(check_status_label(check)))
             .on_click(move |_, _, cx| {

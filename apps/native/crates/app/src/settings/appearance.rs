@@ -32,7 +32,7 @@ use crate::icons::Icon;
 use crate::theme::{
     self, ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_background_layer,
 };
-use gpui_component::slider::{Slider, SliderEvent, SliderState};
+use gpui_component::slider::{SliderEvent, SliderState};
 use t3_core::{
     i18n::IcuArg,
     themes::{self, ThemeDefinition},
@@ -554,6 +554,7 @@ impl SettingsView {
                                 .collect(),
                         )
                         .selected(selected.id.clone())
+                        .width(102.)
                         .popup_width(208.)
                         .show_check()
                         .on_change(move |id, _, cx| {
@@ -1808,6 +1809,7 @@ impl RenderOnce for DurationSlider {
                     .py(r(4.))
                     .text_center()
                     .font_family(theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_xs()
                     .text_color(hsla(p.foreground))
                     .child(format!(
@@ -1815,7 +1817,7 @@ impl RenderOnce for DurationSlider {
                         crate::i18n::format_integer(cx, self.value.into())
                     )),
             )
-            .child(div().flex_1().child(Slider::new(&self.state)))
+            .child(div().flex_1().min_w_0().child(super::controls::styled_slider(&self.state, cx)))
     }
 }
 

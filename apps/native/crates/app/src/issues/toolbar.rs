@@ -19,6 +19,7 @@ use t3_core::issues::saved_views::{
 use t3_core::issues::wire::{IssueInvolvement, IssueListSort, IssueListState};
 
 use super::page::{IssuesPage, SavedViewEditor};
+use crate::components::motion::Spinner;
 use crate::i18n::t;
 use crate::icons::Icon;
 use crate::pull_requests::controls::{Button, Size, Variant};
@@ -139,11 +140,11 @@ pub fn render(
                 } else {
                     hsla(p.background)
                 })
-                .child(
-                    (if busy { Icon::LoaderCircle } else { Icon::Search })
-                        .sized(px(16.))
-                        .text_color(hsla(p.muted_foreground)),
-                )
+                .child(if busy {
+                    Spinner::new("issues-search-spin", px(16.), hsla(p.muted_foreground)).into_any_element()
+                } else {
+                    Icon::Search.sized(px(16.)).text_color(hsla(p.muted_foreground)).into_any_element()
+                })
                 .child(
                     div()
                         .flex_1()

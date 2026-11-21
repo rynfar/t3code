@@ -593,9 +593,20 @@ pub fn floating_shadow(dark: bool) -> Vec<BoxShadow> {
     }]
 }
 
-/// A menu popup surface (`menu.tsx`): opaque `popover` fallback for the dropdown glass.
+/// A menu popup surface (`menu.tsx`): dropdown glass with subtle inner bevel and slot overrides.
 pub fn menu_surface(cx: &App) -> gpui::Div {
     let p = palette(cx);
+    let dark = cx.theme().is_dark();
+    let has_custom_bg = slot_has_background(ThemeSlot::MenuPopup, cx);
+    let backdrop_border = slot_border_color(ThemeSlot::MenuPopup, cx).unwrap_or_else(|| hsla(p.dropdown_border));
+    let mut shadows = floating_shadow(dark);
+    shadows.push(BoxShadow {
+        color: if dark { gpui::white().opacity(0.06) } else { gpui::black().opacity(0.04) },
+        offset: point(px(0.), px(if dark { -1. } else { 1. })),
+        blur_radius: px(0.),
+        spread_radius: px(0.),
+        inset: true,
+    });
     div()
         .relative()
         .flex()
@@ -603,13 +614,21 @@ pub fn menu_surface(cx: &App) -> gpui::Div {
         .min_w(px(160.))
         .p(px(4.))
         .rounded(px(8.))
-        .border_1()
-        .border_color(hsla(p.dropdown_border))
-        .bg(hsla(p.popover))
         .text_color(hsla(p.popover_foreground))
-        .shadow(floating_shadow(cx.theme().is_dark()))
-        .theme_slot(ThemeSlot::MenuPopup, cx)
+        .shadow(shadows)
+        .when(!has_custom_bg, |this| {
+            this.child(crate::glass::backdrop(
+                8. * f32::from(cx.theme().font_size) / 16.,
+                hsla(p.dropdown_surface),
+                backdrop_border,
+                cx,
+            ))
+        })
+        .when(has_custom_bg, |this| {
+            this.bg(hsla(p.dropdown_surface)).border_1().border_color(backdrop_border)
+        })
         .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
+        .theme_slot(ThemeSlot::MenuPopup, cx)
 }
 
 /// The dropdown glass, floating shadow and control bevel of `popover.tsx` (§6.5).

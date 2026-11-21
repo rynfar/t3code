@@ -14,7 +14,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
-use crate::components::motion::transition;
+use crate::components::motion::{Spinner, transition};
 use crate::icons::Icon;
 use crate::theme::{
     SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
@@ -23,6 +23,8 @@ use crate::theme::{
 };
 
 const DISABLED_OPACITY: f32 = 0.64;
+pub(crate) const SELECT_POPUP_PRIORITY: usize = 75;
+pub(crate) const DIALOG_MODAL_PRIORITY: usize = 3;
 
 gpui::actions!(settings_select, [CloseSelect, CloseInheritance]);
 
@@ -138,18 +140,25 @@ pub struct Button {
     size: ButtonSize,
     icon: Option<Icon>,
     icon_color: Option<Hsla>,
+    loading: bool,
     trailing: Option<Icon>,
     label: Option<SharedString>,
     tooltip: Option<SharedString>,
     disabled: bool,
     full_width: bool,
+    justify_start: bool,
     justify_between: bool,
     on_click: Option<ClickHandler>,
 }
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
-        Button { id: id.into(), focus: None, variant, size, icon: None, icon_color: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, justify_between: false, on_click: None }
+        Button { id: id.into(), focus: None, variant, size, icon: None, icon_color: None, loading: false, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, justify_start: false, justify_between: false, on_click: None }
+    }
+
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
     }
 
     pub fn icon_color(mut self, color: Hsla) -> Self {
@@ -166,6 +175,12 @@ impl Button {
     /// on a component's own box.
     pub fn full_width(mut self) -> Self {
         self.full_width = true;
+        self
+    }
+
+    /// Spans the parent's width with its content left-aligned (`w-full justify-start`).
+    pub fn justify_start(mut self) -> Self {
+        self.justify_start = true;
         self
     }
 
@@ -268,6 +283,14 @@ impl RenderOnce for Button {
                 None => svg.text_color(icon_color),
             }
         };
+        let spinner_id = (self.id.clone(), "spinner");
+        let spinner_size = r(icon_size).to_pixels(window.rem_size());
+        let spinner_color = self.icon_color.unwrap_or(icon_color);
+        let leading = if self.loading {
+            Some(Spinner::new(spinner_id, spinner_size, spinner_color).into_any_element())
+        } else {
+            self.icon.map(|glyph| render_icon(glyph, self.icon_color).into_any_element())
+        };
         h_flex()
             .id(self.id)
             .relative()
@@ -277,6 +300,7 @@ impl RenderOnce for Button {
             .h(r(height))
             .when(square, |this| this.w(r(height)).justify_center())
             .when(self.full_width, |this| this.w_full().justify_center())
+            .when(self.justify_start, |this| this.w_full().justify_start())
             .when(self.justify_between, |this| this.w_full().justify_between())
             .px(r(pad))
             .gap(r(match self.size {
@@ -307,7 +331,7 @@ impl RenderOnce for Button {
                     })
             })
             .children(theme_slot_clipped_background_layer(ThemeSlot::Button, r(radius), cx))
-            .children(self.icon.map(|glyph| render_icon(glyph, self.icon_color)))
+            .children(leading)
             .children(self.label.map(|label| {
                 div().relative().min_w_0().truncate()
                     .when(self.justify_between, |label| label.flex_1())
@@ -504,6 +528,48 @@ struct SelectState {
     closed_at: Option<Instant>,
 }
 
+#[derive(Default)]
+struct OpenSelects(Vec<gpui::WeakEntity<SelectState>>);
+impl gpui::Global for OpenSelects {}
+
+fn note_select_open(state: &gpui::Entity<SelectState>, open: bool, cx: &mut App) {
+    let id = state.entity_id();
+    let weak = state.downgrade();
+    let candidates = cx
+        .try_global::<OpenSelects>()
+        .map(|g| g.0.clone())
+        .unwrap_or_default();
+    let mut retained: Vec<_> = candidates
+        .into_iter()
+        .filter(|entry| entry.entity_id() != id && entry.upgrade().is_some_and(|e| e.read(cx).open))
+        .collect();
+    if open {
+        retained.push(weak);
+    }
+    cx.set_global(OpenSelects(retained));
+}
+
+pub(super) fn dismiss_open_select(cx: &mut App) -> bool {
+    let entries: Vec<_> = cx
+        .try_global::<OpenSelects>()
+        .map(|g| g.0.iter().filter_map(|w| w.upgrade()).collect())
+        .unwrap_or_default();
+    let mut closed = false;
+    for entry in entries {
+        if entry.read(cx).open {
+            entry.update(cx, |state, cx| {
+                state.open = false;
+                cx.notify();
+            });
+            closed = true;
+        }
+    }
+    if cx.has_global::<OpenSelects>() {
+        cx.global_mut::<OpenSelects>().0.clear();
+    }
+    closed
+}
+
 type SelectIconRenderer = Rc<dyn Fn(&str, &App) -> Option<AnyElement>>;
 
 /// `select.tsx`: an input-box trigger with a 14px chevron, and a popup list below it aligned to
@@ -518,6 +584,7 @@ pub struct Select {
     width: Option<f32>,
     popup_width: f32,
     show_check: bool,
+    trigger_chevron_only: bool,
     disabled: bool,
     on_change: Option<ValueHandler<SharedString>>,
 }
@@ -533,9 +600,15 @@ impl Select {
             width: None,
             popup_width: 160.,
             show_check: false,
+            trigger_chevron_only: false,
             disabled: false,
             on_change: None,
         }
+    }
+
+    pub fn trigger_chevron_only(mut self) -> Self {
+        self.trigger_chevron_only = true;
+        self
     }
 
     pub fn render_icon(mut self, render: impl Fn(&str, &App) -> Option<AnyElement> + 'static) -> Self {
@@ -591,6 +664,7 @@ impl RenderOnce for Select {
             let state = state.read(cx);
             (state.open && !disabled, state.highlighted)
         };
+        note_select_open(&state, open, cx);
         let selected_index = self.options.iter().position(|option| Some(&option.value) == self.selected.as_ref());
         let trigger_label = self
             .label
@@ -716,10 +790,12 @@ impl RenderOnce for Select {
                 }
             })
             .on_key_down(on_key)
-            .children(trigger_content)
-            .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
-            .when(!trigger_label.is_empty(), |this| {
-                this.child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, trigger_label.as_ref()).to_owned()))
+            .when(!self.trigger_chevron_only, |this| {
+                this.children(trigger_content)
+                    .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
+                    .when(!trigger_label.is_empty(), |this| {
+                        this.child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, trigger_label.as_ref()).to_owned()))
+                    })
             })
             .child(icon(Icon::ChevronDown, 14., hsla(p.foreground).opacity(0.7)));
 
@@ -842,7 +918,7 @@ impl RenderOnce for Select {
                             ),
                     ),
                 )
-                .with_priority(2),
+                .with_priority(SELECT_POPUP_PRIORITY),
             )
         });
 
@@ -1418,7 +1494,7 @@ pub struct DialogFrame {
 
 impl DialogFrame {
     pub fn render(self, window: &Window, on_dismiss: impl Fn(&mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
-        self.render_inner(window,3,false,on_dismiss,cx)
+        self.render_inner(window, DIALOG_MODAL_PRIORITY, false, on_dismiss, cx)
     }
 
     pub fn render_modal(self,window:&Window,priority:usize,on_dismiss:impl Fn(&mut Window,&mut App)+'static,cx:&App)->AnyElement {
@@ -1563,27 +1639,39 @@ impl PercentSlider {
     }
 }
 
-impl RenderOnce for PercentSlider {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        use gpui_base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
+/// Shared track/fill/thumb slider chrome using theme tokens instead of `gpui-component`'s faint bar.
+pub(super) fn styled_slider(
+    state: &gpui::Entity<gpui_component::slider::SliderState>,
+    cx: &App,
+) -> AnyElement {
+    use gpui_base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
 
-        let p = palette(cx);
-        if self.state.read(cx).value().start() != self.value as f32 {
-            self.state.update(cx, |state, cx| state.set_value(self.value as f32, window, cx));
-        }
-        let position = gpui::relative(self.state.read(cx).percentage().end);
-        let slider = Slider::new(&self.state).w_full().child(
-            SliderTrack::new(&self.state).w_full().h(r(24.)).flex().items_center().child(
-                SliderIndicator::new(&self.state)
+    let p = palette(cx);
+    let position = gpui::relative(state.read(cx).percentage().end);
+    Slider::new(state)
+        .w_full()
+        .child(
+            SliderTrack::new(state).w_full().h(r(24.)).px(r(8.)).flex().items_center().child(
+                SliderIndicator::new(state)
                     .relative()
                     .w_full()
                     .h(r(6.))
                     .rounded_full()
                     .border_1()
                     .border_color(hsla(p.border))
-                    .bg(cx.theme().tokens.slider_bar)
+                    .bg(hsla(p.muted))
                     .child(
-                        SliderThumb::new(&self.state)
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(position)
+                            .rounded_full()
+                            .bg(hsla(p.primary)),
+                    )
+                    .child(
+                        SliderThumb::new(state)
                             .absolute()
                             .top(r(-6.))
                             .left(position)
@@ -1592,18 +1680,27 @@ impl RenderOnce for PercentSlider {
                             .rounded_full()
                             .border_2()
                             .border_color(hsla(p.primary))
-                            .bg(cx.theme().tokens.slider_thumb),
+                            .bg(hsla(p.background)),
                     ),
             ),
-        );
-        h_flex().w(r(208.)).gap(r(12.))
+        )
+        .into_any_element()
+}
+
+impl RenderOnce for PercentSlider {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        if self.state.read(cx).value().start() != self.value as f32 {
+            self.state.update(cx, |state, cx| state.set_value(self.value as f32, window, cx));
+        }
+        h_flex().w_full().min_w_0().gap(r(12.))
             .child(
                 div().min_w(r(48.)).rounded(r(6.)).bg(hsla(p.muted)).px(r(8.)).py(r(4.))
                     .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx))
                     .text_center().font_weight(FontWeight::MEDIUM).text_xs().text_color(hsla(p.foreground))
                     .child(format!("{}%", self.value)),
             )
-            .child(div().flex_1().child(slider))
+            .child(div().flex_1().min_w_0().child(styled_slider(&self.state, cx)))
     }
 }
 
@@ -1626,5 +1723,11 @@ mod tests {
         assert_eq!(on.toggled(), gpui::Toggled::True);
         assert_eq!(on.thumb_offset(), 12.);
         assert!(on.selected());
+    }
+
+    #[test]
+    fn select_popup_priority_outranks_dialog_modals() {
+        const { assert!(SELECT_POPUP_PRIORITY > DIALOG_MODAL_PRIORITY); }
+        const { assert!(SELECT_POPUP_PRIORITY > 4); }
     }
 }

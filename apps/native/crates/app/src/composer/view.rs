@@ -1066,7 +1066,8 @@ impl Render for Composer {
                 )
                 .when(matches!(self.snapshot.target, Some(Target::Draft(_))), |this| {
                     this.children(self.render_usage_limits_banner(true, cx).map(render_draft_usage_limits_overlay))
-                }),
+                })
+                .child(self.viewer.clone()),
         )
     }
 }

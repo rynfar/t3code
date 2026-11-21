@@ -1786,8 +1786,11 @@ fn palette_item_icon(value: &str) -> Icon {
         "action:copy-prompt-link" | "action:copy-prompt-link-context" | "action:copy-thread" => Icon::Copy,
         "action:share-thread-with-guest" | "action:use-in-another-app" => Icon::Users,
         "action:usage" => Icon::ChartNoAxesColumn,
+        "action:toggle-sidebar" => Icon::PanelLeft,
+        "action:settle" => Icon::CircleCheck,
         _ if value.starts_with("theme:") => Icon::Palette,
-        _ if value.starts_with("thread:") || value.starts_with("linked-thread:") => Icon::MessagesSquare,
+        _ if value.starts_with("setting:") => Icon::Settings,
+        _ if value.starts_with("thread:") || value.starts_with("scoped-thread:") || value.starts_with("linked-thread:") => Icon::MessagesSquare,
         _ if value.starts_with("project:") || value.starts_with("new-thread-in:") => Icon::FolderCode,
         _ => Icon::Keyboard,
     }
@@ -2421,6 +2424,14 @@ mod visit_recency_tests {
             assert_eq!(threads[0].pull_requests[0].title.as_deref(), Some("Avoid cache overwrite"));
             assert!(threads[0].pull_requests[0].references.iter().any(|r| r.contains("acme/app/pull/88")));
         });
+    }
+
+    #[test]
+    fn palette_item_icon_maps_scoped_threads_settings_and_actions() {
+        assert_eq!(palette_item_icon("scoped-thread:env:t1").path(), Icon::MessagesSquare.path());
+        assert_eq!(palette_item_icon("setting:appearance").path(), Icon::Settings.path());
+        assert_eq!(palette_item_icon("action:toggle-sidebar").path(), Icon::PanelLeft.path());
+        assert_eq!(palette_item_icon("action:settle").path(), Icon::CircleCheck.path());
     }
 
     #[cfg(feature = "snapshot")]

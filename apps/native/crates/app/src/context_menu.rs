@@ -845,7 +845,7 @@ impl ContextMenu {
                 this.child(div().w(px(16.)).flex_none().children(item.checked.filter(|c| *c).map(|_| Icon::Check.sized(px(14.)).text_color(hsla(text)))))
             })
             .children(item.icon.and_then(Icon::from_name).map(|icon| div().opacity(0.8).child(icon.sized(px(16.)).text_color(hsla(icon_color)))))
-            .child(div().flex_1().min_w_0().truncate().child(localize_context_menu_label(cx, &item.label)))
+            .child(div().flex_1().min_w_0().truncate().child(format_menu_item_label(cx, &item.label, preset_detail.as_deref())))
             .children(preset_detail.map(|detail| div().flex_none().text_color(hsla(p.secondary_label)).child(detail)))
             .children(shortcut.map(|keys| {
                 div().flex_none().rounded(px(4.)).px(px(3.)).text_xs().font_weight(FontWeight::MEDIUM)
@@ -920,6 +920,16 @@ impl ContextMenu {
 /// Localizes context-menu labels at render time (`pingdotgg/t3code#39224`), including dynamic
 /// `"Filter by <project>"` and `"New thread on <branch>"` items while leaving `MenuItem.label`
 /// canonical for tests and key routing.
+pub(crate) fn format_menu_item_label(cx: &App, raw_label: &str, preset_detail: Option<&str>) -> String {
+    let base = if let Some(detail) = preset_detail {
+        let suffix = format!(" ({detail})");
+        raw_label.strip_suffix(&suffix).unwrap_or(raw_label)
+    } else {
+        raw_label
+    };
+    localize_context_menu_label(cx, base)
+}
+
 fn localize_context_menu_label(cx: &App, label: &str) -> String {
     let translated = crate::i18n::t(cx, label);
     if translated != label {
@@ -1514,3 +1524,23 @@ pub(crate) mod project_filter_tests {
 
 #[cfg(all(test, feature = "snapshot"))]
 mod thread_menu_tests;
+
+#[cfg(test)]
+mod label_tests {
+    use super::format_menu_item_label;
+
+    #[gpui::test]
+    fn format_menu_item_label_strips_preset_detail_suffix(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(
+                format_menu_item_label(cx, "Tomorrow morning (9:00 AM)", Some("9:00 AM")),
+                "Tomorrow morning"
+            );
+            assert_eq!(
+                format_menu_item_label(cx, "Tomorrow morning (9:00 AM)", Some("8:00 AM")),
+                "Tomorrow morning (9:00 AM)"
+            );
+            assert_eq!(format_menu_item_label(cx, "Filter by api", None), "Filter by api");
+        });
+    }
+}

@@ -194,9 +194,16 @@ impl DevicesState {
                 return;
             }
             let _ = view.update(cx, |view, cx| {
-                if view.section == Section::Devices && (view.devices.editor.is_some()
+                if view.section != Section::Devices {
+                    return;
+                }
+                if super::controls::dismiss_open_select(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if view.devices.editor.is_some()
                     || view.devices.platform_menu.is_some() || view.devices.action_menu.is_some()
-                    || view.devices.add_menu_open)
+                    || view.devices.add_menu_open
                 {
                     cx.stop_propagation();
                     view.devices.platform_menu = None;

@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, icon, muted_text, r, section, section_title};
 use super::{Block, SettingsView, store};
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::theme::{hsla, palette};
@@ -533,7 +534,7 @@ impl SettingsView {
         let text_generators = show_text_generators.then(|| self.render_text_generators_section(window, cx));
         let advanced = self.render_advanced(&data.panel, cx);
         if self.take_onboarding_registry_request() {
-            self.open_add_dialog(window, cx);
+            self.open_add_dialog_with_driver(Some(t3_core::settings::providers::ACP_REGISTRY), window, cx);
         }
         let dialog = self.render_add_dialog(window, cx);
         let removal = self.render_provider_removal(window, cx);
@@ -591,7 +592,11 @@ impl SettingsView {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_providers(cx)))
                     })
                     .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Refresh provider status").build(window, cx))
-                    .child(icon(if refreshing { Icon::LoaderCircle } else { Icon::RefreshCw }, 14., hsla(p.muted_foreground)))
+                    .child(if refreshing {
+                        Spinner::new("providers-refresh-spin", r(14.).to_pixels(window.rem_size()), hsla(p.muted_foreground)).into_any_element()
+                    } else {
+                        icon(Icon::RefreshCw, 14., hsla(p.muted_foreground)).into_any_element()
+                    })
                     .children(label.map(|label| div().truncate().child(label))),
             );
 
@@ -820,14 +825,22 @@ impl SettingsView {
         let Some(advisory) = view.advisory.clone() else { return div().into_any_element() };
         let open = self.providers.advisory_open.as_deref() == Some(instance_id);
         let size = if compact { 20. } else { 24. };
-        let glyph = if view.update_progress.is_some() {
-            Icon::LoaderCircle
-        } else if view.compatibility_warning {
-            Icon::TriangleAlert
-        } else {
-            Icon::CircleArrowUp
-        };
         let color = if view.compatibility_warning { hsla(p.warning) } else { hsla(p.muted_foreground) };
+        let badge_icon = if view.update_progress.is_some() {
+            Spinner::new(
+                SharedString::from(format!("provider-advisory-spin-{instance_id}-{compact}")),
+                px(14.),
+                color,
+            )
+            .into_any_element()
+        } else {
+            let glyph = if view.compatibility_warning {
+                Icon::TriangleAlert
+            } else {
+                Icon::CircleArrowUp
+            };
+            icon(glyph, 14., color).into_any_element()
+        };
         let toggle_id = instance_id.to_owned();
         let tooltip: SharedString = if view.update_progress.is_some() { "Updating".into() } else { advisory.title.clone().into() };
         let trigger = h_flex()
@@ -847,7 +860,7 @@ impl SettingsView {
                 }
                 cx.notify();
             }))
-            .child(icon(glyph, 14., color));
+            .child(badge_icon);
         let popup = open.then(|| self.render_advisory_popover(instance_id, view, &advisory, cx));
         div().relative().flex_none().child(trigger).children(popup).into_any_element()
     }
@@ -860,7 +873,8 @@ impl SettingsView {
             let id = instance_id.to_owned();
             let target = action.target_version().map(str::to_owned);
             Button::new("provider-version-action", ButtonVariant::Outline, ButtonSize::Compact)
-                .icon(if updating { Icon::LoaderCircle } else { Icon::Download })
+                .icon(Icon::Download)
+                .loading(updating)
                 .label(if updating { "Updating".to_owned() } else { action.label() })
                 .disabled(updating)
                 .on_click(cx.listener(move |this, _, _, cx| this.run_update(&id, target.clone(), cx)))

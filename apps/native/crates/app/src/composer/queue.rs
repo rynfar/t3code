@@ -12,7 +12,7 @@ use t3_core::media::{self, AssetResource};
 use t3_core::timeline::Attribution;
 
 use crate::i18n::{t, t_fmt};
-use crate::media::{Media, MediaScope, ViewerItem};
+use crate::media::{MediaScope, ViewerItem};
 
 use super::Composer;
 use super::controls::{Button, ButtonSize, ButtonVariant};
@@ -270,9 +270,30 @@ impl Composer {
         .detach();
     }
 
-    fn queued_media_scope(&self, cx: &App) -> Option<MediaScope> {
-        let scope = cx.try_global::<Media>()?.scope.as_ref()?;
-        (scope.thread_id.as_deref() == self.thread_id().as_deref()).then(|| scope.clone())
+    fn queued_media_scope(&self, cx: &Context<Self>) -> Option<MediaScope> {
+        let thread_id = self.thread_id()?;
+        let state = self.state.read(cx);
+        let workspace_root = state.thread_shell(&thread_id).and_then(|thread| {
+            thread
+                .worktree_path
+                .clone()
+                .or_else(|| state.shell.project(&thread.project_id).map(|p| p.workspace_root.clone()))
+        });
+        let workspace_mutation_id = state
+            .thread_state(&thread_id)
+            .projection
+            .as_ref()
+            .filter(|projection| projection.thread.id == thread_id)
+            .and_then(t3_core::media::workspace_mutation_id);
+        Some(MediaScope {
+            owner: cx.entity_id(),
+            thread_id: Some(thread_id),
+            workspace_root,
+            workspace_mutation_id,
+            source_control_media: false,
+            source_control_media_repository: None,
+            viewer: self.viewer.downgrade(),
+        })
     }
 
     fn queued_images(&self, attachments: &[serde_json::Value], removable: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -281,10 +302,8 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
-        let scope = self.queued_media_scope(cx).map(|mut scope| {
-            scope.owner = cx.entity_id();
-            scope
-        });
+        let _ = crate::media::cache(&self.state, cx);
+        let scope = self.queued_media_scope(cx);
         let gallery: Rc<[ViewerItem]> = images.iter().map(|image| ViewerItem::image(image.source(), image.name.clone())).collect();
         let edge = px(if removable { 56. } else { 32. });
         let tiles = images.into_iter().enumerate().map(|(index, image)| {
@@ -305,12 +324,21 @@ impl Composer {
                 .relative()
                 .size(edge)
                 .flex_none()
+                .overflow_hidden()
                 .rounded(px(6.))
                 .border_1()
                 .border_color(hsla(p.border).opacity(0.7))
                 .bg(hsla(p.muted).opacity(0.6))
                 .child(thumbnail)
-                .children(remove.map(|remove| div().absolute().top_0().right_0().child(remove)))
+                .children(remove.map(|remove| {
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(2.))
+                        .rounded_full()
+                        .bg(hsla(p.background).opacity(0.8))
+                        .child(remove)
+                }))
         });
         Some(h_flex().flex_wrap().gap(px(4.)).children(tiles).into_any_element())
     }

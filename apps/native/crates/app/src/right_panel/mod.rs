@@ -113,6 +113,7 @@ pub struct RightPanelView {
     /// Last rendered inline/sheet panel width, used as the start width for close transitions.
     last_rendered_width: f32,
     last_open_panel: Option<ThreadPanel>,
+    animated_inline_width: std::cell::Cell<Option<f32>>,
     #[cfg(all(test, feature = "snapshot"))]
     animation: Option<(bool, u32)>,
     _close_animation_task: Option<Task<()>>,
@@ -141,6 +142,10 @@ pub(crate) fn snapshot_diff(cx: &gpui::App) -> Entity<DiffPanel> {
 }
 
 impl RightPanelView {
+    pub(crate) fn animated_inline_width(&self) -> Option<f32> {
+        self.animated_inline_width.get()
+    }
+
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffPanel::new(state.clone(), window, cx));
         #[cfg(feature = "snapshot")]
@@ -215,6 +220,7 @@ impl RightPanelView {
             last_open_state: None,
             last_rendered_width: DEFAULT_WIDTH,
             last_open_panel: None,
+            animated_inline_width: std::cell::Cell::new(None),
             #[cfg(all(test, feature = "snapshot"))]
             animation: None,
             _close_animation_task: None,
@@ -802,6 +808,10 @@ impl RightPanelView {
         let thread_owned = (!thread_id.starts_with("new-thread:")
             && !AppState::is_utility_panel_key(thread_id))
             .then(|| thread_id.to_owned());
+        let state_mutated = state.clone();
+        let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
+            state_mutated.update(cx, |_, cx| cx.emit(crate::app_state::AppEvent::IssuesMutated));
+        });
         let view = cx.new(|cx| {
             crate::issues::IssueDetailPanel::new(
                 state,
@@ -811,7 +821,7 @@ impl RightPanelView {
                 None,
                 None,
                 Some(on_select_pr),
-                None,
+                Some(on_mutated),
                 cx,
             )
         });
@@ -934,6 +944,7 @@ impl Render for RightPanelView {
         self.sync_pull_request_tabs(thread_id.as_deref(), rendered.as_ref(), cx);
         self.sync_issue_tabs(thread_id.as_deref(), rendered.as_ref());
         if !is_open && !closing {
+            self.animated_inline_width.set(Some(0.));
             self.last_open_panel = None;
             self._close_animation_task = None;
             cx.default_global::<FileSurfaceExit>().0 = None;
@@ -1074,6 +1085,7 @@ impl Render for RightPanelView {
         } else {
             panel_el
         };
+        self.animated_inline_width.set(Some(if sheet_mode { 0. } else { width * progress }));
         let animated_panel = if panel.maximized {
             panel_el.into_any_element()
         } else {

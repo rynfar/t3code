@@ -147,10 +147,22 @@ pub(crate) fn terminal_drawer_geometry(window: &Window, cx: &gpui::App) -> (Opti
     let right = if t3_core::right_panel::is_sheet_mode(width) {
         0.
     } else {
-        state.panel_thread().filter(|thread| state.panels.panels.is_open(thread))
-            .map_or(0., |thread| crate::right_panel::inline_panel_width(state, &thread, width))
+        workspace
+            .right_panel
+            .read(cx)
+            .animated_inline_width()
+            .unwrap_or_else(|| {
+                state
+                    .panel_thread()
+                    .filter(|thread| state.panels.panels.is_open(thread))
+                    .map_or(0., |thread| crate::right_panel::inline_panel_width(state, &thread, width))
+            })
     };
-    let center = px((width - sidebar_inline_width(state, width) - right).max(0.));
+    let sidebar = workspace
+        .animated_sidebar_width
+        .get()
+        .unwrap_or_else(|| sidebar_inline_width(state, width));
+    let center = px((width - sidebar - right).max(0.));
     let composer = if state.selected_thread.is_some() {
         workspace.composer_overlay_height.get()
     } else {
@@ -217,6 +229,7 @@ pub struct Workspace {
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
     sidebar_is_sheet: Option<bool>,
+    animated_sidebar_width: std::cell::Cell<Option<f32>>,
     theme_background: t3_core::themes::background::ThemeBackgroundTracker,
     theme_background_task: Option<Task<()>>,
     _save_sidebar_width: Option<Task<()>>,
@@ -456,6 +469,7 @@ impl Workspace {
             snapshot_setup,
             rail_dragging: false,
             sidebar_is_sheet: None,
+            animated_sidebar_width: std::cell::Cell::new(None),
             theme_background: t3_core::themes::background::ThemeBackgroundTracker::new(),
             theme_background_task: None,
             _save_sidebar_width: None,
@@ -703,7 +717,6 @@ impl Workspace {
         chat_header::container_with_layout(left, !no_projects, cx)
             .child(self.header.clone())
             .children(status)
-            .when(!has_chat && !no_projects, |bar| bar.child(new_thread::new_thread_button(cx)))
             .child(
                 div()
                     .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
@@ -823,6 +836,7 @@ impl Render for Workspace {
         } else {
             sidebar_inline_width_when_open(self.state.read(cx), viewport)
         };
+        self.animated_sidebar_width.set(Some(if sidebar_is_sheet { 0. } else { sidebar_inline_full * inline_progress }));
         let sidebar_el = (inline_progress > 0.).then(|| {
             panel_width_clip(
                 px(sidebar_inline_full * inline_progress),

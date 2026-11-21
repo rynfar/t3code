@@ -53,6 +53,9 @@ pub enum AppEvent {
     Notice,
     /// Right panel tabs, visibility, width, or the diff selection changed.
     RightPanel,
+    /// Shared Issues / PRs detail tab mutated an issue or pull request, asking list pages to refresh.
+    IssuesMutated,
+    PullRequestsMutated,
     /// A file was queued in `composer_mentions` for the composer.
     ComposerMention,
     /// The sidebar's multi-selection or thread drag changed.

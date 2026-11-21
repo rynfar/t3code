@@ -22,6 +22,7 @@ use t3_core::vcs::change_request_reference::parse_pull_request_reference;
 use t3_core::vcs::{PullRequestCheckoutMode, ResolvedPullRequest, format_diff_count};
 
 use super::{GitEvent, GitStore};
+use crate::components::motion::Spinner;
 use crate::composer::controls::checkbox;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant, focusable, tooltip_view};
@@ -898,7 +899,7 @@ impl GitDialogs {
                                 .bg(hsla(p.muted).opacity(0.4))
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child(Icon::LoaderCircle.sized(px(14.)))
+                                .child(Spinner::new("publish-pending-spin", px(14.), hsla(p.muted_foreground)))
                                 .child(format!("Publishing repository to {}...", provider.label)),
                         )
                     })
@@ -1087,7 +1088,7 @@ impl GitDialogs {
                         .gap(px(6.))
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .child(Icon::LoaderCircle.sized(px(14.)))
+                        .child(Spinner::new("pr-resolve-spin", px(14.), hsla(p.muted_foreground)))
                         .child(format!("Resolving {}...", terms.singular)),
                 )
             })

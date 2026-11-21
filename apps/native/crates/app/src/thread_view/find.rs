@@ -125,7 +125,10 @@ impl ThreadView {
         }
         let had_find = self.find.is_some();
         let input = self.ensure_find_ui(window, cx);
-        input.update(cx, |input, cx| input.focus(window, cx));
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
         if had_find {
             let has_query = self.find.as_ref().is_some_and(|find| !find.query.trim().is_empty());
             if has_query {

@@ -160,6 +160,7 @@ pub struct UsageView {
     dialog_hover: Option<chart::ChartHover>,
     prices: Option<prices::PriceOverridesDialog>,
     segment: Option<SegmentKey>,
+    segment_pinned: bool,
     revealed_account_email: Option<String>,
     confirm_reset: Option<(Redeem, String)>,
     /// The account a reset credit is being used for, and what came of it.
@@ -213,6 +214,7 @@ impl UsageView {
             dialog_hover: None,
             prices: None,
             segment: None,
+            segment_pinned: false,
             revealed_account_email: None,
             confirm_reset: None,
             reset_status: None,
@@ -329,6 +331,7 @@ impl UsageView {
             || self.segment.take().is_some()
             || self.selected_model.take().is_some()
         {
+            self.segment_pinned = false;
             self.dialog_hover = None;
             cx.notify();
             return;
@@ -367,6 +370,7 @@ impl Render for UsageView {
                     if this.menu.is_some() || this.segment.is_some() {
                         this.menu = None;
                         this.segment = None;
+                        this.segment_pinned = false;
                         cx.notify();
                     }
                 }),

@@ -838,7 +838,7 @@ fn config(
         ("link", hex(p.info_foreground)),
         ("link.hover", hex(p.info_foreground)),
         ("link.active", hex(p.info_foreground)),
-        ("slider.background", hex(p.muted)),
+        ("slider.background", hex(p.primary)),
         ("slider.thumb.background", hex(p.background)),
         ("primary.background", hex(p.primary)),
         ("primary.foreground", hex(p.primary_foreground)),

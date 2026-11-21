@@ -25,7 +25,7 @@ use t3_core::mcp::approval::{
 use t3_core::mcp::{McpClientAccess, parse_mcp_approval_code};
 
 use crate::app_state::{AppEvent, AppState};
-use crate::icons::Icon;
+use crate::components::motion::Spinner;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 
@@ -916,7 +916,7 @@ impl Render for AgentApprovalDialog {
                         .into_any_element(),
                     cx,
                 ))
-                .child(Icon::LoaderCircle.render(px(20.), hsla(p.muted_foreground)))
+                .child(Spinner::new("mcp-approval-loading-spin", px(20.), hsla(p.muted_foreground)))
                 .into_any_element(),
             ApprovalLoadState::Invalid(message) => v_flex()
                 .gap(px(12.))

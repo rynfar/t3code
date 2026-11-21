@@ -280,6 +280,11 @@ impl FilesPanel {
         if !visible && !root_changed && crate::right_panel::holding_file_surface(&self.state, cx) {
             return;
         }
+        let prev_was_attachment = self.shown.as_ref().is_some_and(|shown| shown.attachment.is_some());
+        let shown_changed = shown != self.shown || root_changed;
+        if shown_changed {
+            self.shown = shown.clone();
+        }
         // Hidden files do no work: they catch up when they show.
         if visible {
             self.explorer.update(cx, |explorer, cx| explorer.set_root(root.clone(), cx));
@@ -310,11 +315,10 @@ impl FilesPanel {
             let selected = shown.as_ref().and_then(|shown| shown.path.clone()).filter(|path| !is_host_path(path));
             let reveal = shown.as_ref().map_or(0, |shown| shown.reveal_request_id);
             self.explorer.update(cx, |explorer, cx| explorer.set_selected(selected, reveal, cx));
-        } else if self.shown.as_ref().is_some_and(|shown| shown.attachment.is_some()) {
+        } else if prev_was_attachment {
             self.preview.update(cx, |preview, cx| preview.set_attachment(None, cx));
         }
-        if shown != self.shown || root_changed {
-            self.shown = shown;
+        if shown_changed {
             cx.notify();
         }
     }
@@ -574,7 +578,8 @@ impl FilesPanel {
             crate::settings::controls::SelectOption::new(editor, name)
         }).collect();
         let picker = crate::settings::controls::Select::new("file-open-in-menu", options)
-            .label(crate::i18n::t(cx, "Choose editor"))
+            .trigger_chevron_only()
+            .popup_width(208.)
             .render_icon(move |editor, cx| {
                 let p = palette(cx);
                 Some(editor_logo(editor, platform).map_or_else(
@@ -637,7 +642,8 @@ impl FilesPanel {
             .bg(hsla(p.background))
             .child(h_flex()
                 .flex_none()
-                .h(px(28.))
+                .min_h(px(36.))
+                .py(px(4.))
                 .px(px(12.))
                 .gap(px(6.))
                 .items_center()

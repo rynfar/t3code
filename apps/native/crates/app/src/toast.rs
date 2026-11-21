@@ -66,6 +66,12 @@ pub enum ToastKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectApprovalToast {
+    pub saved_id: String,
+    pub pairing_link_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub kind: ToastKind,
     pub title: SharedString,
@@ -83,6 +89,8 @@ pub struct Toast {
     /// Legacy-permission re-pair notice (`PermissionUpdateNotice.ts`), carrying the environment
     /// dismissal key so dismissing via Close/Dismiss/Open persists across restarts.
     pub permission_update_env: Option<String>,
+    /// Inline approve/deny/review controls for pending T3 Connect device approval requests.
+    pub connect_approval: Option<ConnectApprovalToast>,
     /// Expandable slow RPC request rows (`SlowRpcRequestToastCoordinator.tsx`).
     pub slow_rpc_requests: Vec<SlowRpcRequestItem>,
     persistent: bool,
@@ -102,6 +110,7 @@ impl Toast {
             hide_copy_button: false,
             key: None,
             permission_update_env: None,
+            connect_approval: None,
             slow_rpc_requests: Vec::new(),
             persistent: false,
             github_star: false,
@@ -144,6 +153,14 @@ impl Toast {
         let key = format!("permission-update:{env_key}");
         self.permission_update_env = Some(env_key);
         self.key(key).persistent()
+    }
+
+    pub fn connect_approval(mut self, saved_id: impl Into<String>, pairing_link_id: impl Into<String>) -> Self {
+        self.connect_approval = Some(ConnectApprovalToast {
+            saved_id: saved_id.into(),
+            pairing_link_id: pairing_link_id.into(),
+        });
+        self
     }
 
     pub fn persistent(mut self) -> Self {
@@ -575,6 +592,23 @@ impl AppState {
         }
     }
 
+    pub fn withdraw_toasts_by_key_prefix(&mut self, prefix: &str, cx: &mut Context<Self>) {
+        let before = self.toasts.entries.len();
+        self.toasts.entries.retain(|entry| {
+            entry
+                .toast
+                .key
+                .as_deref()
+                .is_none_or(|key| !key.starts_with(prefix))
+        });
+        if self.toasts.entries.is_empty() {
+            self.toasts.hovered = false;
+        }
+        if self.toasts.entries.len() != before {
+            cx.emit(AppEvent::Notice);
+        }
+    }
+
     pub(crate) fn mark_toast_copied(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(entry) = self.toasts.entries.iter_mut().find(|entry| entry.id == id) {
             entry.copied = true;
@@ -863,6 +897,90 @@ fn render_toast(id: u64, toast_data: &Toast, copied: bool, expanded: bool, state
     } else {
         toast
     };
+    let toast = if let Some(approval) = toast_data.connect_approval.clone() {
+        let p = palette(cx);
+        let review_id = approval.saved_id.clone();
+        let deny_state = state.clone();
+        let deny_saved = approval.saved_id.clone();
+        let deny_link = approval.pairing_link_id.clone();
+        let approve_state = state.clone();
+        let approve_saved = approval.saved_id;
+        let approve_link = approval.pairing_link_id;
+        toast.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(6.))
+                .px(px(14.))
+                .pb(px(12.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toast-connect-review-{id}")))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(p.background))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(hsla(p.accent)))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            crate::settings::open_access_environment(review_id.clone(), cx);
+                        })
+                        .child(crate::i18n::t(cx, "Review").to_owned()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toast-connect-deny-{id}")))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(p.background))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.destructive_foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(hsla(p.destructive).opacity(0.08)))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            deny_state.update(cx, |state, cx| state.deny_connect_device(&deny_saved, &deny_link, cx));
+                        })
+                        .child(crate::i18n::t(cx, "Deny").to_owned()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toast-connect-approve-{id}")))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(hsla(p.primary))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.primary_foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.opacity(0.9))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            approve_state.update(cx, |state, cx| state.approve_connect_device(&approve_saved, &approve_link, cx));
+                        })
+                        .child(crate::i18n::t(cx, "Approve").to_owned()),
+                ),
+        )
+    } else {
+        toast
+    };
     let toast = if toast_data.open_keybindings_config {
         let p = palette(cx);
         let can_open = state.read(cx).can_open_keybindings_config();
@@ -984,10 +1102,17 @@ struct ToastPresentation {
     expanded: bool,
 }
 
+#[derive(Clone)]
+struct ExitingToast {
+    card: ToastPresentation,
+    top: f32,
+}
+
 #[derive(Default)]
 struct ToastMotion {
     visible: Vec<ToastPresentation>,
-    exiting: Vec<ToastPresentation>,
+    exiting: Vec<ExitingToast>,
+    tops: std::collections::HashMap<u64, f32>,
 }
 
 /// Top-right toast stack and trigger-anchored copy feedback.
@@ -1021,16 +1146,42 @@ pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Opt
         if reduced_motion {
             motion.exiting.clear();
         } else {
-            motion.exiting.extend(previous.iter().filter(|entry| !ids.contains(&entry.id)).cloned());
+            for (slot, entry) in previous.iter().enumerate() {
+                if !ids.contains(&entry.id) {
+                    let top = motion
+                        .tops
+                        .remove(&entry.id)
+                        .unwrap_or(32. + 52. + (slot as f32) * (56. + GAP));
+                    motion.exiting.push(ExitingToast {
+                        card: entry.clone(),
+                        top,
+                    });
+                }
+            }
             let excess = motion.exiting.len().saturating_sub(VISIBLE_LIMIT);
             motion.exiting.drain(..excess);
         }
+        motion.tops.retain(|id, _| ids.contains(id));
         (previous, std::mem::take(&mut motion.exiting))
     };
     if visible.is_empty() && anchored.is_empty() && exiting.is_empty() {
         return None;
     }
     let mut layer = div().absolute().inset_0();
+    let mut retained = Vec::new();
+    for entry in exiting {
+        let progress = transition(("toast-enter-exit", entry.card.id), 0., TRANSITION_DURATION, window, cx);
+        if progress > 0. {
+            layer = layer.child(
+                div().absolute().top(px(entry.top)).right(px(32. - (1. - progress) * 40.))
+                    .w(px(WIDTH).min((window.viewport_size().width - px(64.)).max(px(0.))))
+                    .opacity(progress)
+                    .child(render_toast(entry.card.id, &entry.card.toast, entry.card.copied, entry.card.expanded, state, window, cx)),
+            );
+            retained.push(entry);
+        }
+    }
+    motion.read(cx).borrow_mut().exiting = retained;
     if !visible.is_empty() {
         let hover_state = state.clone();
         let mut container = div()
@@ -1055,28 +1206,29 @@ pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Opt
                 window.request_animation_frame();
                 transition(key, 0., Duration::ZERO, window, cx)
             };
+            let measure_motion = motion.clone();
+            let card_id = card.id;
             container = container.child(
                 div().relative().left(px((1. - progress) * 40.)).opacity(progress)
-                    .child(render_toast(card.id, &card.toast, card.copied, card.expanded, state, window, cx)),
+                    .child(render_toast(card.id, &card.toast, card.copied, card.expanded, state, window, cx))
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                measure_motion
+                                    .read(cx)
+                                    .borrow_mut()
+                                    .tops
+                                    .insert(card_id, f32::from(bounds.origin.y));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    ),
             );
         }
         layer = layer.child(container);
     }
-    let mut retained = Vec::new();
-    for card in exiting {
-        let progress = transition(("toast-enter-exit", card.id), 0., TRANSITION_DURATION, window, cx);
-        if progress > 0. {
-            layer = layer.child(
-                div().absolute().top(px(32. + 52.)).right(px(32. - (1. - progress) * 40.))
-                    .w(px(WIDTH).min((window.viewport_size().width - px(64.)).max(px(0.))))
-                    .opacity(progress)
-                    .child(render_toast(card.id, &card.toast, card.copied, card.expanded, state, window, cx))
-                    .child(div().absolute().inset_0().occlude()),
-            );
-            retained.push(card);
-        }
-    }
-    motion.read(cx).borrow_mut().exiting = retained;
     for item in &anchored {
         layer = layer.child(render_anchored_toast(item, state, window, cx));
     }

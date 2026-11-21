@@ -495,7 +495,8 @@ impl SettingsView {
 
     fn refresh_button(id: &'static str, label: &'static str, pending: bool, on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static) -> Button {
         Button::new(id, ButtonVariant::GhostMuted, ButtonSize::IconXs)
-            .icon(if pending { Icon::LoaderCircle } else { Icon::RefreshCw })
+            .icon(Icon::RefreshCw)
+            .loading(pending)
             .tooltip(label)
             .disabled(pending)
             .on_click(on_click)

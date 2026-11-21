@@ -36,6 +36,7 @@ use t3_core::sidebar::time::parse_iso;
 use t3_core::settings::access::{T3ConnectTurnOn, can_configure_relay, resolve_t3_connect_turn_on};
 
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::Spinner;
 use crate::i18n::t;
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
@@ -1095,7 +1096,7 @@ impl UseInAnotherAppDialog {
                 .gap(px(8.))
                 .text_sm()
                 .text_color(hsla(p.muted_foreground))
-                .child(Icon::LoaderCircle.render(px(14.), hsla(p.muted_foreground)))
+                .child(Spinner::new("mcp-checking-spin", px(14.), hsla(p.muted_foreground)))
                 .child("Checking T3 Connect\u{2026}")
                 .into_any_element(),
             McpGate::SignIn => Self::render_gate_message(

@@ -112,6 +112,15 @@ impl SettingsView {
     }
 
     pub(super) fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_add_dialog_with_driver(None, window, cx);
+    }
+
+    pub(super) fn open_add_dialog_with_driver(
+        &mut self,
+        preferred_driver: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let driver = {
             let app = self.state.read(cx);
             let policy = app
@@ -119,10 +128,15 @@ impl SettingsView {
                 .config
                 .as_ref()
                 .and_then(|c| c.managed_policy.as_ref());
-            model::offered_drivers(true, policy)
-                .next()
-                .or_else(|| model::offered_drivers(false, policy).next())
-                .or_else(|| model::find_driver(model::ACP_REGISTRY).filter(|d| t3_core::managed_policy::driver_allowed(policy, d.kind)))
+            preferred_driver
+                .and_then(model::find_driver)
+                .filter(|d| t3_core::managed_policy::driver_allowed(policy, d.kind))
+                .or_else(|| {
+                    model::offered_drivers(true, policy)
+                        .next()
+                        .or_else(|| model::offered_drivers(false, policy).next())
+                        .or_else(|| model::find_driver(model::ACP_REGISTRY).filter(|d| t3_core::managed_policy::driver_allowed(policy, d.kind)))
+                })
         };
         let Some(driver) = driver else {
             return;

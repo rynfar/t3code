@@ -14,6 +14,7 @@ use t3_core::pull_requests::wire::{Actor, Label};
 
 use super::controls::{Button, Size, Variant};
 use super::page::{PullRequestsPage, SavedViewEditor};
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -61,7 +62,11 @@ pub fn render(page: &mut PullRequestsPage, _window: &mut Window, cx: &mut Contex
                 .border_1()
                 .border_color(hsla(p.input))
                 .bg(if dark { hsla(p.input).opacity(0.32) } else { hsla(p.background) })
-                .child((if busy { Icon::LoaderCircle } else { Icon::Search }).sized(px(16.)).text_color(hsla(p.muted_foreground)))
+                .child(if busy {
+                    Spinner::new("pr-search-spin", px(16.), hsla(p.muted_foreground)).into_any_element()
+                } else {
+                    Icon::Search.sized(px(16.)).text_color(hsla(p.muted_foreground)).into_any_element()
+                })
                 .child(div().flex_1().min_w_0().child(Input::new(&page.search).appearance(false).bordered(false))),
         )
         .child(sort_menu)

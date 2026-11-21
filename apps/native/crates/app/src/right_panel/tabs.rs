@@ -534,6 +534,20 @@ pub fn tab_bar(
                 .gap(px(4.))
                 .overflow_x_scroll()
                 .track_scroll(&handle)
+                .on_scroll_wheel({
+                    let wheel_handle = handle.clone();
+                    move |event, window, cx| {
+                        let delta = event.delta.pixel_delta(px(20.));
+                        let step = if delta.x != px(0.) { delta.x } else { delta.y };
+                        if step != px(0.) {
+                            let mut offset = wheel_handle.offset();
+                            offset.x = (offset.x + step).clamp(-wheel_handle.max_offset().x, px(0.));
+                            wheel_handle.set_offset(offset);
+                            window.refresh();
+                            cx.stop_propagation();
+                        }
+                    }
+                })
                 .children(tabs),
         )
         .when(overflow, |bar| {

@@ -794,7 +794,7 @@ impl UsageView {
                     let model = row.model.as_ref().map_or_else(|| row.fixed_model.clone(), |input| input.read(cx).value().to_string());
                     return h_flex().gap(r(6.)).min_h(r(28.)).text_size(r(12.)).text_color(hsla(p.muted_foreground))
                         .child(div().flex_1().truncate().child(model))
-                        .child(ActionButton::new("usage-price-undo", crate::i18n::t(cx, "Undo"), ButtonVariant::Outline, ButtonSize::Xs)
+                        .child(ActionButton::new(("usage-price-undo", index), crate::i18n::t(cx, "Undo"), ButtonVariant::Outline, ButtonSize::Xs)
                             .disabled(saving)
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 if let Some(dialog) = view.prices.as_mut()

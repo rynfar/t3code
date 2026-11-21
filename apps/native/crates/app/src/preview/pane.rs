@@ -610,7 +610,8 @@ impl PreviewPane {
                                 Button::new("preview-refresh")
                                     .variant(Variant::Ghost)
                                     .size(Size::IconXs)
-                                    .icon(if loading { Icon::LoaderCircle } else { Icon::RefreshCw })
+                                    .icon(Icon::RefreshCw)
+                                    .loading(loading)
                                     .tooltip(crate::i18n::t(cx, if loading { "Stop" } else { "Refresh" }))
                                     .disabled(refresh_disabled)
                                     .on_click(cx.listener(move |this, _, _, cx| {

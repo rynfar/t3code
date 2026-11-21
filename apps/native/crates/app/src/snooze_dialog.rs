@@ -11,7 +11,7 @@ use gpui::{
 };
 use gpui_base::CalendarView;
 use gpui_component::calendar::{Calendar, CalendarEvent, CalendarState, Date};
-use gpui_component::input::{Escape, Input, InputEvent, InputState};
+use gpui_component::input::{Escape, Input, InputEvent, InputState, NumberInputEvent, StepAction};
 use gpui_component::{Sizable, Size};
 use t3_core::sidebar::settled::{
     CustomSnoozeInput, DurationUnit, local_snooze_fields, resolve_custom_snooze,
@@ -23,6 +23,15 @@ use crate::app_state::{AppState, Phase};
 use crate::sidebar::controller::{SystemZone, now_ms};
 use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
 use t3_client::supervisor::ConnectionStatus;
+
+pub(crate) fn step_snooze_amount(current: &str, action: StepAction) -> String {
+    let current = current.trim().parse::<u32>().unwrap_or(1);
+    let next = match action {
+        StepAction::Increment => current.saturating_add(1),
+        StepAction::Decrement => current.saturating_sub(1).max(1),
+    };
+    next.to_string()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnoozeOwner {
@@ -427,6 +436,17 @@ impl SnoozeDialog {
                     })
                 })
                 .collect();
+        subscriptions.push(cx.subscribe_in(
+            &amount,
+            window,
+            |this, input, event: &NumberInputEvent, window, cx| {
+                let NumberInputEvent::Step(action) = event;
+                let next = step_snooze_amount(input.read(cx).value().as_ref(), *action);
+                input.update(cx, |input, cx| input.set_value(next, window, cx));
+                this.error = None;
+                cx.notify();
+            },
+        ));
         subscriptions.push(cx.subscribe_in(
             &calendar,
             window,
@@ -858,19 +878,34 @@ impl Render for SnoozeDialog {
                     .child(div().flex_1().min_w_0().flex().flex_col().gap(px(8.))
                         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Snooze for")))
                         .child(NumberField::new(&self.amount)))
-                    .child(Select::new("snooze-unit", units.iter().map(|(value, label, _)| SelectOption::new(*value, *label)).collect())
-                        .selected(selected)
-                        .width(102.)
-                        .show_check()
-                        .on_change(move |value, _, cx| {
-                            if let Some((_, _, unit)) = units.iter().find(|(key, _, _)| *key == value.as_ref()) {
-                                let _ = this.update(cx, |this, cx| {
-                                    this.unit = *unit;
-                                    this.error = None;
-                                    cx.notify();
-                                });
-                            }
-                        }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Unit")))
+                            .child(
+                                Select::new(
+                                    "snooze-unit",
+                                    units
+                                        .iter()
+                                        .map(|(value, label, _)| SelectOption::new(*value, crate::i18n::t(cx, label)))
+                                        .collect(),
+                                )
+                                .selected(selected)
+                                .width(102.)
+                                .show_check()
+                                .on_change(move |value, _, cx| {
+                                    if let Some((_, _, unit)) = units.iter().find(|(key, _, _)| *key == value.as_ref()) {
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.unit = *unit;
+                                            this.error = None;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                            ),
+                    )
                     .into_any_element()
             }
         };
@@ -1102,6 +1137,16 @@ mod tests {
             .plan(Some(&owner), true, true, Some(&granted), |_| true)
             .is_none()
         );
+    }
+
+    #[test]
+    fn step_snooze_amount_parses_increments_and_clamps_to_one() {
+        assert_eq!(step_snooze_amount("2", StepAction::Increment), "3");
+        assert_eq!(step_snooze_amount("2", StepAction::Decrement), "1");
+        assert_eq!(step_snooze_amount("1", StepAction::Decrement), "1");
+        assert_eq!(step_snooze_amount("0", StepAction::Decrement), "1");
+        assert_eq!(step_snooze_amount("not-a-number", StepAction::Increment), "2");
+        assert_eq!(step_snooze_amount("4294967295", StepAction::Increment), "4294967295");
     }
 }
 

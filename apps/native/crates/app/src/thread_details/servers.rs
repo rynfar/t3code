@@ -236,7 +236,8 @@ impl ServersFeed {
                         let state = state.clone();
                         let button = right_panel::Button::new(SharedString::from(format!("details-server-stop-{pid}-{port}")))
                             .variant(right_panel::Variant::DestructiveGhost)
-                            .icon(if stopping_this { Icon::LoaderCircle } else { Icon::Square })
+                            .icon(Icon::Square)
+                            .loading(stopping_this)
                             .icon_size(12.)
                             .disabled(any_stopping)
                             .tooltip("Stop server")

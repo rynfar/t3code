@@ -16,6 +16,7 @@ use t3_core::right_panel::{DeviceTarget, SurfaceKind};
 use super::screen::DeviceScreen;
 use super::{Devices, DevicesEvent};
 use crate::app_state::{AppEvent, AppState};
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
 use crate::settings::controls::{Button as ActionButton, ButtonSize, ButtonVariant};
@@ -167,13 +168,12 @@ impl DevicePane {
                                 )
                                 .child(
                                     ActionButton::new(SharedString::from(format!("device-open-{}-{}", device.host_id, device.id)), ButtonVariant::Outline, ButtonSize::Sm)
-                                        .icon(if opening {
-                                            Icon::LoaderCircle
-                                        } else if device.booted {
+                                        .icon(if device.booted {
                                             Icon::ArrowUpRight
                                         } else {
                                             Icon::Play
                                         })
+                                        .loading(opening)
                                         .label(label)
                                         .tooltip(format!("{label} {}", device.name))
                                         .disabled(pending.is_some())
@@ -422,7 +422,7 @@ pub(super) fn loading_view(name: SharedString, description: SharedString, stage:
                         .gap(px(8.))
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .when(!error, |this| this.child(Icon::LoaderCircle.svg().size(px(12.)).text_color(hsla(p.muted_foreground))))
+                        .when(!error, |this| this.child(Spinner::new("device-loading-spinner", px(12.), hsla(p.muted_foreground))))
                         .child(message),
                 )
                 .children(action)

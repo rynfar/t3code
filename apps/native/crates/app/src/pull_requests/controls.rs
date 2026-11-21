@@ -399,6 +399,7 @@ pub(super) fn anchored_picker(
 }
 
 pub(crate) fn markdown_mode_buttons(
+    id_prefix: &str,
     preview: bool,
     disabled: bool,
     on_write: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -406,9 +407,9 @@ pub(crate) fn markdown_mode_buttons(
     cx: &App,
 ) -> impl IntoElement {
     gpui_component::h_flex().gap(px(4.)).flex_none()
-        .child(Button::new("markdown-write", if preview { Variant::Ghost } else { Variant::Outline }, Size::Xs)
+        .child(Button::new(SharedString::from(format!("{id_prefix}-write")), if preview { Variant::Ghost } else { Variant::Outline }, Size::Xs)
             .label(t(cx, "Write")).disabled(disabled).on_click(on_write))
-        .child(Button::new("markdown-preview", if preview { Variant::Outline } else { Variant::Ghost }, Size::Xs)
+        .child(Button::new(SharedString::from(format!("{id_prefix}-preview")), if preview { Variant::Outline } else { Variant::Ghost }, Size::Xs)
             .label(t(cx, "Preview")).disabled(disabled).on_click(on_preview))
 }
 
@@ -426,6 +427,6 @@ pub(crate) fn markdown_preview(
         let state = markdown.state(id, &text, cx);
         crate::transcript::markdown::prose(&state, cx).into_any_element()
     };
-    div().id("markdown-preview-content").min_h(px(46.)).max_h(px(220.)).overflow_y_scroll()
+    div().id(SharedString::from(format!("{id}-content"))).min_h(px(46.)).max_h(px(220.)).overflow_y_scroll()
         .rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.6)).px(px(10.)).py(px(8.)).child(body).into_any_element()
 }

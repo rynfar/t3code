@@ -15,6 +15,7 @@ use t3_core::files::EntryKind;
 use t3_core::files::media_preview::DraggedFileMention;
 
 use super::explorer::{CONTEXT, Explorer};
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
@@ -113,12 +114,12 @@ impl Explorer {
         let cursor = self.cursor.as_deref() == Some(row.path.as_str()) && self.tree_focused;
         let label: SharedString = row.label.clone().into();
         let text = if row.ignored { hsla(p.muted_foreground).opacity(0.7) } else { hsla(p.foreground) };
-        let icon = match (row.kind, row.expanded, row.loading) {
-            (EntryKind::Directory, _, true) => Icon::LoaderCircle,
-            (EntryKind::Directory, true, false) => Icon::ChevronDown,
-            (EntryKind::Directory, false, false) => Icon::ChevronRight,
-            (EntryKind::File, ..) => file_icon(&row.path),
+        let icon = match (row.kind, row.expanded) {
+            (EntryKind::Directory, true) => Icon::ChevronDown,
+            (EntryKind::Directory, false) => Icon::ChevronRight,
+            (EntryKind::File, _) => file_icon(&row.path),
         };
+        let row_loading = row.loading;
         let path = row.path.clone();
         let drag_path = row.path.clone();
         let drag_payload = DraggedFileMention::from_drag(&drag_path, &[])
@@ -160,13 +161,16 @@ impl Explorer {
                 }
                 this.activate_row(index, !modified, cx);
             }))
-            .child(
+            .child(if row_loading && kind == EntryKind::Directory {
+                Spinner::new(("explorer-row-spin", index), px(12.), hsla(p.icon_muted)).into_any_element()
+            } else {
                 icon.svg()
                     .flex_none()
                     .size(px(if kind == EntryKind::File { 14. } else { 12. }))
                     .text_color(hsla(p.icon_muted))
-                    .when(row.loading, |svg| svg.opacity(0.6)),
-            )
+                    .when(row_loading, |svg| svg.opacity(0.6))
+                    .into_any_element()
+            })
             .child(div().min_w_0().truncate().when(selected, |this| this.font_weight(FontWeight::MEDIUM)).child(label))
             .context_menu(move |menu, _, cx| {
                 let item = |label: SharedString, run: fn(&mut crate::app_state::AppState, &str, &mut Context<crate::app_state::AppState>)| {

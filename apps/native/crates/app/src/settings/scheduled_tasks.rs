@@ -187,6 +187,10 @@ impl ScheduledTasksState {
                 {
                     return;
                 }
+                if super::controls::dismiss_open_select(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if view.scheduled.calendar_open {
                     view.scheduled.calendar_open = false;
                     view.scheduled.inputs.run_at.focus_handle(cx).focus(window, cx);

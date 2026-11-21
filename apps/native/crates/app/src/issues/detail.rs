@@ -1874,7 +1874,7 @@ impl Render for IssueDetailPanel {
                                 this.submit_comment(window, cx);
                             }
                         }))
-                        .child(markdown_mode_buttons(preview, locked,
+                        .child(markdown_mode_buttons("issue-comment-mode", preview, locked,
                             cx.listener(move |panel, _, window, cx| {
                                 panel.comment_preview = false;
                                 input.update(cx, |input, cx| input.focus(window, cx));

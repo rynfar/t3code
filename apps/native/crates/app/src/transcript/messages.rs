@@ -873,7 +873,7 @@ pub fn user_row(
         .justify_end()
         .gap(px(8.))
         .pr(px(4.))
-        .max_w(relative(0.8))
+        .when(!float_actions, |this| this.max_w(relative(0.8)))
         .when(!sending && error_status.is_none(), |this| this.invisible().group_hover(ROW_GROUP, |style| style.visible()))
         .when(sending, |this| this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Sending...")))
         .when_some(error_status, |this, status| {

@@ -203,7 +203,7 @@ impl AppState {
     }
 
     pub(crate) fn apply_settings_routes(&mut self, id: &str, routes: Vec<CandidateRoute>, cx: &mut Context<Self>) {
-        if self.environments.get(id).is_none_or(|saved| saved.local || saved.is_relay_managed()) {
+        if self.environments.get(id).is_none_or(|saved| saved.local) {
             return;
         }
         self.record_environment_alternate_routes(id, routes);
@@ -494,7 +494,7 @@ impl AppState {
                     http_base: environment.http_base,
                     access_token,
                 },
-                Vec::new(),
+                alternate_routes,
                 environment.environment_id,
                 Some(prepare),
                 None,
@@ -618,8 +618,77 @@ impl AppState {
 
     fn stop_connect_approvals(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.connect.approval_watches.remove(id).is_some() {
-            self.withdraw_toast_by_key(&format!("connect-approval:{id}"), cx);
+            self.withdraw_toasts_by_key_prefix(&format!("connect-approval:{id}:"), cx);
         }
+    }
+
+    pub(crate) fn approve_connect_device(&mut self, saved_id: &str, pairing_link_id: &str, cx: &mut Context<Self>) {
+        self.resolve_connect_approval(
+            saved_id,
+            pairing_link_id,
+            "/api/auth/connect-devices/approve",
+            serde_json::json!({ "pairingLinkId": pairing_link_id }),
+            "Could not approve the device",
+            cx,
+        );
+    }
+
+    pub(crate) fn deny_connect_device(&mut self, saved_id: &str, pairing_link_id: &str, cx: &mut Context<Self>) {
+        self.resolve_connect_approval(
+            saved_id,
+            pairing_link_id,
+            "/api/auth/pairing-links/revoke",
+            serde_json::json!({ "id": pairing_link_id }),
+            "Could not deny the device",
+            cx,
+        );
+    }
+
+    fn resolve_connect_approval(
+        &mut self,
+        saved_id: &str,
+        pairing_link_id: &str,
+        path: &'static str,
+        body: serde_json::Value,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let immediate = (self.environments.active.as_deref() == Some(saved_id))
+            .then(|| self.client_handle())
+            .flatten();
+        let lookup = immediate.is_none().then(|| self.connections.client(saved_id));
+        let runtime = self.runtime().clone();
+        let saved_id = saved_id.to_owned();
+        let pairing_link_id = pairing_link_id.to_owned();
+        let task = runtime.spawn(async move {
+            let client = match immediate {
+                Some(client) => Some(client),
+                None => match lookup {
+                    Some(fut) => fut.await,
+                    None => None,
+                },
+            }
+            .ok_or_else(|| "Reconnect to this environment first.".to_owned())?;
+            client.post_access(path, Some(body)).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state.withdraw_toast_by_key(&format!("connect-approval:{saved_id}:{pairing_link_id}"), cx);
+                    }
+                    Err(error) => {
+                        state.show_toast(
+                            Toast::new(ToastKind::Error, crate::i18n::t(cx, failure_title))
+                                .description(error),
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn present_connect_approvals(
@@ -637,22 +706,32 @@ impl AppState {
             ))
         }).collect::<HashMap<_, _>>();
         if next == *shown { return; }
+        for removed_id in shown.keys() {
+            if !next.contains_key(removed_id) {
+                self.withdraw_toast_by_key(&format!("connect-approval:{id}:{removed_id}"), cx);
+            }
+        }
         *shown = next;
-        let key = format!("connect-approval:{id}");
-        let Some(first) = requests.first().and_then(|request| shown.get(&request.pairing_link_id)) else {
-            self.withdraw_toast_by_key(&key, cx);
-            return;
-        };
-        let title = crate::i18n::t_fmt(cx, "A device wants to connect to {environmentLabel}", &[
-            ("environmentLabel", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&environment_label))),
-        ]);
-        let description = crate::i18n::t_fmt(cx, "{device}. Approve only if it shows code {code}.", &[
-            ("device", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&first.0))),
-            ("code", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&first.1))),
-        ]);
-        self.show_toast(Toast::new(ToastKind::Info, title).description(format!(
-            "{description} {}", crate::i18n::t(cx, "Review requests in Settings → Sharing & access."),
-        )).key(key).persistent(), cx);
+        for request in &requests {
+            let Some((device, code)) = shown.get(&request.pairing_link_id) else {
+                continue;
+            };
+            let title = crate::i18n::t_fmt(cx, "A device wants to connect to {environmentLabel}", &[
+                ("environmentLabel", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&environment_label))),
+            ]);
+            let description = crate::i18n::t_fmt(cx, "{device}. Approve only if it shows code {code}.", &[
+                ("device", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(device))),
+                ("code", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(code))),
+            ]);
+            self.show_toast(
+                Toast::new(ToastKind::Info, title)
+                    .description(description)
+                    .key(format!("connect-approval:{id}:{}", request.pairing_link_id))
+                    .connect_approval(id, &request.pairing_link_id)
+                    .persistent(),
+                cx,
+            );
+        }
     }
 
     /// Persists alternate/learned direct routes for a saved environment (`CN-SESSION`).

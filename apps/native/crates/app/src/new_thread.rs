@@ -87,6 +87,7 @@ pub fn start_new_thread(state: &mut AppState, cx: &mut Context<AppState>) {
 }
 
 /// The header's New thread button: a ghost 28px toggle with the square-pen icon.
+#[allow(dead_code)]
 pub fn new_thread_button(cx: &App) -> impl IntoElement {
     let p = palette(cx);
     div()

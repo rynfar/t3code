@@ -4,6 +4,7 @@
 //! `ComposerModelEffort.tsx`. Choices go to the composer as `PickerEvent`s.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, ParentElement,
@@ -148,12 +149,14 @@ pub struct ModelPicker {
     rows: Vec<Row>,
     highlighted: Option<usize>,
     permissions_open: bool,
+    permissions_dismissed: Option<Instant>,
     permission_preview: Option<RuntimeMode>,
     effort_focus: FocusHandle,
     effort_index: usize,
     effort_scroll: ScrollHandle,
     option_focus: FocusHandle,
     option_menu: Option<(String, usize)>,
+    option_menu_dismissed: Option<(String, Instant)>,
     option_scroll: ScrollHandle,
     scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -190,12 +193,14 @@ impl ModelPicker {
             rows: Vec::new(),
             highlighted: None,
             permissions_open: false,
+            permissions_dismissed: None,
             permission_preview: None,
             effort_focus: cx.focus_handle(),
             effort_index: 0,
             effort_scroll: ScrollHandle::new(),
             option_focus: cx.focus_handle(),
             option_menu: None,
+            option_menu_dismissed: None,
             option_scroll: ScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -258,9 +263,11 @@ impl ModelPicker {
             }
         }
         self.permissions_open = false;
+        self.permissions_dismissed = None;
         self.permission_preview = None;
         self.effort_index = 0;
         self.option_menu = None;
+        self.option_menu_dismissed = None;
         self.search.update(cx, |search, cx| {
             search.set_value("", window, cx);
             search.focus(window, cx);
@@ -919,7 +926,7 @@ impl ModelPicker {
                             .occlude()
                             .w(px(240.))
                             .on_mouse_down_out(cx.listener(|picker, _, _, cx| {
-                                picker.option_menu = None;
+                                picker.option_menu_dismissed = picker.option_menu.take().map(|(id, _)| (id, Instant::now()));
                                 cx.notify();
                             }))
                             .on_action(cx.listener(|picker, _: &Escape, window, cx| picker.close_option_menu(window, cx)))
@@ -1013,6 +1020,11 @@ impl ModelPicker {
         } else if !row.choices.is_empty() {
             if self.option_menu.as_ref().is_some_and(|(id, _)| id == &row.id) {
                 self.close_option_menu(window, cx);
+            } else if self
+                .option_menu_dismissed
+                .take()
+                .is_some_and(|(id, at)| id == row.id && at.elapsed() < Duration::from_millis(250))
+            {
             } else {
                 let checked = row.choices.iter().position(|choice| choice.selected).unwrap_or_default();
                 self.option_menu = Some((row.id.clone(), checked));
@@ -1049,6 +1061,7 @@ impl ModelPicker {
 
     fn close_option_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.option_menu = None;
+        self.option_menu_dismissed = None;
         window.focus(&self.effort_focus, cx);
         cx.notify();
     }
@@ -1122,6 +1135,13 @@ impl ModelPicker {
                         .child(runtime_mode_label(mode))
                         .child(Icon::ChevronUp.render(px(12.), hsla(p.muted_foreground)))
                         .on_click(cx.listener(|this, _, _, cx| {
+                            if this
+                                .permissions_dismissed
+                                .take()
+                                .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
+                            {
+                                return;
+                            }
                             this.permissions_open = !this.permissions_open;
                             this.permission_preview = None;
                             cx.notify();
@@ -1134,6 +1154,7 @@ impl ModelPicker {
                                     .mb(px(4.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                         this.permissions_open = false;
+                                        this.permissions_dismissed = Some(Instant::now());
                                         this.permission_preview = None;
                                         cx.notify();
                                     }))

@@ -85,13 +85,22 @@ enum CatalogDialog {
     Add {
         address: Entity<InputState>,
         code: Entity<InputState>,
+        username: Entity<InputState>,
+        port: Entity<InputState>,
         source: PairingSource,
         submitted: bool,
         focus: FocusHandle,
         _subscriptions: Vec<Subscription>,
     },
     Confirm { action: CatalogAction, focus: FocusHandle },
-    AddRoute { saved_id: String, focus: FocusHandle },
+    AddRoute {
+        saved_id: String,
+        url: Entity<InputState>,
+        code: Entity<InputState>,
+        error: Option<String>,
+        focus: FocusHandle,
+        _subscriptions: Vec<Subscription>,
+    },
 }
 
 enum CatalogAction {
@@ -163,11 +172,21 @@ impl EnvironmentsState {
 
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
         let mut out = Vec::new();
-        if let Some(CatalogDialog::Add { address, code, source, .. }) = &self.catalog.dialog {
-            out.push(address);
-            if *source == PairingSource::Link {
+        match &self.catalog.dialog {
+            Some(CatalogDialog::Add { address, code, username, port, source, .. }) => {
+                out.push(address);
+                if *source == PairingSource::Link {
+                    out.push(code);
+                } else {
+                    out.push(username);
+                    out.push(port);
+                }
+            }
+            Some(CatalogDialog::AddRoute { url, code, .. }) => {
+                out.push(url);
                 out.push(code);
             }
+            _ => {}
         }
         if let Some(dialog) = &self.link_dialog {
             out.push(&dialog.address);
@@ -255,6 +274,27 @@ fn machine_icon_options(config: Option<&ServerConfig>) -> (&str, &str, bool) {
         .filter(|machine| MACHINE_KINDS.iter().any(|(kind, _)| kind == machine))
         .unwrap_or(detected);
     (selected, detected, reported.is_some())
+}
+
+pub(crate) fn can_add_direct_route(saved: &SavedEnvironment) -> bool {
+    !saved.local && saved.ssh.is_none()
+}
+
+pub(crate) fn parse_direct_route_url(raw_url: &str, code: Option<&str>) -> Result<String, String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a server URL or pairing link.".to_owned());
+    }
+    if let Ok(link) = t3_core::pairing::parse_pairing_link(trimmed, code) {
+        return Ok(link.http_base);
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("http://{trimmed}")
+    };
+    t3_core::pairing::origin_of(&with_scheme)
+        .ok_or_else(|| "Enter a valid http:// or https:// server URL.".to_owned())
 }
 
 fn route_choices(saved: &SavedEnvironment, routes: &[CandidateRoute], reported: &[t3_client::routes::ReportedEndpoint]) -> Vec<CandidateRoute> {
@@ -1141,8 +1181,17 @@ impl SettingsView {
             .debug_selector(|| format!("settings-saved-environment-{}", saved.id))
             .w_full().gap(r(6.)).px(r(16.)).py(r(12.))
             .child(h_flex().w_full().items_start().gap(r(12.))
-                .child(div().pt(r(3.)).child(icon(config.map_or(Icon::Server, Icon::machine), 20., hsla(p.muted_foreground))))
-                .child(information).child(trailing))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_start()
+                        .gap(r(12.))
+                        .when(saved.disabled, |el| el.opacity(0.6))
+                        .child(div().pt(r(3.)).child(icon(config.map_or(Icon::Server, Icon::machine), 20., hsla(p.muted_foreground))))
+                        .child(information),
+                )
+                .child(trailing))
             .children(update.map(|stage| muted_text(t(cx, match stage {
                 ServerUpdateStage::Downloading => "Downloading update…",
                 ServerUpdateStage::Installing => "Installing update…",
@@ -1188,18 +1237,20 @@ impl SettingsView {
             .find(|entry| saved.environment_id.as_deref() == Some(&entry.environment_id))
             .map(|entry| entry.endpoint.http_base_url.as_str());
         let mcp = t3_core::pairing::origin_of(relay_base.unwrap_or(&saved.http_base)).map(|origin| format!("{origin}/mcp"));
-        let copy_button = |name, label, value: Option<String>| {
-            catalog_button((gpui::ElementId::from(key.clone()), name), label, cx)
-                .disabled(value.is_none())
-                .full_width()
-                .on_click(cx.listener({
-                    let saved_id = saved.id.clone();
-                    move |this, _, _, cx| {
-                    if let Some(text) = &value {
+        let copy_button = |name: &'static str, label: &'static str, copied_label: &'static str, value: Option<String>| {
+            value.map(|text| {
+                let saved_id = saved.id.clone();
+                catalog_button((gpui::ElementId::from(key.clone()), name), label, cx)
+                    .justify_start()
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    }
-                    this.close_environment_menu(&saved_id, cx);
-                }}))
+                        let title = t(cx, copied_label).to_owned();
+                        this.state.update(cx, |state, cx| {
+                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, title), cx);
+                        });
+                        this.close_environment_menu(&saved_id, cx);
+                    }))
+            })
         };
         let outside_id = saved.id.clone();
         v_flex().id((gpui::ElementId::from(key.clone()), "catalog-actions-popup"))
@@ -1208,10 +1259,10 @@ impl SettingsView {
             .theme_slot(ThemeSlot::MenuPopup, cx)
             .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
             .on_mouse_down_out(cx.listener(move |this, _, _, cx| this.close_environment_menu(&outside_id, cx)))
-            .child(self.catalog_disclosure(&saved.id, "icon", "Icon", icon_open, |row| &mut row.icon, cx).full_width())
+            .child(self.catalog_disclosure(&saved.id, "icon", "Icon", icon_open, |row| &mut row.icon, cx).justify_start())
             .children(icon_open.then(|| self.catalog_icon_picker(saved, config, cx)))
             .child(catalog_button((gpui::ElementId::from(key.clone()), "menu-routes"), if routes_open { "Hide routes" } else { "Routes" }, cx)
-                .full_width().on_click(cx.listener({
+                .justify_start().on_click(cx.listener({
                     let id = id.clone();
                     move |this, _, _, cx| {
                         let row = this.environments.catalog.rows.entry(id.clone()).or_default();
@@ -1219,14 +1270,23 @@ impl SettingsView {
                         this.close_environment_menu(&id, cx);
                     }
                 })))
-            .child(copy_button("copy-mcp", "Copy MCP URL", mcp))
-            .child(copy_button("copy-trace", "Copy trace ID", trace))
-            .child(Button::new((gpui::ElementId::from(key), "request-remove"), ButtonVariant::GhostDestructive, ButtonSize::Xs)
-                .label(t(cx, "Remove from this device…")).full_width()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.close_environment_menu(&id, cx);
-                    this.show_catalog_confirmation(CatalogAction::Remove { id: id.clone(), label: label.clone() }, window, cx);
-                })))
+            .children(copy_button("copy-mcp", "Copy MCP URL", "MCP URL copied", mcp))
+            .children(copy_button("copy-trace", "Copy trace ID", "Trace ID copied", trace))
+            .child(
+                div()
+                    .mt(r(4.))
+                    .pt(r(4.))
+                    .border_t_1()
+                    .border_color(hsla(p.border).opacity(0.6))
+                    .child(
+                        Button::new((gpui::ElementId::from(key), "request-remove"), ButtonVariant::GhostDestructive, ButtonSize::Xs)
+                            .label(t(cx, "Remove from this device…")).justify_start()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_environment_menu(&id, cx);
+                                this.show_catalog_confirmation(CatalogAction::Remove { id: id.clone(), label: label.clone() }, window, cx);
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1287,7 +1347,7 @@ impl SettingsView {
         let p = palette(cx);
         let key: SharedString = saved.id.clone().into();
         let refused = t3_client::supervisor::refused_routes_for(&saved.http_base).borrow().clone();
-        let can_edit = !saved.local && !saved.is_relay_managed();
+        let can_edit = !saved.local;
         let rows = std::iter::once((None, primary)).chain(alternate_routes.iter().enumerate().map(|(i, route)| (Some(i), route)));
         v_flex().pt(r(6.)).gap(r(5.)).border_t_1().border_color(hsla(p.border).opacity(0.5))
             .children(rows.map(|(index, route)| {
@@ -1334,17 +1394,40 @@ impl SettingsView {
     }
 
     fn catalog_add_route_button(&self, saved: &SavedEnvironment, label: &str, cx: &Context<Self>) -> Button {
-        let available = !saved.local && saved.ssh.is_none() && !saved.is_relay_managed();
+        let available = can_add_direct_route(saved);
         let id = saved.id.clone();
         let mut button = catalog_button((gpui::ElementId::from(SharedString::from(id.clone())), SharedString::from(label.to_owned())), label, cx)
             .icon(Icon::Plus).disabled(!available);
         if !available {
-            button = button.tooltip(t(cx, "Native currently uses one connection type for this environment."));
+            button = button.tooltip(t(cx, "SSH and local environments already use a fixed transport."));
         }
         button.on_click(cx.listener(move |this, _, window, cx| {
+            let url = cx.new(|cx| InputState::new(window, cx).placeholder("https://host:3773 or pairing link"));
+            let code = cx.new(|cx| InputState::new(window, cx).placeholder("Optional pairing code"));
+            let subscriptions = [&url, &code].map(|input| {
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::Change => {
+                            if let Some(CatalogDialog::AddRoute { error, .. }) = this.environments.catalog.dialog.as_mut() {
+                                *error = None;
+                            }
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter { .. } => this.submit_catalog_add_route(window, cx),
+                        _ => {}
+                    }
+                })
+            });
             let focus = cx.focus_handle();
-            focus.focus(window, cx);
-            this.environments.catalog.dialog = Some(CatalogDialog::AddRoute { saved_id: id.clone(), focus });
+            url.read(cx).focus_handle(cx).focus(window, cx);
+            this.environments.catalog.dialog = Some(CatalogDialog::AddRoute {
+                saved_id: id.clone(),
+                url,
+                code,
+                error: None,
+                focus,
+                _subscriptions: subscriptions.into(),
+            });
             cx.notify();
         }))
     }
@@ -1402,7 +1485,10 @@ impl SettingsView {
                     .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_cloud(cx))))
             } else {
                 catalog_button("settings-sign-in-t3-connect", "Sign in", cx).disabled(cloud.busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx))))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        super::close(window, cx);
+                        this.state.update(cx, |state, cx| state.open_switcher(cx));
+                    }))
             });
         v_flex().mt(r(10.)).gap(r(5.)).child(heading)
             .children(cloud.error.as_ref().map(|error| muted_text(error.clone(), cx)))
@@ -1489,9 +1575,11 @@ impl SettingsView {
     }
 
     fn open_catalog_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let address = cx.new(|cx| InputState::new(window, cx));
-        let code = cx.new(|cx| InputState::new(window, cx).masked(true));
-        let subscriptions = [&address, &code].map(|input| cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder("https://host:3773/pair#token=…"));
+        let code = cx.new(|cx| InputState::new(window, cx).placeholder("Pairing code"));
+        let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username (optional)"));
+        let port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
+        let subscriptions = [&address, &code, &username, &port].map(|input| cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
             match event {
                 InputEvent::Change => cx.notify(),
                 InputEvent::PressEnter { .. } => this.submit_catalog_add(cx),
@@ -1501,21 +1589,38 @@ impl SettingsView {
         let focus = cx.focus_handle();
         address.read(cx).focus_handle(cx).focus(window, cx);
         self.environments.catalog.dialog = Some(CatalogDialog::Add {
-            address, code, source: PairingSource::Link, submitted: false, focus, _subscriptions: subscriptions.into(),
+            address, code, username, port, source: PairingSource::Link, submitted: false, focus, _subscriptions: subscriptions.into(),
         });
         cx.notify();
     }
 
     fn submit_catalog_add(&mut self, cx: &mut Context<Self>) {
-        let Some(CatalogDialog::Add { address, code, source, submitted, .. }) = self.environments.catalog.dialog.as_mut() else { return };
+        let Some(CatalogDialog::Add { address, code, username, port, source, submitted, .. }) = self.environments.catalog.dialog.as_mut() else { return };
         if self.state.read(cx).connect.pairing.is_some() || address.read(cx).value().trim().is_empty() { return; }
         let address = address.read(cx).value().to_string();
         let code = code.read(cx).value().to_string();
+        let username = username.read(cx).value().to_string();
+        let port = port.read(cx).value().to_string();
         *submitted = true;
         self.state.update(cx, |state, cx| {
             if *source == PairingSource::Ssh {
-                let discovered = state.unsaved_ssh_hosts().into_iter().find(|host| host.alias == address.trim());
-                match discovered.map(|host| host.target()).map(Ok).unwrap_or_else(|| t3_core::ssh::parse_manual_target(&address, "", "")) {
+                let target = if let Some(host) = state.unsaved_ssh_hosts().into_iter().find(|host| host.alias == address.trim()) {
+                    let mut target = host.target();
+                    if !username.trim().is_empty() {
+                        target.username = Some(username.trim().to_owned());
+                    }
+                    if port.trim().is_empty() {
+                        Ok(target)
+                    } else if let Some(parsed_port) = port.trim().parse::<u16>().ok().filter(|&p| p >= 1) {
+                        target.port = Some(parsed_port);
+                        Ok(target)
+                    } else {
+                        Err("SSH port must be between 1 and 65535.".to_owned())
+                    }
+                } else {
+                    t3_core::ssh::parse_manual_target(&address, &username, &port)
+                };
+                match target {
                     Ok(target) => state.add_settings_ssh(target, cx),
                     Err(error) => state.fail_pairing(PairingSource::Ssh, error, cx),
                 }
@@ -1524,6 +1629,41 @@ impl SettingsView {
             }
         });
         cx.notify();
+    }
+
+    fn submit_catalog_add_route(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(CatalogDialog::AddRoute { saved_id, url, code, error, .. }) = self.environments.catalog.dialog.as_mut() else {
+            return;
+        };
+        let id = saved_id.clone();
+        let raw_url = url.read(cx).value().to_string();
+        let raw_code = code.read(cx).value().to_string();
+        let opt_code = (!raw_code.trim().is_empty()).then_some(raw_code.as_str());
+        let http_base = match parse_direct_route_url(&raw_url, opt_code) {
+            Ok(origin) => origin,
+            Err(message) => {
+                *error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let Some(saved) = self.state.read(cx).environments.get(&id).cloned() else {
+            return;
+        };
+        let candidate = CandidateRoute::saved(&http_base);
+        let mut routes = load_alternate_routes().remove(&id).unwrap_or_default();
+        if t3_client::routes::normalize_http_base(&saved.http_base) == candidate.http_base
+            || routes.iter().any(|entry| entry.http_base == candidate.http_base && !entry.learned)
+        {
+            *error = Some(t(cx, "That address is already saved for this environment.").to_owned());
+            cx.notify();
+            return;
+        }
+        routes.retain(|entry| entry.id != candidate.id);
+        let routes = t3_client::routes::insert_route(&routes, candidate, true);
+        self.state.update(cx, |state, cx| state.apply_settings_routes(&id, routes, cx));
+        self.environments.catalog.rows.entry(id).or_default().routes = true;
+        self.dismiss_environments_overlay(window, cx);
     }
 
     fn catalog_dialog(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1553,20 +1693,34 @@ impl SettingsView {
                         .label(t(cx, submit)).on_click(cx.listener(|this, _, window, cx| this.confirm_catalog_action(window, cx))).into_any_element()),
                     focus.clone())
             }
-            CatalogDialog::Add { address, code, source, focus, .. } => {
+            CatalogDialog::Add { address, code, username, port, source, focus, .. } => {
                 let ssh = *source == PairingSource::Ssh;
                 let p = palette(cx);
                 let error = crate::connect::pairing_error(&self.state.read(cx).connect, *source);
+                let ssh_hosts = if ssh {
+                    self.state.read(cx).unsaved_ssh_hosts()
+                } else {
+                    Vec::new()
+                };
                 let mode = |next, label, icon, cx: &mut Context<Self>| {
                     Button::new(label, if next == *source { ButtonVariant::Outline } else { ButtonVariant::GhostMuted }, ButtonSize::Sm)
                         .icon(icon).label(t(cx, label)).disabled(busy)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(CatalogDialog::Add { source, submitted, address, code, .. }) = this.environments.catalog.dialog.as_mut() {
+                            if let Some(CatalogDialog::Add { source, submitted, address, code, username, port, .. }) = this.environments.catalog.dialog.as_mut() {
                                 if *source == next { return; }
                                 *source = next;
                                 *submitted = false;
-                                address.update(cx, |input, cx| input.set_value("", window, cx));
+                                address.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                    input.set_placeholder(
+                                        if next == PairingSource::Ssh { "host or alias" } else { "https://host:3773/pair#token=…" },
+                                        window,
+                                        cx,
+                                    );
+                                });
                                 code.update(cx, |input, cx| input.set_value("", window, cx));
+                                username.update(cx, |input, cx| input.set_value("", window, cx));
+                                port.update(cx, |input, cx| input.set_value("", window, cx));
                                 this.state.update(cx, |state, cx| {
                                     state.connect.error = None;
                                     if next == PairingSource::Ssh { state.refresh_ssh_hosts(cx); }
@@ -1576,12 +1730,70 @@ impl SettingsView {
                             }
                         }))
                 };
+                let current_addr = address.read(cx).value().to_string();
+                let address_handle = address.clone();
+                let username_handle = username.clone();
+                let port_handle = port.clone();
                 let body = v_flex().gap(r(8.))
                     .child(h_flex().gap(r(6.))
                         .child(mode(PairingSource::Link, "Remote link", Icon::Link, cx))
                         .child(mode(PairingSource::Ssh, "SSH", Icon::Terminal, cx)))
+                    .when(ssh && !ssh_hosts.is_empty(), |el| {
+                        el.child(muted_text(t(cx, "Discovered SSH hosts"), cx)).child(
+                            h_flex().flex_wrap().gap(r(6.)).children(ssh_hosts.into_iter().map(|host| {
+                                let selected = current_addr.trim() == host.alias;
+                                let alias = host.alias.clone();
+                                let user = host.username.clone().unwrap_or_default();
+                                let p_str = host.port.map(|v| v.to_string()).unwrap_or_default();
+                                let address_handle = address_handle.clone();
+                                let username_handle = username_handle.clone();
+                                let port_handle = port_handle.clone();
+                                let btn_label = if host.hostname != host.alias {
+                                    format!("{} ({})", host.alias, host.hostname)
+                                } else {
+                                    host.alias.clone()
+                                };
+                                Button::new(
+                                    SharedString::from(format!("ssh-host-pick-{}", host.alias)),
+                                    if selected { ButtonVariant::Outline } else { ButtonVariant::GhostMuted },
+                                    ButtonSize::Xs,
+                                )
+                                .icon(Icon::Terminal)
+                                .label(btn_label)
+                                .disabled(busy)
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    address_handle.update(cx, |input, cx| input.set_value(alias.clone(), window, cx));
+                                    username_handle.update(cx, |input, cx| input.set_value(user.clone(), window, cx));
+                                    port_handle.update(cx, |input, cx| input.set_value(p_str.clone(), window, cx));
+                                    cx.notify();
+                                }))
+                            })),
+                        )
+                    })
                     .child(muted_text(t(cx, if ssh { "SSH host or alias" } else { "Pairing link or server address" }), cx))
                     .child(catalog_input(address, busy, cx))
+                    .when(ssh, |el| {
+                        el.child(
+                            h_flex()
+                                .gap(r(8.))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(r(4.))
+                                        .child(muted_text(t(cx, "Username (optional)"), cx))
+                                        .child(catalog_input(username, busy, cx)),
+                                )
+                                .child(
+                                    v_flex()
+                                        .w(r(96.))
+                                        .flex_none()
+                                        .gap(r(4.))
+                                        .child(muted_text(t(cx, "Port"), cx))
+                                        .child(catalog_input(port, busy, cx)),
+                                ),
+                        )
+                    })
                     .when(!ssh, |el| el.child(muted_text(t(cx, "Optional pairing code"), cx)).child(catalog_input(code, busy, cx)))
                     .children(error.map(|message| div().text_xs().text_color(hsla(p.destructive_foreground)).child(message)));
                 ("environment-catalog-add", "Add environment", "Choose how to connect to a machine running T3 Code.",
@@ -1591,31 +1803,46 @@ impl SettingsView {
                         .on_click(cx.listener(|this, _, _, cx| this.submit_catalog_add(cx)))
                         .into_any_element()), focus.clone())
             }
-            CatalogDialog::AddRoute { saved_id, focus } => {
+            CatalogDialog::AddRoute { saved_id, url, code, error, focus, .. } => {
                 let saved = self.state.read(cx).environments.get(saved_id)?;
+                let p = palette(cx);
                 let reported = t3_client::supervisor::server_config_extras_for(&saved.http_base).borrow().direct_endpoint_entries.clone();
                 let choices = route_choices(saved, &load_alternate_routes().remove(saved_id).unwrap_or_default(), &reported);
-                let body = v_flex().gap(r(5.))
-                    .when(choices.is_empty(), |el| el.child(muted_text(t(cx, "This server has no additional compatible advertised routes."), cx)))
-                    .children(choices.into_iter().map(|route| {
-                        let id = saved_id.clone();
-                        let route_id: SharedString = route.id.clone().into();
-                        Button::new(route_id, ButtonVariant::Outline, ButtonSize::Sm)
-                            .icon(Icon::Plus).label(format!("{} · {}", route.label(), route.http_base)).justify_between()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let Some(saved) = this.state.read(cx).environments.get(&id) else { return };
-                                let mut routes = load_alternate_routes().remove(&id).unwrap_or_default();
-                                let reported = t3_client::supervisor::server_config_extras_for(&saved.http_base).borrow().direct_endpoint_entries.clone();
-                                let Some(mut candidate) = route_choices(saved, &routes, &reported).into_iter().find(|candidate| candidate.id == route.id) else { return };
-                                routes.retain(|entry| entry.id != candidate.id);
-                                candidate.learned = false;
-                                let routes = t3_client::routes::insert_route(&routes, candidate, true);
-                                this.state.update(cx, |state, cx| state.apply_settings_routes(&id, routes, cx));
-                                this.dismiss_environments_overlay(window, cx);
-                            }))
-                    }));
-                ("environment-catalog-add-route", "Add route", "Save an address advertised by this environment. Native shares the existing sign-in across its direct routes.",
-                    body.into_any_element(), None, focus.clone())
+                let url_empty = url.read(cx).value().trim().is_empty();
+                let body = v_flex().gap(r(8.))
+                    .when(!choices.is_empty(), |el| {
+                        el.child(muted_text(t(cx, "Discovered addresses"), cx)).child(
+                            v_flex().gap(r(5.)).children(choices.into_iter().map(|route| {
+                                let id = saved_id.clone();
+                                let route_id: SharedString = route.id.clone().into();
+                                Button::new(route_id, ButtonVariant::Outline, ButtonSize::Sm)
+                                    .icon(Icon::Plus).label(format!("{} · {}", route.label(), route.http_base)).justify_between()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let Some(saved) = this.state.read(cx).environments.get(&id) else { return };
+                                        let mut routes = load_alternate_routes().remove(&id).unwrap_or_default();
+                                        let reported = t3_client::supervisor::server_config_extras_for(&saved.http_base).borrow().direct_endpoint_entries.clone();
+                                        let Some(mut candidate) = route_choices(saved, &routes, &reported).into_iter().find(|candidate| candidate.id == route.id) else { return };
+                                        routes.retain(|entry| entry.id != candidate.id);
+                                        candidate.learned = false;
+                                        let routes = t3_client::routes::insert_route(&routes, candidate, true);
+                                        this.state.update(cx, |state, cx| state.apply_settings_routes(&id, routes, cx));
+                                        this.environments.catalog.rows.entry(id.clone()).or_default().routes = true;
+                                        this.dismiss_environments_overlay(window, cx);
+                                    }))
+                            })),
+                        )
+                    })
+                    .child(muted_text(t(cx, "Server URL or pairing link"), cx))
+                    .child(catalog_input(url, busy, cx))
+                    .child(muted_text(t(cx, "Optional pairing code"), cx))
+                    .child(catalog_input(code, busy, cx))
+                    .children(error.as_ref().map(|message| div().text_xs().text_color(hsla(p.destructive_foreground)).child(message.clone())));
+                ("environment-catalog-add-route", "Add route", "Save a direct address for this environment. Native tries direct routes before falling back.",
+                    body.into_any_element(), Some(Button::new("environment-dialog-add-route", ButtonVariant::Default, ButtonSize::Sm)
+                        .label(t(cx, "Add route"))
+                        .disabled(url_empty)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit_catalog_add_route(window, cx)))
+                        .into_any_element()), focus.clone())
             }
         };
         let frame = DialogFrame {
@@ -2259,7 +2486,14 @@ impl SettingsView {
         let access_options: Vec<SelectOption> = ACCESS_LEVELS
             .iter()
             .map(|level| {
+                let icon = match *level {
+                    "read-only" => Icon::Eye,
+                    "approval-required" => Icon::Shield,
+                    "auto-accept-edits" => Icon::Check,
+                    _ => Icon::LockOpen,
+                };
                 SelectOption::new(*level, link_access_label(level))
+                    .icon(icon)
                     .description(link_access_description(level))
             })
             .collect();
@@ -2403,6 +2637,38 @@ mod catalog_tests {
         let offered = route_choices(&saved, &choices, &reported);
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].http_base, "https://other.example");
+    }
+
+    #[test]
+    fn direct_route_availability_and_url_parsing() {
+        let relay: SavedEnvironment = serde_json::from_value(json!({
+            "id": "relayed",
+            "label": "Relay Box",
+            "httpBase": "https://relay.example"
+        }))
+        .unwrap();
+        let local: SavedEnvironment = serde_json::from_value(json!({
+            "id": "local",
+            "label": "Local",
+            "httpBase": "http://127.0.0.1:3773",
+            "local": true
+        }))
+        .unwrap();
+        let ssh: SavedEnvironment = serde_json::from_value(json!({
+            "id": "ssh-box",
+            "label": "SSH Box",
+            "httpBase": "http://127.0.0.1:41000",
+            "ssh": { "alias": "host", "hostname": "host.example.com" }
+        }))
+        .unwrap();
+        assert!(can_add_direct_route(&relay));
+        assert!(!can_add_direct_route(&local));
+        assert!(!can_add_direct_route(&ssh));
+
+        assert_eq!(parse_direct_route_url(" https://box.ts.net:3773/ ", None).unwrap(), "https://box.ts.net:3773");
+        assert_eq!(parse_direct_route_url("100.64.0.1:3773", None).unwrap(), "http://100.64.0.1:3773");
+        assert!(parse_direct_route_url("   ", None).is_err());
+        assert!(parse_direct_route_url("ftp://bad.example", None).is_err());
     }
 
     #[gpui::test]

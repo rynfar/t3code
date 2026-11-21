@@ -350,16 +350,17 @@ impl UsageView {
             .when(open, |this| this.border_1().border_color(hsla(p.border)))
             .aria_label(summary)
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered && this.segment.as_ref() != Some(&hover_key) && this.confirm_reset.is_none() {
-                    this.revealed_account_email = None;
-                    this.segment = Some(hover_key.clone());
-                    this.menu = None;
+                if *hovered {
+                    if this.hover_segment(hover_key.clone()) {
+                        cx.notify();
+                    }
+                } else if this.hover_leave_segment(&hover_key) {
                     cx.notify();
                 }
             }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.revealed_account_email = None;
-                this.segment = if this.segment.as_ref() == Some(&toggle_key) { None } else { Some(toggle_key.clone()) };
+                this.toggle_segment_pin(toggle_key.clone());
                 this.menu = None;
                 cx.notify();
             }))
@@ -436,7 +437,7 @@ impl UsageView {
             .cursor_pointer()
             .hover(|style| style.bg(hsla(p.accent)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.segment = if this.segment.as_ref() == Some(&key) { None } else { Some(key.clone()) };
+                this.toggle_segment_pin(key.clone());
                 cx.notify();
             }))
             .child(
@@ -622,6 +623,7 @@ impl UsageView {
                                         .disabled(busy || !can_manage)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.segment = None;
+                                            this.segment_pinned = false;
                                             this.confirm_reset = Some((redeem.clone(), description.clone()));
                                             this.reset_status = Some((account_key.clone(), Some(String::new())));
                                             cx.notify();
@@ -633,6 +635,56 @@ impl UsageView {
             })
             .children(status.filter(|status| !status.is_empty()).map(|status| div().text_color(hsla(p.foreground)).child(status)));
         div().absolute().top_0().left_0().child(deferred(anchored().anchor(gpui::Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(div().mb(r(6.)).child(panel))).with_priority(3))
+    }
+}
+
+fn apply_segment_hover(
+    segment: &mut Option<SegmentKey>,
+    pinned: bool,
+    confirming_reset: bool,
+    key: SegmentKey,
+) -> bool {
+    if !pinned && segment.as_ref() != Some(&key) && !confirming_reset {
+        *segment = Some(key);
+        return true;
+    }
+    false
+}
+
+fn apply_segment_hover_leave(segment: &mut Option<SegmentKey>, pinned: bool, key: &SegmentKey) -> bool {
+    if !pinned && segment.as_ref() == Some(key) {
+        *segment = None;
+        return true;
+    }
+    false
+}
+
+fn apply_segment_pin(segment: &mut Option<SegmentKey>, pinned: &mut bool, key: SegmentKey) {
+    if segment.as_ref() == Some(&key) && *pinned {
+        *segment = None;
+        *pinned = false;
+    } else {
+        *segment = Some(key);
+        *pinned = true;
+    }
+}
+
+impl UsageView {
+    pub(super) fn hover_segment(&mut self, key: SegmentKey) -> bool {
+        if apply_segment_hover(&mut self.segment, self.segment_pinned, self.confirm_reset.is_some(), key) {
+            self.revealed_account_email = None;
+            self.menu = None;
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn hover_leave_segment(&mut self, key: &SegmentKey) -> bool {
+        apply_segment_hover_leave(&mut self.segment, self.segment_pinned, key)
+    }
+
+    pub(super) fn toggle_segment_pin(&mut self, key: SegmentKey) {
+        apply_segment_pin(&mut self.segment, &mut self.segment_pinned, key);
     }
 
     /// The confirm a reset credit asks for (`ResetCreditDialog`): redemption spends a credit.
@@ -700,5 +752,42 @@ impl UsageView {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SegmentKey, apply_segment_hover, apply_segment_hover_leave, apply_segment_pin};
+
+    fn key(account: &str) -> SegmentKey {
+        SegmentKey {
+            driver: "claude".into(),
+            window: "5h".into(),
+            account: account.into(),
+        }
+    }
+
+    #[test]
+    fn segment_hover_and_pin_preserve_click_until_second_click() {
+        let mut segment = None;
+        let mut pinned = false;
+        let first = key("acct-a");
+        let second = key("acct-b");
+
+        assert!(apply_segment_hover(&mut segment, pinned, false, first.clone()));
+        assert_eq!(segment.as_ref(), Some(&first));
+        assert!(apply_segment_hover_leave(&mut segment, pinned, &first));
+        assert!(segment.is_none());
+
+        apply_segment_pin(&mut segment, &mut pinned, first.clone());
+        assert!(pinned);
+        assert_eq!(segment.as_ref(), Some(&first));
+        assert!(!apply_segment_hover_leave(&mut segment, pinned, &first));
+        assert!(!apply_segment_hover(&mut segment, pinned, false, second));
+        assert_eq!(segment.as_ref(), Some(&first));
+
+        apply_segment_pin(&mut segment, &mut pinned, first);
+        assert!(!pinned);
+        assert!(segment.is_none());
     }
 }

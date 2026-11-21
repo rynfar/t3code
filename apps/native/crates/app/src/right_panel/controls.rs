@@ -14,6 +14,7 @@ use gpui_component::Selectable;
 use gpui_component::menu::DropdownMenu;
 use gpui_component::tooltip::Tooltip;
 
+use crate::components::motion::Spinner;
 use crate::icons::Icon;
 use crate::theme::{
     ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover, slot_has_active,
@@ -74,6 +75,7 @@ pub struct Button {
     size: Size,
     icon: Option<Icon>,
     icon_size: Option<f32>,
+    loading: bool,
     label: Option<SharedString>,
     trailing: Option<Icon>,
     selected: bool,
@@ -92,6 +94,7 @@ impl Button {
             size: Size::IconSm,
             icon: None,
             icon_size: None,
+            loading: false,
             label: None,
             trailing: None,
             selected: false,
@@ -99,6 +102,11 @@ impl Button {
             tooltip: None,
             on_click: None,
         }
+    }
+
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
     }
 
     pub fn variant(mut self, variant: Variant) -> Self {
@@ -235,10 +243,15 @@ impl RenderOnce for Button {
                         this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
                     })
             })
-            .when_some(self.icon, |this, icon| {
-                let svg = icon.svg().size(px(icon_size)).text_color(icon_color);
-                let hover_icon = hsla(hover_text);
-                this.child(svg.when(follows_hover, |svg| svg.group_hover(CONTROL_GROUP, move |style| style.text_color(hover_icon))))
+            .when(self.loading, |this| {
+                this.child(Spinner::new((self.id.clone(), "spinner"), px(icon_size), icon_color))
+            })
+            .when(!self.loading, |this| {
+                this.when_some(self.icon, |this, icon| {
+                    let svg = icon.svg().size(px(icon_size)).text_color(icon_color);
+                    let hover_icon = hsla(hover_text);
+                    this.child(svg.when(follows_hover, |svg| svg.group_hover(CONTROL_GROUP, move |style| style.text_color(hover_icon))))
+                })
             })
             .when_some(self.label, |this, label| this.child(div().min_w_0().truncate().child(label)))
             .when_some(self.trailing, |this, icon| {

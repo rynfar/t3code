@@ -170,7 +170,7 @@ struct ResolvedAccessTarget {
 pub(crate) struct AccessPageState {
     pub(crate) label: Entity<InputState>,
     /// Explicitly chosen saved environment ID from the `"Showing access for"` picker.
-    selected_env: Option<String>,
+    pub(super) selected_env: Option<String>,
     /// Saved environment ID that the per-target state below currently belongs to.
     active_target: Option<String>,
     /// Supervised `ClientHandle` resolved for a non-active saved environment.
@@ -1066,15 +1066,23 @@ impl SettingsView {
     }
 
     fn access_network_row(&self, target: &ResolvedAccessTarget, cx: &Context<Self>) -> AnyElement {
+        let auth_policy = target.extras.auth_policy.as_deref();
         let network_accessible = is_server_network_accessible(
-            target.extras.auth_policy.as_deref(),
+            auth_policy,
             target.extras.direct_endpoints.len(),
         );
-        let network_reason = t(cx, "Change network exposure where this server starts.");
-        let tailscale_reason = t(cx, "Configure Tailscale HTTPS on the server host.");
-        let tailscale = target.extras.direct_endpoint_entries.iter().any(|endpoint| {
+        let network_description = if network_accessible {
+            t(cx, "Remote access is already configured. Change network exposure where the server starts.")
+        } else if auth_policy == Some("loopback-browser") {
+            t(cx, "Only this machine can connect. Restart with a non-loopback host for remote pairing.")
+        } else {
+            t(cx, "Network exposure information is unavailable.")
+        };
+        let show_network_switch = matches!(auth_policy, Some("remote-reachable" | "loopback-browser"));
+        let network_tooltip = t(cx, "Network exposure changes restart the backend and must be controlled where the server process is launched.");
+        let tailscale_url = target.extras.direct_endpoint_entries.iter().find(|endpoint| {
             endpoint.kind.as_deref() == Some("tailnet") && endpoint.http_base_url.starts_with("https://")
-        });
+        }).map(|endpoint| endpoint.http_base_url.as_str());
         let p = palette(cx);
         let candidates = pairing_endpoints(target);
         let default = t3_core::pairing::origin_of(effective_pairing_address(&target.address, &target.extras.direct_endpoints));
@@ -1110,16 +1118,28 @@ impl SettingsView {
             })))
             .children(self.pairing_denial_for(target.config.as_ref()).filter(|_| !network_accessible)
                 .map(|reason| crate::components::managed::notice(reason, cx)));
-        let network = Row::new("access-network", t(cx, "Network access"))
-            .description(t(cx, if network_accessible { "Remote access is configured." } else { "No remote address is advertised." }))
-            .control(div().id("access-network-control-hint").tooltip(super::controls::tooltip(network_reason.into()))
-                .child(Switch::new("access-network-switch", network_accessible).disabled(true)))
+        let mut network = Row::new("access-network", t(cx, "Network access"))
+            .description(network_description)
             .below(details);
-        let tailscale = Row::new("access-tailscale-serve", t(cx, "Tailscale HTTPS"))
-            .description(tailscale_reason)
-            .control(div().id("access-tailscale-control-hint").tooltip(super::controls::tooltip(tailscale_reason.into()))
-                .child(Switch::new("access-tailscale-switch", tailscale).disabled(true)));
-        v_flex().child(network).child(div().border_t_1().border_color(hsla(p.border).opacity(0.5)).child(tailscale)).into_any_element()
+        if show_network_switch {
+            network = network.control(
+                div()
+                    .id("access-network-control-hint")
+                    .tooltip(super::controls::tooltip(network_tooltip.into()))
+                    .child(Switch::new("access-network-switch", network_accessible).disabled(true)),
+            );
+        }
+        v_flex()
+            .child(network)
+            .when_some(tailscale_url, |el, url| {
+                el.child(
+                    div()
+                        .border_t_1()
+                        .border_color(hsla(p.border).opacity(0.5))
+                        .child(Row::new("access-tailscale-serve", t(cx, "Tailscale HTTPS")).description(url.to_owned())),
+                )
+            })
+            .into_any_element()
     }
 
     fn access_relay_rows(&self, target: &ResolvedAccessTarget, link: &CloudLinkState, cx: &Context<Self>) -> Vec<AnyElement> {
@@ -1212,7 +1232,10 @@ impl SettingsView {
         };
         let sign_in = || Button::new("access-relay-sign-in", ButtonVariant::Outline, ButtonSize::Xs)
             .label(t(cx, "Sign in")).disabled(state.cloud.busy)
-            .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx))));
+            .on_click(cx.listener(|this, _, window, cx| {
+                super::close(window, cx);
+                this.state.update(cx, |state, cx| state.open_switcher(cx));
+            }));
         let mut connect = Row::new("access-relay-configure", t(cx, "T3 Connect"));
         connect = if !managed && let Some(reason) = denial.clone() {
             connect.description_content(connect_policy_notice(reason, cx))
@@ -1716,7 +1739,12 @@ impl SettingsView {
 
         let mut container = v_flex().gap(r(10.)).child(header);
         if !rows.is_empty() {
-            container = container.child(group(rows, cx));
+            container = container.child(
+                group(rows, cx)
+                    .id("access-clients-scroll")
+                    .max_h(r(360.))
+                    .overflow_y_scroll(),
+            );
         }
         container.into_any_element()
     }
@@ -2539,7 +2567,12 @@ impl SettingsView {
             .px(r(16.))
             .py(r(12.))
             .gap(r(12.))
-            .child(div().size(r(8.)).flex_none().rounded_full().bg(if client.online() { hsla(p.success) } else { hsla(p.muted_foreground).opacity(0.35) }))
+            .child(StatusDot::new(
+                SharedString::from(format!("client-online-{}", client.session_id)),
+                px(8.),
+                if client.online() { hsla(p.success) } else { hsla(p.muted_foreground).opacity(0.35) },
+                client.online(),
+            ))
             .child(
                 v_flex()
                     .flex_1()

@@ -287,6 +287,8 @@ impl PullRequestsPage {
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Shell) {
                     this.sync(cx);
+                } else if matches!(event, AppEvent::PullRequestsMutated) {
+                    this.refetch(cx);
                 }
             }),
             cx.observe_global::<Mutations>(|_, cx| cx.notify()),

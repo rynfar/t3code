@@ -719,8 +719,7 @@ pub fn render_voice_setup_modal(
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(hsla(p.foreground))
-                                            .children(microphone)
-                            .child(match setup.step {
+                                            .child(match setup.step {
                                                 VoiceSetupStep::Confirm => "Download voice model",
                                                 VoiceSetupStep::Downloading => "Downloading voice model…",
                                                 VoiceSetupStep::Ready => "Voice model ready",
@@ -743,6 +742,7 @@ pub fn render_voice_setup_modal(
                                         ))
                                     }),
                             )
+                            .children(microphone)
                             .child(match setup.step {
                                 VoiceSetupStep::Confirm => {
                                     let model_desc = match (&setup.model, &setup.language) {
