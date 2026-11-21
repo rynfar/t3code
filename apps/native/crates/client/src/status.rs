@@ -3,9 +3,68 @@
 //! `apps/web/src/components/ConnectionStatusDot.tsx`, `hostFreeze.ts`, and the direct-route
 //! headlines, hops, facts, and steps of `client-runtime/src/connection/diagnosis.ts`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
+
 use serde::Deserialize;
 
+use crate::routes::normalize_http_base;
 use crate::supervisor::ConnectionStatus;
+use t3_core::relay::EnvironmentHealth;
+
+#[derive(Debug, Clone, Default)]
+pub struct RouteProgress {
+    pub active_route_id: Option<String>,
+    pub retry_at: Option<Instant>,
+}
+
+type RouteProgressCell = Mutex<RouteProgress>;
+
+static ROUTE_PROGRESS: LazyLock<Mutex<HashMap<String, Weak<RouteProgressCell>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The route selected by the supervisor and its actual retry deadline.
+pub fn route_progress(http_base: &str) -> RouteProgress {
+    let progress = ROUTE_PROGRESS.lock().unwrap_or_else(|error| error.into_inner())
+        .get(&normalize_http_base(http_base)).and_then(Weak::upgrade);
+    progress.map_or_else(RouteProgress::default, |progress| {
+        progress.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    })
+}
+
+/// Each supervised connection owns its progress for its original address.
+pub struct RouteProgressPublisher {
+    key: String,
+    progress: Arc<RouteProgressCell>,
+}
+
+impl RouteProgressPublisher {
+    pub fn new(http_base: &str) -> Self {
+        let key = normalize_http_base(http_base);
+        let progress = Arc::new(Mutex::new(RouteProgress::default()));
+        ROUTE_PROGRESS.lock().unwrap_or_else(|error| error.into_inner())
+            .insert(key.clone(), Arc::downgrade(&progress));
+        Self { key, progress }
+    }
+
+    /// Publish before sending the corresponding status event.
+    pub fn publish(&self, active_route_id: Option<&str>, retry_after: Option<Duration>) {
+        *self.progress.lock().unwrap_or_else(|error| error.into_inner()) = RouteProgress {
+            active_route_id: active_route_id.map(str::to_owned),
+            retry_at: retry_after.map(|delay| Instant::now() + delay),
+        };
+    }
+}
+
+impl Drop for RouteProgressPublisher {
+    fn drop(&mut self) {
+        let mut progress = ROUTE_PROGRESS.lock().unwrap_or_else(|error| error.into_inner());
+        if progress.get(&self.key).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), Arc::as_ptr(&self.progress))) {
+            progress.remove(&self.key);
+        }
+    }
+}
 
 /// `EnvironmentConnectionPhase` for the states a direct connection reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +364,66 @@ pub fn diagnose(status: &ConnectionStatus, host: &str) -> Option<Diagnosis> {
     Some(Diagnosis { headline, hops, steps, facts })
 }
 
+/// Extends the native supervisor's diagnosis with health reported by T3 Connect.
+pub fn diagnose_relay(
+    status: Option<&ConnectionStatus>,
+    health: Option<&EnvironmentHealth>,
+    host: &str,
+) -> Option<Diagnosis> {
+    if status == Some(&ConnectionStatus::Connected) {
+        return None;
+    }
+    let direct = status.and_then(|status| diagnose(status, host));
+    let offline = match health {
+        Some(EnvironmentHealth::Offline { offline_reason, error, trace_id }) => {
+            Some((offline_reason.as_deref(), error.as_deref(), trace_id.as_deref()))
+        }
+        _ => None,
+    };
+    let (mut diagnosis, failure) = match (direct, offline) {
+        (Some(diagnosis), _) if matches!(
+            status,
+            Some(ConnectionStatus::AwaitingApproval { .. } | ConnectionStatus::NeedsPairing { .. } | ConnectionStatus::Unsupported { .. })
+        ) => (diagnosis, Some(3)),
+        (direct, Some((reason, error, trace_id))) => {
+            let mut facts = direct.map_or_else(Vec::new, |diagnosis| diagnosis.facts);
+            if let Some(trace_id) = trace_id.filter(|_| !facts.iter().any(|(label, _)| label == "Trace ID")) {
+                facts.push(("Trace ID".into(), trace_id.into()));
+            }
+            if let Some(error) = error.filter(|_| !facts.iter().any(|(label, _)| label == "Detail")) {
+                facts.push(("Detail".into(), error.into()));
+            }
+            (
+                Diagnosis {
+                    headline: format!("{host} is offline through T3 Connect"),
+                    hops: Vec::new(),
+                    steps: vec![t3_core::relay::offline_reason_message(reason).map_or_else(
+                        || format!("Make sure T3 Code is running on {host}."),
+                        str::to_owned,
+                    )],
+                    facts,
+                },
+                Some(2),
+            )
+        }
+        (Some(diagnosis), None) => {
+            let failure = matches!(status, Some(ConnectionStatus::Blocked { .. })).then_some(0);
+            (diagnosis, failure)
+        }
+        (None, None) => return None,
+    };
+    diagnosis.hops = ["This device".into(), "T3 Connect".into(), format!("{host} tunnel"), format!("T3 Code on {host}")]
+        .into_iter().enumerate().map(|(index, label)| DiagnosisHop {
+            label,
+            result: match failure {
+                Some(failed) if index == failed => HopResult::Failed,
+                Some(failed) if index < failed => HopResult::Ok,
+                _ => HopResult::Unchecked,
+            },
+        }).collect();
+    Some(diagnosis)
+}
+
 /// Plain-text report copied by "Copy diagnostics" (`connectionDiagnosisText` in `diagnosis.ts`).
 pub fn connection_diagnosis_text(host: &str, diagnosis: &Diagnosis) -> String {
     let mut lines = vec![format!("{host}: {}", diagnosis.headline)];
@@ -329,6 +448,39 @@ mod tests {
 
     fn reconnecting(reason: &str) -> ConnectionStatus {
         ConnectionStatus::Reconnecting { reason: reason.into(), attempt: 2 }
+    }
+
+    #[test]
+    fn replacing_a_route_publisher_does_not_let_the_previous_supervisor_clear_progress() {
+        let old = RouteProgressPublisher::new("https://fixture.invalid");
+        let active = RouteProgressPublisher::new("https://fixture.invalid/");
+        active.publish(Some("direct:https://route.invalid"), None);
+        old.publish(None, Some(Duration::from_secs(2)));
+        drop(old);
+        let progress = route_progress("https://fixture.invalid");
+        assert_eq!(progress.active_route_id.as_deref(), Some("direct:https://route.invalid"));
+        assert!(progress.retry_at.is_none());
+        drop(active);
+        assert!(route_progress("https://fixture.invalid").active_route_id.is_none());
+    }
+
+    #[test]
+    fn relay_health_identifies_the_tunnel_without_blame_when_the_hop_is_unknown() {
+        let waiting = reconnecting("connection timed out");
+        let diagnosis = diagnose_relay(Some(&waiting), None, "Studio").unwrap();
+        assert_eq!(diagnosis.hops.iter().map(|hop| hop.result).collect::<Vec<_>>(), [HopResult::Unchecked; 4]);
+
+        let offline = EnvironmentHealth::Offline {
+            offline_reason: Some("connector_not_ready".into()),
+            error: None,
+            trace_id: Some("trace-fixture".into()),
+        };
+        let diagnosis = diagnose_relay(Some(&waiting), Some(&offline), "Studio").unwrap();
+        assert_eq!(diagnosis.hops[2].label, "Studio tunnel");
+        assert_eq!(diagnosis.hops[2].result, HopResult::Failed);
+        assert_eq!(diagnosis.hops[3].result, HopResult::Unchecked);
+        assert!(diagnosis.facts.contains(&("Trace ID".into(), "trace-fixture".into())));
+        assert!(diagnose_relay(Some(&ConnectionStatus::Connected), Some(&offline), "Studio").is_none());
     }
 
     #[test]
