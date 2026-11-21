@@ -32,6 +32,12 @@ use crate::{
 const DATA_LIMIT: usize = 4_096;
 const PROVIDERS_MANAGE: &str = t3_core::usage::PROVIDERS_MANAGE_SCOPE;
 
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalInput {
+    Data(String),
+    Resize(Grid),
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Owner {
     environment: String,
@@ -74,12 +80,16 @@ impl Owner {
         current.as_ref() == Some(self)
     }
 
-    fn payload(&self, data: &str) -> Value {
+    fn payload(&self, data: &str, size: Option<Grid>) -> Value {
+        let mut response = json!({ "type": "terminal", "data": data });
+        if let Some(size) = size {
+            response["size"] = json!({ "cols": size.cols, "rows": size.rows });
+        }
         json!({
             "instanceId": self.instance,
             "flowId": self.flow,
             "interactionId": self.interaction,
-            "response": { "type": "terminal", "data": data },
+            "response": response,
         })
     }
 }
@@ -120,19 +130,23 @@ impl SettingsView {
             .as_ref()
             .is_none_or(|active| active.owner != owner)
         {
-            let (input, mut inputs) = mpsc::unbounded_channel::<String>();
+            let (input, mut inputs) = mpsc::unbounded_channel();
             let view = cx.new(|cx| AuthTerminal::new(input, cx));
             let target = owner.clone();
             let pump = cx.spawn(async move |this, cx| {
-                while let Some(data) = inputs.recv().await {
-                    for part in response_chunks(&data) {
+                while let Some(input) = inputs.recv().await {
+                    let (data, size) = match &input {
+                        TerminalInput::Data(data) => (data.as_str(), None),
+                        TerminalInput::Resize(grid) => ("", Some(*grid)),
+                    };
+                    for part in response_chunks(data).chain(size.map(|_| "")) {
                         let Ok(Some(request)) = this.update(cx, |this, cx| {
                             (target.current(this, cx) && this.can_use_auth_terminal(&target, cx))
                                 .then(|| {
                                     this.scoped_rpc(
                                         PROVIDERS_MANAGE,
                                         auth::AUTH_RESPOND,
-                                        target.payload(part),
+                                        target.payload(part, size),
                                         cx,
                                     )
                                 })
@@ -233,12 +247,13 @@ fn offset_delta(output: &str, previous: usize, offset: usize) -> Option<&str> {
 }
 
 pub(super) struct AuthTerminal {
-    input: mpsc::UnboundedSender<String>,
+    input: mpsc::UnboundedSender<TerminalInput>,
     can_type: bool,
     emulator: Emulator,
     output: String,
     offset: usize,
     fitted: bool,
+    sent_grid: Option<Grid>,
     focus: FocusHandle,
     front: Front,
     frame: Rc<RefCell<Frame>>,
@@ -248,7 +263,7 @@ pub(super) struct AuthTerminal {
 }
 
 impl AuthTerminal {
-    fn new(input: mpsc::UnboundedSender<String>, cx: &mut Context<Self>) -> Self {
+    fn new(input: mpsc::UnboundedSender<TerminalInput>, cx: &mut Context<Self>) -> Self {
         Self {
             input,
             can_type: false,
@@ -256,6 +271,7 @@ impl AuthTerminal {
             output: String::new(),
             offset: 0,
             fitted: false,
+            sent_grid: None,
             focus: cx.focus_handle().tab_stop(true),
             front: Front::default(),
             frame: Rc::default(),
@@ -267,7 +283,7 @@ impl AuthTerminal {
 
     fn send(&self, data: String) {
         if self.can_type && !data.is_empty() {
-            let _ = self.input.send(data);
+            let _ = self.input.send(TerminalInput::Data(data));
         }
     }
 
@@ -287,8 +303,7 @@ impl AuthTerminal {
                 self.send(reply);
             } else {
                 self.emulator = self.emulator.blank();
-                let reply = self.emulator.feed(output.as_bytes());
-                self.send(reply);
+                self.emulator.replay(output);
             }
         }
         self.output.clear();
@@ -319,9 +334,17 @@ impl AuthTerminal {
 
 impl TerminalSurface for AuthTerminal {
     fn fit(&mut self, grid: Grid, cell: (f32, f32), cx: &mut Context<Self>) {
+        // provider.auth.respond has smaller grid limits than terminal.resize.
+        let grid = Grid::new(grid.cols.min(500), grid.rows.min(200));
         self.emulator.resize(grid);
         self.emulator.set_theme(colors::theme_colors(cx));
         self.emulator.set_cell_size(cell.0, cell.1);
+        if self.can_type
+            && self.sent_grid != Some(grid)
+            && self.input.send(TerminalInput::Resize(grid)).is_ok()
+        {
+            self.sent_grid = Some(grid);
+        }
         if !self.fitted {
             self.fitted = true;
             let reply = self.emulator.feed(self.output.as_bytes());
@@ -494,6 +517,51 @@ impl EntityInputHandler for AuthTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<AuthTerminal>, mpsc::UnboundedReceiver<TerminalInput>) {
+        let (input, inputs) = mpsc::unbounded_channel();
+        let terminal = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            cx.new(|cx| AuthTerminal::new(input, cx))
+        });
+        (terminal, inputs)
+    }
+
+    #[gpui::test]
+    fn fit_sends_resize_only_when_grid_changes(cx: &mut gpui::TestAppContext) {
+        let (terminal, mut inputs) = test_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.can_type = true;
+            terminal.fit(Grid::new(80, 14), (8., 18.), cx);
+            assert_eq!(inputs.try_recv().unwrap(), TerminalInput::Resize(Grid::new(80, 14)));
+            terminal.fit(Grid::new(80, 14), (9., 18.), cx);
+            assert!(inputs.try_recv().is_err());
+            terminal.fit(Grid::new(600, 250), (9., 18.), cx);
+            assert_eq!(inputs.try_recv().unwrap(), TerminalInput::Resize(Grid::new(500, 200)));
+            terminal.fit(Grid::new(610, 250), (9., 18.), cx);
+            assert!(inputs.try_recv().is_err());
+        });
+    }
+
+    #[gpui::test]
+    fn recovered_output_does_not_resend_terminal_replies(cx: &mut gpui::TestAppContext) {
+        let (terminal, mut inputs) = test_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.fit(Grid::new(80, 14), (8., 18.), cx);
+            terminal.can_type = true;
+            terminal.write("one\x1b[6n", None, cx);
+            assert_eq!(inputs.try_recv().unwrap(), TerminalInput::Data("\x1b[1;4R".into()));
+
+            terminal.write("reset\x1b[6n", None, cx);
+            assert!(inputs.try_recv().is_err());
+
+            terminal.write("reset\x1b[6n!\x1b[6n", None, cx);
+            assert_eq!(inputs.try_recv().unwrap(), TerminalInput::Data("\x1b[1;7R".into()));
+        });
+    }
 
     #[test]
     fn rolled_output_uses_utf16_offsets_and_recovers_from_gaps() {

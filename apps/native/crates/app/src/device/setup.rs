@@ -86,7 +86,7 @@ impl DeviceSetupDialog {
     fn compute_shown(&self, cx: &App) -> Option<Shown> {
         let devices = self.devices.as_ref()?.read(cx);
         let state = self.state.read(cx);
-        let thread_id = state.panel_thread()?;
+        let thread_id = state.panel_thread().filter(|key| !AppState::is_utility_panel_key(key))?;
         if devices.setup_requested() == Some(thread_id.as_str()) {
             return Some(Shown::Requested(thread_id));
         }

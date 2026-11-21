@@ -21,7 +21,7 @@ use t3_core::pull_requests::{
     link::{ThreadLink, can_start_thread_pull_request_watch, visible_links, watch_command},
     method, project_default_merge_method,
     thread_badge::resolve_thread_current_pull_request_link,
-    wire::{Action, CheckStatus, Detail, Mergeability, PrState, decode},
+    wire::{Action, CheckStatus, Detail, MergeMethod, Mergeability, PrState, decode},
 };
 use t3_core::vcs::{ChangeRequest, format_diff_count};
 
@@ -580,6 +580,45 @@ impl DetailsView {
             self.draft_pr_handoff(action, detail, window, cx);
             return;
         }
+        if action == RowAction::Ready {
+            self.confirm_pr_row_action(action, reference, None, cx);
+            return;
+        }
+        let app = self.state.read(cx);
+        let origin = app.connection_id();
+        let thread = app.selected_thread.clone();
+        let reference = reference.clone();
+        let last = cx.background_spawn(async {
+            t3_client::store::load_ui_state(PREFERENCES_KEY)
+                .and_then(|value| serde_json::from_value::<ListPreferences>(value).ok())
+                .and_then(|preferences| preferences.merge_method)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let last = last.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                let app = this.state.read(cx);
+                if app.connection_id() == origin && app.selected_thread == thread {
+                    this.confirm_pr_row_action(action, &reference, last, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_pr_row_action(
+        &mut self,
+        action: RowAction,
+        reference: &PrRef,
+        last: Option<MergeMethod>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detail) = self
+            .pull_requests
+            .detail(reference)
+            .filter(|detail| row_action(detail) == Some(action))
+        else {
+            return;
+        };
         let app = self.state.read(cx);
         if !self.git.read(cx).can_write_source_control() {
             return;
@@ -595,9 +634,6 @@ impl DetailsView {
         let project_default = app.server_config.config.as_ref().and_then(|config| {
             project_default_merge_method(&config.settings, &reference.project_id)
         });
-        let last = t3_client::store::load_ui_state(PREFERENCES_KEY)
-            .and_then(|value| serde_json::from_value::<ListPreferences>(value).ok())
-            .and_then(|preferences| preferences.merge_method);
         let merge = action == RowAction::Merge;
         let method = merge.then(|| {
             resolve_merge_method(&detail.allowed_merge_methods(), None, project_default, last)
