@@ -8,7 +8,7 @@ use crate::{
     theme::{hsla, palette},
     toast::{Toast, ToastKind},
 };
-use gpui::{AnyElement, Context, ElementId, IntoElement, ParentElement, Styled, Task, Window, div, prelude::*, uniform_list};
+use gpui::{AnyElement, Context, ElementId, IntoElement, ParentElement, Styled, Task, Window, div, prelude::*, px, uniform_list};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use serde_json::{Value, json};
 use std::{collections::HashSet, rc::Rc, time::Duration};
@@ -43,6 +43,7 @@ pub(super) struct Projects {
     scan: Option<model::Scan>,
     error: Option<String>,
     selected: HashSet<String>,
+    reviewing: bool,
     collapsed: HashSet<String>,
     rows: Rc<Vec<Row>>,
     progress: model::Progress,
@@ -236,7 +237,9 @@ impl WelcomeWizard {
     }
     fn receive_scan(&mut self, scan: model::Scan, cx: &mut Context<Self>) {
         if self.projects.scan.is_none() {
-            self.projects.selected = model::default_selection(&scan, &self.projects.environment, parse_iso(&super::now_iso()).unwrap_or(0));
+            self.projects.selected = self.project_selections.get(&self.projects.environment).cloned().unwrap_or_else(|| {
+                model::default_selection(&scan, &self.projects.environment, parse_iso(&super::now_iso()).unwrap_or(0))
+            });
             self.projects.collapsed.insert("other".into());
         }
         self.projects.scan = Some(scan);
@@ -304,6 +307,7 @@ impl WelcomeWizard {
                     .collect()
             })
             .unwrap_or_default();
+        self.persist_project_selection();
         self.projects.progress.begin_attempt(selection);
         self.projects.error = None;
         self.projects.busy = true;
@@ -478,6 +482,7 @@ impl WelcomeWizard {
                     this.projects.selected.insert(key.clone());
                 }
             }
+            this.persist_project_selection();
             cx.notify();
         }));
         let candidate_row = group.is_none();
@@ -586,18 +591,27 @@ impl WelcomeWizard {
         }
     }
 
-    pub(super) fn render_projects(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let busy = self.projects.busy;
         let pending = self.projects.pending.is_some() && self.projects.scan.is_none();
         let can_read = self.projects_access("orchestration:read", cx);
         let allowed = self.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx);
         let count = self.projects.scan.as_ref().map_or(0, |s| s.candidates.len());
-        let selected = self
-            .projects
-            .scan
-            .as_ref()
-            .map_or(0, |s| s.candidates.iter().filter(|c| self.projects.selected.contains(&model::key(&self.projects.environment, &c.path))).count());
+        let selected = self.selected_project_count();
+        let reviewing = self.projects.reviewing;
+        let summary = if selected == 0 {
+            crate::i18n::t(cx, "Import projects and their threads").to_owned()
+        } else {
+            crate::i18n::t_fmt(
+                cx,
+                "{count, plural, one {Import {count} project and their threads} other {Import {count} projects and their threads}}",
+                &[("count", (selected as i64).into())],
+            )
+        };
+        let chevron = crate::components::motion::animated_chevron(
+            "welcome-projects-review-chevron", reviewing, px(14.), hsla(p.icon_muted), window, cx,
+        );
         let rows = self.projects.rows.clone();
         let list = uniform_list(
             "welcome-projects-list",
@@ -620,10 +634,35 @@ impl WelcomeWizard {
             ))
             .when(pending, |d| d.child(div().py(r(24.)).text_sm().text_color(hsla(p.muted_foreground)).child("Looking for projects from Claude Code and Codex…")))
             .when(!can_read && self.projects.scan.is_none(), |d| d.child(div().py(r(16.)).text_sm().child("Waiting for permission to check projects…")))
-            .when(count > 0, |d| {
+            .when(count > 0, |section| section.child(
+                h_flex().gap(r(8.))
+                    .child(div().flex_1().text_sm().child(summary))
+                    .child(Button::new("welcome-projects-toggle-default", ButtonVariant::Ghost, ButtonSize::Xs)
+                        .label(if selected > 0 { "Do not import projects" } else { "Select projects to import" })
+                        .disabled(busy || !allowed)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if selected > 0 {
+                                this.projects.selected.clear();
+                            } else if let Some(scan) = &this.projects.scan {
+                                this.projects.selected = model::default_selection(
+                                    scan, &this.projects.environment, parse_iso(&super::now_iso()).unwrap_or(0),
+                                );
+                            }
+                            this.persist_project_selection();
+                            cx.notify();
+                        })))
+                    .when(allowed, |row| row.child(h_flex().gap(r(2.))
+                        .child(Button::new("welcome-projects-review", ButtonVariant::GhostMuted, ButtonSize::Xs)
+                            .label(if reviewing { "Hide" } else { "Review" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.projects.reviewing = !this.projects.reviewing;
+                                cx.notify();
+                            })))
+                        .child(chevron))),
+            ))
+            .when(count > 0 && reviewing && allowed, |d| {
                 d.child(
                     h_flex()
-                        .mt(r(20.))
                         .items_center()
                         .justify_between()
                         .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("{selected} of {count} selected")))
@@ -638,6 +677,7 @@ impl WelcomeWizard {
                                             if let Some(scan) = &this.projects.scan {
                                                 this.projects.selected = scan.candidates.iter().map(|c| model::key(&this.projects.environment, &c.path)).collect();
                                             }
+                                            this.persist_project_selection();
                                             cx.notify();
                                         })),
                                 )
@@ -647,6 +687,7 @@ impl WelcomeWizard {
                                         .disabled(busy || selected == 0)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.projects.selected.clear();
+                                            this.persist_project_selection();
                                             cx.notify();
                                         })),
                                 ),
@@ -659,7 +700,7 @@ impl WelcomeWizard {
             .when(self.projects.scan.as_ref().is_some_and(|s| s.truncated), |d| {
                 d.child(div().mt(r(8.)).text_xs().text_color(hsla(p.muted_foreground)).child(model::LIMIT_MESSAGE))
             })
-            .when(count > 0, |d| d.child(div().mt(r(8.)).child(list)))
+            .when(count > 0 && reviewing && allowed, |d| d.child(div().mt(r(8.)).child(list)))
             .children(error.map(|error| div().mt(r(12.)).text_sm().text_color(hsla(p.destructive)).child(error)))
             .when(self.projects.error.is_some() && !busy, |d| {
                 d.child(
@@ -684,30 +725,67 @@ impl WelcomeWizard {
                     self.projects.progress.skipped
                 )))
             })
-            .child(
-                h_flex()
-                    .mt(r(24.))
-                    .justify_end()
-                    .gap(r(12.))
-                    .child(
-                        Button::new("welcome-projects-skip", ButtonVariant::GhostMuted, ButtonSize::Default)
-                            .label("Do not import projects")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.skip_import(cx))),
-                    )
-                    .child(
-                        Button::new("welcome-projects-import", ButtonVariant::Default, ButtonSize::Default)
-                            .label(if busy {
-                                "Importing…".into()
-                            } else {
-                                format!("Import {selected} {}", if selected == 1 { "project" } else { "projects" })
-                            })
-                            .disabled(!allowed || busy || selected == 0)
-                            .on_click(cx.listener(|this, _, _, cx| this.run_import(cx))),
-                    ),
-            )
             .into_any_element()
     }
+    fn persist_project_selection(&mut self) {
+        if self.projects.environment.is_empty() { return; }
+        self.project_selections.insert(self.projects.environment.clone(), self.projects.selected.clone());
+        t3_client::store::save_ui_state("welcome-project-selections", &self.project_selections);
+    }
+
+    fn selected_project_count(&self) -> usize {
+        self.projects.scan.as_ref().map_or(0, |scan| {
+            scan.candidates.iter().filter(|candidate| {
+                self.projects.selected.contains(&model::key(&self.projects.environment, &candidate.path))
+            }).count()
+        })
+    }
+
+    pub(super) fn render_start_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let ready = self.state.read(cx).server_config.config.as_ref().is_some_and(|config| {
+            t3_core::onboarding::group_welcome_agents(
+                Some(&config.providers), Some(&config.settings), config.managed_policy.as_ref(),
+            ).ready_count > 0
+        });
+        let selected = self.selected_project_count();
+        let import = selected > 0 && self.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx);
+        let busy = self.projects.busy;
+        let label = if busy {
+            "Importing…".to_owned()
+        } else if import {
+            crate::i18n::t_fmt(cx,
+                "{count, plural, one {Import {count} project and start} other {Import {count} projects and start}}",
+                &[("count", (selected as i64).into())],
+            )
+        } else {
+            "Start".to_owned()
+        };
+        let start = move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+            if this.projects.busy { return; }
+            if this.selected_project_count() > 0 && this.projects_access(ORCHESTRATION_OPERATE_SCOPE, cx) {
+                this.run_import(cx);
+            } else if this.projects_current(cx) {
+                this.skip_import(cx);
+            } else {
+                this.finish(cx);
+            }
+        };
+        h_flex().justify_between().gap(r(8.)).flex_wrap()
+            .when(!ready, |row| row.child(
+                Button::new("welcome-start-without-agent", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                    .label("Start without an agent").disabled(busy)
+                    .on_click(cx.listener(start)),
+            ))
+            .child(div().flex_1())
+            .when(!ready, |row| row.child(div().text_xs().text_color(hsla(p.muted_foreground))
+                .child(crate::i18n::t(cx, "Set up one agent to start."))))
+            .child(Button::new("welcome-continue", ButtonVariant::Default, ButtonSize::Sm)
+                .label(label).trailing(Icon::ArrowRight).disabled(!ready || busy)
+                .on_click(cx.listener(start)))
+            .into_any_element()
+    }
+
 }
 
 #[cfg(feature = "snapshot")]

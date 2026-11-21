@@ -34,7 +34,7 @@ use t3_core::sidebar::time::format_iso;
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant, activates, focus_handle, r};
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -117,7 +117,7 @@ struct WelcomeFetch {
 
 /// The agent whose setup command shows below the cards (`AgentInstallTerminal`'s session).
 struct AgentSetup {
-    driver: &'static str,
+    instance_id: String,
     terminal: Entity<agent_terminal::AgentInstallTerminal>,
     _closed: Subscription,
     _finished: Option<Subscription>,
@@ -137,6 +137,8 @@ pub struct WelcomeWizard {
     privacy_focus: FocusHandle,
     focus_pending: bool,
     welcome: Option<WelcomeFetch>,
+    recovery_timer: Option<Task<()>>,
+    recovery_visible: bool,
     link: Entity<InputState>,
     /// "Add a computer": `None` until toggled, open while there is nothing else to connect to.
     pairing_open: Option<bool>,
@@ -144,6 +146,7 @@ pub struct WelcomeWizard {
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
     setup: Option<AgentSetup>,
+    enabling_agents: std::collections::HashSet<String>,
     /// Whether the "More agents" disclosure is expanded on the single Welcome page (`#33209`).
     more_agents_open: bool,
     /// Local `t3` CLI installation / PATH status (`#33150`, `#33153`).
@@ -163,6 +166,7 @@ pub struct WelcomeWizard {
     privacy_policy_clicks: usize,
     copied: Option<(String, Task<()>)>,
     projects: projects::Projects,
+    project_selections: std::collections::BTreeMap<String, std::collections::HashSet<String>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -193,11 +197,14 @@ impl WelcomeWizard {
             privacy_focus: cx.focus_handle().tab_stop(true),
             focus_pending: false,
             welcome: None,
+            recovery_timer: None,
+            recovery_visible: false,
             link,
             pairing_open: None,
             pairing_help_open: false,
             submitted: false,
             setup: None,
+            enabling_agents: Default::default(),
             more_agents_open: false,
             cli_status: t3_client::local::cli_command_status(),
             cli_path_added: false,
@@ -214,6 +221,12 @@ impl WelcomeWizard {
             privacy_policy_clicks: 0,
             copied: None,
             projects: projects::Projects::default(),
+            project_selections: if crate::chatgpt_setup::fixture_active(cx) {
+                Default::default()
+            } else {
+                t3_client::store::load_ui_state("welcome-project-selections")
+                    .and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default()
+            },
             _subscriptions: subscriptions,
         };
         wizard.watch_terminal_grants(cx);
@@ -229,7 +242,7 @@ impl WelcomeWizard {
     }
 
     pub fn is_open(&self) -> bool {
-        self.open
+        self.open || self.recovery_visible
     }
 
     /// Moves to the next or previous control inside the wizard (the dialog's focus trap).
@@ -277,6 +290,7 @@ impl WelcomeWizard {
                 self.step = Step::Connection;
             }
             let connection_changed = previous_connection.is_some() && previous_connection != connection_id;
+            if connection_changed || !connected { self.enabling_agents.clear(); }
             if !connected {
                 self.connected_for_welcome = None;
             } else if self.open && self.connected_for_welcome != connection_id {
@@ -302,11 +316,14 @@ impl WelcomeWizard {
             || crate::settings::client_settings(cx).onboarding_completed()
         {
             self.welcome = None;
+            self.clear_recovery(cx);
             return;
         }
         let app = self.state.read(cx);
         let Phase::Online(status) = &app.phase else {
-            if resolve_unpaired(false, app.environments.environments.len()) == FirstRunDecision::Wizard {
+            let decision = resolve_unpaired(false, app.environments.environments.len());
+            self.clear_recovery(cx);
+            if decision == FirstRunDecision::Wizard {
                 self.show(Step::Connection, cx);
             }
             return;
@@ -314,7 +331,8 @@ impl WelcomeWizard {
         let connected = *status == ConnectionStatus::Connected;
         let connection = app.connection_id();
         // Setup opens by itself only from home, so it never takes over an open thread.
-        let at_home = app.selected_thread.is_none() && !app.pull_requests_open;
+        let at_home = app.selected_thread.is_none() && app.draft_project.is_none()
+            && !app.pull_requests_open && !app.issues_open && !crate::settings::is_open_or_pending(cx);
         let config = app.server_config.config.as_ref();
         let (projects, threads): (&[_], Vec<&ThreadShell>) = match app.shell.snapshot.as_ref() {
             Some(snapshot) => (&snapshot.projects, snapshot.threads.iter().chain(&snapshot.archived_threads).collect()),
@@ -335,11 +353,66 @@ impl WelcomeWizard {
         if resolution.persist_completion {
             return self.complete(cx);
         }
+        if resolution.decision == FirstRunDecision::Pending && at_home {
+            self.schedule_recovery(cx);
+        } else {
+            self.clear_recovery(cx);
+        }
         match (resolution.decision, connection) {
             (FirstRunDecision::Wizard, _) if at_home => self.show(Step::Connection, cx),
             (FirstRunDecision::Pending, Some(connection)) if connected => self.fetch_welcome(connection, cx),
             _ => {}
         }
+    }
+
+    fn schedule_recovery(&mut self, cx: &mut Context<Self>) {
+        if self.recovery_timer.is_some() || self.recovery_visible { return; }
+        self.recovery_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.recovery_timer = None;
+                if !this.open && !crate::settings::is_open_or_pending(cx) {
+                    this.recovery_visible = true;
+                    this.focus_pending = true;
+                    cx.emit(Visibility);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn clear_recovery(&mut self, cx: &mut Context<Self>) {
+        self.recovery_timer = None;
+        if std::mem::take(&mut self.recovery_visible) {
+            cx.emit(Visibility);
+            cx.notify();
+        }
+    }
+
+    fn retry_first_run(&mut self, cx: &mut Context<Self>) {
+        self.clear_recovery(cx);
+        self.welcome = None;
+        self.state.read(cx).retry_connection();
+        self.evaluate(cx);
+    }
+
+    fn render_recovery(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let t = crate::i18n::t;
+        deferred(
+            div().id("first-run-recovery").absolute().inset_0().occlude()
+                .track_focus(&self.focus).key_context(CONTEXT)
+                .on_action(cx.listener(|this, _: &FocusNextInWelcome, window, cx| this.cycle_focus(true, window, cx)))
+                .on_action(cx.listener(|this, _: &FocusPreviousInWelcome, window, cx| this.cycle_focus(false, window, cx)))
+                .bg(hsla(p.background)).flex().items_center().justify_center()
+                .child(v_flex().items_center().gap(r(10.)).px(r(24.)).text_center()
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(t(cx, "Still connecting")))
+                    .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(t(cx, "T3 Code could not confirm this workspace.")))
+                    .child(Button::new("first-run-retry", ButtonVariant::Outline, ButtonSize::Sm)
+                        .icon(Icon::RefreshCw)
+                        .label("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_first_run(cx))))),
+        ).with_priority(50).into_any_element()
     }
 
     /// Reads `subscribeServerLifecycle` until the welcome arrives, then lets the stream go.
@@ -381,6 +454,7 @@ impl WelcomeWizard {
     }
 
     fn show(&mut self, step: Step, cx: &mut Context<Self>) {
+        self.clear_recovery(cx);
         self.open = true;
         self.dismissed_for_settings = false;
         self.step = step;
@@ -404,6 +478,7 @@ impl WelcomeWizard {
 
     /// `completeOnboarding`.
     fn complete(&mut self, cx: &mut Context<Self>) {
+        self.clear_recovery(cx);
         self.welcome = None;
         crate::settings::store::update_client(&self.state, ClientSettingChange::OnboardingCompletedAt(now_iso()), cx);
     }
@@ -610,11 +685,17 @@ fn row_card(cx: &App) -> gpui::Div {
 
 impl Render for WelcomeWizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.open {
+        if !self.is_open() {
             return div().into_any_element();
         }
         if std::mem::take(&mut self.focus_pending) {
             window.focus(&self.focus, cx);
+        }
+        if self.recovery_visible {
+            if crate::settings::is_open_or_pending(cx) {
+                return div().into_any_element();
+            }
+            return self.render_recovery(cx);
         }
         let p = palette(cx);
         let dark = cx.theme().is_dark();
@@ -637,6 +718,9 @@ impl Render for WelcomeWizard {
         }
         if let Some(cli) = self.render_cli_setup(cx) {
             sections.push(cli);
+        }
+        if connected {
+            sections.push(self.render_start_actions(cx));
         }
         sections.push(self.render_welcome_footer(window, cx));
 
@@ -679,7 +763,9 @@ impl Render for WelcomeWizard {
             .max_w(r(768.))
             .max_h(viewport.height - px(32.))
             .rounded(r(16.))
+            .theme_slot(ThemeSlot::DialogPopup, cx)
             .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+            .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::DialogPopup, px(16.), cx))
             .shadow(vec![BoxShadow {
                 color: gpui::black().opacity(if dark { 0.9 } else { 0.65 }),
                 offset: point(px(0.), px(24.)),
@@ -759,7 +845,7 @@ pub fn terminal_fixture(fixture: TerminalFixture, window: &mut Window, cx: &mut 
             cx.notify();
         });
         wizard.setup = Some(AgentSetup {
-            driver: "codex",
+            instance_id: "codex".to_owned(),
             terminal,
             _closed: closed,
             _finished: None,

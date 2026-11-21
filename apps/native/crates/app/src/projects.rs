@@ -7,18 +7,18 @@ use std::collections::BTreeMap;
 
 use gpui::{
     AnyElement, App, BoxShadow, ClipboardItem, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, deferred, div,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Task, Window, deferred, div,
     hsla as gpui_hsla, point, prelude::*, px,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::projects::{
-    COPIED_FILES_MAX_COUNT, COPYABLE_FILE_MAX_BYTES, CloneProtocol, CreateNewResult, PROJECT_CLONE_CANCEL,
-    PROJECT_CLONE_RETRY, PROJECT_CLONE_START, PROJECTS_CREATE_NEW, PROJECTS_LIST_IGNORED_FILES, PROJECTS_MUTATE,
+    COPIED_FILES_MAX_COUNT, COPYABLE_FILE_MAX_BYTES, CloneProtocol, PROJECT_CLONE_CANCEL,
+    PROJECT_CLONE_RETRY, PROJECT_CLONE_START, PROJECTS_LIST_IGNORED_FILES, PROJECTS_MUTATE,
     PROJECTS_READ_FILE, PROJECTS_WRITE_FILE, ProjectClonePhase, ProjectCloneSnapshot, ProjectCloneStartResult,
     ProjectIgnoredFile, ProjectListIgnoredFilesResult, ProjectReadFileResult, SUBSCRIBE_PROJECT_CLONES,
     add_project_initial_query, cancel_project_clone_request, clone_destination_path, clone_directory_name,
-    clone_directory_path, clone_url_for_protocol, clone_url_protocol, compute_clone_preview, create_new_project,
+    clone_directory_path, clone_url_for_protocol, clone_url_protocol, compute_clone_preview,
     create_project, default_selected_ignored_files, extract_project_remote_url, extract_repository_display_name,
     extract_repository_root_path, find_project_by_path, format_bytes, infer_project_title, is_clone_query,
     list_ignored_files_request, project_clone_display_name, project_clone_progress_summary,
@@ -26,12 +26,14 @@ use t3_core::projects::{
     set_project_pinned, start_project_clone, write_project_file_request,
 };
 use t3_core::settings::projects::delete_project;
+use t3_core::sidebar::grouping::EnvironmentOwner;
+use t3_core::auth::{ORCHESTRATION_OPERATE_SCOPE, SOURCE_CONTROL_WRITE_SCOPE};
 
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
-use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant, Select, SelectOption};
 use crate::sidebar::controller::uuid;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
 /// Target connected machine eligible for `AddProjectToMachineDialog`.
@@ -49,6 +51,7 @@ pub struct MachineTarget {
 pub enum PendingProjectModal {
     Clone {
         initial_url: String,
+        owner: Option<EnvironmentOwner>,
     },
     AddToMachine {
         source_saved_id: String,
@@ -185,8 +188,13 @@ impl AppState {
 
     /// Opens the interactive Clone Repository modal (`AP-PROJECTS`), optionally pre-filled with a URL.
     pub fn open_clone_project_modal(&mut self, initial_url: impl Into<String>, cx: &mut Context<Self>) {
+        self.open_clone_project_on(None, initial_url.into(), cx);
+    }
+
+    pub(crate) fn open_clone_project_on(&self, owner: Option<EnvironmentOwner>, initial_url: String, cx: &mut Context<Self>) {
         cx.set_global(PendingProjectModalGlobal(Some(PendingProjectModal::Clone {
-            initial_url: initial_url.into(),
+            initial_url,
+            owner,
         })));
         cx.emit(AppEvent::Notice);
     }
@@ -224,7 +232,9 @@ impl AppState {
         let mut out = Vec::new();
         for env in &self.fleet.environments {
             let saved_id = &env.summary.owner.saved_id;
-            if saved_id == source_saved_id || !env.summary.synchronized {
+            if saved_id == source_saved_id
+                || !self.scoped_ready(&env.summary.owner, SOURCE_CONTROL_WRITE_SCOPE)
+            {
                 continue;
             }
             if let Some(key) = source_key {
@@ -317,24 +327,71 @@ impl AppState {
         .detach();
     }
 
-    /// `projects.createNew`: the server makes the folder under its new-projects root.
-    pub fn create_new_project(&mut self, name: &str, cx: &mut Context<Self>) {
-        if name.trim().is_empty() {
+    pub(crate) fn project_request(
+        &self,
+        owner: Option<&EnvironmentOwner>,
+        scope: &str,
+        method: &'static str,
+        payload: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + use<> {
+        let destination = owner.map(|owner| self.connections.destination(owner, scope));
+        let active = destination.is_none().then(|| self.rpc(method, payload.clone()));
+        async move {
+            if let Some(active) = active {
+                return active.await.map_err(|error| error.to_string());
+            }
+            let dest = destination.expect("scoped project request").await
+                .map_err(|error| format!("Project destination is unavailable ({error:?})."))?;
+            dest.client.request(method, payload).await.map_err(|error| error.to_string())
+        }
+    }
+
+    pub(crate) fn open_created_project(&mut self, owner: Option<EnvironmentOwner>, project_id: String, cx: &mut Context<Self>) {
+        if let Some(owner) = owner {
+            self.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(project_id), cx);
+        } else {
+            self.start_draft(&project_id, cx);
+        }
+    }
+
+    pub(crate) fn add_scoped_project(&mut self, owner: EnvironmentOwner, query: &str, cx: &mut Context<Self>) {
+        if is_clone_query(query) {
+            self.open_clone_project_on(Some(owner), query.trim().to_owned(), cx);
             return;
         }
-        let request = self.rpc(PROJECTS_CREATE_NEW, create_new_project(name));
+        let Some(entry) = self.scoped_environment(&owner.saved_id).filter(|entry| entry.summary.owner == owner) else { return };
+        let platform = entry.config.config.as_ref().and_then(|config| config.environment.platform.as_ref())
+            .map_or("darwin", |platform| platform.os.as_str());
+        let current_cwd = (self.environments.active.as_deref() == Some(owner.saved_id.as_str())).then(|| {
+            self.selected_thread.as_deref().and_then(|id| self.thread_shell(id)).map(|thread| thread.project_id.as_str())
+                .or(self.draft_project.as_deref())
+                .and_then(|id| self.shell.project(id))
+                .map(|project| project.workspace_root.as_str())
+        }).flatten();
+        let path = match resolve_add_project_path(query, current_cwd, platform) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_toast(Toast::new(ToastKind::Error, "Failed to add project").description(error), cx);
+                return;
+            }
+        };
+        if let Some(project) = find_project_by_path(&entry.summary.projects, &path, |project| &project.project.workspace_root) {
+            self.open_created_project(Some(owner), project.project.id.clone(), cx);
+            return;
+        }
+        let project_id = uuid();
+        let title = infer_project_title(&path);
+        let req = self.project_request(Some(&owner), ORCHESTRATION_OPERATE_SCOPE, PROJECTS_MUTATE, create_project(&uuid(), &project_id, &title, &path));
         cx.spawn(async move |this, cx| {
-            let result = request.await.map_err(|error| error.to_string()).and_then(|value| serde_json::from_value::<CreateNewResult>(value).map_err(|error| error.to_string()));
+            let result = req.await;
             let _ = this.update(cx, |state, cx| match result {
-                Ok(created) => {
-                    let toast = Toast::new(ToastKind::Success, "Project created").description(created.workspace_root.clone());
-                    state.show_toast(created.commit_error.map_or(toast, |error| Toast::new(ToastKind::Warning, "Project created without a first commit").description(error)), cx);
-                    state.start_draft(&created.project_id, cx);
+                Ok(_) => {
+                    state.show_toast(Toast::new(ToastKind::Success, "Project added").description(title), cx);
+                    state.open_created_project(Some(owner), project_id, cx);
                 }
-                Err(error) => state.show_toast(Toast::new(ToastKind::Error, "Failed to create project").description(error), cx),
+                Err(error) => state.show_toast(Toast::new(ToastKind::Error, "Failed to add project").description(error), cx),
             });
-        })
-        .detach();
+        }).detach();
     }
 
     pub fn set_project_pinned(&mut self, project_id: &str, pinned: bool, cx: &mut Context<Self>) {
@@ -391,6 +448,7 @@ pub struct ProjectDialogs {
     state: Entity<AppState>,
     clone: Option<CloneModalState>,
     add_to_machine: Option<AddToMachineState>,
+    composer: Option<gpui::WeakEntity<crate::composer::Composer>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -405,6 +463,7 @@ struct ActiveCloneState {
 }
 
 struct CloneModalState {
+    owner: Option<EnvironmentOwner>,
     url_input: Entity<InputState>,
     dest_input: Entity<InputState>,
     protocol_override: Option<CloneProtocol>,
@@ -419,6 +478,7 @@ struct CloneModalState {
 
 struct AddToMachineState {
     source_saved_id: String,
+    source_project_id: String,
     source_label: String,
     project_title: String,
     display_name: String,
@@ -459,10 +519,17 @@ impl ProjectDialogs {
             state,
             clone: None,
             add_to_machine: None,
+            composer: None,
             _subscriptions: vec![sub],
         };
         this.consume_pending(window, cx);
         this
+    }
+
+    #[allow(dead_code, reason = "Workspace wiring lands during the native parity merge")]
+    pub(crate) fn with_composer(mut self, composer: &Entity<crate::composer::Composer>) -> Self {
+        self.composer = Some(composer.downgrade());
+        self
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -497,8 +564,8 @@ impl ProjectDialogs {
         let Some(request) = pending else { return };
         cx.set_global(PendingProjectModalGlobal(None));
         match request {
-            PendingProjectModal::Clone { initial_url } => {
-                self.open_clone_modal(initial_url, window, cx);
+            PendingProjectModal::Clone { initial_url, owner } => {
+                self.open_clone_modal(initial_url, owner, window, cx);
             }
             PendingProjectModal::AddToMachine {
                 source_saved_id,
@@ -510,16 +577,19 @@ impl ProjectDialogs {
         }
     }
 
-    fn clone_base_dirs(&self, cx: &App) -> (Option<String>, Option<String>, bool, String) {
+    fn clone_base_dirs(&self, owner: Option<&EnvironmentOwner>, cx: &App) -> (Option<String>, Option<String>, bool, String) {
         let app = self.state.read(cx);
-        let cfg = app.server_config.config.as_ref();
+        let cfg = match owner {
+            Some(owner) => app.scoped_environment(&owner.saved_id).and_then(|entry| entry.config.config.as_ref()),
+            None => app.server_config.config.as_ref(),
+        };
         let base_dir = cfg
             .map(|c| c.settings.threads.add_project_base_directory.clone())
             .filter(|s| !s.trim().is_empty());
         let fallback_root = cfg.and_then(|c| c.new_projects_root.clone());
         let ghq_layout = cfg.is_some_and(|c| c.settings.threads.ghq_clone_layout);
-        let env_label = app
-            .active_environment()
+        let env_label = owner.and_then(|owner| app.environments.get(&owner.saved_id))
+            .or_else(|| owner.is_none().then(|| app.active_environment()).flatten())
             .map(|e| e.label.clone())
             .filter(|s| !s.trim().is_empty())
             .or_else(|| cfg.map(|c| c.environment.label.clone()).filter(|s| !s.trim().is_empty()))
@@ -527,9 +597,9 @@ impl ProjectDialogs {
         (base_dir, fallback_root, ghq_layout, env_label)
     }
 
-    fn open_clone_modal(&mut self, initial_url: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_clone_modal(&mut self, initial_url: String, owner: Option<EnvironmentOwner>, window: &mut Window, cx: &mut Context<Self>) {
         self.add_to_machine = None;
-        let (base_dir, fallback_root, ghq_layout, _) = self.clone_base_dirs(cx);
+        let (base_dir, fallback_root, ghq_layout, _) = self.clone_base_dirs(owner.as_ref(), cx);
         let preview = compute_clone_preview(
             &initial_url,
             base_dir.as_deref(),
@@ -575,6 +645,7 @@ impl ProjectDialogs {
         #[cfg(not(test))]
         url_input.update(cx, |input, cx| input.focus(window, cx));
         self.clone = Some(CloneModalState {
+            owner,
             url_input,
             dest_input,
             protocol_override: None,
@@ -590,7 +661,7 @@ impl ProjectDialogs {
     }
 
     fn sync_clone_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (base_dir, fallback_root, _, _) = self.clone_base_dirs(cx);
+        let (base_dir, fallback_root, _, _) = self.clone_base_dirs(self.clone.as_ref().and_then(|modal| modal.owner.as_ref()), cx);
         let Some(modal) = self.clone.as_mut() else { return };
         modal.error = None;
         if modal.path_overridden {
@@ -636,7 +707,7 @@ impl ProjectDialogs {
     }
 
     fn submit_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (base_dir, fallback_root, _, _) = self.clone_base_dirs(cx);
+        let (base_dir, fallback_root, _, _) = self.clone_base_dirs(self.clone.as_ref().and_then(|modal| modal.owner.as_ref()), cx);
         let (raw_url, destination, preview) = {
             let Some(modal) = self.clone.as_ref() else { return };
             if modal.submitting || modal.active_clone.is_some() {
@@ -683,8 +754,12 @@ impl ProjectDialogs {
         let project_id = uuid();
         let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let payload = start_project_clone(&project_id, &preview.title, &created_at, &preview.remote_url, &destination);
-        let req = self.state.read(cx).rpc(PROJECT_CLONE_START, payload);
-        let client = self.state.read(cx).client_handle();
+        let owner = self.clone.as_ref().and_then(|modal| modal.owner.clone());
+        let req = self.state.read(cx).project_request(owner.as_ref(), SOURCE_CONTROL_WRITE_SCOPE, PROJECT_CLONE_START, payload);
+        let (remote_client, active_client) = match owner.as_ref() {
+            Some(owner) => (Some(self.state.read(cx).connections.client(&owner.saved_id)), None),
+            None => (None, self.state.read(cx).client_handle()),
+        };
         let runtime = self.state.read(cx).runtime().clone();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -692,6 +767,10 @@ impl ProjectDialogs {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| serde_json::from_value::<ProjectCloneStartResult>(value).map_err(|e| e.to_string()));
+            let client = match remote_client {
+                Some(remote) if result.is_ok() => remote.await,
+                _ => active_client,
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(modal) = this.clone.as_mut() else { return };
                 modal.submitting = false;
@@ -709,7 +788,7 @@ impl ProjectDialogs {
                                     // Older servers predate `subscribeProjectClones`: open draft immediately.
                                     let _ = this.update(cx, |this, cx| {
                                         this.clone = None;
-                                        this.state.update(cx, |s, cx| s.start_draft(&watched_id, cx));
+                                        this.state.update(cx, |s, cx| s.open_created_project(owner.clone(), watched_id.clone(), cx));
                                         cx.notify();
                                     });
                                     return;
@@ -749,7 +828,7 @@ impl ProjectDialogs {
                                                     Toast::new(ToastKind::Success, format!("Cloned {display}")).description(dest),
                                                     cx,
                                                 );
-                                                s.start_draft(&watched_id, cx);
+                                                s.open_created_project(owner.clone(), watched_id.clone(), cx);
                                             });
                                         }
                                         cx.notify();
@@ -814,7 +893,8 @@ impl ProjectDialogs {
             }
             _ => return,
         };
-        let req = self.state.read(cx).rpc(PROJECT_CLONE_CANCEL, cancel_project_clone_request(&project_id));
+        let owner = self.clone.as_ref().and_then(|modal| modal.owner.as_ref());
+        let req = self.state.read(cx).project_request(owner, SOURCE_CONTROL_WRITE_SCOPE, PROJECT_CLONE_CANCEL, cancel_project_clone_request(&project_id));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = req.await;
@@ -840,7 +920,8 @@ impl ProjectDialogs {
             }
             _ => return,
         };
-        let req = self.state.read(cx).rpc(PROJECT_CLONE_RETRY, retry_project_clone_request(&project_id));
+        let owner = self.clone.as_ref().and_then(|modal| modal.owner.as_ref());
+        let req = self.state.read(cx).project_request(owner, SOURCE_CONTROL_WRITE_SCOPE, PROJECT_CLONE_RETRY, retry_project_clone_request(&project_id));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = req.await;
@@ -861,8 +942,8 @@ impl ProjectDialogs {
         let Some(project_id) = self.clone.as_ref().and_then(|m| m.active_clone.as_ref()).map(|a| a.project_id.clone()) else {
             return;
         };
-        self.clone = None;
-        self.state.update(cx, |s, cx| s.start_draft(&project_id, cx));
+        let owner = self.clone.take().and_then(|modal| modal.owner);
+        self.state.update(cx, |s, cx| s.open_created_project(owner, project_id, cx));
         cx.notify();
     }
 
@@ -950,6 +1031,7 @@ impl ProjectDialogs {
         let workspace_root = project.workspace_root.clone();
         self.add_to_machine = Some(AddToMachineState {
             source_saved_id: source_saved_id.clone(),
+            source_project_id: project_id,
             source_label,
             project_title: project.title,
             display_name,
@@ -1149,6 +1231,7 @@ impl ProjectDialogs {
     fn submit_add_to_machine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (
             source_saved_id,
+            source_project_id,
             source_cwd,
             subdirectory,
             target,
@@ -1183,6 +1266,7 @@ impl ProjectDialogs {
             let files: Vec<String> = modal.selected_files.keys().cloned().collect();
             (
                 modal.source_saved_id.clone(),
+                modal.source_project_id.clone(),
                 modal.workspace_root.clone(),
                 subdirectory,
                 target,
@@ -1200,6 +1284,12 @@ impl ProjectDialogs {
         cx.notify();
 
         let active_saved = self.state.read(cx).environments.active.clone().unwrap_or_default();
+        let source_route = {
+            let state = self.state.read(cx);
+            (state.connection_id(), state.selected_thread.clone(), state.draft_project.clone())
+        };
+        let composer = self.composer.clone();
+        let dialog_input = self.add_to_machine.as_ref().expect("submitting dialog").dest_input.downgrade();
         let active_client = self.state.read(cx).client_handle();
         let source_fut = (!source_saved_id.is_empty() && source_saved_id != active_saved)
             .then(|| self.state.read(cx).connections.client(&source_saved_id));
@@ -1280,29 +1370,59 @@ impl ProjectDialogs {
                 }
             };
 
-            // Step 3: Close dialog, notify user that clone started, and select draft when targeting active machine.
-            let _ = this.update(cx, |this, cx| {
+            let modal_current = this.update(cx, |this, cx| {
+                if !this.add_to_machine.as_ref().is_some_and(|modal| {
+                    modal.submitting && modal.dest_input.downgrade() == dialog_input
+                }) {
+                    return false;
+                }
                 this.add_to_machine = None;
                 cx.notify();
-            });
+                true
+            }).unwrap_or(false);
             let total_files = reads.len();
-            let target_is_active = target.saved_id == active_saved;
             let clone_toast_desc = if total_files == 0 {
                 started.cwd.clone()
             } else {
                 let plural = if total_files == 1 { "file" } else { "files" };
                 format!("{} — will copy {total_files} ignored {plural} after clone", started.cwd)
             };
-            state_entity.update(cx, |s, cx| {
-                s.show_toast(
-                    Toast::new(ToastKind::Info, format!("Cloning {title} to {}", target.label))
-                        .description(clone_toast_desc),
-                    cx,
-                );
-                if target_is_active {
-                    s.start_draft(&started.project_id, cx);
+            cx.update(|window, cx| {
+                state_entity.update(cx, |state, cx| {
+                    state.show_toast(
+                        Toast::new(ToastKind::Info, format!("Cloning {title} to {}", target.label))
+                            .description(clone_toast_desc),
+                        cx,
+                    );
+                });
+                let (route_current, source_draft, target_is_active, owner) = {
+                    let state = state_entity.read(cx);
+                    let route_current = modal_current && state.connection_id() == source_route.0
+                        && state.selected_thread == source_route.1 && state.draft_project == source_route.2;
+                    let source_draft = state.selected_thread.is_none()
+                        && state.draft_project.as_deref() == Some(source_project_id.as_str())
+                        && (source_saved_id.is_empty() || source_saved_id == active_saved);
+                    let owner = state.scoped_environment(&target.saved_id)
+                        .map(|entry| entry.summary.owner.clone())
+                        .filter(|owner| state.scoped_ready(owner, t3_core::auth::ORCHESTRATION_READ_SCOPE));
+                    (route_current, source_draft, target.saved_id == active_saved, owner)
+                };
+                if !route_current || (!target_is_active && owner.is_none()) {
+                    return;
                 }
-            });
+                if source_draft && let Some(composer) = composer.as_ref().and_then(gpui::WeakEntity::upgrade) {
+                    composer.update(cx, |composer, cx| {
+                        composer.retarget_draft(&source_project_id, &started.project_id, target_is_active, window, cx);
+                    });
+                }
+                state_entity.update(cx, |state, cx| {
+                    if target_is_active {
+                        state.start_draft(&started.project_id, cx);
+                    } else if let Some(owner) = owner {
+                        state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(started.project_id.clone()), cx);
+                    }
+                });
+            }).ok();
             if reads.is_empty() {
                 return;
             }
@@ -1443,7 +1563,7 @@ impl ProjectDialogs {
     fn render_clone_modal(&self, modal: &CloneModalState, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let mono = cx.theme().mono_font_family.clone();
-        let (base_dir, fallback_root, _, env_label) = self.clone_base_dirs(cx);
+        let (base_dir, fallback_root, _, env_label) = self.clone_base_dirs(self.clone.as_ref().and_then(|modal| modal.owner.as_ref()), cx);
         let raw_url = modal.url_input.read(cx).value().to_string();
         let dest_value = modal.dest_input.read(cx).value().to_string();
         let preview = compute_clone_preview(
@@ -1544,7 +1664,7 @@ impl ProjectDialogs {
                     v_flex()
                         .gap(px(6.))
                         .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Repository URL or owner/repo"))
-                        .child(Input::new(&modal.url_input))
+                        .child(Input::new(&modal.url_input).theme_slot(ThemeSlot::Input, cx))
                         .when(!preview.remote_url.is_empty(), |col| {
                             col.child(
                                 h_flex()
@@ -1678,7 +1798,7 @@ impl ProjectDialogs {
                                         }),
                                 ),
                         )
-                        .child(Input::new(&modal.dest_input))
+                        .child(Input::new(&modal.dest_input).theme_slot(ThemeSlot::Input, cx))
                         .when(!preview.directory_path.is_empty(), |col| {
                             let layout_note = if modal.ghq_layout {
                                 format!("ghq layout: {}", preview.directory_path)
@@ -1791,7 +1911,9 @@ impl ProjectDialogs {
                         .max_w(px(576.))
                         .relative()
                         .rounded(px(16.))
+                        .theme_slot(ThemeSlot::DialogPopup, cx)
                         .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                        .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::DialogPopup, px(16.), cx))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),
                             offset: point(px(0.), px(24.)),
@@ -1835,7 +1957,18 @@ impl ProjectDialogs {
         let p = palette(cx);
         let mono = cx.theme().mono_font_family.clone();
         let target = modal.targets.get(modal.selected_target_idx);
-        let target_label = target.map(|t| t.label.as_str()).unwrap_or("No machine available");
+        let state = self.state.read(cx);
+        let source_id = if modal.source_saved_id.is_empty() {
+            state.environments.active.as_deref().unwrap_or_default()
+        } else {
+            &modal.source_saved_id
+        };
+        let source_machine = crate::context_chip::environment_machine_icon(state, source_id);
+        let target_machine = target.map(|target| crate::context_chip::environment_machine_icon(state, &target.saved_id));
+        let machine_options = modal.targets.iter().enumerate().map(|(index, target)| {
+            SelectOption::new(index.to_string(), target.label.clone())
+                .icon(crate::context_chip::environment_machine_icon(state, &target.saved_id))
+        }).collect();
         let dest_path = modal.dest_input.read(cx).value().to_string();
         let ssh_url = clone_url_for_protocol(&modal.source_url, CloneProtocol::Ssh);
         let https_url = clone_url_for_protocol(&modal.source_url, CloneProtocol::Https);
@@ -1885,7 +2018,9 @@ impl ProjectDialogs {
                         .max_w(px(576.))
                         .relative()
                         .rounded(px(16.))
+                        .theme_slot(ThemeSlot::DialogPopup, cx)
                         .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                        .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::DialogPopup, px(16.), cx))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),
                             offset: point(px(0.), px(24.)),
@@ -1935,19 +2070,22 @@ impl ProjectDialogs {
                                                         .min_w_0()
                                                         .gap(px(2.))
                                                         .child(
-                                                            div()
-                                                                .text_sm()
-                                                                .font_weight(FontWeight::MEDIUM)
-                                                                .text_color(hsla(p.foreground))
-                                                                .truncate()
-                                                                .child(modal.source_label.clone()),
+                                                            h_flex().gap(px(6.)).min_w_0()
+                                                                .child(source_machine.render(px(14.), hsla(p.muted_foreground)))
+                                                                .child(div()
+                                                                    .min_w_0()
+                                                                    .text_sm()
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(hsla(p.foreground))
+                                                                    .truncate()
+                                                                    .child(modal.source_label.clone())),
                                                         )
                                                         .child(
                                                             div()
                                                                 .font_family(mono.clone())
                                                                 .text_xs()
                                                                 .text_color(hsla(p.muted_foreground))
-                                                                .truncate()
+                                                                .text_ellipsis_middle()
                                                                 .child(modal.workspace_root.clone()),
                                                         ),
                                                 )
@@ -1982,29 +2120,29 @@ impl ProjectDialogs {
                                                         .min_w_0()
                                                         .gap(px(2.))
                                                         .child(if modal.targets.len() > 1 {
-                                                            h_flex()
-                                                                .gap(px(4.))
-                                                                .flex_wrap()
-                                                                .children(modal.targets.iter().enumerate().map(|(ix, candidate)| {
-                                                                    let active = ix == modal.selected_target_idx;
-                                                                    Button::new(
-                                                                        SharedString::from(format!("machine-target-{ix}")),
-                                                                        if active { ButtonVariant::Secondary } else { ButtonVariant::Ghost },
-                                                                        ButtonSize::Xs,
-                                                                    )
-                                                                    .label(candidate.label.clone())
-                                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                                        this.select_machine_target(ix, window, cx);
-                                                                    }))
-                                                                }))
+                                                            Select::new("add-to-machine-target", machine_options)
+                                                                .selected(modal.selected_target_idx.to_string())
+                                                                .show_check()
+                                                                .disabled(modal.submitting)
+                                                                .on_change({
+                                                                    let view = cx.entity().downgrade();
+                                                                    move |value, window, cx| {
+                                                                        if let Ok(index) = value.parse() {
+                                                                            let _ = view.update(cx, |this, cx| this.select_machine_target(index, window, cx));
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .into_any_element()
                                                         } else {
-                                                            div()
-                                                                .text_sm()
-                                                                .font_weight(FontWeight::MEDIUM)
-                                                                .text_color(hsla(p.foreground))
-                                                                .truncate()
-                                                                .child(target_label.to_owned())
+                                                            h_flex().gap(px(6.)).min_w_0()
+                                                                .children(target_machine.map(|glyph| glyph.render(px(14.), hsla(p.muted_foreground))))
+                                                                .child(div()
+                                                                    .min_w_0()
+                                                                    .text_sm()
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(hsla(p.foreground))
+                                                                    .truncate()
+                                                                    .child(target.map_or_else(|| crate::i18n::t(cx, "No machine available").to_owned(), |target| target.label.clone())))
                                                                 .into_any_element()
                                                         })
                                                         .child(
@@ -2012,7 +2150,7 @@ impl ProjectDialogs {
                                                                 .font_family(mono.clone())
                                                                 .text_xs()
                                                                 .text_color(hsla(p.muted_foreground))
-                                                                .truncate()
+                                                                .text_ellipsis_middle()
                                                                 .child(dest_path),
                                                         ),
                                                 ),
@@ -2098,7 +2236,7 @@ impl ProjectDialogs {
                                                             target.map(|t| t.label.as_str()).unwrap_or("the other machine")
                                                         )),
                                                 )
-                                                .child(Input::new(&modal.dest_input)),
+                                                .child(Input::new(&modal.dest_input).theme_slot(ThemeSlot::Input, cx)),
                                         )
                                         // Copy ignored files
                                         .when(modal.can_list_files, |col| {
@@ -2143,7 +2281,7 @@ impl ProjectDialogs {
                                                             }),
                                                     )
                                                     .when(modal.truncated || !modal.file_query.is_empty(), |col| {
-                                                        col.child(Input::new(&modal.search_input))
+                                                        col.child(Input::new(&modal.search_input).theme_slot(ThemeSlot::Input, cx))
                                                     })
                                                     .child(if let Some(err) = &modal.files_error {
                                                         div()
@@ -2292,7 +2430,8 @@ impl ProjectDialogs {
                         ),
                 ),
         )
-        .with_priority(55)
+        // The shared Select defers its popup at priority 2.
+        .with_priority(1)
         .into_any_element()
     }
 }

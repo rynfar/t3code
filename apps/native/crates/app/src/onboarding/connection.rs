@@ -430,7 +430,6 @@ impl WelcomeWizard {
     pub(super) fn render_welcome_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let app = self.state.read(cx);
-        let connected = app.phase == Phase::Online(ConnectionStatus::Connected) && app.connect.pairing.is_none();
         let policy = app.server_config.config.as_ref().and_then(|config| config.managed_policy.clone());
         let sentence = match policy.as_ref().filter(|policy| policy["limits"]["telemetry"] == false) {
             Some(policy) => {
@@ -489,13 +488,6 @@ impl WelcomeWizard {
             .justify_between()
             .gap(r(24.))
             .child(telemetry_notice)
-            .child(
-                Button::new("welcome-continue", ButtonVariant::Default, ButtonSize::Default)
-                    .label("Start coding")
-                    .trailing(Icon::ArrowRight)
-                    .disabled(!connected)
-                    .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
-            )
             .into_any_element()
     }
 }

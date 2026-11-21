@@ -2,9 +2,17 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const assert = require("node:assert/strict");
-const store = path.resolve(__dirname, "../../../../../../../node_modules/.pnpm");
-const pkg = fs.readdirSync(store).find((name) => name.startsWith("ws@"));
-const WebSocketServer = require(path.join(store, pkg, "node_modules/ws")).Server;
+function wsServer() {
+  try {
+    return require("ws").Server;
+  } catch (error) {
+    if (error.code !== "MODULE_NOT_FOUND") throw error;
+    const store = path.resolve(__dirname, "../../../../../../../node_modules/.pnpm");
+    const pkg = fs.readdirSync(store).find((name) => name.startsWith("ws@"));
+    return require(path.join(store, pkg, "node_modules/ws")).Server;
+  }
+}
+const WebSocketServer = wsServer();
 const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
 const commands = new Set();
 let creates = 0,

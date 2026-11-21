@@ -14,6 +14,23 @@ use gpui_component::{ActiveTheme, h_flex, tooltip::Tooltip, v_flex};
 use serde_json::Value;
 use t3_core::composer::records::{self as rules, field};
 
+pub(crate) fn environment_machine_icon(state: &AppState, environment_id: &str) -> Icon {
+    let saved = state.environments.environments.iter().find(|saved| {
+        saved.id == environment_id || saved.environment_id.as_deref() == Some(environment_id)
+    });
+    let config = state.fleet.environments.iter().find(|entry| {
+        let owner = &entry.summary.owner;
+        owner.saved_id == environment_id
+            || owner.canonical_id.as_deref() == Some(environment_id)
+            || saved.is_some_and(|saved| owner.saved_id == saved.id)
+    }).and_then(|entry| entry.config.config.as_ref());
+    config.or_else(|| state.server_config.config.as_ref().filter(|config| {
+        config.environment.environment_id == environment_id
+            || state.environments.active.as_deref() == Some(environment_id)
+            || saved.is_some_and(|saved| state.environments.active.as_deref() == Some(&saved.id))
+    })).map_or(Icon::Server, Icon::machine)
+}
+
 fn accent(kind: &str, cx: &App) -> u32 {
     let p = palette(cx);
     match kind {
@@ -112,7 +129,7 @@ pub(crate) fn shell(
                 .environments
                 .environments
                 .iter()
-                .find(|e| e.environment_id.as_deref() == Some(field(record, "environmentId")));
+                .find(|e| e.id == field(record, "environmentId") || e.environment_id.as_deref() == Some(field(record, "environmentId")));
             if let Some(e) = environment
                 && !e.label.trim().is_empty()
             {
@@ -124,14 +141,7 @@ pub(crate) fn shell(
                 "Machine not in this app"
             }
             .into();
-            if let Some(config) = state
-                .server_config
-                .config
-                .as_ref()
-                .filter(|c| c.environment.environment_id == field(record, "environmentId"))
-            {
-                icon = Icon::machine(config);
-            }
+            icon = environment_machine_icon(state, field(record, "environmentId"));
         }
     }
     let accent_kind = if rules::pull_request(record) {
