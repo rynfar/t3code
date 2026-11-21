@@ -535,10 +535,19 @@ mod tests {
         });
 
         // Both environments receive provisional `server.getUsageSummary` requests in parallel.
-        let ((method_a, _, reply_a), (method_b, _, reply_b)) = runtime
-            .spawn(async move { futures::future::join(fixture_a.next_request(), fixture_b.next_request()).await })
-            .await
-            .unwrap();
+        async fn next_summary_request(fixture: &mut ClientFixture) -> t3_client::supervisor::FixtureRequest {
+            loop {
+                let (method, payload, reply) = fixture.next_request().await;
+                if method != t3_core::usage::method::REFRESH_PROVIDERS {
+                    return (method, payload, reply);
+                }
+                reply.send(Ok(json!({}))).unwrap();
+            }
+        }
+        let ((method_a, _, reply_a), (method_b, _, reply_b)) = futures::future::join(
+            next_summary_request(&mut fixture_a),
+            next_summary_request(&mut fixture_b),
+        ).await;
         assert_eq!(method_a, t3_core::usage::method::GET_USAGE_SUMMARY);
         assert_eq!(method_b, t3_core::usage::method::GET_USAGE_SUMMARY);
         let _ = reply_a.send(Ok(sample_summary("host-mac", "claude-sonnet-4", 12.5, 1_000)));

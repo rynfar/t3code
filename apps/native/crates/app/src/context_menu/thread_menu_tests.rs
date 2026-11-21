@@ -1923,6 +1923,9 @@ async fn scoped_settle_and_undo_use_captured_actor_without_navigation(cx:&mut gp
 async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppContext) {
     use t3_core::sidebar::grouping::{GroupConsumer, ProjectPreferences, ProjectRef};
     use t3_client::supervisor::{ClientEvent, ClientFixture, ConnectionStatus};
+    if crate::snapshot::run_test_in_isolated_home(concat!(module_path!(), "::scoped_preferences_follow_canonical_arrival")) {
+        return;
+    }
     cx.executor().allow_parking();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (state, mut active) = cx.update(|cx| project_filter_tests::install_state(cx, runtime.handle().clone()));
@@ -2006,7 +2009,8 @@ async fn scoped_preferences_follow_canonical_arrival(cx: &mut gpui::TestAppConte
         assert!(state.sidebar.fleet.thread(&t3_core::sidebar::tag_filter::ThreadKey::new("arriving", "menu-thread")).is_some());
     });
     runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())).await.unwrap().unwrap();
-    assert!(t3_client::store::load_project_preferences().scope_keys.is_empty(), "the widened scope must be persisted");
+    let persisted: ProjectPreferences = serde_json::from_value(t3_client::store::load_ui_state("sidebar-projects").expect("project preferences persisted")).unwrap();
+    assert!(persisted.scope_keys.is_empty(), "the widened scope must be persisted");
     state.update(cx, |state, cx| {
         state.set_scoped_project_scope(vec![incompatible.clone()], cx);
         state.rebuild_sidebar(cx);

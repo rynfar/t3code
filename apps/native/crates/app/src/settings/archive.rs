@@ -562,9 +562,8 @@ fn archive_groups(app: &AppState, owner: Option<&EnvironmentOwner>, snapshot: &s
 
 #[cfg(all(test, feature = "snapshot"))]
 mod tests {
-    use gpui::{Focusable, Render, Window, div, prelude::*};
+    use gpui::{Render, Window, div, prelude::*};
     use serde_json::json;
-    use t3_core::settings::archive::{ArchiveGroup, ArchivedThread};
     use t3_core::settings::search::Section;
 
     use super::*;
@@ -583,30 +582,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn archive_unarchive_and_confirmed_delete_dispatch_and_guard_pending(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let drive = |vcx: &mut gpui::VisualTestContext| {
-            vcx.run_until_parked();
-            runtime.block_on(async {
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
-            });
-            vcx.run_until_parked();
-        };
+    async fn archive_unarchive_and_confirmed_delete_dispatch_and_guard_pending(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
-        fixture
-            .grants
-            .send(Some(
-                serde_json::from_value(json!({
-                    "authenticated": true,
-                    "permissions": ["orchestration:read", "orchestration:operate"]
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        cx.run_until_parked();
+        fixture.grants.send(Some(serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "orchestration:operate"]
+        })).unwrap())).unwrap();
         cx.update(|cx| {
             crate::composer::init(cx);
             crate::keymap::init(cx);
@@ -617,96 +600,59 @@ mod tests {
         let frame_dialog = dialog.clone();
         let window = cx.add_window(|_, _| TestFrame { dialog: frame_dialog });
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
-        vcx.update(|_, cx| crate::settings::open(Section::Archived, cx));
-        drive(&mut vcx);
-        let _ = fixture.take_requests();
+        let view = vcx.update(|window, cx| {
+            crate::settings::open(Section::Archived, cx);
+            crate::settings::settings_view_for_test(window, cx).unwrap()
+        });
+        let (method, _, reply) = fixture.next_request().await;
+        assert_eq!(method, GET_ARCHIVED_SHELL_SNAPSHOT);
+        let threads = ["thread-1", "thread-2"].map(|id| json!({
+            "id": id, "projectId": "proj-1", "title": id,
+            "createdAt": "2026-11-18T00:00:00Z", "archivedAt": "2026-11-18T00:00:00Z"
+        }));
+        reply.send(Ok(json!({
+            "projects": [{ "id": "proj-1", "title": "App" }],
+            "threads": threads
+        }))).unwrap();
+        vcx.condition(&view, |view, _| matches!(view.archive.status, Status::Loaded(_))).await;
 
-        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view open"));
-        vcx.update(|_, cx| {
-            view.update(cx, |view, _| {
-                view.archive.status = Status::Loaded(vec![ArchiveGroup {
-                    project_id: "proj-1".into(),
-                    title: "App".into(),
-                    threads: vec![ArchivedThread {
-                        id: "thread-1".into(),
-                        project_id: "proj-1".into(),
-                        title: "Old migration".into(),
-                        created_at: "2026-11-18T00:00:00Z".into(),
-                        archived_at: Some("2026-11-18T00:00:00Z".into()),
-                        tags: vec![],
-                        lineage: None,
-                        delegated_from: None,
-                    }],
-                }]);
-                view.archive.sync_entries();
-            });
+        view.update(&mut vcx, |view, cx| {
+            view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
+            assert!(view.archive.pending.contains("thread-1"));
+            view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
         });
-
-        // Unarchive dispatches immediately and blocks duplicate actions while pending.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
-                assert!(view.archive.pending.contains("thread-1"));
-                view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
-            });
-        });
-        drive(&mut vcx);
-        let (requests, _) = fixture.take_requests();
-        let unarchives: Vec<_> = requests.into_iter().filter(|(m, _, _)| *m == "orchestration.dispatchCommand").collect();
-        assert_eq!(unarchives.len(), 1);
-        assert_eq!(unarchives[0].1["type"], json!("thread.unarchive"));
-        assert_eq!(unarchives[0].1["threadId"], json!("thread-1"));
-        let _ = unarchives.into_iter().next().unwrap().2.send(Ok(json!({})));
-        drive(&mut vcx);
-        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
-
-        // Delete opens confirmation first; cancelling sends nothing and releases pending.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.run_archive_action(Action::Delete, "thread-1".into(), cx);
-            });
-        });
-        drive(&mut vcx);
-        assert!(vcx.read(|cx| crate::dialog::is_open(cx)));
-        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "orchestration.dispatchCommand"));
-        vcx.update(|window, cx| {
-            let focus = dialog.focus_handle(cx);
-            window.focus(&focus, cx);
-            window.refresh();
-            window.draw(cx).clear();
-        });
-        vcx.simulate_keystrokes("escape");
-        drive(&mut vcx);
-        assert!(!vcx.read(|cx| crate::dialog::is_open(cx)));
-        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "orchestration.dispatchCommand"));
-        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
-
-        // Confirming Delete dispatches thread.delete.
-        vcx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.run_archive_action(Action::Delete, "thread-1".into(), cx);
-            });
-        });
-        drive(&mut vcx);
-        vcx.update(|window, cx| {
-            let focus = dialog.focus_handle(cx);
-            window.focus(&focus, cx);
-            window.refresh();
-            window.draw(cx).clear();
-        });
-        vcx.simulate_keystrokes("enter");
-        drive(&mut vcx);
-        let (requests, _) = fixture.take_requests();
-        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "orchestration.dispatchCommand").expect("thread.delete sent");
-        assert_eq!(payload["type"], json!("thread.delete"));
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method, method::DISPATCH_COMMAND);
+        assert_eq!(payload["type"], json!("thread.unarchive"));
         assert_eq!(payload["threadId"], json!("thread-1"));
-        let _ = reply.send(Ok(json!({})));
-        drive(&mut vcx);
-        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
+        reply.send(Ok(json!({}))).unwrap();
+        vcx.condition(&view, |view, _| !view.archive.pending.contains("thread-1")).await;
+        assert!(view.read_with(&vcx, |view, _| view.archived_title("thread-1").is_none()));
+        assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != method::DISPATCH_COMMAND));
+
+        for confirm in [false, true] {
+            vcx.update(|window, cx| {
+                view.update(cx, |view, cx| view.run_archive_action(Action::Delete, "thread-2".into(), cx));
+                assert!(crate::dialog::is_open(cx));
+                window.focus(&dialog.read(cx).initial_focus_for_test(), cx);
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != method::DISPATCH_COMMAND));
+            crate::dialog::press_confirmation_key_for_test(&mut vcx, confirm);
+            assert!(!vcx.read(|cx| crate::dialog::is_open(cx)), "confirm={confirm}");
+            if confirm {
+                let (method, payload, reply) = fixture.next_request().await;
+                assert_eq!(method, method::DISPATCH_COMMAND);
+                assert_eq!(payload["type"], json!("thread.delete"));
+                assert_eq!(payload["threadId"], json!("thread-2"));
+                reply.send(Ok(json!({}))).unwrap();
+            }
+            vcx.condition(&view, |view, _| !view.archive.pending.contains("thread-2")).await;
+            assert_eq!(view.read_with(&vcx, |view, _| view.archived_title("thread-2").is_none()), confirm);
+            assert!(fixture.take_requests().0.into_iter().all(|(method, _, _)| method != method::DISPATCH_COMMAND));
+        }
 
         state.update(&mut vcx, |state, _| state.stop_pump());
-        drop(vcx);
-        drop(fixture);
-        drop(runtime);
     }
 }

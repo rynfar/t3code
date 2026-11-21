@@ -192,6 +192,13 @@ pub(crate) fn is_open(cx: &App) -> bool {
     cx.try_global::<Host>().and_then(|host| host.0.upgrade()).is_some_and(|dialog| dialog.read(cx).is_open())
 }
 
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn press_confirmation_key_for_test(cx: &mut gpui::VisualTestContext, confirm: bool) {
+    let key = if confirm { "enter" } else { "escape" };
+    cx.simulate_keystrokes(key);
+    cx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse(key).unwrap() });
+}
+
 impl AppState {
     fn thread_title(&self, thread_id: &str) -> String {
         self.snapshot_thread(thread_id).map_or_else(|| "this thread".to_owned(), |thread| thread.title)
@@ -322,6 +329,11 @@ impl ConfirmDialog {
     pub(crate) fn set_previous_focus(&mut self, focus: Option<FocusHandle>) { self.previous_focus = focus; }
 
     pub(crate) fn is_open(&self) -> bool { self.pending.is_some() || !self.queued.is_empty() }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn initial_focus_for_test(&self) -> FocusHandle {
+        self.button_focus(self.pending.as_ref().expect("confirmation open").initial_focus).clone()
+    }
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn resolve_for_test(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {

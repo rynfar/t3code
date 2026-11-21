@@ -1048,18 +1048,20 @@ pub(crate) mod project_filter_tests {
     }
 
     pub(crate) fn install_state(cx: &mut App, runtime: tokio::runtime::Handle) -> (Entity<AppState>, ClientFixture) {
+            cx.background_executor().allow_parking();
             gpui_component::init(cx);
             crate::theme::init(cx);
+            cx.set_global(crate::settings::store::UseDefaultClientSettings);
             crate::settings::store::init(cx);
             let fixture: crate::chatgpt_setup::Fixture = serde_json::from_value(serde_json::json!({
                 "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
                 "auth":{"phase":"idle"},"install":{"phase":"idle"}
             })).unwrap();
             cx.set_global(fixture);
-        t3_client::store::save_last_thread("");
         let state = cx.new(|cx| AppState::new(runtime, cx));
         let (client, mut fixture) = ClientFixture::handle(session(true));
         state.update(cx, |state, cx| {
+            state.reset_fixture_preferences();
             state.environments = serde_json::from_value(serde_json::json!({"active":"saved-fixture", "environments":[{
                 "id":"saved-fixture","label":"Fixture","httpBase":"http://fixture.invalid","environmentId":"fixture-env"
             }]})).unwrap();

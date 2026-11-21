@@ -1396,6 +1396,7 @@ impl SidebarPane {
             .child(
                 div()
                     .id(id)
+                    .debug_selector(|| "settled-show-more".to_owned())
                     .track_focus(&focus)
                     .role(gpui::Role::Button)
                     .focus_visible(|this| this.bg(hsla(p.sidebar_row_hover)))

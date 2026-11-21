@@ -48,7 +48,18 @@ struct ClientPrefs {
 
 impl Global for ClientPrefs {}
 
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) struct UseDefaultClientSettings;
+
+#[cfg(all(test, feature = "snapshot"))]
+impl Global for UseDefaultClientSettings {}
+
 pub fn init(cx: &mut App) {
+    #[cfg(all(test, feature = "snapshot"))]
+    if cx.has_global::<UseDefaultClientSettings>() {
+        install_initial_doc(ClientSettingsDoc::default(), cx);
+        return;
+    }
     let mut doc = ClientSettingsDoc::from_json(&store::load_client_settings().unwrap_or_default());
     if !doc.entries().contains_key(t3_core::client_settings::typography::ADVANCED_KEY)
         && let Some(advanced) = store::load_ui_state("typography-advanced").and_then(|value| value.as_bool()) {
@@ -58,6 +69,10 @@ pub fn init(cx: &mut App) {
         let patch = doc.migrate_diff_layout(&legacy_panels);
         if !patch.is_empty() { store::patch_client_settings(patch); }
     }
+    install_initial_doc(doc, cx);
+}
+
+fn install_initial_doc(doc: ClientSettingsDoc, cx: &mut App) {
     crate::notifications::prepare_sounds(doc.notification_mode());
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);

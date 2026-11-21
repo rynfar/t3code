@@ -37,6 +37,25 @@ pub(crate) fn test_context() -> gpui::HeadlessAppContext {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn run_test_in_isolated_home(test: &str) -> bool {
+    const CHILD: &str = "T3_NATIVE_ISOLATED_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let home = std::env::temp_dir().join(format!("t3-native-isolated-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test.split_once("::").unwrap().1])
+        .env(CHILD, "1")
+        .env("T3_NATIVE_HOME", &home)
+        .output().unwrap();
+    std::fs::remove_dir_all(home).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("1 passed"), "Isolated test {test}: {stdout}{}", String::from_utf8_lossy(&output.stderr));
+    true
+}
+
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
