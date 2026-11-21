@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -30,20 +30,24 @@ use t3_core::pairing::{
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::access::{
     self, ACCESS_READ, ACCESS_WRITE, AccessState, ClientSession, CloudLinkState, PairingLink,
-    READ_ONLY_SCOPES, SCOPE_OPTIONS, T3ConnectTurnOn, can_configure_relay,
-    cloud_change_replaces_link, expires_label, pairing_token_body, pairing_url,
-    resolve_t3_connect_turn_on, scope_count, scope_warning, shown_scopes, standard_scopes,
+    READ_ONLY_SCOPES, SCOPE_OPTIONS, expires_label, pairing_token_body, pairing_url,
+    scope_count, scope_warning, shown_scopes, standard_scopes,
     toggle_scope,
 };
 use t3_core::settings::peer_link_create_payload;
 
-use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, muted_text, r, section, section_title};
+use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, muted_text, r, section, section_title};
 use super::source_control::{Tone, tone_badge};
 use super::worktrees::disclosure;
 use super::{Block, SettingsView, store};
 use crate::composer::controls::checkbox;
+use crate::components::motion::StatusDot;
 use crate::icons::Icon;
+use crate::i18n::t;
+use crate::theme::{ThemeSlot, ThemeSlotExt};
 use crate::theme::{hsla, palette};
+
+type SwitchHandler = Box<dyn Fn(bool, &mut Window, &mut App)>;
 
 const QR_SIZE: f32 = 168.;
 const RELAY_READ: &str = "relay:read";
@@ -109,7 +113,6 @@ impl Drop for TargetStream {
 /// The inline peer-link panel state (`LinkedEnvironmentsSettings.tsx` + `LinkMachineSelect.tsx`).
 struct LinkMachineForm {
     choice: Option<String>,
-    select_open: bool,
     address: Entity<InputState>,
     pairing_code: Entity<InputState>,
     access: String,
@@ -121,6 +124,7 @@ struct LinkMachineForm {
 
 /// The create dialog's state, open in the page.
 struct CreateLink {
+    focus: FocusHandle,
     scopes: Vec<String>,
     creating: bool,
     error: Option<String>,
@@ -146,6 +150,7 @@ struct RevokeConnectDeviceConfirm {
 }
 
 /// Resolved target environment for Sharing & access (`pingdotgg/t3code#26464`).
+#[derive(Clone)]
 struct ResolvedAccessTarget {
     saved_id: String,
     label: String,
@@ -178,6 +183,13 @@ pub(crate) struct AccessPageState {
     managed_tunnel_active: bool,
     /// Full decoded `GET /api/connect/link-state` (`pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`).
     cloud_link_state: Option<CloudLinkState>,
+    cloud_details: t3_core::mcp::gate::CloudLinkState,
+    relay_saving: bool,
+    endpoints_open: bool,
+    endpoint_preference: Option<String>,
+    qr_endpoint: Option<String>,
+    dialog_target: Option<ResolvedAccessTarget>,
+    revoke_focus: Option<FocusHandle>,
     /// Keyed by `(saved_id, connection_generation)`.
     link_state_task: Option<(String, u64, Task<()>)>,
     create: Option<CreateLink>,
@@ -221,6 +233,13 @@ impl AccessPageState {
             extras_watcher: None,
             managed_tunnel_active: false,
             cloud_link_state: None,
+            cloud_details: Default::default(),
+            relay_saving: false,
+            endpoints_open: false,
+            endpoint_preference: None,
+            qr_endpoint: None,
+            dialog_target: None,
+            revoke_focus: None,
             link_state_task: None,
             create: None,
             link_machine: None,
@@ -244,6 +263,9 @@ impl AccessPageState {
 
     /// Resets per-target state when switching to a different environment (`pingdotgg/t3code#26464`).
     fn reset_target(&mut self, next_target: Option<String>) {
+        self.endpoint_preference = next_target.as_ref().and_then(|id| {
+            t3_client::store::load_ui_state(&format!("preferred-endpoint:{id}")).and_then(|value| value.as_str().map(str::to_owned))
+        });
         self.active_target = next_target;
         self.target_client = None;
         self.target_client_task = None;
@@ -254,6 +276,12 @@ impl AccessPageState {
         self.extras_watcher = None;
         self.managed_tunnel_active = false;
         self.cloud_link_state = None;
+        self.cloud_details = Default::default();
+        self.relay_saving = false;
+        self.qr_endpoint = None;
+        self.dialog_target = None;
+        self.revoke_focus = None;
+        self.endpoints_open = false;
         self.link_state_task = None;
         self.create = None;
         self.link_machine = None;
@@ -275,6 +303,13 @@ impl AccessPageState {
     pub(super) fn close(&mut self) {
         self.stream = None;
         self.extras_watcher = None;
+        self.cloud_details = Default::default();
+        self.relay_saving = false;
+        self.qr_endpoint = None;
+        self.dialog_target = None;
+        self.create = None;
+        self.revoke_device_confirm = None;
+        self.revoke_focus = None;
         self.link_state_task = None;
         self.ticker = None;
         self.target_client_task = None;
@@ -345,6 +380,50 @@ fn effective_pairing_address<'a>(address: &'a str, direct_endpoints: &'a [String
         return endpoint.as_str();
     }
     address
+}
+
+fn pairing_endpoints(target: &ResolvedAccessTarget) -> Vec<String> {
+    collect_known_machine_urls(target.extras.direct_endpoints.iter().map(String::as_str).chain(std::iter::once(target.address.as_str())))
+}
+
+fn use_in_another_app_action(target: &ResolvedAccessTarget, cx: &App) -> Button {
+    let mcp_id = target.config.as_ref().map(|config| config.environment.environment_id.clone())
+        .filter(|id| !id.is_empty()).unwrap_or_else(|| target.saved_id.clone());
+    Button::new("access-use-in-another-app", ButtonVariant::Outline, ButtonSize::Compact)
+        .icon(Icon::Blocks)
+        .label(t(cx, "Use in another app (MCP)"))
+        .on_click(move |_, window, cx| crate::mcp::open_use_in_another_app(Some(mcp_id.clone()), window.window_handle(), cx))
+}
+
+fn access_scope_summary(id: SharedString, scopes: &[String], cx: &App) -> AnyElement {
+    let labels = scopes.iter().map(|scope| {
+        SCOPE_OPTIONS.iter().find(|(key, _, _)| key == scope)
+            .map_or(scope.as_str(), |(_, label, _)| t(cx, label))
+    }).collect::<Vec<_>>();
+    div().id(id)
+        .text_xs().text_color(hsla(palette(cx).muted_foreground))
+        .when(!labels.is_empty(), |el| el.tooltip(super::controls::tooltip(labels.join("
+").into())))
+        .child(scope_count(scopes)).into_any_element()
+}
+
+pub(super) fn session_permissions(session: Option<&AuthSessionState>, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    let Some(session) = session else {
+        return muted_text(t(cx, "Checking permissions…"), cx).into_any_element();
+    };
+    v_flex().gap(r(8.))
+        .child(muted_text(t(cx, "These permissions apply to this client’s current connection."), cx))
+        .child(v_flex().gap(r(4.)).children(SCOPE_OPTIONS.chunks(2).map(|pair| {
+            h_flex().items_start().gap(r(14.)).children(pair.iter().map(|(scope, title, _)| {
+                let allowed = session.grants(scope);
+                h_flex().flex_1().min_w_0().justify_between().gap(r(4.)).text_xs()
+                    .child(div().text_color(hsla(p.foreground)).child(t(cx, title)))
+                    .child(div().flex_none().text_color(hsla(if allowed { p.success_foreground } else { p.muted_foreground }))
+                        .child(t(cx, if allowed { "Allowed" } else { "Not granted" })))
+            }))
+        })))
+        .into_any_element()
 }
 
 impl SettingsView {
@@ -629,22 +708,34 @@ impl SettingsView {
         }
         let runtime = self.state.read(cx).runtime().clone();
         let expected = target_id.clone();
-        let fetch = runtime.spawn(async move { client.get_access("/api/connect/link-state").await });
         let task = cx.spawn(async move |this, cx| {
-            let link_state = fetch.await.ok().and_then(|res| res.ok()).map(|body| {
-                let mut decoded = serde_json::from_value::<CloudLinkState>(body.clone()).unwrap_or_default();
-                if body.get("managedTunnelActive").is_none() {
-                    decoded.managed_tunnel_active = decoded.linked && !decoded.link_revoked;
-                }
-                decoded
-            });
-            let _ = this.update(cx, |this, cx| {
-                if this.access.active_target.as_deref() == Some(expected.as_str()) {
-                    this.access.managed_tunnel_active = link_state.as_ref().is_some_and(|s| s.managed_tunnel_active);
+            loop {
+                let client = client.clone();
+                let fetch = runtime.spawn(async move { client.get_access("/api/connect/link-state").await });
+                let body = fetch.await.ok().and_then(Result::ok);
+                let link_state = body.as_ref().and_then(|body| serde_json::from_value::<CloudLinkState>(body.clone()).ok()).map(|mut decoded| {
+                    if body.as_ref().is_some_and(|body| body.get("managedTunnelActive").is_none()) {
+                        decoded.managed_tunnel_active = decoded.linked && !decoded.link_revoked;
+                    }
+                    decoded
+                });
+                let details = body.and_then(|body| serde_json::from_value(body).ok()).unwrap_or_default();
+                if !this.update(cx, |this, cx| {
+                    if this.access.active_target.as_deref() != Some(expected.as_str())
+                        || !this.access.link_state_task.as_ref().is_some_and(|(_, current, _)| *current == generation)
+                    {
+                        return false;
+                    }
+                    this.access.managed_tunnel_active = link_state.as_ref().is_some_and(|state| state.managed_tunnel_active);
                     this.access.cloud_link_state = link_state;
+                    this.access.cloud_details = details;
                     cx.notify();
+                    true
+                }).unwrap_or(false) {
+                    break;
                 }
-            });
+                cx.background_executor().timer(Duration::from_secs(30)).await;
+            }
         });
         self.access.link_state_task = Some((target_id, generation, task));
     }
@@ -901,12 +992,192 @@ impl SettingsView {
                     store::show_error(format!("Could not revoke access: {error}"), cx);
                 } else {
                     this.access.revoke_device_confirm = None;
+                    this.access.revoke_focus = None;
                 }
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn access_network_row(&self, target: &ResolvedAccessTarget, cx: &Context<Self>) -> AnyElement {
+        let network_accessible = is_server_network_accessible(
+            target.extras.auth_policy.as_deref(),
+            target.extras.direct_endpoints.len(),
+        );
+        let network_reason = t(cx, "Change network exposure where this server starts.");
+        let tailscale_reason = t(cx, "Configure Tailscale HTTPS on the server host.");
+        let tailscale = target.extras.direct_endpoint_entries.iter().any(|endpoint| {
+            endpoint.kind.as_deref() == Some("tailnet") && endpoint.http_base_url.starts_with("https://")
+        });
+        let p = palette(cx);
+        let candidates = pairing_endpoints(target);
+        let default = t3_core::pairing::origin_of(effective_pairing_address(&target.address, &target.extras.direct_endpoints));
+        let current = self.access.endpoint_preference.as_ref()
+            .filter(|origin| candidates.contains(origin))
+            .or_else(|| default.as_ref().filter(|origin| candidates.contains(origin)))
+            .or_else(|| candidates.first());
+        let id = target.saved_id.clone();
+        let toggle = Button::new("access-show-endpoints", ButtonVariant::GhostMuted, ButtonSize::Xs)
+            .label(t(cx, if self.access.endpoints_open { "Hide addresses" } else { "Show addresses" }))
+            .icon(if self.access.endpoints_open { Icon::ChevronDown } else { Icon::ChevronRight })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.access.endpoints_open = !this.access.endpoints_open;
+                cx.notify();
+            }));
+        let details = v_flex().gap(r(6.))
+            .when(!candidates.is_empty(), |el| el.child(div().child(toggle)))
+            .when(self.access.endpoints_open, |el| el.children(candidates.iter().map(|origin| {
+                let is_default = current == Some(origin);
+                let selected = origin.clone();
+                let target_id = id.clone();
+                h_flex().w_full().gap(r(8.))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(origin.clone()))
+                    .child(Button::new(SharedString::from(format!("prefer-{origin}")), ButtonVariant::Outline, ButtonSize::Xs)
+                        .label(t(cx, if is_default { "Default" } else { "Set as default" })).disabled(is_default)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.access.active_target.as_deref() == Some(&target_id) {
+                                this.access.endpoint_preference = Some(selected.clone());
+                                t3_client::store::save_ui_state(&format!("preferred-endpoint:{target_id}"), &json!(selected));
+                                cx.notify();
+                            }
+                        })))
+            })))
+            .children(self.pairing_denial_for(target.config.as_ref()).filter(|_| !network_accessible)
+                .map(|reason| crate::components::managed::notice(reason, cx)));
+        let network = Row::new("access-network", t(cx, "Network access"))
+            .description(t(cx, if network_accessible { "Remote access is configured." } else { "No remote address is advertised." }))
+            .control(div().id("access-network-control-hint").tooltip(super::controls::tooltip(network_reason.into()))
+                .child(Switch::new("access-network-switch", network_accessible).disabled(true)))
+            .below(details);
+        let tailscale = Row::new("access-tailscale-serve", t(cx, "Tailscale HTTPS"))
+            .description(tailscale_reason)
+            .control(div().id("access-tailscale-control-hint").tooltip(super::controls::tooltip(tailscale_reason.into()))
+                .child(Switch::new("access-tailscale-switch", tailscale).disabled(true)));
+        v_flex().child(network).child(div().border_t_1().border_color(hsla(p.border).opacity(0.5)).child(tailscale)).into_any_element()
+    }
+
+    fn access_relay_rows(&self, target: &ResolvedAccessTarget, link: &CloudLinkState, cx: &Context<Self>) -> Vec<AnyElement> {
+        let policy = target.config.as_ref().and_then(|config| config.managed_policy.as_ref());
+        let denial = t3_core::managed_policy::capability_denial(policy, t3_core::managed_policy::Capability::Connect);
+        let can_manage = target.client.is_some() && target.grants.as_ref().is_some_and(|grants| {
+            grants.grants(RELAY_READ) && grants.grants(RELAY_WRITE)
+        });
+        let disabled = |needs_link: bool| -> Option<String> {
+            if self.access.relay_saving {
+                Some(t(cx, "A T3 Connect change is in progress.").to_owned())
+            } else if !can_manage {
+                Some(t(cx, "This connection cannot manage T3 Connect.").to_owned())
+            } else if needs_link {
+                Some(denial.clone().unwrap_or_else(|| t(cx, "Run `t3 connect link` on the server host to configure this connection.").to_owned()))
+            } else {
+                None
+            }
+        };
+        let make_switch = |id, checked, reason: Option<String>, handler: SwitchHandler| {
+            div().id((gpui::ElementId::from(id), "tooltip"))
+                .when_some(reason.clone(), |el, reason| el.tooltip(super::controls::tooltip(reason.into())))
+                .child(Switch::new(id, checked).disabled(reason.is_some()).on_change(handler))
+        };
+        let current_hold = self.access.cloud_details.hold_webhooks_while_offline;
+        let (client, id) = (target.client.clone(), target.saved_id.clone());
+        let unlink = {
+            let entity = cx.entity().downgrade();
+            let (client, id) = (client.clone(), id.clone());
+            Box::new(move |_, _: &mut Window, cx: &mut App| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/unlink", None, cx);
+                });
+            })
+        };
+        let publish = {
+            let entity = cx.entity().downgrade();
+            let (client, id) = (client.clone(), id.clone());
+            let tunnel = link.managed_tunnel_active;
+            Box::new(move |enabled: bool, _: &mut Window, cx: &mut App| {
+                let path = if !enabled && !tunnel { "/api/connect/unlink" } else { "/api/connect/preferences" };
+                let body = (path == "/api/connect/preferences").then(|| json!({"publishAgentActivity": enabled}));
+                let _ = entity.update(cx, |this, cx| {
+                    this.mutate_access_relay(client.clone(), id.clone(), path, body, cx);
+                });
+            })
+        };
+        let hold = {
+            let entity = cx.entity().downgrade();
+            let (client, id) = (client.clone(), id.clone());
+            let publish = link.publish_agent_activity;
+            Box::new(move |enabled: bool, _: &mut Window, cx: &mut App| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.mutate_access_relay(client.clone(), id.clone(), "/api/connect/preferences", Some(json!({
+                        "publishAgentActivity": publish, "holdWebhooksWhileOffline": enabled,
+                    })), cx);
+                });
+            })
+        };
+        let tunnel_reason = disabled(!link.managed_tunnel_active || link.publish_agent_activity);
+        let publish_reason = if !link.publish_agent_activity { denial.clone() } else { None }
+            .or_else(|| disabled(!link.linked || link.link_revoked));
+        let check_client = target.client.clone();
+        let check_id = target.saved_id.clone();
+        let can_check = check_client.is_some() && target.grants.as_ref().is_some_and(|grants| grants.grants(RELAY_READ));
+        let reachability = match &self.access.cloud_details.reachability {
+            Some(t3_core::mcp::gate::ConnectReachability::Reachable { .. }) => vec![t(cx, "Reachable").to_owned()],
+            Some(reachability) => reachability.unreachable_info().map(|info| {
+                [Some(info.reason), info.hint, Some(info.fix)].into_iter().flatten().filter(|text| !text.is_empty()).collect()
+            }).unwrap_or_default(),
+            None => vec![t(cx, "No reachability check yet.").to_owned()],
+        };
+        let connect = Row::new("access-relay-configure", "T3 Connect")
+            .description(t(cx, if link.managed_tunnel_active { "The environment is linked to T3 Connect." } else { "Run `t3 connect link` on the server host to enable access." }))
+            .control(make_switch("access-relay-switch", link.managed_tunnel_active, tunnel_reason, unlink))
+            .below(v_flex().gap(r(4.)).when(link.managed_tunnel_active, |el| {
+                el.children(reachability.into_iter().map(|text| muted_text(text, cx)))
+                    .child(div().child(Button::new("access-check-reachability", ButtonVariant::Outline, ButtonSize::Xs)
+                        .label(t(cx, "Check reachability")).disabled(!can_check || self.access.relay_saving)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mutate_access_relay(check_client.clone(), check_id.clone(), "/api/connect/reachability", None, cx);
+                        }))))
+            }));
+        let mut rows = vec![connect.into_any_element(), Row::new("access-publish-activity", t(cx, "Publish agent activity"))
+            .description(t(cx, "Send activity to mobile notifications and Live Activities."))
+            .control(make_switch("access-publish-activity-switch", link.publish_agent_activity, publish_reason, publish))
+            .into_any_element()];
+        if link.managed_tunnel_active {
+            let reason = if current_hold.is_none() {
+                Some(t(cx, "This server does not report a webhook queue preference.").to_owned())
+            } else {
+                disabled(false)
+            };
+            rows.push(Row::new("access-hold-webhooks", t(cx, "Hold webhooks while offline"))
+                .control(make_switch("access-hold-webhooks-switch", current_hold.unwrap_or(false), reason, hold)).into_any_element());
+        }
+        rows
+    }
+
+    fn mutate_access_relay(
+        &mut self, client: Option<ClientHandle>, id: String, path: &'static str, body: Option<Value>, cx: &mut Context<Self>,
+    ) {
+        if self.access.relay_saving || client.is_none() { return; }
+        self.access.relay_saving = true;
+        self.access_post_on(client, id, path, body, cx, move |this, result, cx| {
+            this.access.relay_saving = false;
+            match result {
+                Ok(value) if path == "/api/connect/reachability" => {
+                    this.access.cloud_details.reachability = serde_json::from_value(value).ok();
+                }
+                Ok(_) => {
+                    this.access.link_state_task = None;
+                    if path == "/api/connect/unlink" {
+                        this.state.update(cx, |state, cx| state.refresh_cloud(cx));
+                    }
+                }
+                Err(error) => {
+                    this.access.link_state_task = None;
+                    store::show_error(error, cx);
+                }
+            }
+        });
     }
 
     pub(super) fn access_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
@@ -916,6 +1187,12 @@ impl SettingsView {
                 .description("Connect an environment to view its settings and access.");
             return vec![Block::new(&["connections-environment"], section("Primary environment", vec![row.into_any_element()], cx))];
         };
+        self.access.dialog_target = Some(target.clone());
+        if self.access.revoke_device_confirm.is_some() && self.access.revoke_focus.is_none() {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            self.access.revoke_focus = Some(focus);
+        }
         self.ensure_target_watchers(&target, cx);
         self.ensure_target_access_stream(&target, cx);
         let now = now_ms();
@@ -929,11 +1206,15 @@ impl SettingsView {
         if candidates.len() > 1 {
             let options: Vec<SelectOption> = candidates
                 .iter()
-                .map(|(candidate, label)| SelectOption::new(candidate.id.clone(), label.clone()))
+                .map(|(candidate, label)| {
+                    let config = self.state.read(cx).fleet.environment(&candidate.id).and_then(|view| view.config.config.as_ref());
+                    SelectOption::new(candidate.id.clone(), label.clone()).icon(config.map_or(Icon::Server, Icon::machine))
+                })
                 .collect();
             let entity = cx.entity().downgrade();
             let select = Select::new("access-environment-select", options)
                 .selected(target.saved_id.clone())
+                .show_check()
                 .on_change(move |next: SharedString, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         this.access.selected_env = Some(next.to_string());
@@ -962,35 +1243,14 @@ impl SettingsView {
             .map(|c| c.environment.server_version.as_str())
             .filter(|v| !v.is_empty())
             .unwrap_or("unknown");
-        let version = Row::new("access-version", "Version")
-            .description(format!("{server_version} \u{00b7} {}", target.address))
-            .into_any_element();
-
-        // Network reachability note (`pingdotgg/t3code#35543`): Tailscale Serve direct endpoints make
-        // a loopback server network-accessible rather than local-only.
-        let network_accessible = is_server_network_accessible(
-            target.extras.auth_policy.as_deref(),
-            target.extras.direct_endpoints.len(),
-        );
-        let network_desc = if network_accessible {
-            "Remote access is configured. Change network exposure where the server starts."
-        } else if target.extras.auth_policy.as_deref() == Some("loopback-browser") {
-            "Only this machine can connect. Restart with a non-loopback host or publish through Tailscale Serve for remote pairing."
-        } else if target.is_primary {
-            "Local environment access is active on this machine."
-        } else {
-            "Connected to a saved remote environment."
-        };
-        let remote_denial = self.pairing_denial_for(target.config.as_ref());
-        let mut network_row = Row::new("access-network", "Network access").description(network_desc);
-        if let Some(reason) = remote_denial.filter(|_| !network_accessible) {
-            network_row = network_row.below(
-                div()
-                    .pb(r(8.))
-                    .child(crate::components::managed::notice(reason, cx)),
-            );
+        let mut version = Row::new("access-version", t(cx, "Version"))
+            .description(format!("{server_version} \u{00b7} {}", target.address));
+        if let Some(update) = self.access_server_update_button(&target.saved_id, cx) {
+            version = version.control(update);
         }
-        let network = network_row.into_any_element();
+        let version = version.into_any_element();
+
+        let network = self.access_network_row(&target, cx);
 
         let can_read = Self::target_may(target.grants.as_ref(), ACCESS_READ);
         let can_write = Self::target_may(target.grants.as_ref(), ACCESS_WRITE);
@@ -1002,55 +1262,8 @@ impl SettingsView {
         let permissions = disclosure("access-permissions", "Permissions", self.access.permissions_open, vec![self.permissions_row(target.grants.as_ref(), cx)], toggle, cx);
 
         let mut machine_rows = vec![version, network];
-        // T3 Connect relay configuration access (`pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`):
-        // linking or replacing a relay configuration requires `relay:configure`; remote clients
-        // carrying `relay:read` + `relay:write` + `relay:configure` are allowed to link.
-        if let Some(link_state) = &self.access.cloud_link_state {
-            let policy = target.config.as_ref().and_then(|c| c.managed_policy.as_ref());
-            let connect_denial = t3_core::managed_policy::capability_denial(
-                policy,
-                t3_core::managed_policy::Capability::Connect,
-            );
-            let can_read_relay = Self::target_may(target.grants.as_ref(), RELAY_READ);
-            let can_write_relay = Self::target_may(target.grants.as_ref(), RELAY_WRITE);
-            let has_configure_relay = target.grants.as_ref().is_some_and(can_configure_relay);
-            let needs_configure = !has_configure_relay
-                && cloud_change_replaces_link(
-                    link_state,
-                    !link_state.managed_tunnel_active,
-                    link_state.publish_agent_activity,
-                );
-            let turn_on = resolve_t3_connect_turn_on(
-                link_state.linkable_here.unwrap_or(true),
-                true,
-                can_read_relay,
-                can_write_relay,
-                has_configure_relay,
-                connect_denial.as_deref(),
-            );
-            let relay_desc = match turn_on {
-                T3ConnectTurnOn::Policy(reason) => Some(reason),
-                T3ConnectTurnOn::Here if link_state.managed_tunnel_active => {
-                    Some("T3 Connect is linked and configurable from this client.".to_owned())
-                }
-                T3ConnectTurnOn::Here => {
-                    Some("This client has relay configuration permission to link T3 Connect.".to_owned())
-                }
-                T3ConnectTurnOn::OnHost if needs_configure => {
-                    Some("This connection needs the relay configuration permission to configure T3 Connect.".to_owned())
-                }
-                T3ConnectTurnOn::OnHost if link_state.link_revoked => {
-                    Some("This environment was removed from T3 Connect. Run `t3 connect link` on the host to link it again.".to_owned())
-                }
-                T3ConnectTurnOn::OnHost => None,
-            };
-            if let Some(desc) = relay_desc {
-                machine_rows.push(
-                    Row::new("access-relay-configure", "T3 Connect")
-                        .description(desc)
-                        .into_any_element(),
-                );
-            }
+        if let Some(link) = self.access.cloud_link_state.as_ref() {
+            machine_rows.extend(self.access_relay_rows(&target, link, cx));
         }
         // `ConnectionsSettings.tsx:1304-1311` + `SavedEnvironmentRows.tsx:746`: render the
         // T3 Connect device-approval switch only when the managed tunnel is active and the server
@@ -1095,10 +1308,6 @@ impl SettingsView {
             machine_rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::attribution(policy, cx)).into_any_element());
         }
         blocks.push(Block::new(&["connections-environment"], section(target.label.clone(), machine_rows, cx)));
-
-        if let Some(confirm_panel) = self.revoke_connect_confirm_panel(&target, cx) {
-            blocks.push(Block::new(&["connect-revoke-confirm"], confirm_panel));
-        }
 
         if can_read || can_write {
             blocks.push(Block::new(&["authorized-clients"], self.authorized_clients(&target, now, window, cx)));
@@ -1164,28 +1373,7 @@ impl SettingsView {
 
     /// The "Permissions" disclosure's content: each scope and whether this connection has it.
     fn permissions_row(&self, session: Option<&AuthSessionState>, cx: &App) -> AnyElement {
-        let p = palette(cx);
-        let body: AnyElement = match session {
-            None => muted_text("Checking permissions\u{2026}", cx).into_any_element(),
-            Some(session) => v_flex()
-                .gap(r(4.))
-                .children(SCOPE_OPTIONS.iter().map(|(scope, title, _)| {
-                    let allowed = session.grants(scope);
-                    h_flex()
-                        .justify_between()
-                        .text_xs()
-                        .child(div().text_color(hsla(p.foreground)).child(*title))
-                        .child(div().text_color(if allowed { hsla(p.success_foreground) } else { hsla(p.muted_foreground) }).child(if allowed { "Allowed" } else { "Not granted" }))
-                }))
-                .into_any_element(),
-        };
-        v_flex()
-            .px(r(16.))
-            .py(r(12.))
-            .gap(r(8.))
-            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("These permissions apply to this client\u{2019}s current connection."))
-            .child(div().max_w(r(420.)).child(body))
-            .into_any_element()
+        session_permissions(session, cx)
     }
 
     fn authorized_clients(&mut self, target: &ResolvedAccessTarget, now: i64, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1260,7 +1448,9 @@ impl SettingsView {
                                 let allowed = |scope: &str| grants_for_create.as_ref().is_none_or(|session| session.grants(scope));
                                 let scopes = standard_scopes().into_iter().filter(|scope| allowed(scope)).collect();
                                 this.access.label.update(cx, |input, cx| input.set_value("", window, cx));
-                                this.access.create = Some(CreateLink { scopes, creating: false, error: None });
+                                let focus = cx.focus_handle();
+                                this.access.label.read(cx).focus_handle(cx).focus(window, cx);
+                                this.access.create = Some(CreateLink { focus, scopes, creating: false, error: None });
                                 cx.notify();
                             })),
                     ),
@@ -1280,8 +1470,11 @@ impl SettingsView {
             s
         };
 
+        let mcp = use_in_another_app_action(target, cx);
         let header = h_flex()
             .justify_between()
+            .gap(r(6.))
+            .flex_wrap()
             .pr(r(8.))
             .child(
                 h_flex()
@@ -1301,15 +1494,14 @@ impl SettingsView {
                         this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(summary))
                     }),
             )
-            .children(actions);
+            .child(h_flex().gap(r(6.)).flex_wrap().child(mcp).children(actions));
 
-        let effective_address = effective_pairing_address(&target.address, &target.extras.direct_endpoints);
+        let effective_address = self.access.endpoint_preference.as_deref()
+            .filter(|origin| pairing_endpoints(target).iter().any(|candidate| candidate == origin))
+            .unwrap_or_else(|| effective_pairing_address(&target.address, &target.extras.direct_endpoints));
         let mut rows: Vec<AnyElement> = Vec::new();
         if let Some(reason) = denial {
             rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::notice(reason, cx)).into_any_element());
-        }
-        if let Some(create) = &self.access.create && !denied {
-            rows.push(self.create_link_panel(create, target, cx));
         }
         if self.access.link_machine.is_some() && !denied {
             rows.push(self.link_machine_panel(target, cx));
@@ -1347,71 +1539,76 @@ impl SettingsView {
         container.into_any_element()
     }
 
-    /// Confirmation banner when revoking a Connect device, `cloud-connect` session, or other
-    /// clients while device approval is turned off (`RevokeConnectDeviceDialog.tsx`).
-    fn revoke_connect_confirm_panel(&self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn dismiss_access_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.access.create.is_none() && self.access.revoke_device_confirm.is_none() {
+            return false;
+        }
+        if self.access.create.as_ref().is_some_and(|create| create.creating)
+            || self.access.revoke_device_confirm.as_ref().is_some_and(|confirm| confirm.busy)
+        {
+            return true;
+        }
+        self.access.create = None;
+        self.access.revoke_device_confirm = None;
+        self.access.revoke_focus = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn access_dialog_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let target = self.access.dialog_target.as_ref()?;
+        let frame = if let Some(create) = self.access.create.as_ref() {
+            self.create_link_frame(create, target, cx)
+        } else {
+            self.revoke_connect_frame(target, cx)?
+        };
+        let weak = cx.entity().downgrade();
+        Some(frame.render(window, move |window, cx| {
+            let _ = weak.update(cx, |this, cx| { this.dismiss_access_dialog(window, cx); });
+        }, cx))
+    }
+
+    fn revoke_connect_frame(&self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> Option<DialogFrame> {
         let confirm = self.access.revoke_device_confirm.as_ref()?;
         let p = palette(cx);
         let confirm_client = target.client.clone();
         let confirm_target = target.saved_id.clone();
         let checked = confirm.turn_on_approval;
         let busy = confirm.busy;
-        let card = v_flex()
-            .px(r(16.))
-            .py(r(14.))
-            .gap(r(10.))
-            .rounded(r(12.))
-            .border_1()
-            .border_color(hsla(p.warning).opacity(0.35))
-            .bg(hsla(p.muted).opacity(0.25))
-            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(confirm.title.clone()))
-            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                "Approval for new devices is off, so a revoked device signed in to your T3 Connect account can connect again on its own.",
-            ))
-            .child(
-                h_flex()
-                    .id("revoke-connect-turn-on-approval")
-                    .items_start()
-                    .gap(r(8.))
-                    .when(!busy, |this| this.cursor_pointer())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(confirm) = this.access.revoke_device_confirm.as_mut().filter(|c| !c.busy) {
-                            confirm.turn_on_approval = !confirm.turn_on_approval;
-                        }
-                        cx.notify();
-                    }))
-                    .child(div().pt(r(2.)).child(checkbox(checked, cx)))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Require approval for new devices"))
-                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("The device has to be approved here before it can connect again.")),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap(r(8.))
-                    .child(
-                        Button::new("revoke-connect-cancel", ButtonVariant::Outline, ButtonSize::Compact)
-                            .label("Cancel")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.access.revoke_device_confirm = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("revoke-connect-confirm", ButtonVariant::DestructiveOutline, ButtonSize::Compact)
-                            .label(if busy { "Revoking\u{2026}" } else { "Revoke" })
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.confirm_revoke_connect_device(confirm_client.clone(), confirm_target.clone(), cx);
-                            })),
-                    ),
-            )
-            .into_any_element();
-        Some(card)
+        let focus = self.access.revoke_focus.clone()?;
+        let body = h_flex()
+            .id("revoke-connect-turn-on-approval")
+            .items_start().gap(r(8.))
+            .when(!busy, |this| this.cursor_pointer())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(confirm) = this.access.revoke_device_confirm.as_mut().filter(|confirm| !confirm.busy) {
+                    confirm.turn_on_approval = !confirm.turn_on_approval;
+                }
+                cx.notify();
+            }))
+            .child(div().pt(r(2.)).child(checkbox(checked, cx)))
+            .child(v_flex().min_w_0()
+                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(t(cx, "Require approval for new devices")))
+                .child(muted_text(t(cx, "The device has to be approved here before it can connect again."), cx)));
+        Some(DialogFrame {
+            id: "connect-revoke-confirm",
+            title: confirm.title.clone().into(),
+            description: t(cx, "Approval for new devices is off, so a revoked device signed in to your T3 Connect account can connect again on its own.").into(),
+            max_width: 448.,
+            body: body.into_any_element(),
+            footer: dialog_footer(true, vec![
+                Button::new("revoke-connect-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, "Cancel")).disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| { this.dismiss_access_dialog(window, cx); })).into_any_element(),
+                Button::new("revoke-connect-confirm", ButtonVariant::Destructive, ButtonSize::Sm)
+                    .label(t(cx, if busy { "Revoking…" } else { "Revoke" })).disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.confirm_revoke_connect_device(confirm_client.clone(), confirm_target.clone(), cx);
+                    })).into_any_element(),
+            ], cx).into_any_element(),
+            focus,
+        })
     }
 
     /// Pending T3 Connect approval requests and trusted Connect devices
@@ -1582,7 +1779,9 @@ impl SettingsView {
             machines.push(LinkableMachine {
                 environment_id: env_id,
                 label: if env.label.trim().is_empty() { env.address() } else { env.label.clone() },
-                machine: None,
+                machine: fleet_view.and_then(|view| view.config.config.as_ref()).and_then(|config| {
+                    config.settings.environment_icon.clone().or_else(|| config.environment.platform.as_ref().map(|platform| platform.machine.clone()))
+                }),
                 urls,
                 connected,
                 connect_only: false,
@@ -1630,7 +1829,6 @@ impl SettingsView {
         ];
         self.access.link_machine = Some(LinkMachineForm {
             choice: None,
-            select_open: false,
             address,
             pairing_code,
             access: "approval-required".to_owned(),
@@ -1814,7 +2012,6 @@ impl SettingsView {
         let typed_code = form.pairing_code.read(cx).value().trim().to_owned();
         let can_mint = machine.is_some_and(|m| !needs_address && m.connected && !form.mint_failed.contains(&m.environment_id));
         let ready = selected.is_some() && (!needs_address || !typed_address.is_empty()) && (can_mint || !typed_code.is_empty());
-        let entity_toggle = cx.entity().downgrade();
         let entity_select = cx.entity().downgrade();
         let submit_target = ResolvedAccessTarget {
             saved_id: target.saved_id.clone(),
@@ -1844,21 +2041,11 @@ impl SettingsView {
                     "access-link-machine-select",
                     &machines,
                     selected,
-                    form.select_open,
                     form.submitting,
-                    move |_, cx| {
-                        let _ = entity_toggle.update(cx, |this, cx| {
-                            if let Some(form) = this.access.link_machine.as_mut() {
-                                form.select_open = !form.select_open;
-                            }
-                            cx.notify();
-                        });
-                    },
                     move |next, _, cx| {
                         let _ = entity_select.update(cx, |this, cx| {
                             if let Some(form) = this.access.link_machine.as_mut() {
                                 form.choice = Some(next);
-                                form.select_open = false;
                                 form.error = None;
                             }
                             cx.notify();
@@ -1872,7 +2059,7 @@ impl SettingsView {
                     v_flex()
                         .gap(r(6.))
                         .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Address"))
-                        .child(Input::new(&form.address).small().disabled(form.submitting)),
+                        .child(Input::new(&form.address).small().disabled(form.submitting).theme_slot(ThemeSlot::Input, cx)),
                 )
             })
             .when(needs_address && !typed_address.is_empty(), |this| {
@@ -1883,9 +2070,21 @@ impl SettingsView {
                     v_flex()
                         .gap(r(6.))
                         .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Pairing code"))
-                        .child(Input::new(&form.pairing_code).small().disabled(form.submitting)),
+                        .child(Input::new(&form.pairing_code).small().disabled(form.submitting).theme_slot(ThemeSlot::Input, cx)),
                 )
             })
+            .child(crate::connect::link_access_picker("access-link-level", &form.access, form.submitting,
+                {
+                    let weak = cx.entity().downgrade();
+                    move |next, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if let Some(form) = this.access.link_machine.as_mut() {
+                                form.access = next.to_string();
+                                cx.notify();
+                            }
+                        });
+                    }
+                }, cx))
             .children(form.error.clone().map(|error| div().text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
             .child(
                 h_flex()
@@ -1912,7 +2111,7 @@ impl SettingsView {
             .into_any_element()
     }
 
-    fn create_link_panel(&self, create: &CreateLink, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> AnyElement {
+    fn create_link_frame(&self, create: &CreateLink, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> DialogFrame {
         let p = palette(cx);
         let grants = target.grants.clone();
         let allowed = move |scope: &str| grants.as_ref().is_none_or(|session| session.grants(scope));
@@ -1933,23 +2132,12 @@ impl SettingsView {
         let submit_client = target.client.clone();
         let submit_target = target.saved_id.clone();
         let denied = self.pairing_denial_for(target.config.as_ref()).is_some();
-        v_flex()
-            .px(r(16.))
-            .py(r(14.))
-            .gap(r(12.))
-            .child(
-                v_flex()
-                    .gap(r(2.))
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Create pairing link"))
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                        "Generate a one-time link that another device can use to pair with this backend as an authorized client.",
-                    )),
-            )
+        let body = v_flex().gap(r(12.))
             .child(
                 v_flex()
                     .gap(r(6.))
                     .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Client label (optional)"))
-                    .child(div().max_w(r(320.)).child(Input::new(&self.access.label).small().disabled(create.creating))),
+                    .child(div().max_w(r(320.)).child(Input::new(&self.access.label).small().disabled(create.creating).theme_slot(ThemeSlot::Input, cx))),
             )
             .child(
                 h_flex()
@@ -1992,24 +2180,26 @@ impl SettingsView {
                 div().text_xs().text_color(if error { hsla(p.destructive_foreground) } else { hsla(p.warning_foreground) }).child(text)
             }))
             .children(create.error.clone().map(|error| div().text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap(r(8.))
-                    .child(Button::new("access-create-cancel", ButtonVariant::Ghost, ButtonSize::Sm).label("Cancel").on_click(cx.listener(|this, _, _, cx| {
-                        this.access.create = None;
-                        cx.notify();
-                    })))
-                    .child(
-                        Button::new("access-create-submit", ButtonVariant::Default, ButtonSize::Sm)
-                            .label(if create.creating { "Creating\u{2026}" } else { "Create link" })
-                            .disabled(create.creating || create.scopes.is_empty())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.create_pairing_link(submit_client.clone(), submit_target.clone(), denied, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
+            .into_any_element();
+        DialogFrame {
+            id: "access-create-link-dialog",
+            title: t(cx, "Create pairing link").into(),
+            description: t(cx, "Generate a one-time link that another device can use to pair with this backend as an authorized client.").into(),
+            max_width: 620.,
+            body,
+            footer: dialog_footer(true, vec![
+                Button::new("access-create-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, "Cancel")).disabled(create.creating)
+                    .on_click(cx.listener(|this, _, window, cx| { this.dismiss_access_dialog(window, cx); })).into_any_element(),
+                Button::new("access-create-submit", ButtonVariant::Default, ButtonSize::Sm)
+                    .label(t(cx, if create.creating { "Creating…" } else { "Create link" }))
+                    .disabled(create.creating || create.scopes.is_empty())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.create_pairing_link(submit_client.clone(), submit_target.clone(), denied, cx);
+                    })).into_any_element(),
+            ], cx).into_any_element(),
+            focus: create.focus.clone(),
+        }
     }
 
     fn link_row(&self, link: &PairingLink, address: &str, now: i64, can_write: bool, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> AnyElement {
@@ -2018,7 +2208,8 @@ impl SettingsView {
         let sharing = self.access.sharing.as_deref() == Some(link.id.as_str()) && credential.is_some();
         let revoking = self.access.revoking.as_deref() == Some(link.id.as_str());
         let scopes = shown_scopes(&link.permissions, &link.scopes);
-        let subline = format!("{} \u{00b7} {}", expires_label(&link.expires_at, now), scope_count(scopes));
+        let subline = expires_label(&link.expires_at, now);
+        let scope_badge = access_scope_summary(SharedString::from(format!("link-scopes-{}", link.id)), scopes, cx);
         let share_id = link.id.clone();
         let revoke_id = link.id.clone();
         let revoke_client = target.client.clone();
@@ -2044,7 +2235,7 @@ impl SettingsView {
                         })),
                 )
             });
-        let share = credential.filter(|_| sharing).map(|credential| self.share_panel(address, &credential, cx));
+        let share = credential.filter(|_| sharing).map(|credential| self.share_panel(address, target, &credential, cx));
         v_flex()
             .px(r(16.))
             .py(r(12.))
@@ -2052,14 +2243,14 @@ impl SettingsView {
             .child(
                 h_flex()
                     .gap(r(12.))
-                    .child(div().size(r(8.)).flex_none().rounded_full().bg(hsla(p.warning)))
+                    .child(StatusDot::new(SharedString::from(format!("pairing-link-{}", link.id)), px(8.), hsla(p.warning), false))
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
                             .gap(r(2.))
                             .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(link.title().to_owned()))
-                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(subline))
+                            .child(h_flex().gap(r(6.)).child(muted_text(subline, cx)).child(scope_badge))
                             .when(!self.access.credentials.contains_key(&link.id), |this| {
                                 this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Create a new link to share from this client."))
                             }),
@@ -2082,8 +2273,12 @@ impl SettingsView {
 
     /// The inline share panel: the URL, copy buttons and its QR, or the code alone for a
     /// loopback server another device cannot reach.
-    fn share_panel(&self, address: &str, credential: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn share_panel(&self, address: &str, target: &ResolvedAccessTarget, credential: &str, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let endpoints = pairing_endpoints(target);
+        let address = self.access.qr_endpoint.as_deref()
+            .filter(|origin| endpoints.iter().any(|endpoint| endpoint == origin))
+            .unwrap_or(address);
         let code = credential.to_owned();
         let copy_code = Button::new("access-copy-code", ButtonVariant::Outline, ButtonSize::Compact).icon(Icon::Copy).label("Copy code only").on_click(move |_, _, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.clone()));
@@ -2097,7 +2292,21 @@ impl SettingsView {
                 .into_any_element();
         };
         let copy_url = url.clone();
+        let picker = (endpoints.len() > 1).then(|| {
+            let weak = cx.entity().downgrade();
+            Select::new("access-qr-endpoint", endpoints.iter().map(|origin| SelectOption::new(origin.clone(), origin.clone())).collect())
+                .selected(address.to_owned()).show_check().popup_width(320.)
+                .on_change(move |next, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.access.qr_endpoint = Some(next.to_string());
+                        cx.notify();
+                    });
+                })
+        });
         h_flex()
+            .id("access-qr-panel")
+            .max_h(r(260.))
+            .overflow_y_scroll()
             .pl(r(20.))
             .gap(r(16.))
             .items_start()
@@ -2106,6 +2315,7 @@ impl SettingsView {
                     .flex_1()
                     .min_w_0()
                     .gap(r(8.))
+                    .children(picker)
                     .child(
                         div()
                             .px(r(8.))
@@ -2134,7 +2344,8 @@ impl SettingsView {
         let p = palette(cx);
         let revoking = self.access.revoking.as_deref() == Some(client.session_id.as_str());
         let scopes = shown_scopes(&client.permissions, &client.scopes);
-        let subline = [client.subline(), scope_count(scopes)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" \u{00b7} ");
+        let subline = client.subline();
+        let scope_badge = access_scope_summary(SharedString::from(format!("session-scopes-{}", client.session_id)), scopes, cx);
         let session_id = client.session_id.clone();
         let revoke_client = target.client.clone();
         let revoke_target = target.saved_id.clone();
@@ -2158,7 +2369,7 @@ impl SettingsView {
                             .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(client.title()))
                             .when(client.current, |this| this.child(tone_badge("This device", Tone::Secondary, cx))),
                     )
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(subline)),
+                    .child(h_flex().gap(r(6.)).child(muted_text(subline, cx)).child(scope_badge)),
             )
             .when(can_write && !client.current, |this| {
                 this.child(
@@ -2187,6 +2398,52 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn authorized_clients_mcp_action_opens_the_existing_wizard(cx: &mut gpui::TestAppContext) {
+        struct Preview {
+            target: ResolvedAccessTarget,
+            mcp: Entity<crate::mcp::McpDialogs>,
+        }
+
+        impl gpui::Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().debug_selector(|| "access-mcp-fixture".to_owned())
+                    .child(use_in_another_app_action(&self.target, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let state = cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx));
+            crate::settings::init(state.clone(), cx);
+            state
+        });
+        let window = cx.open_window(gpui::size(px(600.), px(480.)), |window, cx| Preview {
+            target: ResolvedAccessTarget {
+                saved_id: "saved".into(),
+                label: "Fixture".into(),
+                address: "https://example.invalid".into(),
+                is_primary: false,
+                config: None,
+                grants: None,
+                client: None,
+                extras: ServerConfigExtras::default(),
+            },
+            mcp: cx.new(|cx| crate::mcp::McpDialogs::new(state.clone(), window, cx)),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| { window.draw(cx).clear(); });
+        let bounds = visual.debug_bounds("access-mcp-fixture").unwrap();
+        let position = point(bounds.origin.x + px(12.), bounds.origin.y + px(12.));
+        visual.simulate_mouse_move(position, None::<gpui::MouseButton>, Default::default());
+        visual.simulate_click(position, Default::default());
+        window.update(&mut visual, |view, _, cx| {
+            assert!(view.mcp.read(cx).is_open(cx));
+        }).unwrap();
+    }
 
     #[test]
     fn regular_visible_links_excludes_connect_device_requests_and_prefers_tailscale_direct_endpoint() {

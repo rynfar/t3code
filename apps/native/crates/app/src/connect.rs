@@ -21,7 +21,7 @@ use t3_core::compatibility::resolve_version_mismatch;
 use t3_core::connect::{FirstFactorKind, SecondFactorKind, SocialProvider};
 use t3_core::local_server::{LocalServerFailure, LocalServerFailureKind, LocalServerPhase, describe_startup_recovery_offer};
 use t3_core::pairing::{
-    ANOTHER_ADDRESS, LinkMachineBadge, LinkableMachine, link_destination, link_machine_badge as resolve_link_machine_badge,
+    ANOTHER_ADDRESS, LinkableMachine, link_destination, link_machine_badge as resolve_link_machine_badge,
     link_machine_select_label, session_has_legacy_permissions,
 };
 use t3_core::relay::EnvironmentHealth;
@@ -204,154 +204,67 @@ pub fn link_address_warning(address: &str, cx: &App) -> Div {
         )
 }
 
-/// `LinkMachineBadge` (`apps/web/src/components/settings/LinkMachineSelect.tsx`).
-pub fn link_machine_badge(machine: &LinkableMachine, cx: &App) -> Option<Div> {
-    let badge = resolve_link_machine_badge(machine)?;
-    let p = palette(cx);
-    let (bg, border, fg) = match badge {
-        LinkMachineBadge::Linked => (hsla(p.success).opacity(0.14), hsla(p.success).opacity(0.35), hsla(p.success_foreground)),
-        LinkMachineBadge::T3Connect | LinkMachineBadge::NotConnected => (hsla(p.background), hsla(p.border), hsla(p.muted_foreground)),
-    };
-    Some(
-        div()
-            .flex_none()
-            .px(px(6.))
-            .py(px(2.))
-            .rounded(px(999.))
-            .border_1()
-            .border_color(border)
-            .bg(bg)
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(fg)
-            .child(crate::i18n::t(cx, badge.label())),
-    )
-}
-
 /// `LinkMachineSelect` (`apps/web/src/components/settings/LinkMachineSelect.tsx`):
 /// the user's other machines, including those on T3 Connect, followed by `"Another address…"`.
-#[allow(clippy::too_many_arguments)]
-pub fn render_link_machine_select(
+pub(crate) fn render_link_machine_select(
     id: impl Into<SharedString>,
     machines: &[LinkableMachine],
     selected: Option<&str>,
-    open: bool,
     disabled: bool,
-    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
-    on_select: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+    on_select: impl Fn(String, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Div {
-    let id = id.into();
-    let p = palette(cx);
-    let selected_machine = selected
-        .filter(|value| *value != ANOTHER_ADDRESS)
-        .and_then(|value| machines.iter().find(|candidate| candidate.environment_id == value));
-    let trigger_label = link_machine_select_label(machines, selected);
+    use crate::i18n::t;
+    use crate::settings::controls::{Select, SelectOption};
 
-    let trigger = h_flex()
-        .id(SharedString::from(format!("{id}-trigger")))
-        .w_full()
-        .h(px(32.))
-        .px(px(10.))
-        .gap(px(8.))
-        .items_center()
-        .justify_between()
-        .rounded(px(8.))
-        .border_1()
-        .border_color(hsla(p.input))
-        .bg(hsla(p.background))
-        .when(disabled, |this| this.opacity(0.6))
-        .when(!disabled, |this| {
-            this.cursor_pointer()
-                .hover(|this| this.bg(hsla(p.accent)))
-                .on_click(move |_, window, cx| on_toggle(window, cx))
-        })
-        .child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(8.))
-                .items_center()
-                .when_some(selected_machine, |this, machine| {
-                    this.child(
-                        environment_machine_icon(machine.machine.as_deref())
-                            .render(px(14.), hsla(p.muted_foreground).opacity(0.8)),
-                    )
-                })
-                .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(trigger_label)),
-        )
-        .child(
-            (if open { Icon::ChevronUp } else { Icon::ChevronDown })
-                .render(px(14.), hsla(p.icon_muted).opacity(0.8)),
-        );
-
-    let mut container = v_flex()
-        .gap(px(6.))
-        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Machine")))
-        .child(trigger);
-
-    if open && !disabled {
-        let mut list = v_flex()
-            .p(px(4.))
-            .gap(px(2.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(hsla(p.border))
-            .bg(hsla(p.popover));
-
-        for (index, machine) in machines.iter().enumerate() {
-            let is_selected = selected == Some(machine.environment_id.as_str());
-            let env_id = machine.environment_id.clone();
-            let select_cb = on_select.clone();
-            list = list.child(
-                h_flex()
-                    .id(SharedString::from(format!("{id}-opt-{index}")))
-                    .w_full()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .gap(px(8.))
-                    .items_center()
-                    .justify_between()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .when(is_selected, |this| this.bg(hsla(p.accent)))
-                    .hover(|this| this.bg(hsla(p.accent)))
-                    .on_click(move |_, window, cx| select_cb(env_id.clone(), window, cx))
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                environment_machine_icon(machine.machine.as_deref())
-                                    .render(px(14.), hsla(p.muted_foreground).opacity(0.8)),
-                            )
-                            .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(machine.label.clone())),
-                    )
-                    .children(link_machine_badge(machine, cx)),
-            );
+    let options = machines.iter().map(|machine| {
+        let mut option = SelectOption::new(machine.environment_id.clone(), machine.label.clone())
+            .icon(environment_machine_icon(machine.machine.as_deref()));
+        if let Some(badge) = resolve_link_machine_badge(machine) {
+            option = option.description(t(cx, badge.label()));
         }
-
-        let another_selected = selected == Some(ANOTHER_ADDRESS);
-        let select_another = on_select;
-        list = list.child(
-            h_flex()
-                .id(SharedString::from(format!("{id}-another")))
-                .w_full()
-                .px(px(8.))
-                .py(px(6.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(another_selected, |this| this.bg(hsla(p.accent)))
-                .hover(|this| this.bg(hsla(p.accent)))
-                .on_click(move |_, window, cx| select_another(ANOTHER_ADDRESS.to_owned(), window, cx))
-                .child(div().text_sm().text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Another address…"))),
-        );
-        container = container.child(list);
+        option
+    }).chain(std::iter::once(SelectOption::new(ANOTHER_ADDRESS, t(cx, "Another address…")))).collect();
+    let mut select = Select::new(id.into(), options)
+        .label(t(cx, &link_machine_select_label(machines, selected)).to_owned())
+        .popup_width(320.)
+        .disabled(disabled)
+        .show_check()
+        .on_change(move |choice, window, cx| on_select(choice.to_string(), window, cx));
+    if let Some(selected) = selected {
+        select = select.selected(selected.to_owned());
     }
+    v_flex().gap(px(6.))
+        .child(label(t(cx, "Machine"), cx))
+        .child(select)
+}
 
-    container
+pub(crate) fn link_access_picker(
+    id: impl Into<gpui::ElementId>,
+    selected: &str,
+    disabled: bool,
+    on_select: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Div {
+    use crate::i18n::t;
+    use crate::settings::controls::{Select, SelectOption};
+    use t3_core::timeline::{link_access_description, link_access_label};
+
+    let options = [
+        ("read-only", Icon::Eye),
+        ("approval-required", Icon::Shield),
+        ("auto-accept-edits", Icon::Check),
+        ("full-access", Icon::LockOpen),
+    ].into_iter().map(|(level, icon)| {
+        SelectOption::new(level, t(cx, link_access_label(level)))
+            .icon(icon)
+            .description(t(cx, link_access_description(level)))
+    }).collect();
+    v_flex().gap(px(6.))
+        .child(label(t(cx, "Access level"), cx))
+        .child(Select::new(id, options).selected(selected.to_owned()).show_check()
+            .popup_width(360.).disabled(disabled).on_change(on_select))
+        .child(muted(t(cx, "An agent never gets more access there than its own mode here."), cx))
 }
 
 fn label(text: impl Into<SharedString>, cx: &App) -> Div {
@@ -837,6 +750,11 @@ impl ConnectView {
         };
 
         let local_title = crate::i18n::t(cx, "T3 Code on this Mac");
+        let local_icon = state.local_saved_environment()
+            .or_else(|| state.active_environment().filter(|environment| environment.local))
+            .and_then(|environment| state.fleet.environment(&environment.id))
+            .and_then(|view| view.config.config.as_ref())
+            .map_or(Icon::Server, Icon::machine);
         let Some(server) = connect.local_server.clone() else {
             let message = crate::i18n::t(
                 cx,
@@ -859,7 +777,7 @@ impl ConnectView {
                     h_flex()
                         .gap(px(10.))
                         .items_center()
-                        .child(Icon::Server.render(px(16.), hsla(p.muted_foreground)))
+                        .child(local_icon.render(px(16.), hsla(p.muted_foreground)))
                         .child(
                             v_flex()
                                 .flex_1()
@@ -933,7 +851,7 @@ impl ConnectView {
             .child(
                 h_flex()
                     .gap(px(10.))
-                    .child(Icon::Server.render(px(16.), hsla(p.muted_foreground)))
+                    .child(local_icon.render(px(16.), hsla(p.muted_foreground)))
                     .child(
                         v_flex()
                             .flex_1()
@@ -1438,6 +1356,12 @@ impl ConnectView {
             }
         };
 
+        let online = matches!(cloud.statuses.get(&environment.environment_id), Some(EnvironmentHealth::Online));
+        let config = state.environments.find(Some(&environment.environment_id), &environment.endpoint.http_base_url)
+            .and_then(|saved| state.fleet.environment(&saved.id))
+            .and_then(|view| view.config.config.as_ref());
+        let compatible = config.is_none_or(|config| t3_core::compatibility::protocol_mismatch(&config.environment).is_none());
+        let live = has_clerk_session && matches!(cloud.statuses.get(&environment.environment_id), Some(EnvironmentHealth::Checking) | None);
         let action_button = if !has_clerk_session {
             Button::new(
                 SharedString::from(format!("relay-{}", environment.environment_id)),
@@ -1463,7 +1387,9 @@ impl ConnectView {
                 ButtonSize::Compact,
             )
             .label(crate::i18n::t(cx, if connecting { "Connecting…" } else { "Connect" }))
-            .disabled(any_connecting)
+            .disabled(any_connecting || !online || !compatible)
+            .tooltip(crate::i18n::t(cx, if !compatible { "This environment uses an incompatible server version." }
+                else if !online { "This environment must be online to connect." } else { "Connect to this environment" }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 let env = env_to_connect.clone();
                 this.state
@@ -1476,7 +1402,18 @@ impl ConnectView {
             .min_w_0()
             .h(px(64.))
             .gap(px(10.))
-            .child(status_dot(dot_tone, cx))
+            .child(config.map_or(Icon::Cloud, Icon::machine).render(px(16.), hsla(palette(cx).muted_foreground)))
+            .child(crate::components::motion::StatusDot::new(
+                SharedString::from(format!("connect-status-{}", environment.environment_id)),
+                px(8.),
+                hsla(match dot_tone {
+                    Some(DotTone::Success) => palette(cx).success,
+                    Some(DotTone::Warning) => palette(cx).warning,
+                    Some(DotTone::Destructive) => palette(cx).destructive,
+                    None => palette(cx).muted_foreground,
+                }),
+                live,
+            ))
             .child(
                 v_flex()
                     .flex_1()
@@ -2113,9 +2050,7 @@ mod tests {
                         "test-link-machine",
                         &self.0,
                         Some(ANOTHER_ADDRESS),
-                        true,
                         false,
-                        |_, _| {},
                         |_, _, _| {},
                         cx,
                     ))
@@ -2155,6 +2090,36 @@ mod tests {
             cx.shutdown();
             cx.clear_globals();
         });
+    }
+
+    #[gpui::test]
+    fn link_access_picker_selects_the_next_level_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+        struct Preview(SharedString);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let weak = cx.entity().downgrade();
+                link_access_picker("test-link-access", &self.0, false, move |next, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.0 = next;
+                        cx.notify();
+                    });
+                }, cx)
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let window = cx.open_window(gpui::size(px(480.), px(360.)), |_, _| Preview("approval-required".into()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            window.focus_next(cx);
+        }).unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.simulate_keystrokes(window.into(), "down");
+        cx.simulate_keystrokes(window.into(), "enter");
+        window.update(cx, |view, _, _| assert_eq!(view.0.as_ref(), "auto-accept-edits")).unwrap();
     }
 
     #[cfg(feature = "snapshot")]

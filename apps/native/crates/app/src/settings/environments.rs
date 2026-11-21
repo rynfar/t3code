@@ -5,16 +5,21 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, FontWeight, IntoElement,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Task,
     ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
-use t3_client::auth::ORCHESTRATION_PROTOCOL_VERSION;
-use t3_client::store::{SavedEnvironment, load_ui_state, save_ui_state};
+use t3_client::routes::{CandidateRoute, ConnectionRouteKind, merge_learned_routes};
+use t3_client::status::{self, Diagnosis, DotTone, HopResult};
+use t3_client::updates::{self as update_client, UpdateDestination, UpdateEvent};
+use t3_client::store::{SavedEnvironment, load_alternate_routes, load_ui_state, save_ui_state};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::client_settings::ClientSettingChange;
+use t3_core::relay::EnvironmentHealth;
+use t3_core::settings::ServerSettingChange;
+use t3_core::updates::{self, ServerTarget, ServerUpdateStage};
 use t3_core::pairing::{ANOTHER_ADDRESS, LinkableMachine, collect_known_machine_urls};
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::access::ACCESS_READ as ACCESS_READ_SCOPE;
@@ -33,8 +38,12 @@ use super::controls::{
     Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch,
     dialog_footer, group, icon, muted_text, r, section, section_title,
 };
-use super::{Block, SettingsView, close, folded_section, store};
+use super::{Block, SettingsView, folded_section, store};
 use crate::app_state::Phase;
+use crate::components::motion::{Spinner, StatusDot};
+use crate::environments::PairingSource;
+use crate::i18n::t;
+use crate::theme::{ThemeSlot, ThemeSlotExt};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -53,7 +62,6 @@ struct LinkEnvironmentDialog {
     host_saved_id: String,
     host_env_id: String,
     choice: Option<String>,
-    select_open: bool,
     address: Entity<InputState>,
     pairing_code: Entity<InputState>,
     access: String,
@@ -73,7 +81,45 @@ struct ForgetPeerLinkConfirm {
     focus: FocusHandle,
 }
 
+enum CatalogDialog {
+    Add {
+        address: Entity<InputState>,
+        code: Entity<InputState>,
+        source: PairingSource,
+        submitted: bool,
+        focus: FocusHandle,
+        _subscriptions: Vec<Subscription>,
+    },
+    Confirm { action: CatalogAction, focus: FocusHandle },
+    AddRoute { saved_id: String, focus: FocusHandle },
+}
+
+enum CatalogAction {
+    Local { enable: bool },
+    Remove { id: String, label: String },
+    RemoveRoute { id: String, route: CandidateRoute },
+    Update(Vec<ServerTarget>),
+}
+
+#[derive(Default)]
+struct EnvironmentSections {
+    routes: bool,
+    permissions: bool,
+    diagnosis: bool,
+    menu: bool,
+    icon: bool,
+}
+
+#[derive(Default)]
+struct CatalogState {
+    rows: HashMap<String, EnvironmentSections>,
+    dialog: Option<CatalogDialog>,
+    update_stages: HashMap<String, ServerUpdateStage>,
+    retry_ticker: Option<Task<()>>,
+}
+
 pub(crate) struct EnvironmentsState {
+    catalog: CatalogState,
     peer_links: HashMap<String, PeerLinksLoad>,
     peer_links_seq: HashMap<String, u64>,
     link_dialog: Option<LinkEnvironmentDialog>,
@@ -89,6 +135,7 @@ impl EnvironmentsState {
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         Self {
+            catalog: CatalogState::default(),
             peer_links: HashMap::new(),
             peer_links_seq: HashMap::new(),
             link_dialog: None,
@@ -100,6 +147,8 @@ impl EnvironmentsState {
     }
 
     pub(super) fn leave(&mut self) {
+        self.catalog.dialog = None;
+        self.catalog.retry_ticker = None;
         self.link_dialog = None;
         self.forget_confirm = None;
     }
@@ -114,6 +163,12 @@ impl EnvironmentsState {
 
     pub(super) fn inputs(&self) -> Vec<&Entity<InputState>> {
         let mut out = Vec::new();
+        if let Some(CatalogDialog::Add { address, code, source, .. }) = &self.catalog.dialog {
+            out.push(address);
+            if *source == PairingSource::Link {
+                out.push(code);
+            }
+        }
         if let Some(dialog) = &self.link_dialog {
             out.push(&dialog.address);
             out.push(&dialog.pairing_code);
@@ -158,14 +213,69 @@ fn saved_env_connection_key(env_id: &str, saved: &SavedEnvironment) -> Option<St
 }
 
 fn transport_subtitle(saved: &SavedEnvironment) -> String {
-    if let Some(ssh) = &saved.ssh {
-        return format!("SSH \u{00b7} {}", ssh.alias);
-    }
     if saved.local {
-        return "Local".to_owned();
+        return "This machine".to_owned();
     }
-    let addr = saved.address();
-    if addr.is_empty() { "Remote".to_owned() } else { addr }
+    if saved.ssh.is_some() {
+        return saved.address();
+    }
+    if saved.is_relay_managed() {
+        return "T3 Connect".to_owned();
+    }
+    let route = CandidateRoute::saved(&saved.http_base);
+    if route.kind() == ConnectionRouteKind::Tailnet {
+        return "via Tailscale".to_owned();
+    }
+    saved.address()
+}
+
+const MACHINE_KINDS: [(&str, &str); 7] = [
+    ("server", "Server"),
+    ("cloud", "Cloud VM"),
+    ("linux", "Linux/WSL"),
+    ("desktop", "Desktop"),
+    ("laptop", "Laptop"),
+    ("mac-mini", "Mini PC"),
+    ("mac-studio", "Workstation"),
+];
+
+fn machine_icon_options(config: Option<&ServerConfig>) -> (&str, &str, bool) {
+    let reported = config.and_then(|config| config.environment.platform.as_ref())
+        .map(|platform| platform.machine.as_str())
+        .filter(|machine| MACHINE_KINDS.iter().any(|(kind, _)| kind == machine));
+    let detected = reported.unwrap_or("server");
+    let selected = config.and_then(|config| config.settings.environment_icon.as_deref())
+        .filter(|machine| MACHINE_KINDS.iter().any(|(kind, _)| kind == machine))
+        .unwrap_or(detected);
+    (selected, detected, reported.is_some())
+}
+
+fn route_choices(saved: &SavedEnvironment, routes: &[CandidateRoute], reported: &[t3_client::routes::ReportedEndpoint]) -> Vec<CandidateRoute> {
+    let Some(environment_id) = saved.environment_id.as_deref() else { return Vec::new() };
+    let primary = CandidateRoute::saved(&saved.http_base);
+    let current: Vec<_> = std::iter::once(primary.clone()).chain(routes.iter().cloned()).collect();
+    let offered = merge_learned_routes(environment_id, &current, &primary.id, reported, true).unwrap_or(current);
+    let advertised = |candidate: &CandidateRoute| reported.iter().any(|endpoint| {
+        t3_core::pairing::origin_of(&endpoint.http_base_url).as_deref() == Some(&candidate.http_base)
+    });
+    offered.into_iter().filter(|candidate| candidate.learned && advertised(candidate)).collect()
+}
+
+fn move_alternate_route(routes: &mut [CandidateRoute], id: &str, offset: isize) -> bool {
+    let Some(index) = routes.iter().position(|route| route.id == id) else { return false };
+    let Some(destination) = index.checked_add_signed(offset).filter(|next| *next < routes.len()) else { return false };
+    routes.swap(index, destination);
+    true
+}
+
+fn catalog_button(id: impl Into<gpui::ElementId>, label: &str, cx: &App) -> Button {
+    Button::new(id, ButtonVariant::GhostMuted, ButtonSize::Xs).label(t(cx, label))
+}
+
+fn catalog_input(input: &Entity<InputState>, busy: bool, cx: &App) -> impl IntoElement {
+    let background = crate::theme::theme_slot_clipped_background_layer(ThemeSlot::Input, r(8.), cx);
+    div().relative().children(background)
+        .child(Input::new(input).small().disabled(busy).theme_slot(ThemeSlot::Input, cx))
 }
 
 impl SettingsView {
@@ -174,6 +284,17 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.dismiss_access_dialog(window, cx) {
+            return true;
+        }
+        if self.environments.catalog.dialog.is_some() {
+            if self.state.read(cx).connect.pairing.is_none() {
+                self.environments.catalog.dialog = None;
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            return true;
+        }
         if let Some(dialog) = &self.environments.link_dialog {
             if dialog.busy {
                 return true;
@@ -190,6 +311,10 @@ impl SettingsView {
             self.environments.forget_confirm = None;
             self.focus.focus(window, cx);
             cx.notify();
+            return true;
+        }
+        if let Some(id) = self.environments.catalog.rows.iter().find(|(_, row)| row.menu).map(|(id, _)| id.clone()) {
+            self.close_environment_menu(&id, cx);
             return true;
         }
         false
@@ -426,7 +551,6 @@ impl SettingsView {
             host_saved_id,
             host_env_id,
             choice: None,
-            select_open: false,
             address,
             pairing_code,
             access: "approval-required".to_owned(),
@@ -726,188 +850,781 @@ impl SettingsView {
         .detach();
     }
 
-    pub(super) fn environments(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
-        let p = palette(cx);
+    fn catalog_blocks(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
         let state = self.state.read(cx);
-        let environment = state
-            .server_config
-            .config
-            .as_ref()
-            .map(|config| config.environment.clone())
-            .unwrap_or_default();
-        let saved = state.active_environment().cloned();
-        let address = saved.as_ref().map(SavedEnvironment::address).unwrap_or_default();
-        let status = match &state.phase {
-            Phase::Online(status) => status.summary().0,
-            Phase::Unpaired => "Not connected".to_owned(),
-        };
-        let label = [environment.label.as_str(), saved.as_ref().map_or("", |saved| saved.label.as_str())]
-            .into_iter()
-            .find(|label| !label.trim().is_empty())
-            .unwrap_or("Environment")
-            .to_owned();
-        let protocol = environment
-            .orchestration_protocol_version
-            .unwrap_or(ORCHESTRATION_PROTOCOL_VERSION);
-        let value = |text: String| muted_text(text, cx);
-        let (switch_state, disconnect_state, remove_state) =
-            (self.state.clone(), self.state.clone(), self.state.clone());
-        let cloud_state = self.state.clone();
-        let remove_id = saved.as_ref().map(|saved| saved.id.clone());
-
-        let mut env_rows = vec![
-            Row::new("remote-environments", label)
-                .description(if address.is_empty() {
-                    "This device's paired environment.".to_owned()
-                } else {
-                    address
-                })
-                .highlighted(self.is_target("remote-environments"))
-                .below(
-                    div().children(
-                        state
-                            .server_config
-                            .config
-                            .as_ref()
-                            .and_then(|c| c.managed_policy.as_ref())
-                            .map(|policy| crate::components::managed::attribution(policy, cx)),
-                    ),
-                )
-                .control(value(status))
-                .into_any_element(),
-            Row::new("server-version", "Server version")
-                .control(value(if environment.server_version.is_empty() {
-                    "Unknown".to_owned()
-                } else {
-                    environment.server_version.clone()
-                }))
-                .into_any_element(),
-            Row::new("orchestration-protocol", "Orchestration protocol")
-                .control(value(protocol.to_string()))
-                .into_any_element(),
-            {
-                let connect_denial = t3_core::managed_policy::capability_denial(
-                    state
-                        .server_config
-                        .config
-                        .as_ref()
-                        .and_then(|c| c.managed_policy.as_ref()),
-                    t3_core::managed_policy::Capability::Connect,
-                );
-                let mut row = Row::new("cloud-account", "T3 Connect")
-                    .description("Sign in to view your T3 Connect environments.")
-                    .control(
-                        Button::new("cloud-account-button", ButtonVariant::Outline, ButtonSize::Sm)
-                            .label("Manage\u{2026}")
-                            .on_click(move |_, window, cx| {
-                                close(window, cx);
-                                cloud_state.update(cx, |state, cx| state.open_switcher(cx));
-                            }),
-                    );
-                if let Some(reason) = connect_denial {
-                    row = row.below(
-                        div()
-                            .pb(r(8.))
-                            .debug_selector(|| "managed-connect-notice".to_owned())
-                            .child(crate::components::managed::notice(reason, cx)),
-                    );
-                }
-                row.into_any_element()
-            },
-            Row::new("switch-environment", "Switch environment")
-                .description("Connect to another saved environment, or pair a new one.")
-                .control(
-                    Button::new("switch-environment-button", ButtonVariant::Outline, ButtonSize::Sm)
-                        .label("Switch\u{2026}")
-                        .on_click(move |_, window, cx| {
-                            close(window, cx);
-                            switch_state.update(cx, |state, cx| state.open_switcher(cx));
-                        }),
-                )
-                .into_any_element(),
-            Row::new("disconnect", "Disconnect")
-                .description("Stop using this environment for now. It stays saved on this device.")
-                .control(
-                    Button::new("disconnect-server", ButtonVariant::Outline, ButtonSize::Sm)
-                        .label("Disconnect")
-                        .on_click(move |_, window, cx| {
-                            close(window, cx);
-                            disconnect_state.update(cx, |state, cx| state.disconnect(cx));
-                        }),
-                )
-                .into_any_element(),
-            Row::new("remove-environment", "Remove from this device")
-                .description(
-                    "Forget this environment and its credential. Pair again with a new pairing link.",
-                )
-                .control(
-                    Button::new(
-                        "remove-environment-button",
-                        ButtonVariant::DestructiveOutline,
-                        ButtonSize::Sm,
-                    )
-                    .label("Remove")
-                    .disabled(remove_id.is_none())
-                    .on_click(move |_, window, cx| {
-                        let Some(id) = remove_id.clone() else {
-                            return;
-                        };
-                        close(window, cx);
-                        remove_state.update(cx, |state, cx| state.remove_environment(&id, cx));
-                    }),
-                )
-                .into_any_element(),
-        ];
-
-        // Also surface other saved environments when multiple are saved.
-        let active_saved_id = state.environments.active.as_deref();
-        let other_saved: Vec<(String, String, String, bool)> = state
-            .environments
-            .environments
-            .iter()
-            .filter(|env| Some(env.id.as_str()) != active_saved_id)
-            .map(|env| {
-                let connected = state
-                    .fleet
-                    .environment(&env.id)
-                    .is_some_and(|v| v.status == ConnectionStatus::Connected);
-                let name = if env.label.trim().is_empty() {
-                    env.address()
-                } else {
-                    env.label.clone()
-                };
-                (env.id.clone(), name, transport_subtitle(env), connected)
-            })
-            .collect();
-        for (saved_id, name, subtitle, connected) in other_saved {
-            let connect_state = self.state.clone();
-            let connect_id = saved_id.clone();
-            env_rows.push(
-                Row::new(SharedString::from(format!("saved-env-{saved_id}")), name)
-                    .description(format!(
-                        "{subtitle} \u{00b7} {}",
-                        if connected { "Connected" } else { "Saved" }
-                    ))
-                    .control(
-                        Button::new(
-                            SharedString::from(format!("connect-saved-env-{saved_id}")),
-                            ButtonVariant::Outline,
-                            ButtonSize::Xs,
-                        )
-                        .label("Switch to")
-                        .on_click(move |_, window, cx| {
-                            close(window, cx);
-                            connect_state.update(cx, |state, cx| state.connect_environment(&connect_id, cx));
-                        }),
-                    )
-                    .into_any_element(),
-            );
+        if let Some(CatalogDialog::Add { source, submitted: true, .. }) = self.environments.catalog.dialog.as_ref()
+            && state.connect.pairing.is_none()
+            && crate::connect::pairing_error(&state.connect, *source).is_none()
+        {
+            self.environments.catalog.dialog = None;
         }
 
-        let mut blocks = vec![Block::new(
-            &["remote-environments", "connections"],
-            section("Environments", env_rows, cx),
-        )];
+        let settings = cx.entity();
+        let enabled = state.local_server_auto_start;
+        let local = Row::new("local-environment", t(cx, "Local environment"))
+            .description(t(cx, if enabled {
+                "Run agents on this computer."
+            } else {
+                "Automatic startup is off for this app."
+            }))
+            .highlighted(self.is_target("local-environment"))
+            .control(Switch::new("local-environment-switch", enabled)
+                .disabled(state.local_host_phase.is_starting() || state.local_host_phase.is_stopping())
+                .on_change(move |enable, window, cx| {
+                    settings.update(cx, |this, cx| {
+                        this.show_catalog_confirmation(CatalogAction::Local { enable }, window, cx);
+                    });
+                }));
+        let local = Block::new(&["local-environment"], section(t(cx, "This app"), vec![local.into_any_element()], cx));
+
+        let targets = self.catalog_update_targets(cx);
+        let can_update = !targets.is_empty();
+        let all_targets = targets.clone();
+        let updating = !self.environments.catalog.update_stages.is_empty() || crate::updates::has_active_update_run(cx);
+        let actions = h_flex().gap(r(6.))
+            .child(Button::new("settings-update-all", ButtonVariant::Outline, ButtonSize::Xs)
+                .icon(Icon::RefreshCw)
+                .label(t(cx, if updating { "Updating…" } else { "Update all" }))
+                .disabled(!can_update || updating)
+                .tooltip(t(cx, if updating { "An update is already running." } else if !can_update { "No eligible server updates." } else { "Update eligible environments." }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.show_catalog_confirmation(CatalogAction::Update(all_targets.clone()), window, cx);
+                })))
+            .child(Button::new("settings-add-environment", ButtonVariant::Default, ButtonSize::Xs)
+                .icon(Icon::Plus).label(t(cx, "Add environment"))
+                .on_click(cx.listener(|this, _, window, cx| this.open_catalog_add(window, cx))));
+        let mut ticking = false;
+        let saved = state.environments.environments.clone();
+        self.environments.catalog.rows.retain(|id, _| saved.iter().any(|entry| &entry.id == id));
+        let alternates = load_alternate_routes();
+        let rows: Vec<_> = saved.iter().map(|entry| {
+            let configured = alternates.get(&entry.id).map(Vec::as_slice).unwrap_or_default();
+            let progress = status::route_progress(&entry.http_base);
+            ticking |= !entry.disabled && progress.retry_at.is_some_and(|deadline| deadline > Instant::now());
+            self.catalog_environment_row(entry, configured, progress, &targets, cx)
+        }).collect();
+        let cloud = self.catalog_cloud_rows(cx);
+        let heading = h_flex().w_full().gap(r(8.)).justify_between()
+            .child(section_title(t(cx, "Environments")))
+            .child(actions);
+        let catalog = v_flex().gap(r(8.)).child(heading)
+            .when(!rows.is_empty(), |this| this.child(group(rows, cx)))
+            .child(cloud);
+        if ticking && self.environments.catalog.retry_ticker.is_none() {
+            self.environments.catalog.retry_ticker = Some(cx.spawn(async |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.environments.catalog.retry_ticker = None;
+                    cx.notify();
+                });
+            }));
+        }
+        vec![local, Block::new(&["remote-environments", "connections", "server-version"], catalog)]
+    }
+
+    fn catalog_update_targets(&self, cx: &App) -> Vec<ServerTarget> {
+        let state = self.state.read(cx);
+        let machines = state.fleet.environments.iter().map(|entry| {
+            let id = &entry.summary.owner.saved_id;
+            let config = entry.config.config.as_ref();
+            let saved = state.environments.get(id);
+            updates::Machine {
+                id,
+                label: config.map(|config| config.environment.label.as_str()).filter(|label| !label.is_empty())
+                    .or_else(|| saved.map(|saved| saved.label.as_str())).unwrap_or(id),
+                config,
+                connected: entry.status == ConnectionStatus::Connected && entry.summary.synchronized && entry.summary.config_loaded,
+                hosted_by_this_app: saved.is_some_and(|saved| saved.local) && state.is_hosting_local_server(),
+                can_maintain: entry.grants.as_ref().is_some_and(|state| state.grants("environment:maintain")),
+                can_manage_providers: false,
+                updating: self.environments.catalog.update_stages.contains_key(id),
+            }
+        }).collect::<Vec<_>>();
+        updates::collect(&machines, include_str!("../updates/TARGET_SERVER_VERSION").trim()).servers
+    }
+
+    fn start_catalog_updates(&mut self, targets: Vec<ServerTarget>, cx: &mut Context<Self>) {
+        if !self.environments.catalog.update_stages.is_empty() || crate::updates::has_active_update_run(cx) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let plan = updates::Plan { servers: targets.clone(), ..Default::default() };
+        let captured = match update_client::capture(&plan, &state.fleet) {
+            Ok(captured) => captured,
+            Err(error) => return store::show_error(error, cx),
+        };
+        let scope = "environment:maintain";
+        let destinations = captured.into_iter().map(|capture| {
+            let destination = state.connections.destination(&capture.owner, scope);
+            (capture, destination)
+        }).collect::<Vec<_>>();
+        let view = state.connections.view();
+        let ids = targets.iter().map(|target| target.environment_id.clone()).collect::<Vec<_>>();
+        for id in &ids {
+            self.environments.catalog.update_stages.insert(id.clone(), ServerUpdateStage::Downloading);
+        }
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let task = state.runtime().spawn(async move {
+            let mut receipts = Vec::new();
+            for (capture, destination) in destinations {
+                receipts.push(UpdateDestination { capture, scope, receipt: destination.await });
+            }
+            update_client::retry_servers_with_progress(
+                targets.into_iter().map(|target| (target, None)).collect(), receipts, view, Some(tx)
+            ).await
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    match event {
+                        UpdateEvent::ServerStage { environment_id, stage } => {
+                            this.environments.catalog.update_stages.insert(environment_id, stage);
+                        }
+                        UpdateEvent::MachineSettled { environment_id, .. } => {
+                            this.environments.catalog.update_stages.remove(&environment_id);
+                        }
+                        _ => return,
+                    }
+                    cx.notify();
+                });
+            }
+            let failures = task.await.unwrap_or_else(|error| vec![error.to_string()]);
+            let _ = this.update(cx, |this, cx| {
+                for id in &ids {
+                    this.environments.catalog.update_stages.remove(id);
+                }
+                if !failures.is_empty() {
+                    store::show_error(failures.join("\n"), cx);
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    pub(super) fn access_server_update_button(&self, id: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        if let Some(stage) = self.environments.catalog.update_stages.get(id).copied() {
+            let label = match stage {
+                ServerUpdateStage::Downloading => "Downloading update…",
+                ServerUpdateStage::Installing => "Installing update…",
+                ServerUpdateStage::Resuming => "Waiting for the server to reconnect…",
+            };
+            return Some(h_flex().gap(r(6.))
+                .child(Spinner::new("access-server-update-spinner", gpui::px(13.), hsla(palette(cx).muted_foreground)))
+                .child(muted_text(t(cx, label), cx)).into_any_element());
+        }
+        self.catalog_update_targets(cx).into_iter().find(|target| target.environment_id == id)
+            .map(|target| self.catalog_update_button(target, cx).into_any_element())
+    }
+
+    fn catalog_update_button(&self, target: ServerTarget, cx: &Context<Self>) -> Button {
+        let key = gpui::ElementId::from(SharedString::from(target.environment_id.clone()));
+        Button::new((key, "update-server"), ButtonVariant::Outline, ButtonSize::Xs)
+            .label(t(cx, "Update"))
+            .disabled(!self.environments.catalog.update_stages.is_empty() || crate::updates::has_active_update_run(cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_catalog_confirmation(CatalogAction::Update(vec![target.clone()]), window, cx);
+            }))
+    }
+
+    fn catalog_environment_row(
+        &self,
+        saved: &SavedEnvironment,
+        alternate_routes: &[CandidateRoute],
+        progress: status::RouteProgress,
+        update_targets: &[ServerTarget],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let app = self.state.read(cx);
+        let active = app.environments.active.as_deref() == Some(&saved.id);
+        let view = app.fleet.environment(&saved.id);
+        let status = app.environment_statuses.get(&saved.id).or_else(|| view.map(|view| &view.status))
+            .or(match &app.phase { Phase::Online(status) if active => Some(status), _ => None });
+        let config = view.and_then(|view| view.config.config.as_ref())
+            .or_else(|| active.then_some(app.server_config.config.as_ref()).flatten());
+        let grants = view.and_then(|view| view.grants.as_ref());
+        let connected = status == Some(&ConnectionStatus::Connected) && !saved.disabled;
+        let label = config.map(|config| config.environment.label.as_str()).filter(|label| !label.trim().is_empty()).unwrap_or(&saved.label);
+        let version = config.map(|config| config.environment.server_version.as_str())
+            .filter(|version| !version.is_empty()).or(saved.server_version.as_deref());
+        let version = version.map_or_else(|| t(cx, "Unknown version").to_owned(), |version| format!("v{}", version.trim_start_matches('v')));
+        let relay = saved.is_relay_managed();
+        let diagnosis = if saved.disabled {
+            None
+        } else if relay {
+            let health = saved.environment_id.as_ref().and_then(|id| app.cloud.statuses.get(id));
+            status::diagnose_relay(status, health, label)
+        } else {
+            status.and_then(|status| status::diagnose(status, label))
+        };
+        let (tone, status_label, live) = if saved.disabled {
+            (None, t(cx, "Off").to_owned(), false)
+        } else if saved.access_token.is_none() {
+            (Some(DotTone::Destructive), t(cx, "Needs pairing again").to_owned(), false)
+        } else if let Some(status) = status {
+            (Some(status.dot()), t(cx, &status.title()).to_owned(), matches!(status.phase(), status::ConnectionPhase::Connecting | status::ConnectionPhase::Reconnecting))
+        } else {
+            (None, t(cx, "Not connected").to_owned(), false)
+        };
+        let p = palette(cx);
+        let dot_color = match tone {
+            Some(DotTone::Success) => p.success,
+            Some(DotTone::Warning) => p.warning,
+            Some(DotTone::Destructive) => p.destructive,
+            None => p.muted_foreground,
+        };
+        let row_state = self.environments.catalog.rows.get(&saved.id);
+        let routes_open = row_state.is_some_and(|state| state.routes);
+        let permissions_open = row_state.is_some_and(|state| state.permissions);
+        let diagnosis_open = row_state.is_some_and(|state| state.diagnosis);
+        let menu_open = row_state.is_some_and(|state| state.menu);
+        let diagnosis_button = diagnosis.as_ref().map(|_| self.catalog_disclosure(&saved.id, "diagnosis", "Details", diagnosis_open, |row| &mut row.diagnosis, cx));
+        let update = self.environments.catalog.update_stages.get(&saved.id).copied();
+        let update_target = update_targets.iter().find(|target| target.environment_id == saved.id).cloned();
+        let enable_id = saved.id.clone();
+        let switch_id = saved.id.clone();
+        let state = self.state.clone();
+        let can_switch = saved.access_token.is_some();
+        let trailing = h_flex().gap(r(6.)).flex_none()
+            .children(update.map(|_| Spinner::new((gpui::ElementId::from(SharedString::from(saved.id.clone())), "update"), gpui::px(13.), hsla(p.muted_foreground))))
+            .children(update_target.map(|target| self.catalog_update_button(target, cx)))
+            .when(!active && can_switch && !saved.disabled, |this| this.child(
+                catalog_button((gpui::ElementId::from(SharedString::from(saved.id.clone())), "switch-to"), "Switch to", cx)
+                    .on_click(move |_, _, cx| state.update(cx, |state, cx| state.connect_environment(&switch_id, cx))),
+            ))
+            .child(div().id((gpui::ElementId::from(SharedString::from(saved.id.clone())), "enable-hint"))
+                .when(!can_switch, |el| el.tooltip(super::controls::tooltip(t(cx, "Pair this environment again to enable it.").into())))
+                .child(Switch::new((gpui::ElementId::from(SharedString::from(saved.id.clone())), "enable"), !saved.disabled)
+                    .disabled(!can_switch)
+                    .on_change({
+                        let state = self.state.clone();
+                        move |enabled, _, cx| state.update(cx, |state, cx| state.set_saved_environment_enabled(&enable_id, enabled, cx))
+                    })))
+            .child(div().relative()
+                .child(self.catalog_disclosure(&saved.id, "actions", "Environment actions", menu_open, |row| &mut row.menu, cx))
+                .children(menu_open.then(|| div().absolute().bottom_0().right_0().child(
+                    gpui::deferred(
+                        gpui::anchored().anchor(gpui::Anchor::TopRight)
+                            .snap_to_window_with_margin(gpui::px(8.))
+                            .child(self.catalog_environment_actions(saved, config, status, cx))
+                    ).with_priority(2)
+                ))));
+        let status_line = h_flex().gap(r(6.)).min_w_0()
+            .child(StatusDot::new((gpui::ElementId::from(SharedString::from(saved.id.clone())), "connection"), gpui::px(8.), hsla(dot_color), live))
+            .child(div().text_xs().truncate().child(status_label))
+            .child(muted_text(format!("· {version}"), cx));
+        let primary = CandidateRoute::primary(&saved.http_base, saved.ssh.is_some());
+        let active_route = progress.active_route_id.as_deref()
+            .or_else(|| (connected && alternate_routes.is_empty()).then_some(primary.id.as_str()));
+        let subtitle = if !saved.local && !relay && saved.ssh.is_none() && active_route != Some(primary.id.as_str()) {
+            active_route.and_then(|id| alternate_routes.iter().find(|route| route.id == id))
+                .map(|route| format!("via {}", route.label())).unwrap_or_else(|| transport_subtitle(saved))
+        } else {
+            transport_subtitle(saved)
+        };
+        let information = v_flex().min_w_0().flex_1().gap(r(2.))
+            .child(div().truncate().font_weight(FontWeight::MEDIUM).text_sm().child(label.to_owned()))
+            .child(div().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(t(cx, &subtitle).to_owned()))
+            .child(status_line)
+            .child(h_flex().flex_wrap().gap(r(5.))
+                .child(self.catalog_disclosure(&saved.id, "routes", "Routes", routes_open, |row| &mut row.routes, cx))
+                .children(grants.filter(|_| connected).map(|_| self.catalog_disclosure(&saved.id, "permissions", "Permissions", permissions_open, |row| &mut row.permissions, cx)))
+                .children(diagnosis_button));
+        v_flex()
+            .debug_selector(|| format!("settings-saved-environment-{}", saved.id))
+            .w_full().gap(r(6.)).px(r(16.)).py(r(12.))
+            .child(h_flex().w_full().items_start().gap(r(12.))
+                .child(div().pt(r(3.)).child(icon(config.map_or(Icon::Server, Icon::machine), 20., hsla(p.muted_foreground))))
+                .child(information).child(trailing))
+            .children(update.map(|stage| muted_text(t(cx, match stage {
+                ServerUpdateStage::Downloading => "Downloading update…",
+                ServerUpdateStage::Installing => "Installing update…",
+                ServerUpdateStage::Resuming => "Waiting for the server to reconnect…",
+            }), cx)))
+            .children(routes_open.then(|| self.catalog_routes(saved, &primary, alternate_routes, active_route, cx)))
+            .children(grants.filter(|_| permissions_open && connected).map(|grants| super::access::session_permissions(Some(grants), cx)))
+            .children(diagnosis.map(|diagnosis| self.catalog_diagnosis(saved, label, diagnosis, diagnosis_open, status, progress.retry_at, cx)))
+            .into_any_element()
+    }
+
+    fn catalog_disclosure(
+        &self, id: &str, key: &'static str, label: &str, open: bool,
+        section: fn(&mut EnvironmentSections) -> &mut bool, cx: &Context<Self>,
+    ) -> Button {
+        let id: SharedString = id.to_owned().into();
+        let button = if key == "actions" {
+            Button::new((gpui::ElementId::from(id.clone()), key), ButtonVariant::Ghost, ButtonSize::IconSm).icon(Icon::Ellipsis).tooltip(t(cx, label))
+        } else {
+            catalog_button((gpui::ElementId::from(id.clone()), key), label, cx).icon(if open { Icon::ChevronDown } else { Icon::ChevronRight })
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| {
+            let value = section(this.environments.catalog.rows.entry(id.to_string()).or_default());
+            *value = !open;
+            cx.notify();
+        }))
+    }
+
+    fn catalog_environment_actions(
+        &self, saved: &SavedEnvironment, config: Option<&ServerConfig>, connection: Option<&ConnectionStatus>, cx: &Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let key: SharedString = saved.id.clone().into();
+        let row = self.environments.catalog.rows.get(&saved.id);
+        let icon_open = row.is_some_and(|row| row.icon);
+        let routes_open = row.is_some_and(|row| row.routes);
+        let id = saved.id.clone();
+        let label = saved.label.clone();
+        let trace = connection.and_then(ConnectionStatus::error).and_then(status::extract_trace_id).map(str::to_owned);
+        let relay_base = self.state.read(cx).cloud.discovery.environments.iter()
+            .find(|entry| saved.environment_id.as_deref() == Some(&entry.environment_id))
+            .map(|entry| entry.endpoint.http_base_url.as_str());
+        let mcp = t3_core::pairing::origin_of(relay_base.unwrap_or(&saved.http_base)).map(|origin| format!("{origin}/mcp"));
+        let copy_button = |name, label, value: Option<String>| {
+            catalog_button((gpui::ElementId::from(key.clone()), name), label, cx)
+                .disabled(value.is_none())
+                .full_width()
+                .on_click(cx.listener({
+                    let saved_id = saved.id.clone();
+                    move |this, _, _, cx| {
+                    if let Some(text) = &value {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    }
+                    this.close_environment_menu(&saved_id, cx);
+                }}))
+        };
+        let outside_id = saved.id.clone();
+        v_flex().id((gpui::ElementId::from(key.clone()), "catalog-actions-popup"))
+            .relative().occlude().mt(r(4.)).w(r(280.)).p(r(6.)).gap(r(3.))
+            .rounded(r(8.)).border_1().border_color(hsla(p.dropdown_border)).bg(hsla(p.popover))
+            .theme_slot(ThemeSlot::MenuPopup, cx)
+            .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx))
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| this.close_environment_menu(&outside_id, cx)))
+            .child(self.catalog_disclosure(&saved.id, "icon", "Icon", icon_open, |row| &mut row.icon, cx).full_width())
+            .children(icon_open.then(|| self.catalog_icon_picker(saved, config, cx)))
+            .child(catalog_button((gpui::ElementId::from(key.clone()), "menu-routes"), if routes_open { "Hide routes" } else { "Routes" }, cx)
+                .full_width().on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| {
+                        let row = this.environments.catalog.rows.entry(id.clone()).or_default();
+                        row.routes = !row.routes;
+                        this.close_environment_menu(&id, cx);
+                    }
+                })))
+            .child(copy_button("copy-mcp", "Copy MCP URL", mcp))
+            .child(copy_button("copy-trace", "Copy trace ID", trace))
+            .child(Button::new((gpui::ElementId::from(key), "request-remove"), ButtonVariant::GhostDestructive, ButtonSize::Xs)
+                .label(t(cx, "Remove from this device…")).full_width()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_environment_menu(&id, cx);
+                    this.show_catalog_confirmation(CatalogAction::Remove { id: id.clone(), label: label.clone() }, window, cx);
+                })))
+            .into_any_element()
+    }
+
+    fn close_environment_menu(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(row) = self.environments.catalog.rows.get_mut(id) {
+            row.menu = false;
+            row.icon = false;
+            cx.notify();
+        }
+    }
+
+    fn catalog_icon_picker(&self, saved: &SavedEnvironment, config: Option<&ServerConfig>, cx: &Context<Self>) -> AnyElement {
+        let app = self.state.read(cx);
+        let owner = app.fleet.environment(&saved.id).filter(|entry| {
+            entry.status == ConnectionStatus::Connected
+                && entry.grants.as_ref().is_some_and(|grants| grants.grants("settings:write"))
+        }).map(|entry| entry.summary.owner.clone());
+        let lock = if config.is_none() {
+            Some(t(cx, "Connect to this environment to change its icon."))
+        } else if owner.is_none() {
+            Some(t(cx, "Your session on this environment cannot change its settings."))
+        } else {
+            None
+        };
+        let (selected, detected, reported) = machine_icon_options(config);
+        v_flex().items_start().gap(r(4.)).pt(r(4.))
+            .children(lock.map(|reason| muted_text(reason, cx)))
+            .child(h_flex().flex_wrap().gap(r(4.)).children(MACHINE_KINDS.iter().map(|&(kind, title)| {
+                let label = if kind == detected {
+                    format!("{} · {}", t(cx, title), t(cx, if reported { "detected" } else { "default" }))
+                } else {
+                    t(cx, title).to_owned()
+                };
+                let state = self.state.clone();
+                let owner = owner.clone();
+                let choice = (kind != detected).then_some(kind);
+                let mut button = Button::new((gpui::ElementId::from(SharedString::from(saved.id.clone())), kind),
+                    if kind == selected { ButtonVariant::Outline } else { ButtonVariant::GhostMuted }, ButtonSize::Xs)
+                    .icon(crate::connect::environment_machine_icon(Some(kind))).label(label).disabled(lock.is_some());
+                if let Some(reason) = lock {
+                    button = button.tooltip(reason);
+                }
+                button.on_click(move |_, _, cx| {
+                    if let Some(owner) = owner.clone() {
+                        store::update_scoped_environments(&state, vec![owner], ServerSettingChange::Prepared(json!({
+                            "patch": { "environmentIcon": choice },
+                        })), None, cx);
+                    }
+                })
+            })))
+            .into_any_element()
+    }
+
+    fn catalog_routes(
+        &self, saved: &SavedEnvironment, primary: &CandidateRoute, alternate_routes: &[CandidateRoute],
+        active_route: Option<&str>, cx: &Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let key: SharedString = saved.id.clone().into();
+        let refused = t3_client::supervisor::refused_routes_for(&saved.http_base).borrow().clone();
+        let can_edit = !saved.local && saved.ssh.is_none() && !saved.is_relay_managed();
+        let rows = std::iter::once((None, primary)).chain(alternate_routes.iter().enumerate().map(|(i, route)| (Some(i), route)));
+        v_flex().pt(r(6.)).gap(r(5.)).border_t_1().border_color(hsla(p.border).opacity(0.5))
+            .children(rows.map(|(index, route)| {
+                let route_key: SharedString = format!("{key}-{}", route.id).into();
+                let active = active_route == Some(&route.id);
+                let refused = refused.contains(&route.id);
+                let remove = route.clone();
+                let id = saved.id.clone();
+                let label = if index.is_none() && saved.is_relay_managed() { "T3 Connect".to_owned() } else { route.label() };
+                h_flex().gap(r(4.)).w_full()
+                    .child(v_flex().flex_1().min_w_0()
+                        .child(h_flex().gap(r(5.)).flex_wrap().text_xs()
+                            .child(div().font_weight(FontWeight::MEDIUM).child(t(cx, &label).to_owned()))
+                            .when(active, |el| el.child(div().text_color(hsla(p.success_foreground)).child(t(cx, "In use"))))
+                            .when(refused, |el| el.child(div().text_color(hsla(p.destructive_foreground)).child(t(cx, "Sign-in refused")))))
+                        .child(div().text_xs().truncate().text_color(hsla(p.muted_foreground))
+                            .child(if route.learned { format!("{} · {}", route.http_base, t(cx, "found automatically")) }
+                                else if saved.ssh.is_some() { saved.address() } else { route.http_base.clone() })))
+                    .when_some(index.filter(|_| can_edit), |el, index| {
+                        el.children([(-1, "Move route up", Icon::ChevronUp), (1, "Move route down", Icon::ChevronDown)].map(|(offset, title, icon)| {
+                            let saved_id = saved.id.clone();
+                            let route_id = route.id.clone();
+                            Button::new((gpui::ElementId::from(route_key.clone()), title), ButtonVariant::GhostMuted, ButtonSize::IconXs)
+                                .icon(icon).tooltip(t(cx, title))
+                                .disabled(index.checked_add_signed(offset).is_none_or(|destination| destination >= alternate_routes.len()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let mut alternates = load_alternate_routes().remove(&saved_id).unwrap_or_default();
+                                    if move_alternate_route(&mut alternates, &route_id, offset) {
+                                        this.state.update(cx, |state, cx| state.apply_settings_routes(&saved_id, alternates, cx));
+                                    }
+                                }))
+                        }))
+                    })
+                    .when(index.is_some() && can_edit && !route.learned, |el| {
+                        el.child(Button::new((gpui::ElementId::from(route_key), "remove"), ButtonVariant::GhostDestructive, ButtonSize::IconXs)
+                            .icon(Icon::X).tooltip(t(cx, "Remove route"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_catalog_confirmation(CatalogAction::RemoveRoute { id: id.clone(), route: remove.clone() }, window, cx);
+                            })))
+                    })
+            }))
+            .child(div().child(self.catalog_add_route_button(saved, "Add route", cx)))
+            .into_any_element()
+    }
+
+    fn catalog_add_route_button(&self, saved: &SavedEnvironment, label: &str, cx: &Context<Self>) -> Button {
+        let available = !saved.local && saved.ssh.is_none() && !saved.is_relay_managed();
+        let id = saved.id.clone();
+        let mut button = catalog_button((gpui::ElementId::from(SharedString::from(id.clone())), SharedString::from(label.to_owned())), label, cx)
+            .icon(Icon::Plus).disabled(!available);
+        if !available {
+            button = button.tooltip(t(cx, "Native currently uses one connection type for this environment."));
+        }
+        button.on_click(cx.listener(move |this, _, window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            this.environments.catalog.dialog = Some(CatalogDialog::AddRoute { saved_id: id.clone(), focus });
+            cx.notify();
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_diagnosis(
+        &self, saved: &SavedEnvironment, label: &str, diagnosis: Diagnosis, expanded: bool,
+        connection: Option<&ConnectionStatus>, retry_at: Option<Instant>, cx: &Context<Self>,
+    ) -> AnyElement {
+        let key: SharedString = saved.id.clone().into();
+        let p = palette(cx);
+        let report = status::connection_diagnosis_text(label, &diagnosis);
+        let retry = retry_at.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000);
+            if remaining == 0 { t(cx, "Retrying…").to_owned() }
+            else { format!("{} {remaining}s", t(cx, "Retrying in")) }
+        });
+        v_flex().gap(r(4.)).text_xs()
+            .child(div().text_color(hsla(p.destructive)).child(diagnosis.headline))
+            .children(retry.map(|retry| muted_text(retry, cx)))
+            .when(expanded, |el| {
+                el.child(v_flex().gap(r(6.)).pt(r(6.)).border_t_1().border_color(hsla(p.border).opacity(0.5))
+                    .children(diagnosis.hops.into_iter().map(|hop| h_flex().gap(r(6.))
+                        .text_color(hsla(if hop.result == HopResult::Failed { p.destructive } else { p.muted_foreground }))
+                        .child(hop.result.mark()).child(hop.label).child(t(cx, hop.result.note()))))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(t(cx, "What to try")))
+                    .children(diagnosis.steps.into_iter().map(|step| muted_text(step, cx)))
+                    .children(diagnosis.facts.into_iter().map(|(label, value)| muted_text(format!("{label} · {value}"), cx)))
+                    .child(h_flex().flex_wrap().gap(r(4.))
+                        .child(catalog_button((gpui::ElementId::from(key.clone()), "retry"), "Retry now", cx)
+                            .disabled(!connection.is_some_and(ConnectionStatus::can_retry))
+                            .on_click({
+                                let state = self.state.clone();
+                                let id = saved.id.clone();
+                                move |_, _, cx| state.read(cx).retry_environment(&id)
+                            }))
+                        .child(catalog_button((gpui::ElementId::from(key.clone()), "copy-diagnosis"), "Copy diagnostics", cx)
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(report.clone()))))
+                        .child(self.catalog_add_route_button(saved, "Add direct route", cx))
+                        .children(saved.is_relay_managed().then(|| catalog_button((gpui::ElementId::from(key), "more-info"), "More info", cx)
+                            .on_click(|_, _, cx| cx.open_url("https://github.com/pingdotgg/t3code/blob/main/docs/user/t3-connect-troubleshooting.md"))))))
+            })
+            .into_any_element()
+    }
+
+    fn catalog_cloud_rows(&self, cx: &Context<Self>) -> AnyElement {
+        let state = self.state.read(cx);
+        let cloud = &state.cloud;
+        let p = palette(cx);
+        let heading = h_flex().gap(r(6.)).justify_between()
+            .child(section_title("T3 Connect"))
+            .child(if cloud.has_clerk_session {
+                catalog_button("settings-refresh-t3-connect", "Refresh", cx).icon(Icon::RefreshCw)
+                    .disabled(cloud.discovery.refreshing)
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_cloud(cx))))
+            } else {
+                catalog_button("settings-sign-in-t3-connect", "Sign in", cx).disabled(cloud.busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.sign_in_cloud(cx))))
+            });
+        v_flex().mt(r(10.)).gap(r(5.)).child(heading)
+            .children(cloud.error.as_ref().map(|error| muted_text(error.clone(), cx)))
+            .children(cloud.discovery.environments.iter().filter_map(|entry| {
+                let saved = state.environments.find(Some(&entry.environment_id), &entry.endpoint.http_base_url);
+                if saved.is_some_and(SavedEnvironment::is_relay_managed) { return None; }
+                let known = saved.and_then(|saved| state.fleet.environment(&saved.id)).and_then(|view| view.config.config.as_ref());
+                let incompatible = known.is_some_and(|config| t3_core::compatibility::protocol_mismatch(&config.environment).is_some());
+                let (label, color, live) = match cloud.statuses.get(&entry.environment_id) {
+                    Some(EnvironmentHealth::Online) => ("Online", p.success, false),
+                    Some(EnvironmentHealth::Offline { .. }) => ("Offline", p.destructive, false),
+                    Some(EnvironmentHealth::Error(_)) => ("Status unavailable", p.muted_foreground, false),
+                    Some(EnvironmentHealth::Checking) | None => ("Checking…", p.warning, cloud.has_clerk_session),
+                };
+                let adding = cloud.connecting_env_id.as_deref() == Some(&entry.environment_id);
+                let disabled_reason = if !cloud.has_clerk_session {
+                    Some("Sign in to T3 Connect first.")
+                } else if incompatible {
+                    Some("This environment uses an incompatible server version.")
+                } else if saved.is_some() {
+                    Some("Native cannot add a T3 Connect route alongside a direct or SSH route yet.")
+                } else if label != "Online" {
+                    Some("This environment must be online to add it.")
+                } else {
+                    None
+                };
+                let key: SharedString = entry.environment_id.clone().into();
+                let env = entry.clone();
+                let mut add = Button::new((gpui::ElementId::from(key.clone()), "cloud-add"), ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(t(cx, if adding { "Adding…" } else if saved.is_some() { "Add route" } else { "Add" }))
+                    .disabled(disabled_reason.is_some() || cloud.connecting_env_id.is_some());
+                if let Some(reason) = disabled_reason {
+                    add = add.tooltip(t(cx, reason));
+                }
+                Some(h_flex().w_full().gap(r(10.)).px(r(12.)).py(r(6.))
+                    .child(icon(known.map_or(Icon::Cloud, Icon::machine), 16., hsla(p.muted_foreground)))
+                    .child(div().flex_1().min_w_0().truncate().text_sm().child(entry.label.clone()))
+                    .child(StatusDot::new((gpui::ElementId::from(key), "cloud-status"), gpui::px(8.), hsla(color), live))
+                    .child(muted_text(t(cx, if incompatible { "Client not supported" } else { label }), cx))
+                    .child(add.on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |state, cx| state.connect_cloud_environment(env.clone(), cx));
+                    }))))
+            }))
+            .into_any_element()
+    }
+
+    fn show_catalog_confirmation(&mut self, action: CatalogAction, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.environments.catalog.dialog = Some(CatalogDialog::Confirm { action, focus });
+        cx.notify();
+    }
+
+    fn confirm_catalog_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(CatalogDialog::Confirm { action, .. }) = self.environments.catalog.dialog.take() else { return };
+        self.focus.focus(window, cx);
+        match action {
+            CatalogAction::Local { enable } => self.state.update(cx, |state, cx| {
+                state.set_local_server_auto_start(enable, cx);
+                if enable {
+                    if let Some(id) = state.environments.environments.iter().find(|saved| saved.local).map(|saved| saved.id.clone()) {
+                        state.set_saved_environment_enabled(&id, true, cx);
+                    }
+                    state.start_local_server(false, cx);
+                } else {
+                    if let Some(id) = state.environments.environments.iter().find(|saved| saved.local).map(|saved| saved.id.clone()) {
+                        state.set_saved_environment_enabled(&id, false, cx);
+                    }
+                    state.stop_local_server(cx);
+                }
+            }),
+            CatalogAction::Remove { id, .. } => self.state.update(cx, |state, cx| state.remove_environment(&id, cx)),
+            CatalogAction::RemoveRoute { id, route } => {
+                let current = load_alternate_routes().remove(&id).unwrap_or_default();
+                let routes = t3_client::routes::routes_after_removing(&current, &route.id);
+                if routes != current {
+                    self.state.update(cx, |state, cx| state.apply_settings_routes(&id, routes, cx));
+                }
+            }
+            CatalogAction::Update(targets) => self.start_catalog_updates(targets, cx),
+        }
+        cx.notify();
+    }
+
+    fn open_catalog_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let address = cx.new(|cx| InputState::new(window, cx));
+        let code = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let subscriptions = [&address, &code].map(|input| cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+            match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => this.submit_catalog_add(cx),
+                _ => {}
+            }
+        }));
+        let focus = cx.focus_handle();
+        address.read(cx).focus_handle(cx).focus(window, cx);
+        self.environments.catalog.dialog = Some(CatalogDialog::Add {
+            address, code, source: PairingSource::Link, submitted: false, focus, _subscriptions: subscriptions.into(),
+        });
+        cx.notify();
+    }
+
+    fn submit_catalog_add(&mut self, cx: &mut Context<Self>) {
+        let Some(CatalogDialog::Add { address, code, source, submitted, .. }) = self.environments.catalog.dialog.as_mut() else { return };
+        if self.state.read(cx).connect.pairing.is_some() || address.read(cx).value().trim().is_empty() { return; }
+        let address = address.read(cx).value().to_string();
+        let code = code.read(cx).value().to_string();
+        *submitted = true;
+        self.state.update(cx, |state, cx| {
+            if *source == PairingSource::Ssh {
+                let discovered = state.unsaved_ssh_hosts().into_iter().find(|host| host.alias == address.trim());
+                match discovered.map(|host| host.target()).map(Ok).unwrap_or_else(|| t3_core::ssh::parse_manual_target(&address, "", "")) {
+                    Ok(target) => state.add_settings_ssh(target, cx),
+                    Err(error) => state.fail_pairing(PairingSource::Ssh, error, cx),
+                }
+            } else {
+                state.add_settings_environment(&address, Some(&code).filter(|code| !code.trim().is_empty()).map(String::as_str), cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn catalog_dialog(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let catalog = self.environments.catalog.dialog.as_ref()?;
+        let busy = self.state.read(cx).connect.pairing.is_some();
+        let cancel = Button::new("environment-dialog-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+            .label(t(cx, "Cancel")).disabled(busy)
+            .on_click(cx.listener(|this, _, window, cx| { this.dismiss_environments_overlay(window, cx); }))
+            .into_any_element();
+        let (id, title, description, body, action, focus) = match catalog {
+            CatalogDialog::Confirm { action, focus } => {
+                let (title, description, submit, destructive) = match action {
+                    CatalogAction::Local { enable: true } => ("Turn on local environment?", "Start the local T3 Code server and enable automatic startup.", "Turn on", false),
+                    CatalogAction::Local { enable: false } => ("Turn off local environment?", "Agents and terminals on the server hosted by this app will stop. Other devices will lose access to that server.", "Turn off", true),
+                    CatalogAction::Remove { .. } => ("Remove from this device?", "This forgets the saved pairing and credential on this device. To keep it saved, switch the environment off.", "Remove", true),
+                    CatalogAction::RemoveRoute { .. } => ("Remove saved route?", "This address can still appear if the server advertises it automatically.", "Remove", true),
+                    CatalogAction::Update(_) => ("Update environments?", "Eligible servers may restart while installing the update.", "Update", false),
+                };
+                let detail = match action {
+                    CatalogAction::Remove { label, .. } => Some(label.clone()),
+                    CatalogAction::RemoveRoute { route, .. } => Some(route.http_base.clone()),
+                    CatalogAction::Update(targets) => Some(targets.iter().map(|target| target.label.as_str()).collect::<Vec<_>>().join(", ")),
+                    CatalogAction::Local { .. } => None,
+                };
+                ("environment-catalog-confirm", title, description, div().children(detail.map(|detail| muted_text(detail, cx))).into_any_element(),
+                    Some(Button::new("environment-dialog-confirm", if destructive { ButtonVariant::Destructive } else { ButtonVariant::Default }, ButtonSize::Sm)
+                        .label(t(cx, submit)).on_click(cx.listener(|this, _, window, cx| this.confirm_catalog_action(window, cx))).into_any_element()),
+                    focus.clone())
+            }
+            CatalogDialog::Add { address, code, source, focus, .. } => {
+                let ssh = *source == PairingSource::Ssh;
+                let p = palette(cx);
+                let error = crate::connect::pairing_error(&self.state.read(cx).connect, *source);
+                let mode = |next, label, icon, cx: &mut Context<Self>| {
+                    Button::new(label, if next == *source { ButtonVariant::Outline } else { ButtonVariant::GhostMuted }, ButtonSize::Sm)
+                        .icon(icon).label(t(cx, label)).disabled(busy)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(CatalogDialog::Add { source, submitted, address, code, .. }) = this.environments.catalog.dialog.as_mut() {
+                                if *source == next { return; }
+                                *source = next;
+                                *submitted = false;
+                                address.update(cx, |input, cx| input.set_value("", window, cx));
+                                code.update(cx, |input, cx| input.set_value("", window, cx));
+                                this.state.update(cx, |state, cx| {
+                                    state.connect.error = None;
+                                    if next == PairingSource::Ssh { state.refresh_ssh_hosts(cx); }
+                                });
+                                address.read(cx).focus_handle(cx).focus(window, cx);
+                                cx.notify();
+                            }
+                        }))
+                };
+                let body = v_flex().gap(r(8.))
+                    .child(h_flex().gap(r(6.))
+                        .child(mode(PairingSource::Link, "Remote link", Icon::Link, cx))
+                        .child(mode(PairingSource::Ssh, "SSH", Icon::Terminal, cx)))
+                    .child(muted_text(t(cx, if ssh { "SSH host or alias" } else { "Pairing link or server address" }), cx))
+                    .child(catalog_input(address, busy, cx))
+                    .when(!ssh, |el| el.child(muted_text(t(cx, "Optional pairing code"), cx)).child(catalog_input(code, busy, cx)))
+                    .children(error.map(|message| div().text_xs().text_color(hsla(p.destructive_foreground)).child(message)));
+                ("environment-catalog-add", "Add environment", "Choose how to connect to a machine running T3 Code.",
+                    body.into_any_element(), Some(Button::new("environment-dialog-add", ButtonVariant::Default, ButtonSize::Sm)
+                        .label(t(cx, if busy { "Adding…" } else { "Add environment" }))
+                        .disabled(busy || address.read(cx).value().trim().is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_catalog_add(cx)))
+                        .into_any_element()), focus.clone())
+            }
+            CatalogDialog::AddRoute { saved_id, focus } => {
+                let saved = self.state.read(cx).environments.get(saved_id)?;
+                let reported = t3_client::supervisor::server_config_extras_for(&saved.http_base).borrow().direct_endpoint_entries.clone();
+                let choices = route_choices(saved, &load_alternate_routes().remove(saved_id).unwrap_or_default(), &reported);
+                let body = v_flex().gap(r(5.))
+                    .when(choices.is_empty(), |el| el.child(muted_text(t(cx, "This server has no additional compatible advertised routes."), cx)))
+                    .children(choices.into_iter().map(|route| {
+                        let id = saved_id.clone();
+                        let route_id: SharedString = route.id.clone().into();
+                        Button::new(route_id, ButtonVariant::Outline, ButtonSize::Sm)
+                            .icon(Icon::Plus).label(format!("{} · {}", route.label(), route.http_base)).justify_between()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let Some(saved) = this.state.read(cx).environments.get(&id) else { return };
+                                let mut routes = load_alternate_routes().remove(&id).unwrap_or_default();
+                                let reported = t3_client::supervisor::server_config_extras_for(&saved.http_base).borrow().direct_endpoint_entries.clone();
+                                let Some(mut candidate) = route_choices(saved, &routes, &reported).into_iter().find(|candidate| candidate.id == route.id) else { return };
+                                routes.retain(|entry| entry.id != candidate.id);
+                                candidate.learned = false;
+                                let routes = t3_client::routes::insert_route(&routes, candidate, true);
+                                this.state.update(cx, |state, cx| state.apply_settings_routes(&id, routes, cx));
+                                this.dismiss_environments_overlay(window, cx);
+                            }))
+                    }));
+                ("environment-catalog-add-route", "Add route", "Save an address advertised by this environment. Native shares the existing sign-in across its direct routes.",
+                    body.into_any_element(), None, focus.clone())
+            }
+        };
+        let frame = DialogFrame {
+            id,
+            title: t(cx, title).into(),
+            description: t(cx, description).into(),
+            max_width: 448.,
+            body,
+            footer: dialog_footer(true, std::iter::once(cancel).chain(action).collect(), cx).into_any_element(),
+            focus,
+        };
+        let weak = cx.entity().downgrade();
+        Some(frame.render(window, move |window, cx| {
+            let _ = weak.update(cx, |this, cx| { this.dismiss_environments_overlay(window, cx); });
+        }, cx))
+    }
+
+    pub(super) fn environments(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+        let p = palette(cx);
+        let mut blocks = self.catalog_blocks(cx);
 
         // 1. Linked environments (`LinkedEnvironmentsSettings.tsx`)
         let hosts = self.peer_link_hosts(cx);
@@ -1154,6 +1871,7 @@ impl SettingsView {
                                     .collect(),
                             )
                             .selected(current_pref.as_str())
+                            .show_check()
                             .width(128.)
                             .disabled(!lb_enabled)
                             .on_change(move |value, _, cx| {
@@ -1281,6 +1999,7 @@ impl SettingsView {
                                     .collect(),
                             )
                             .selected(current_perm.as_str())
+                            .show_check()
                             .width(128.)
                             .disabled(env.connection_key.is_none())
                             .on_change(move |value, _, cx| {
@@ -1363,6 +2082,12 @@ impl SettingsView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if let Some(dialog) = self.access_dialog_overlay(window, cx) {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.catalog_dialog(window, cx) {
+            return Some(dialog);
+        }
         let p = palette(cx);
         if let Some(confirm) = &self.environments.forget_confirm {
             let busy = confirm.busy;
@@ -1436,7 +2161,6 @@ impl SettingsView {
         let address_val = dialog.address.read(cx).value().trim().to_owned();
         let ready = self.link_dialog_ready(cx);
         let busy = dialog.busy;
-        let weak_toggle = cx.entity().downgrade();
         let weak_choice = cx.entity().downgrade();
         let weak_access = cx.entity().downgrade();
         let weak_dismiss = cx.entity().downgrade();
@@ -1447,21 +2171,11 @@ impl SettingsView {
                 "peer-link-machine-select",
                 &machines,
                 selected.as_deref(),
-                dialog.select_open,
                 busy,
-                move |_, cx| {
-                    let _ = weak_toggle.update(cx, |this, cx| {
-                        if let Some(d) = this.environments.link_dialog.as_mut() {
-                            d.select_open = !d.select_open;
-                            cx.notify();
-                        }
-                    });
-                },
                 move |value, _, cx| {
                     let _ = weak_choice.update(cx, |this, cx| {
                         if let Some(d) = this.environments.link_dialog.as_mut() {
                             d.choice = Some(value);
-                            d.select_open = false;
                             d.error = None;
                             cx.notify();
                         }
@@ -1497,7 +2211,7 @@ impl SettingsView {
                             .text_color(hsla(p.foreground))
                             .child("Address"),
                     )
-                    .child(Input::new(&dialog.address).small().disabled(busy))
+                    .child(catalog_input(&dialog.address, busy, cx))
                     .children(no_reachable_note.map(|note| {
                         div().text_xs().text_color(hsla(p.muted_foreground)).child(note)
                     })),
@@ -1524,7 +2238,7 @@ impl SettingsView {
                             .text_color(hsla(p.foreground))
                             .child("Pairing code"),
                     )
-                    .child(Input::new(&dialog.pairing_code).small().disabled(busy))
+                    .child(catalog_input(&dialog.pairing_code, busy, cx))
                     .children(help_note.map(|note| {
                         div().text_xs().text_color(hsla(p.muted_foreground)).child(note)
                     })),
@@ -1551,6 +2265,7 @@ impl SettingsView {
                 .child(
                     Select::new("peer-link-access-select", access_options)
                         .selected(dialog.access.clone())
+                        .show_check()
                         .width(360.)
                         .disabled(busy)
                         .on_change(move |value, _, cx| {
@@ -1616,6 +2331,81 @@ impl SettingsView {
             },
             cx,
         ))
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use t3_client::routes::ReportedEndpoint;
+
+    #[test]
+    fn icon_picker_resolves_override_detection_and_default() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "environment": { "platform": { "machine": "mac-mini", "os": "darwin" } },
+            "settings": { "environmentIcon": "cloud" }
+        })).unwrap();
+        assert_eq!(machine_icon_options(Some(&config)), ("cloud", "mac-mini", true));
+        assert_eq!(Icon::machine(&config), Icon::Cloud);
+        assert_eq!(machine_icon_options(None), ("server", "server", false));
+    }
+
+    #[test]
+    fn route_choices_use_safe_advertised_addresses_and_preserve_a_saved_order() {
+        let saved: SavedEnvironment = serde_json::from_value(json!({
+            "id": "dev",
+            "environmentId": "dev",
+            "label": "Dev box",
+            "httpBase": "https://dev.example"
+        })).unwrap();
+        let reported = [
+            ReportedEndpoint { http_base_url: "http://192.168.0.23:3773".into(), kind: None },
+            ReportedEndpoint { http_base_url: "https://dev.example.ts.net".into(), kind: Some("tailnet".into()) },
+            ReportedEndpoint { http_base_url: "https://other.example".into(), kind: None },
+        ];
+        let mut choices = route_choices(&saved, &[], &reported);
+        assert_eq!(choices.iter().map(|route| route.http_base.as_str()).collect::<Vec<_>>(),
+            ["https://dev.example.ts.net", "https://other.example"]);
+        let id = choices[0].id.clone();
+        assert!(!move_alternate_route(&mut choices, &id, -1));
+        assert!(move_alternate_route(&mut choices, &id, 1));
+        assert_eq!(choices[1].id, id);
+        choices[1].learned = false;
+        let offered = route_choices(&saved, &choices, &reported);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].http_base, "https://other.example");
+    }
+
+    #[gpui::test]
+    fn removing_a_saved_environment_requires_confirmation(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let state = cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx));
+            crate::settings::init(state.clone(), cx);
+            state.update(cx, |state, _| {
+                state.environments = serde_json::from_value(json!({"environments": [{
+                    "id": "fixture-remote",
+                    "label": "Remote",
+                    "httpBase": "https://example.invalid"
+                }]})).unwrap();
+            });
+            state
+        });
+        let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), |window, cx| {
+            SettingsView::new(state.clone(), t3_core::settings::search::Section::Connections, None, window, cx)
+        });
+        window.update(cx, |view, window, cx| {
+            let remove = || CatalogAction::Remove { id: "fixture-remote".into(), label: "Remote".into() };
+            view.show_catalog_confirmation(remove(), window, cx);
+            assert!(state.read(cx).environments.get("fixture-remote").is_some());
+            assert!(view.dismiss_environments_overlay(window, cx));
+            assert!(state.read(cx).environments.get("fixture-remote").is_some());
+            view.show_catalog_confirmation(remove(), window, cx);
+            view.confirm_catalog_action(window, cx);
+            assert!(state.read(cx).environments.get("fixture-remote").is_none());
+        }).unwrap();
     }
 }
 

@@ -51,6 +51,15 @@ pub struct Rejected {
     pub ssh: bool,
 }
 
+#[derive(Debug)]
+struct ConnectApprovalWatch(tokio::task::AbortHandle);
+
+impl Drop for ConnectApprovalWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What the connect screen shows besides the saved list.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectScreen {
@@ -68,6 +77,7 @@ pub struct ConnectScreen {
     attempt: u64,
     /// The pairing running on the network runtime. Aborting it stops `t3 pair`.
     pairing_task: Option<tokio::task::AbortHandle>,
+    approval_watches: HashMap<String, Arc<ConnectApprovalWatch>>,
 }
 
 impl AppState {
@@ -119,6 +129,90 @@ impl AppState {
         };
         let task = self.runtime().spawn(async move { auth::pair_with_link(&link).await.map_err(|error| error.to_string()) });
         self.await_pairing(PairingSource::Link, task, |state, paired, cx| state.adopt(paired, false, cx), cx);
+    }
+
+    pub(crate) fn add_settings_environment(&mut self, link: &str, code: Option<&str>, cx: &mut Context<Self>) {
+        if self.connect.pairing.is_some() {
+            return;
+        }
+        let link = match parse_pairing_link(link, code) {
+            Ok(link) => link,
+            Err(error) => return self.fail_pairing(PairingSource::Link, error.to_string(), cx),
+        };
+        if self.environments.find(None, &link.http_base).is_some() {
+            return self.fail_pairing(PairingSource::Link, "This address is already saved. Use its Routes to manage it.".into(), cx);
+        }
+        let saved_ids: std::collections::HashSet<String> = self.environments.environments.iter()
+            .filter_map(|saved| saved.environment_id.clone()).collect();
+        let task = self.runtime().spawn(async move {
+            if let Ok(descriptor) = auth::fetch_descriptor(&link.http_base).await
+                && saved_ids.contains(&descriptor.environment_id)
+            {
+                return Err("This environment is already saved. Use its Routes to manage this address.".into());
+            }
+            auth::pair_with_link(&link).await.map_err(|error| error.to_string())
+        });
+        self.await_pairing(PairingSource::Link, task, |state, paired, cx| {
+            let canonical = paired.descriptor.as_ref().map(|descriptor| descriptor.environment_id.as_str()).filter(|id| !id.is_empty());
+            if state.environments.find(canonical, &paired.credentials.http_base).is_some() {
+                return state.fail_pairing(PairingSource::Link, "This environment was already saved. Use its Routes to manage this address.".into(), cx);
+            }
+            let active = state.environments.active.clone();
+            let id = state.environments.upsert(&paired, false);
+            state.finish_settings_add(active, id, cx);
+        }, cx);
+    }
+
+    pub(crate) fn add_settings_ssh(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        if self.connect.pairing.is_some() {
+            return;
+        }
+        let key = t3_core::ssh::target_connection_key(&target);
+        if self.environments.environments.iter().filter_map(|saved| saved.ssh.as_ref())
+            .any(|saved| t3_core::ssh::target_connection_key(saved) == key)
+        {
+            return self.fail_pairing(PairingSource::Ssh, "This SSH route is already saved.".into(), cx);
+        }
+        let ssh = self.ssh.clone();
+        let task = self.runtime().spawn(async move { ssh.provision(&target, None).await.map_err(|error| error.to_string()) });
+        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| {
+            let canonical = pairing.paired.descriptor.as_ref().map(|descriptor| descriptor.environment_id.as_str()).filter(|id| !id.is_empty());
+            if let Some(existing) = state.environments.find(canonical, &pairing.paired.credentials.http_base) {
+                if existing.ssh.is_none() {
+                    state.stop_ssh(pairing.target);
+                }
+                return state.fail_pairing(PairingSource::Ssh, "This environment is already saved.".into(), cx);
+            }
+            let active = state.environments.active.clone();
+            let id = state.environments.upsert_ssh(&pairing.paired, pairing.target);
+            state.finish_settings_add(active, id, cx);
+        }, cx);
+    }
+
+    fn finish_settings_add(&mut self, active: Option<String>, id: String, cx: &mut Context<Self>) {
+        let select_new = active.is_none();
+        if !select_new {
+            self.environments.active = active;
+        }
+        self.persist_environments();
+        self.start_environment(&id, cx);
+        if select_new {
+            self.connections.activate(Some(&id));
+        }
+        cx.emit(AppEvent::Phase);
+    }
+
+    pub(crate) fn apply_settings_routes(&mut self, id: &str, routes: Vec<CandidateRoute>, cx: &mut Context<Self>) {
+        if self.environments.get(id).is_none_or(|saved| saved.ssh.is_some() || saved.local || saved.is_relay_managed()) {
+            return;
+        }
+        self.record_environment_alternate_routes(id, routes);
+        self.connections.remove(id);
+        self.start_environment(id, cx);
+        if self.environments.active.as_deref() == Some(id) {
+            self.connections.activate(Some(id));
+        }
+        cx.emit(AppEvent::Phase);
     }
 
     /// "Connect to T3 Code on this Mac": reuses a saved credential for it, else pairs.
@@ -249,7 +343,8 @@ impl AppState {
     fn reset_connect_screen(&mut self) {
         self.cancel_pairing();
         let (local_server, ssh_hosts, attempt) = (self.connect.local_server.take(), self.connect.ssh_hosts.take(), self.connect.attempt);
-        self.connect = ConnectScreen { local_server, ssh_hosts, attempt, ..Default::default() };
+        let approval_watches = std::mem::take(&mut self.connect.approval_watches);
+        self.connect = ConnectScreen { local_server, ssh_hosts, attempt, approval_watches, ..Default::default() };
     }
 
     /// Saves a new pairing and connects to it.
@@ -322,6 +417,7 @@ impl AppState {
     /// Direct environments pass any persisted alternate routes for multi-route candidate fallback.
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
+        if environment.disabled { return; }
         let Some(access_token) = environment.access_token.clone() else { return };
         if environment.ssh.is_none()
             && environment.is_relay_managed()
@@ -369,7 +465,7 @@ impl AppState {
                     Ok(())
                 })
             });
-            return self.connections.watch_with_routes(
+            self.connections.watch_with_routes(
                 id,
                 Credentials {
                     http_base: environment.http_base,
@@ -379,16 +475,20 @@ impl AppState {
                 environment.environment_id,
                 Some(prepare),
             );
+            self.watch_connect_approvals(id, cx);
+            return;
         }
         let Some(target) = environment.ssh.clone() else {
             let alternate_routes = store::load_alternate_routes().remove(id).unwrap_or_default();
-            return self.connections.watch_with_routes(
+            self.connections.watch_with_routes(
                 id,
                 Credentials { http_base: environment.http_base, access_token },
                 alternate_routes,
                 environment.environment_id,
                 None,
             );
+            self.watch_connect_approvals(id, cx);
+            return;
         };
         let port = match self.ssh.session_port(&target) {
             Ok(port) => port,
@@ -410,6 +510,124 @@ impl AppState {
             environment.environment_id,
             Some(prepare),
         );
+        self.watch_connect_approvals(id, cx);
+    }
+
+    fn watch_connect_approvals(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.stop_connect_approvals(id, cx);
+        let lookup = self.connections.client(id);
+        let (output, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let task = self.runtime().spawn(async move {
+            let Some(client) = lookup.await else { return };
+            let mut config = client.server_config_extras();
+            let mut grants = client.session_state();
+            let mut generation = client.connection_generation();
+            let mut pending = t3_core::connect::ConnectDevicesState::default();
+            let mut stream: Option<t3_client::session::StreamHandle> = None;
+            loop {
+                let can_approve = config.borrow_and_update().require_connect_device_approval == Some(true)
+                    && grants.borrow_and_update().as_ref().is_some_and(|grants| {
+                        grants.grants(t3_core::settings::access::ACCESS_READ) && grants.grants(t3_core::settings::access::ACCESS_WRITE)
+                    });
+                generation.borrow_and_update();
+                if !can_approve {
+                    stream = None;
+                    pending.pending_requests.clear();
+                } else if stream.is_none() {
+                    stream = client.stream(t3_core::settings::access::SUBSCRIBE, serde_json::json!({})).await.ok();
+                }
+                let now = t3_client::dpop::now_epoch_ms();
+                let visible = pending.visible_pending_requests(now);
+                let expire_after = visible.iter().filter_map(|request| t3_core::sidebar::time::parse_iso(&request.expires_at))
+                    .map(|at| std::time::Duration::from_millis(at.saturating_sub(now) as u64)).min();
+                if output.send(visible.into_iter().cloned().collect::<Vec<_>>()).is_err() {
+                    return;
+                }
+                tokio::select! {
+                    changed = config.changed() => if changed.is_err() { return },
+                    changed = grants.changed() => if changed.is_err() { return },
+                    changed = generation.changed() => {
+                        if changed.is_err() { return; }
+                        stream = None;
+                        pending.pending_requests.clear();
+                    }
+                    item = async {
+                        match &mut stream {
+                            Some(stream) => stream.receiver.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match item {
+                        Some(Ok(item)) => pending.apply(&item),
+                        _ => {
+                            stream = None;
+                            pending.pending_requests.clear();
+                            if output.send(Vec::new()).is_err() || generation.changed().await.is_err() { return; }
+                        }
+                    },
+                    () = async {
+                        match expire_after {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
+            }
+        });
+        let watch = Arc::new(ConnectApprovalWatch(task.abort_handle()));
+        let weak_watch = Arc::downgrade(&watch);
+        self.connect.approval_watches.insert(id.to_owned(), watch);
+        let id = id.to_owned();
+        cx.spawn(async move |this, cx| {
+            let mut shown = HashMap::new();
+            while let Some(requests) = requests.recv().await {
+                let _ = this.update(cx, |state, cx| {
+                    let current = weak_watch.upgrade().zip(state.connect.approval_watches.get(&id))
+                        .is_some_and(|(current, stored)| Arc::ptr_eq(&current, stored));
+                    if current {
+                        state.present_connect_approvals(&id, requests, &mut shown, cx);
+                    }
+                });
+            }
+        }).detach();
+    }
+
+    fn stop_connect_approvals(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.connect.approval_watches.remove(id).is_some() {
+            self.withdraw_toast_by_key(&format!("connect-approval:{id}"), cx);
+        }
+    }
+
+    fn present_connect_approvals(
+        &mut self, id: &str,
+        requests: Vec<t3_core::connect::PendingConnectDeviceRequest>,
+        shown: &mut HashMap<String, (String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(environment) = self.environments.get(id) else { return };
+        let environment_label = environment.label.clone();
+        let next = requests.iter().map(|request| {
+            (request.pairing_link_id.clone(), (
+                t3_core::connect::describe_connect_device_client(request.client.as_ref()),
+                request.verification_code.clone(),
+            ))
+        }).collect::<HashMap<_, _>>();
+        if next == *shown { return; }
+        *shown = next;
+        let key = format!("connect-approval:{id}");
+        let Some(first) = requests.first().and_then(|request| shown.get(&request.pairing_link_id)) else {
+            self.withdraw_toast_by_key(&key, cx);
+            return;
+        };
+        let title = crate::i18n::t_fmt(cx, "A device wants to connect to {environmentLabel}", &[
+            ("environmentLabel", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&environment_label))),
+        ]);
+        let description = crate::i18n::t_fmt(cx, "{device}. Approve only if it shows code {code}.", &[
+            ("device", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&first.0))),
+            ("code", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&first.1))),
+        ]);
+        self.show_toast(Toast::new(ToastKind::Info, title).description(format!(
+            "{description} {}", crate::i18n::t(cx, "Review requests in Settings → Sharing & access."),
+        )).key(key).persistent(), cx);
     }
 
     /// Persists alternate/learned direct routes for a saved environment (`CN-SESSION`).
@@ -966,6 +1184,7 @@ impl AppState {
             if let Some(entry) = self.environments.environments.iter_mut().find(|e| e.id == id) { entry.disabled = true; }
             self.connections.remove(&id);
             self.environment_statuses.remove(&id);
+            self.stop_connect_approvals(&id, cx);
             self.retire_environment_notifications(&id, cx);
         }
         self.connections.activate(None);
@@ -978,6 +1197,50 @@ impl AppState {
         self.refresh_local_server(cx);
         if let Some(target) = ssh {
             self.stop_ssh(target);
+        }
+    }
+
+    pub(crate) fn set_saved_environment_enabled(&mut self, id: &str, enabled: bool, cx: &mut Context<Self>) {
+        let Some(entry) = self.environments.environments.iter_mut().find(|entry| entry.id == id) else { return };
+        if entry.disabled != enabled || (enabled && entry.access_token.is_none()) {
+            return;
+        }
+        entry.disabled = !enabled;
+        let ssh = entry.ssh.clone();
+        self.persist_environments();
+        if enabled {
+            if self.environments.active.is_none() {
+                self.connect_environment(id, cx);
+            } else {
+                self.start_environment(id, cx);
+            }
+        } else {
+            self.connections.remove(id);
+            self.environment_statuses.remove(id);
+            self.stop_connect_approvals(id, cx);
+            self.retire_environment_notifications(id, cx);
+            if let Some(target) = ssh {
+                self.stop_ssh(target);
+            }
+            if self.environments.active.as_deref() == Some(id) {
+                self.select_remaining_environment(cx);
+            }
+        }
+        cx.emit(AppEvent::Phase);
+    }
+
+    fn select_remaining_environment(&mut self, cx: &mut Context<Self>) {
+        let next = self.environments.environments.iter()
+            .find(|saved| !saved.disabled && saved.access_token.is_some())
+            .map(|saved| saved.id.clone());
+        self.environments.active = next.clone();
+        self.notification_route = None;
+        self.persist_environments();
+        self.reset_connection(cx);
+        self.connections.activate(next.as_deref());
+        if next.is_none() {
+            self.connect.switching = false;
+            self.set_phase(Phase::Unpaired, cx);
         }
     }
 
@@ -995,7 +1258,7 @@ impl AppState {
     /// "Remove from this device": forgets the environment and its credential, and withdraws any
     /// active permission-update notice toast for it (`pingdotgg/t3code#38980`).
     pub fn remove_environment(&mut self, id: &str, cx: &mut Context<Self>) {
-        let was_active = self.environments.active.as_deref() == Some(id) && self.client_handle().is_some();
+        let was_active = self.environments.active.as_deref() == Some(id);
         let ssh = self.environments.get(id).and_then(|environment| environment.ssh.clone());
         let canonical_id = self
             .environments
@@ -1012,6 +1275,7 @@ impl AppState {
         if !self.environments.remove(id) {
             return;
         }
+        self.record_environment_alternate_routes(id, Vec::new());
         self.withdraw_toast_by_key(&format!("permission-update:{id}"), cx);
         if let Some(cid) = canonical_id
             && cid != id
@@ -1021,13 +1285,12 @@ impl AppState {
         self.persist_environments();
         self.connections.remove(id);
         self.environment_statuses.remove(id);
+        self.stop_connect_approvals(id, cx);
         self.retire_environment_notifications(id, cx);
         if self.notification_route.as_ref().is_some_and(|key| key.environment_id == id) { self.notification_route = None; }
         self.connect.rejected = self.connect.rejected.take().filter(|rejected| rejected.id != id);
         if was_active {
-            self.reset_connection(cx);
-            self.connect.switching = false;
-            self.set_phase(Phase::Unpaired, cx);
+            self.select_remaining_environment(cx);
         }
         if let Some(target) = ssh {
             self.stop_ssh(target);
@@ -1090,6 +1353,7 @@ impl AppState {
         self.persist_environments();
         self.connections.remove(id);
         self.environment_statuses.remove(id);
+        self.stop_connect_approvals(id, cx);
         self.retire_environment_notifications(id, cx);
         if self.environments.active.as_deref() != Some(id) { cx.emit(AppEvent::Phase); return; }
         self.notification_route = None;
