@@ -12,7 +12,6 @@ use gpui::{
 use gpui_component::{
     Sizable, h_flex,
     input::{Input, InputState},
-    v_flex,
 };
 use serde_json::Value;
 use t3_client::session::RpcError;
@@ -57,10 +56,6 @@ pub struct SecretSourceCheck {
 
 impl SecretSourceCheck {
     /// Supplies the destination and transport for checking this reference without reading its value.
-    #[allow(
-        dead_code,
-        reason = "Shared foundation for the native parity consumers"
-    )]
     pub fn new<F>(
         environment: impl Into<SharedString>,
         provider: impl Into<SharedString>,
@@ -203,14 +198,9 @@ pub struct SecretSourceInput {
     one_password: bool,
     disabled: bool,
     on_source_change: Option<ChangeSource>,
-    error: Option<SharedString>,
     check: Option<SecretSourceCheck>,
 }
 
-#[allow(
-    dead_code,
-    reason = "Shared foundation for the native parity consumers"
-)]
 impl SecretSourceInput {
     /// Uses the caller's input and current source; pass the providers supported by the destination.
     pub fn new(
@@ -250,7 +240,6 @@ impl SecretSourceInput {
             }),
             disabled: false,
             on_source_change: None,
-            error: None,
             check: None,
         }
     }
@@ -270,12 +259,6 @@ impl SecretSourceInput {
         self
     }
 
-    /// Shows validation feedback from the caller's reference commit handler.
-    pub fn error(mut self, error: impl Into<SharedString>) -> Self {
-        self.error = Some(error.into());
-        self
-    }
-
     /// Enables verification for a committed reference on a server that supports the check.
     pub fn check(mut self, check: SecretSourceCheck) -> Self {
         self.check = Some(check);
@@ -285,7 +268,6 @@ impl SecretSourceInput {
 
 impl RenderOnce for SecretSourceInput {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let p = palette(cx);
         let is_reference = self.selected.is_some();
         let label = crate::i18n::t(cx, self.label.as_ref()).to_owned();
         let picker = (self.options.len() > 1).then(|| {
@@ -303,7 +285,6 @@ impl RenderOnce for SecretSourceInput {
             .check
             .filter(|check| {
                 self.selected.as_ref() == Some(&check.key.provider)
-                    && self.error.is_none()
                     && self.input.read(cx).value().trim() == check.key.reference.as_ref()
                     && validate_reference(self.one_password, &check.key.reference).is_ok()
             })
@@ -338,39 +319,18 @@ impl RenderOnce for SecretSourceInput {
             .gap(r(6.))
             .children(picker)
             .child(
-                v_flex()
+                div()
+                    .relative()
                     .flex_1()
                     .min_w_0()
-                    .gap(r(4.))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap(r(6.))
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .children(background)
-                                    .child(field),
-                            )
-                            .children(check),
-                    )
-                    .children(self.error.map(|error| {
-                        div()
-                            .text_xs()
-                            .text_color(hsla(p.destructive))
-                            .child(crate::i18n::t(cx, error.as_ref()).to_owned())
-                    })),
+                    .children(background)
+                    .child(field),
             )
+            .children(check)
     }
 }
 
 /// Validates a draft using the same reference rules as the settings models.
-#[allow(
-    dead_code,
-    reason = "Shared foundation for the native parity consumers"
-)]
 pub fn validate_reference(one_password: bool, text: &str) -> Result<(), &'static str> {
     if one_password && !form::valid_one_password_reference(text) {
         return Err("Use a 1Password reference like op://vault/item/field.");

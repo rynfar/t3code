@@ -13,7 +13,7 @@ use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 
 use crate::app_state::{AppEvent, AppState, Phase};
-use crate::components::motion::{Spinner, prefers_reduced_motion, transition};
+use crate::components::motion::{prefers_reduced_motion, transition};
 use crate::icons::Icon;
 use crate::selectable_text::SelectableText;
 use crate::theme::{hsla, palette};
@@ -63,8 +63,6 @@ pub enum ToastKind {
     Error,
     Warning,
     Info,
-    #[allow(dead_code, reason = "Available to callers that show a pending operation")]
-    Loading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +103,7 @@ impl Toast {
             key: None,
             permission_update_env: None,
             slow_rpc_requests: Vec::new(),
-            persistent: kind == ToastKind::Loading,
+            persistent: false,
             github_star: false,
             replace_linked_prompt: None,
         }
@@ -184,7 +182,7 @@ impl Toast {
                 (_, Icon::MessageCircleQuestion) => p.info,
                 (ToastKind::Warning, _) => p.warning,
                 (ToastKind::Info, _) => p.info,
-                (ToastKind::Loading, _) => p.muted_foreground,
+
             };
             (custom, color)
         } else if self.github_star && self.kind != ToastKind::Success {
@@ -195,7 +193,7 @@ impl Toast {
                 ToastKind::Error => (Icon::CircleAlert, p.destructive),
                 ToastKind::Warning => (Icon::TriangleAlert, p.warning),
                 ToastKind::Info => (Icon::Info, p.info),
-                ToastKind::Loading => (Icon::LoaderCircle, p.muted_foreground),
+
             }
         };
         let show_copy = self.kind == ToastKind::Error && !self.hide_copy_button;
@@ -213,13 +211,7 @@ impl Toast {
             .py(px(12.))
             .text_sm()
             .text_color(hsla(p.popover_foreground))
-            .child(div().pt(px(2.)).map(|glyph| {
-                if self.kind == ToastKind::Loading {
-                    glyph.child(Spinner::new(("toast-loading", id), px(16.), hsla(color)))
-                } else {
-                    glyph.child(icon.sized(px(16.)).text_color(hsla(color)))
-                }
-            }))
+            .child(div().pt(px(2.)).child(icon.sized(px(16.)).text_color(hsla(color))))
             .child(
                 div()
                     .flex()

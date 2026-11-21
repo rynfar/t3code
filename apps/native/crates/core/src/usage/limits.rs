@@ -156,6 +156,7 @@ fn resolver<'a>(environments: &[LimitEnvironment<'a>]) -> KeyResolver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResetCreditInput {
     Instance { instance_id: String },
+    InstanceCredit { instance_id: String, credit_id: String },
     Source { source_id: String, account_id: String, credit_id: String },
 }
 
@@ -163,6 +164,9 @@ impl ResetCreditInput {
     pub fn payload(&self) -> Value {
         match self {
             ResetCreditInput::Instance { instance_id } => json!({ "instanceId": instance_id }),
+            ResetCreditInput::InstanceCredit { instance_id, credit_id } => {
+                json!({ "instanceId": instance_id, "creditId": credit_id })
+            }
             ResetCreditInput::Source { source_id, account_id, credit_id } => {
                 json!({ "sourceId": source_id, "accountId": account_id, "creditId": credit_id })
             }
@@ -174,6 +178,20 @@ impl ResetCreditInput {
 pub struct Redeem {
     pub environment_id: String,
     pub input: ResetCreditInput,
+}
+
+impl Redeem {
+    /// Fixed hub credits keep their source/account pair. Only an instance offers a choice.
+    pub fn with_instance_credit(&self, credit_id: &str) -> Option<Self> {
+        let ResetCreditInput::Instance { instance_id } = &self.input else { return None };
+        Some(Self {
+            environment_id: self.environment_id.clone(),
+            input: ResetCreditInput::InstanceCredit {
+                instance_id: instance_id.clone(),
+                credit_id: credit_id.to_owned(),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

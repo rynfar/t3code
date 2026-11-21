@@ -1112,27 +1112,30 @@ mod tests {
     use super::*;
     use gpui::{EntityInputHandler, KeyBinding, TestAppContext};
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    // The settings writer resolves one process-wide home, including on its background thread.
+    static SETTINGS_TEST: Mutex<()> = Mutex::new(());
+    const WRITE_FAILURE_CHILD: &str = "T3_NATIVE_THEME_IMPORT_WRITE_FAILURE_CHILD";
+
     fn setup(
         cx: &mut TestAppContext,
     ) -> (
+        MutexGuard<'static, ()>,
         tokio::runtime::Runtime,
         Entity<AppState>,
-        std::path::PathBuf,
     ) {
+        let guard = SETTINGS_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        let home = HOME
-            .get_or_init(|| {
-                std::env::temp_dir().join(format!("t3-theme-import-ui-{}", uuid::Uuid::new_v4()))
-            })
-            .clone();
+        let home = HOME.get_or_init(|| {
+            std::env::var_os(WRITE_FAILURE_CHILD)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join(format!("t3-theme-import-ui-{}", uuid::Uuid::new_v4())))
+        });
         t3_client::store::use_home(home.clone());
-        let _ = t3_client::store::commit_client_settings(serde_json::Map::new());
-        let settings = home.join("settings.json");
-        if settings.is_dir() {
-            std::fs::remove_dir_all(settings).unwrap();
-        } else if settings.exists() {
-            std::fs::remove_file(settings).unwrap();
-        }
+        t3_client::store::commit_client_settings(serde_json::Map::from_iter([
+            (themes::LIBRARY_KEY.into(), json!([])),
+        ])).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1145,7 +1148,7 @@ mod tests {
             store::install_committed_client(&state,serde_json::Map::from_iter([(themes::LIBRARY_KEY.into(),json!([]))]),cx);
             state
         });
-        (runtime, state, home)
+        (guard, runtime, state)
     }
     fn source() -> String {
         json!({"version":1,"name":"Dusk","appearance":"dark","colors":{"accent":"#123456"}})
@@ -1168,7 +1171,7 @@ mod tests {
     }
     #[gpui::test]
     fn ime_clause_selection_is_hidden_until_composition_ends(cx: &mut TestAppContext) {
-        let (_runtime, state, _home) = setup(cx);
+        let (_settings_test, _runtime, state) = setup(cx);
         let text = r#"{"name":"é😀"}"#;
         let byte_start = text.find('😀').unwrap();
         let clause = byte_start..byte_start + '😀'.len_utf8();
@@ -1248,7 +1251,7 @@ mod tests {
     }
     #[gpui::test]
     fn tab_leaves_json_and_keyboard_conflict_back_restores_editor(cx: &mut TestAppContext) {
-        let (_runtime, state, _home) = setup(cx);
+        let (_settings_test, _runtime, state) = setup(cx);
         let window = cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
         window
             .update(cx, |view, window, cx| {
@@ -1309,7 +1312,7 @@ mod tests {
     }
     #[gpui::test]
     fn editing_after_submit_retires_the_parse_before_it_installs(cx: &mut TestAppContext) {
-        let (_runtime, state, _home) = setup(cx);
+        let (_settings_test, _runtime, state) = setup(cx);
         let window = cx.add_window(|window, cx| ThemeImportDialog::new(state.clone(), window, cx));
         window
             .update(cx, |view, window, cx| {
@@ -1334,7 +1337,7 @@ mod tests {
     fn concurrent_library_edits_survive_preparation_and_delayed_completion(
         cx: &mut TestAppContext,
     ) {
-        let (_runtime, state, home) = setup(cx);
+        let (_settings_test, _runtime, state) = setup(cx);
         let theme = |name: &str| themes::import(&source().replace("Dusk", name)).unwrap();
         let baseline = serde_json::json!([theme("Keep"), theme("Remove")]);
         let edited = serde_json::json!([theme("Keep"), theme("Other")]);
@@ -1396,7 +1399,7 @@ mod tests {
                         .collect::<std::collections::BTreeSet<_>>()
                 });
                 let disk = t3_core::client_settings::ClientSettingsDoc::from_json(
-                    &std::fs::read_to_string(home.join("settings.json")).unwrap(),
+                    &t3_client::store::load_client_settings().unwrap(),
                 );
                 let disk = themes::library(&disk)
                     .into_iter()
@@ -1434,7 +1437,28 @@ mod tests {
                 themes: vec![theme],
             }
         }
-        let (_runtime, state, home) = setup(cx);
+        // This fixture replaces the settings file with a directory, so isolate the writer
+        // from other GPUI tests that initialize or read the process-wide home.
+        let Some(home) = std::env::var_os(WRITE_FAILURE_CHILD).map(std::path::PathBuf::from) else {
+            let home = std::env::temp_dir().join(format!("t3-theme-import-write-failure-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&home).unwrap();
+            let test = concat!(module_path!(), "::single_batch_marketplace_and_conflict_stay_open_when_the_settings_write_fails");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test.split_once("::").unwrap().1])
+                .env(WRITE_FAILURE_CHILD, &home)
+                .env("T3_NATIVE_HOME", &home)
+                .output().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "Isolated write-failure test: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        };
+        let (_settings_test, _runtime, state) = setup(cx);
+        std::fs::remove_file(home.join("settings.json")).unwrap();
         std::fs::create_dir_all(home.join("settings.json")).unwrap();
         let mut last = None;
         for mode in [3, 0, 1, 2] {

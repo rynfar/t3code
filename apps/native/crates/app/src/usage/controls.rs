@@ -7,12 +7,12 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, BoxShadow, ClickEvent, Div, ElementId, FontWeight, Hsla, IntoElement, ParentElement, Rems, RenderOnce, SharedString,
-    Stateful, Styled, Window, div, img, point, prelude::*, px, rems, svg,
+    Stateful, Styled, Window, div, point, prelude::*, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::usage::UsageProvider;
 
-use crate::icons::{Icon, ProviderLogo, provider_logo};
+use crate::icons::{Icon, provider_logo};
 use crate::right_panel::{focusable, tooltip_view};
 use crate::theme::{Palette, hsla, palette};
 
@@ -47,11 +47,10 @@ pub fn driver_color(driver: &str, p: Palette) -> Hsla {
 
 /// The provider's brand mark (`ProviderInstanceIcon` without a badge); one-color marks take `color`.
 pub fn brand_mark(driver: &str, size: f32, color: Hsla, cx: &App) -> AnyElement {
-    match provider_logo(driver) {
-        Some(ProviderLogo::Mono(path)) => svg().path(path).size(r(size)).flex_none().text_color(color).into_any_element(),
-        Some(ProviderLogo::Image { light, dark }) => img(if cx.theme().is_dark() { dark } else { light }).size(r(size)).flex_none().into_any_element(),
-        None => div().size(r(size)).flex_none().into_any_element(),
-    }
+    provider_logo(driver).map_or_else(
+        || div().size(r(size)).flex_none().into_any_element(),
+        |logo| logo.render(r(size), color, cx.theme().is_dark()),
+    )
 }
 
 pub fn icon(glyph: Icon, size: f32, color: Hsla) -> gpui::Svg {

@@ -154,10 +154,6 @@ pub struct StatusDot {
     live: bool,
 }
 
-#[allow(
-    dead_code,
-    reason = "Shared foundation for the native parity consumers"
-)]
 impl StatusDot {
     /// Creates a dot that pings when live and stays solid otherwise.
     pub fn new(id: impl Into<ElementId>, size: Pixels, color: Hsla, live: bool) -> Self {
@@ -211,10 +207,6 @@ pub struct Shimmer {
     content: AnyElement,
 }
 
-#[allow(
-    dead_code,
-    reason = "Shared foundation for the native parity consumers"
-)]
 impl Shimmer {
     /// Wraps content and sweeps a highlight across it while active.
     pub fn new(id: impl Into<ElementId>, active: bool, content: impl IntoElement) -> Self {
@@ -330,10 +322,6 @@ pub(crate) fn transition(
 }
 
 /// Rotates a right chevron a quarter turn when expanded.
-#[allow(
-    dead_code,
-    reason = "Shared foundation for the native parity consumers"
-)]
 pub fn animated_chevron(
     id: impl Into<ElementId>,
     expanded: bool,
@@ -387,10 +375,6 @@ macro_rules! animated_extent {
 }
 
 animated_extent!(AnimatedHeight, h, w_full, "height");
-animated_extent!(
-    #[allow(dead_code, reason = "Shared foundation for the native parity consumers")]
-    AnimatedWidth, w, min_h_0, "width"
-);
 
 #[cfg(test)]
 mod tests {

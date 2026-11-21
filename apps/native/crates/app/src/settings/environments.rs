@@ -212,7 +212,7 @@ fn saved_env_connection_key(env_id: &str, saved: &SavedEnvironment) -> Option<St
     pull_request_routing_connection_key(env_id, &saved.http_base, ssh)
 }
 
-fn transport_subtitle(saved: &SavedEnvironment) -> String {
+fn transport_subtitle(saved: &SavedEnvironment, config: Option<&ServerConfig>) -> String {
     if saved.local {
         return "This machine".to_owned();
     }
@@ -225,6 +225,13 @@ fn transport_subtitle(saved: &SavedEnvironment) -> String {
     let route = CandidateRoute::saved(&saved.http_base);
     if route.kind() == ConnectionRouteKind::Tailnet {
         return "via Tailscale".to_owned();
+    }
+    // Linux only advertises a Windows file manager when the server detects WSL interop.
+    if config.is_some_and(|config| {
+        config.shell_reveal_in_file_manager_kind.as_deref() == Some("file-explorer")
+            && config.environment.platform.as_ref().is_some_and(|platform| platform.os == "linux")
+    }) {
+        return "WSL".to_owned();
     }
     saved.address()
 }
@@ -414,7 +421,7 @@ impl SettingsView {
                 saved_id: saved.id.clone(),
                 environment_id: env_id,
                 label,
-                subtitle: transport_subtitle(saved),
+                subtitle: transport_subtitle(saved, config),
                 icon: machine_icon,
                 connection_key,
             });
@@ -1117,9 +1124,9 @@ impl SettingsView {
             .or_else(|| (connected && alternate_routes.is_empty()).then_some(primary.id.as_str()));
         let subtitle = if !saved.local && !relay && saved.ssh.is_none() && active_route != Some(primary.id.as_str()) {
             active_route.and_then(|id| alternate_routes.iter().find(|route| route.id == id))
-                .map(|route| format!("via {}", route.label())).unwrap_or_else(|| transport_subtitle(saved))
+                .map(|route| format!("via {}", route.label())).unwrap_or_else(|| transport_subtitle(saved, config))
         } else {
-            transport_subtitle(saved)
+            transport_subtitle(saved, config)
         };
         let information = v_flex().min_w_0().flex_1().gap(r(2.))
             .child(div().truncate().font_weight(FontWeight::MEDIUM).text_sm().child(label.to_owned()))
@@ -2337,6 +2344,24 @@ impl SettingsView {
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
+
+    #[test]
+    fn linux_with_windows_file_manager_uses_wsl_transport_label() {
+        let saved = t3_client::store::SavedEnvironments::from_legacy(t3_client::auth::Credentials {
+            http_base: "http://localhost:3773".into(),
+            access_token: "fixture".into(),
+        });
+        let saved = saved.active().unwrap();
+        let mut config: ServerConfig = serde_json::from_value(serde_json::json!({
+            "environment": { "platform": { "os": "linux", "machine": "linux" } }
+        })).unwrap();
+        assert_eq!(transport_subtitle(saved, Some(&config)), saved.http_base);
+        config.shell_reveal_in_file_manager_kind = Some("file-explorer".into());
+        assert_eq!(transport_subtitle(saved, Some(&config)), "WSL");
+        config.environment.platform.as_mut().unwrap().os = "windows".into();
+        assert_eq!(transport_subtitle(saved, Some(&config)), saved.http_base);
+    }
+
     use t3_client::routes::ReportedEndpoint;
 
     #[test]

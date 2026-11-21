@@ -4,7 +4,7 @@
 //! `StorageSettings.tsx` (database notice, artifact and log retention, Delete now and the last
 //! run's report), and the link to Diagnostics. Rules live in `t3_core::settings::maintenance`.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::{HashMap, HashSet}, time::Duration};
 
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton,
@@ -13,10 +13,12 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState, NumberInputEvent, StepAction};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::json;
+use t3_client::session::RpcError;
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::i18n::IcuArg;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::sidebar::grouping::EnvironmentOwner;
-use crate::i18n::t;
+use crate::i18n::{t, t_fmt};
 use t3_core::server_config::{DEFAULT_USAGE_HISTORY_RETENTION_DAYS, ServerConfig, ServerSettings, UsageHistoryRetentionDays};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::diagnostics::ENVIRONMENT_MAINTAIN_SCOPE;
@@ -27,7 +29,7 @@ use t3_core::settings::maintenance::{
 use t3_core::settings::search::Section;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, NumberField, Row, Select, SelectOption, SettingInheritance, SettingInheritanceLayer, SettingSource, Switch, dialog_footer, group, icon, muted_text, r, section, section_title};
-use super::providers::{Stream, failure_text};
+use super::providers::failure_text;
 use super::{Block, SettingsView};
 use crate::app_state::Phase;
 use crate::icons::Icon;
@@ -93,6 +95,32 @@ impl Field {
 /// Above this many results the last run's list is virtualized in a fixed height.
 const INLINE_RESULTS: usize = 20;
 
+#[derive(Clone, PartialEq, Eq)]
+struct StorageConnection {
+    owner: Option<EnvironmentOwner>,
+    active_connection: Option<u64>,
+    cleanup: bool,
+    database: bool,
+}
+
+struct StorageTarget {
+    id: String,
+    label: String,
+    connection: StorageConnection,
+    has_rules: bool,
+    can_clean: bool,
+    can_reclaim: bool,
+}
+
+struct StorageReports {
+    connection: StorageConnection,
+    last_run: LastRun,
+    database: Option<DatabaseStorage>,
+    reclaim_requested: bool,
+    results: ListState,
+    _streams: Vec<Task<()>>,
+}
+
 pub(crate) struct MaintenanceState {
     artifacts_days: Entity<InputState>,
     logs_days: Entity<InputState>,
@@ -101,16 +129,10 @@ pub(crate) struct MaintenanceState {
     retention_switch_pressed: [bool; 3],
     retention_seq: u64,
     intervals: [Entity<InputState>; 4],
-    last_run: LastRun,
-    stream_target: Option<(Option<EnvironmentOwner>, Option<u64>)>,
-    report_stream: Option<Stream>,
-    database: Option<DatabaseStorage>,
-    database_stream: Option<Stream>,
+    storage: HashMap<String, StorageReports>,
     cleanup_pending: bool,
-    reclaim_confirming: Option<FocusHandle>,
-    reclaim_requested: bool,
+    reclaim_confirming: Option<(String, FocusHandle)>,
     last_run_open: bool,
-    results: ListState,
     background_dialog: Option<FocusHandle>,
     ticker: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -122,6 +144,7 @@ const DATABASE_NOTICE_DISMISSALS: &str = "dismissed-database-storage";
 struct DismissedDatabaseNotice {
     environments: HashSet<String>,
     loaded: bool,
+    save_task: Option<Task<()>>,
 }
 
 impl gpui::Global for DismissedDatabaseNotice {}
@@ -187,16 +210,10 @@ impl MaintenanceState {
             retention_switch_pressed: [false; 3],
             retention_seq: 0,
             intervals,
-            last_run: LastRun::Loading,
-            stream_target: None,
-            report_stream: None,
-            database: None,
-            database_stream: None,
+            storage: HashMap::new(),
             cleanup_pending: false,
             reclaim_confirming: None,
-            reclaim_requested: false,
             last_run_open: false,
-            results: ListState::new(0, ListAlignment::Top, gpui::px(400.)),
             background_dialog: None,
             ticker: None,
             _subscriptions: subscriptions,
@@ -219,17 +236,11 @@ impl MaintenanceState {
 
     /// Off the page: its streams and clock stop.
     pub(super) fn leave(&mut self) {
-        self.stream_target = None;
-        self.report_stream = None;
-        self.database_stream = None;
-        self.last_run = LastRun::Loading;
-        self.database = None;
+        self.storage.clear();
         self.last_run_open = false;
-        self.cleanup_pending = false;
         self.ticker = None;
         self.background_dialog = None;
         self.reclaim_confirming = None;
-        self.reclaim_requested = false;
         self.retention_drafts = [RetentionDraft::Closed; 3];
         self.retention_switch_pressed = [false; 3];
     }
@@ -365,20 +376,51 @@ impl SettingsView {
         super::store::update_server(state, ServerSettingChange::Prepared(payload), cx);
     }
 
-    fn maintenance_storage_target(&self, cx: &App) -> Option<(Option<EnvironmentOwner>, Option<u64>)> {
-        if self.is_project_scope(cx) || self.scoped_environment_owners(cx).len() > 1 || !self.scoped_connected_now(cx) {
-            return None;
+    fn storage_targets(&self, cx: &App) -> Vec<StorageTarget> {
+        if self.is_project_scope(cx) {
+            return Vec::new();
         }
-        let owner = self.scoped_primary_owner(cx);
-        if owner.is_none() && self.scope.machine.is_some() {
-            return None;
+        let app = self.state.read(cx);
+        let make_target = |config: &ServerConfig, owner, active_connection, grants: Option<&t3_core::auth::AuthSessionState>| {
+            let environment = &config.environment;
+            let cleanup = environment.capabilities.storage_cleanup_run == Some(true);
+            let database = environment.capabilities.database_storage == Some(true);
+            StorageTarget {
+                id: environment.environment_id.clone(),
+                label: environment.label.clone(),
+                connection: StorageConnection { owner, active_connection, cleanup, database },
+                has_rules: cleanup && model::has_cleanup_rules(&config.settings),
+                can_clean: cleanup && grants.is_some_and(|grants| grants.grants(SETTINGS_WRITE_SCOPE)),
+                can_reclaim: database && grants.is_some_and(|grants| grants.grants(ENVIRONMENT_MAINTAIN_SCOPE)),
+            }
+        };
+        let owners = self.scoped_environment_owners(cx);
+        if owners.is_empty() && self.scope.machine.is_none() && self.connected_now(cx) {
+            let grants = self.session(cx);
+            return app.server_config.config.as_ref().map(|config| {
+                make_target(config, None, app.connection_id(), grants.as_ref())
+            }).into_iter().collect();
         }
-        Some((owner, self.state.read(cx).connection_id()))
+        owners.into_iter().filter_map(|owner| {
+            let entry = app.fleet.environment(&owner.saved_id)?;
+            Some(make_target(entry.config.config.as_ref()?, Some(owner), None, entry.grants.as_ref()))
+        }).collect()
     }
 
-    fn maintenance_may(&self, scope: &str, cx: &App) -> bool {
-        self.maintenance_storage_target(cx).is_some()
-            && self.scoped_session(cx).is_none_or(|session| session.grants(scope))
+    fn storage_rpc(
+        &self, target: &StorageTarget, scope: &'static str, method: &'static str, cx: &App,
+    ) -> impl Future<Output = Result<serde_json::Value, RpcError>> + use<> {
+        let app = self.state.read(cx);
+        let destination = target.connection.owner.as_ref().map(|owner| app.connections.destination(owner, scope));
+        let active = app.client_handle();
+        async move {
+            let client = if let Some(destination) = destination {
+                destination.await.map_err(|_| RpcError::Closed)?.client
+            } else {
+                active.ok_or(RpcError::Closed)?
+            };
+            client.request(method, json!({})).await
+        }
     }
 
     fn ensure_database_dismissals(&self, cx: &mut Context<Self>) {
@@ -393,50 +435,114 @@ impl SettingsView {
         });
         cx.spawn(async move |this, cx| {
             let environments = load.await;
-            cx.update(|cx| cx.set_global(DismissedDatabaseNotice { loaded: true, environments }));
+            cx.update(|cx| cx.set_global(DismissedDatabaseNotice { loaded: true, environments, save_task: None }));
             let _ = this.update(cx, |_, cx| cx.notify());
         }).detach();
     }
 
-    /// Follows the last cleanup report and the database's reclaimable space while the page shows.
-    fn ensure_maintenance_streams(&mut self, config: &ServerConfig, cx: &mut Context<Self>) {
-        let target = self.maintenance_storage_target(cx);
-        if self.maintenance.stream_target != target {
-            self.maintenance.leave();
-            self.maintenance.stream_target = target.clone();
-        }
-        let Some(target) = target else { return };
-        let capabilities = &config.environment.capabilities;
-        if capabilities.storage_cleanup_run == Some(true) && self.maintenance.report_stream.is_none() {
-            self.maintenance.last_run = LastRun::Loading;
-            let report_target = target.clone();
-            self.maintenance.report_stream = self.subscribe(model::GET_STORAGE_CLEANUP_REPORT, json!({}), cx, move |this, item, cx| {
-                if this.maintenance_storage_target(cx).as_ref() != Some(&report_target) { return; }
-                this.maintenance.last_run = match item {
-                    Ok(serde_json::Value::Null) => LastRun::None,
-                    Ok(value) => match model::decode_report(&value) {
-                        Some(report) => LastRun::Report(report),
-                        None => return,
-                    },
-                    Err(_) => LastRun::Failed,
-                };
-            });
-        }
-        if capabilities.database_storage == Some(true) {
-            self.ensure_database_dismissals(cx);
-            if self.maintenance.database_stream.is_none() {
-                self.maintenance.database_stream = self.subscribe(model::GET_DATABASE_STORAGE, json!({}), cx, move |this, item, cx| {
-                    if this.maintenance_storage_target(cx).as_ref() != Some(&target) { return; }
-                    if let Ok(value) = item {
-                        this.maintenance.database = model::compaction_recommendation(&value);
-                        if this.maintenance.database.as_ref().is_some_and(|d| d.reclaim_failure.is_some()) {
-                            this.maintenance.reclaim_requested = false;
+    fn storage_stream(
+        &self, target: &StorageTarget, method: &'static str, cx: &mut Context<Self>,
+        on_item: impl Fn(&mut StorageReports, Result<serde_json::Value, RpcError>) + 'static,
+    ) -> Task<()> {
+        let app = self.state.read(cx);
+        let lookup = target.connection.owner.as_ref().map(|owner| app.connections.client(&owner.saved_id));
+        let active = app.client_handle();
+        let id = target.id.clone();
+        let connection = target.connection.clone();
+        cx.spawn(async move |this, cx| {
+            let client = if let Some(lookup) = lookup { lookup.await } else { active };
+            let update = |item, cx: &mut gpui::AsyncApp| {
+                this.update(cx, |this, cx| {
+                    let Some(reports) = this.maintenance.storage.get_mut(&id).filter(|entry| entry.connection == connection) else { return false };
+                    on_item(reports, item);
+                    cx.notify();
+                    true
+                }).unwrap_or(false)
+            };
+            let Some(client) = client else {
+                update(Err(RpcError::Closed), cx);
+                return;
+            };
+            let mut delay = Duration::from_millis(250);
+            loop {
+                match client.stream(method, json!({})).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.receiver.recv().await {
+                            match item {
+                                Ok(value) => {
+                                    delay = Duration::from_millis(250);
+                                    if !update(Ok(value), cx) { return; }
+                                }
+                                Err(RpcError::Closed) => break,
+                                Err(error) => {
+                                    update(Err(error), cx);
+                                    return;
+                                }
+                            }
                         }
                     }
-                });
+                    Err(RpcError::Closed) => {}
+                    Err(error) => {
+                        update(Err(error), cx);
+                        return;
+                    }
+                }
+                cx.background_executor().timer(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
             }
+        })
+    }
+
+    /// Follows cleanup and database reports for the selected environments while the page shows.
+    fn ensure_maintenance_streams(&mut self, targets: &[StorageTarget], cx: &mut Context<Self>) {
+        self.maintenance.storage.retain(|id, entry| {
+            targets.iter().any(|target| &target.id == id && target.connection == entry.connection)
+        });
+        if let Some((id, _)) = &self.maintenance.reclaim_confirming
+            && !targets.iter().any(|target| &target.id == id && target.can_reclaim)
+        {
+            self.maintenance.reclaim_confirming = None;
         }
-        if self.maintenance.ticker.is_none() {
+        if targets.iter().any(|target| target.connection.database) {
+            self.ensure_database_dismissals(cx);
+        }
+        for target in targets {
+            if self.maintenance.storage.contains_key(&target.id) || !(target.connection.cleanup || target.connection.database) {
+                continue;
+            }
+            let mut streams = Vec::new();
+            if target.connection.cleanup {
+                streams.push(self.storage_stream(target, model::GET_STORAGE_CLEANUP_REPORT, cx, |reports, item| {
+                    reports.last_run = match item {
+                        Ok(serde_json::Value::Null) => LastRun::None,
+                        Ok(value) => match model::decode_report(&value) {
+                            Some(report) => LastRun::Report(report),
+                            None => return,
+                        },
+                        Err(_) => LastRun::Failed,
+                    };
+                }));
+            }
+            if target.connection.database {
+                streams.push(self.storage_stream(target, model::GET_DATABASE_STORAGE, cx, |reports, item| {
+                    if let Ok(value) = item {
+                        reports.database = model::compaction_recommendation(&value);
+                        if reports.database.as_ref().is_none_or(|storage| storage.reclaim_failure.is_some()) {
+                            reports.reclaim_requested = false;
+                        }
+                    }
+                }));
+            }
+            self.maintenance.storage.insert(target.id.clone(), StorageReports {
+                connection: target.connection.clone(),
+                last_run: LastRun::Loading,
+                database: None,
+                reclaim_requested: false,
+                results: ListState::new(0, ListAlignment::Top, gpui::px(400.)),
+                _streams: streams,
+            });
+        }
+        if targets.iter().any(|target| target.connection.cleanup) && self.maintenance.ticker.is_none() {
             self.maintenance.ticker = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(30)).await;
@@ -445,11 +551,11 @@ impl SettingsView {
                     }
                 }
             }));
+        } else if !targets.iter().any(|target| target.connection.cleanup) {
+            self.maintenance.ticker = None;
         }
     }
 
-    /// `RetentionControl`'s commit: explicit Enter or edited blur saves clamped; untouched blur
-    /// discards a draft without saving.
     fn commit_artifact_retention(&mut self, field: Field, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_project_scope(cx) {
             return;
@@ -535,10 +641,11 @@ impl SettingsView {
     }
 
     pub(super) fn maintenance_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
+        let storage_targets = self.storage_targets(cx);
+        self.ensure_maintenance_streams(&storage_targets, cx);
         let Some(config) = self.scoped_representative_config(cx) else {
             return vec![Block::new(&[], muted_text("Reconnect to change this environment's settings.", cx))];
         };
-        self.ensure_maintenance_streams(&config, cx);
         let scoped_configs = self.scoped_all_configs(cx);
         let settings = &config.settings;
         let unavailable = self.settings_unavailable(cx);
@@ -694,7 +801,7 @@ impl SettingsView {
             Block::new(&["usage-history-retention"], usage_history),
         ];
         if !self.is_project_scope(cx) {
-            blocks.extend(self.storage_blocks(&config, env_only, window, cx));
+            blocks.extend(self.storage_blocks(&storage_targets, &config, env_only, window, cx));
         }
         let diagnostics = section(
             "Diagnostics",
@@ -942,10 +1049,9 @@ impl SettingsView {
     }
 
     /// `StorageCleanupSections`: the database notice, retention, and the cleanup run.
-    fn storage_blocks(&mut self, config: &ServerConfig, unavailable: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let capabilities = &config.environment.capabilities;
+    fn storage_blocks(&mut self, targets: &[StorageTarget], config: &ServerConfig, unavailable: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         let mut blocks = Vec::new();
-        if let Some(notice) = self.database_notice(config, cx) {
+        if let Some(notice) = self.database_notice(targets, cx) {
             blocks.push(Block::new(&["storage-database"], notice));
         }
         if self.scoped_all_configs(cx).iter().any(|cfg| cfg.environment.capabilities.storage_cleanup != Some(true)) {
@@ -1001,25 +1107,24 @@ impl SettingsView {
             &["storage-artifacts"],
             div().id("storage-artifacts").rounded(r(12.)).when(highlighted, |this| this.bg(hsla(p.accent).opacity(0.3))).child(artifacts),
         ));
-        if capabilities.storage_cleanup_run == Some(true) {
-            let cleanup = if self.maintenance_storage_target(cx).is_some() {
-                self.storage_cleanup_section(config, cx)
-            } else {
-                section(t(cx, "Cleanup"), vec![Row::new("storage-delete-now", t(cx, "Delete now"))
-                    .description(t(cx, "Select one connected environment to run cleanup.")).into_any_element()], cx).into_any_element()
-            };
-            blocks.push(Block::new(&["storage-delete-now"], cleanup));
+        let cleanup_targets: Vec<_> = targets.iter().filter(|target| target.connection.cleanup).collect();
+        if !cleanup_targets.is_empty() {
+            blocks.push(Block::new(&["storage-delete-now"], self.storage_cleanup_section(&cleanup_targets, targets.len(), cx)));
         }
         blocks
     }
 
-    fn open_reclaim_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.maintenance_may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+    fn open_reclaim_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.storage_targets(cx).into_iter().find(|target| target.id == id && target.can_reclaim) else { return };
+        if !self.maintenance.storage.get(id).is_some_and(|entry| {
+            entry.connection == target.connection && !entry.reclaim_requested
+                && entry.database.as_ref().is_some_and(|database| database.can_reclaim)
+        }) {
             return;
         }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        self.maintenance.reclaim_confirming = Some(focus);
+        self.maintenance.reclaim_confirming = Some((id.to_owned(), focus));
         cx.notify();
     }
 
@@ -1031,48 +1136,43 @@ impl SettingsView {
     }
 
     fn start_database_reclaim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
-            self.close_reclaim_dialog(window, cx);
-            return;
-        }
-        let Some(storage) = self.maintenance.database.clone() else {
-            self.close_reclaim_dialog(window, cx);
-            return;
-        };
-        self.maintenance.reclaim_confirming = None;
-        self.maintenance.reclaim_requested = true;
+        let Some((id, _)) = self.maintenance.reclaim_confirming.take() else { return };
         self.focus.focus(window, cx);
+        cx.notify();
+        let Some(target) = self.storage_targets(cx).into_iter().find(|target| target.id == id && target.can_reclaim) else { return };
+        let Some(reports) = self.maintenance.storage.get_mut(&id).filter(|reports| reports.connection == target.connection && !reports.reclaim_requested) else { return };
+        let Some(storage) = reports.database.as_ref().filter(|storage| storage.can_reclaim) else { return };
+        reports.reclaim_requested = true;
         let amount = storage.amount();
-        let label = self.scoped_raw_representative_config(cx).map(|cfg| cfg.environment.label).unwrap_or_default();
         let minutes = storage.reclaim_minutes();
-        let target = self.maintenance_storage_target(cx);
-        let task = self.scoped_rpc(ENVIRONMENT_MAINTAIN_SCOPE, model::RECLAIM_DATABASE_SPACE, json!({}), cx);
+        let task = self.storage_rpc(&target, ENVIRONMENT_MAINTAIN_SCOPE, model::RECLAIM_DATABASE_SPACE, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.maintenance_storage_target(cx) != target { return; }
+                let environment = IcuArg::from(&target.label);
                 let toast = match result {
-                    Ok(_) => Toast::new(ToastKind::Success, format!("Reclaiming {amount} on {label}"))
-                        .description(format!("T3 Code there restarts and is back in about {minutes} min.")),
+                    Ok(_) => Toast::new(ToastKind::Success, t_fmt(cx, "Reclaiming {amount} on {environment}", &[
+                        ("amount", IcuArg::from(&amount)), ("environment", environment),
+                    ])).description(t_fmt(cx, "T3 Code there restarts and is back in about {minutes} min.", &[("minutes", IcuArg::Int(minutes as i64))])),
                     Err(error) => {
-                        this.maintenance.reclaim_requested = false;
-                        Toast::new(ToastKind::Error, format!("Could not reclaim space on {label}"))
-                            .description(failure_text(&error, "An error occurred."))
+                        if let Some(reports) = this.maintenance.storage.get_mut(&id).filter(|entry| entry.connection == target.connection) {
+                            reports.reclaim_requested = false;
+                        }
+                        Toast::new(ToastKind::Error, t_fmt(cx, "Could not reclaim space on {environment}", &[("environment", environment)]))
+                            .description(failure_text(&error, t(cx, "An error occurred.")))
                     }
                 };
                 this.state.update(cx, |state, cx| state.show_toast(toast, cx));
                 cx.notify();
             });
-        })
-        .detach();
-        cx.notify();
+        }).detach();
     }
 
     fn reclaim_dialog_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let focus = self.maintenance.reclaim_confirming.clone()?;
-        let storage = self.maintenance.database.as_ref()?;
-        let label = self.scoped_raw_representative_config(cx)?.environment.label;
-        let (title, description) = storage.reclaim_confirmation(&label);
+        let (id, focus) = self.maintenance.reclaim_confirming.clone()?;
+        let storage = self.maintenance.storage.get(&id)?.database.as_ref()?;
+        let target = self.storage_targets(cx).into_iter().find(|target| target.id == id && target.can_reclaim)?;
+        let (title, description) = storage.reclaim_confirmation(&target.label);
         let footer = dialog_footer(
             false,
             vec![
@@ -1106,81 +1206,109 @@ impl SettingsView {
         ))
     }
 
-    /// `DatabaseStorageNotice`: offers in-app Reclaim when supported & permitted, else `t3 doctor`.
-    fn database_notice(&self, config: &ServerConfig, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn dismiss_database_notice(&self, id: &str, cx: &mut Context<Self>) {
+        let dismissed = cx.global_mut::<DismissedDatabaseNotice>();
+        dismissed.environments.insert(id.to_owned());
+        let environments = dismissed.environments.clone();
+        let previous = dismissed.save_task.take();
+        let save = cx.background_executor().spawn(async move {
+            // Preserve click order when several machine notices are dismissed in quick succession.
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            t3_client::store::save_ui_state(DATABASE_NOTICE_DISMISSALS, &environments);
+        });
+        cx.global_mut::<DismissedDatabaseNotice>().save_task = Some(save);
+        cx.notify();
+    }
+
+    /// `DatabaseStorageNotice` shows each machine's current recommendation.
+    fn database_notice(&self, targets: &[StorageTarget], cx: &mut Context<Self>) -> Option<AnyElement> {
         let dismissed = cx.try_global::<DismissedDatabaseNotice>()?;
-        let environment = &config.environment;
-        if environment.capabilities.database_storage != Some(true) || !dismissed.loaded
-            || dismissed.environments.contains(&environment.environment_id)
-        {
+        if !dismissed.loaded {
             return None;
         }
-        let storage = self.maintenance.database.clone()?;
-        let reclaimable = storage.can_reclaim && self.maintenance_may(ENVIRONMENT_MAINTAIN_SCOPE, cx);
-        let restarting = self.maintenance.reclaim_requested && storage.reclaim_failure.is_none();
-        let command = storage.compact_command.clone();
-        let env_id = environment.environment_id.clone();
-        let dismiss = Button::new("storage-database-dismiss", ButtonVariant::Ghost, ButtonSize::Xs)
-            .label(t(cx, "Dismiss"))
-            .on_click(cx.listener(move |_, _, _, cx| {
-                let dismissed = cx.global_mut::<DismissedDatabaseNotice>();
-                dismissed.environments.insert(env_id.clone());
-                t3_client::store::save_ui_state(DATABASE_NOTICE_DISMISSALS, &dismissed.environments);
-                cx.notify();
-            }));
-        let machine_row = if reclaimable {
-            Row::new("storage-database-machine", storage.title(&environment.label))
-                .description(storage.reclaim_description())
-                .control(
-                    h_flex()
-                        .gap(r(6.))
-                        .child(
-                            Button::new("storage-database-reclaim", ButtonVariant::Outline, ButtonSize::Xs)
-                                .label(if restarting { "Restarting\u{2026}" } else { "Reclaim" })
-                                .disabled(restarting)
-                                .on_click(cx.listener(|this, _, window, cx| this.open_reclaim_dialog(window, cx))),
-                        )
+        let mut rows = Vec::new();
+        let mut all_reclaimable = true;
+        for target in targets.iter().filter(|target| !dismissed.environments.contains(&target.id)) {
+            let Some(reports) = self.maintenance.storage.get(&target.id) else { continue };
+            let Some(storage) = &reports.database else { continue };
+            let reclaimable = storage.can_reclaim && target.can_reclaim;
+            all_reclaimable &= reclaimable;
+            let restarting = reports.reclaim_requested && storage.reclaim_failure.is_none();
+            let row_id = SharedString::from(format!("storage-database-machine-{}", target.id));
+            let id = target.id.clone();
+            let dismiss = Button::new((gpui::ElementId::from(row_id.clone()), "dismiss"), ButtonVariant::Ghost, ButtonSize::Xs)
+                .label(t(cx, "Dismiss"))
+                .on_click(cx.listener(move |this, _, _, cx| this.dismiss_database_notice(&id, cx)));
+            let row = Row::new(row_id.clone(), storage.title(&target.label));
+            let control = |name, variant| Button::new((gpui::ElementId::from(row_id.clone()), name), variant, ButtonSize::Xs);
+            let machine_row = if reclaimable {
+                let id = target.id.clone();
+                row.description(storage.reclaim_description()).control(
+                    h_flex().gap(r(6.)).child(control("reclaim", ButtonVariant::Outline)
+                        .label(t(cx, if restarting { "Restarting…" } else { "Reclaim" }))
+                        .disabled(restarting)
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_reclaim_dialog(&id, window, cx))))
                         .child(dismiss),
                 )
-                .into_any_element()
-        } else {
-            Row::new("storage-database-machine", storage.title(&environment.label))
-                .description_content(div().font_family(cx.theme().mono_font_family.clone()).child(command.clone()))
-                .control(
-                    h_flex()
-                        .gap(r(6.))
-                        .child(Button::new("storage-database-copy", ButtonVariant::Outline, ButtonSize::Xs).label("Copy command").on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
-                        }))
-                        .child(dismiss),
-                )
-                .into_any_element()
-        };
-        let rows = vec![
-            Row::new("storage-database-intro", "Reclaim freed database space")
-                .description(model::database_description(reclaimable))
-                .into_any_element(),
-            machine_row,
-        ];
-        Some(section("Database", rows, cx).into_any_element())
+            } else {
+                let command = storage.compact_command.clone();
+                row.description_content(div().font_family(cx.theme().mono_font_family.clone()).child(command.clone()))
+                    .control(h_flex().gap(r(6.)).child(control("copy", ButtonVariant::Outline)
+                        .label(t(cx, "Copy command"))
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))))
+                        .child(dismiss))
+            };
+            rows.push(machine_row.into_any_element());
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        rows.insert(0, Row::new("storage-database-intro", t(cx, "Reclaim freed database space"))
+            .description(t(cx, model::database_description(all_reclaimable)))
+            .into_any_element());
+        Some(section(t(cx, "Database"), rows, cx).into_any_element())
     }
 
     /// `CleanupSection`: Delete now with the last run, and the last run's results folded below.
-    fn storage_cleanup_section(&mut self, config: &ServerConfig, cx: &mut Context<Self>) -> AnyElement {
+    fn storage_cleanup_section(&self, targets: &[&StorageTarget], machine_count: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let has_rules = model::has_cleanup_rules(&config.settings);
-        let allowed = self.maintenance_may(SETTINGS_WRITE_SCOPE, cx);
+        let has_rules = targets.iter().any(|target| target.has_rules);
+        let allowed = targets.iter().any(|target| target.can_clean);
         let pending = self.maintenance.cleanup_pending;
-        let description = if has_rules { self.maintenance.last_run.description(now_ms()) } else { model::NO_RULES.to_owned() };
-        let delete_now = Row::new("storage-delete-now", "Delete now").description(description).highlighted(self.is_target("storage-delete-now")).control(
-            Button::new("storage-delete-now-button", ButtonVariant::Outline, ButtonSize::Sm)
-                .label(if pending { "Deleting\u{2026}" } else { "Delete now" })
-                .disabled(pending || !has_rules || !allowed)
-                .on_click(cx.listener(|this, _, _, cx| this.run_storage_cleanup(cx))),
-        );
-        let mut content = v_flex().gap(r(10.)).child(section_title("Cleanup")).child(group(vec![delete_now.into_any_element()], cx));
-        if let Some(report) = self.maintenance.last_run.report().cloned() {
+        let now = now_ms();
+        let description = if has_rules {
+            v_flex().children(targets.iter().map(|target| {
+                let run = self.maintenance.storage.get(&target.id).map_or(&LastRun::Loading, |entry| &entry.last_run);
+                let text = cleanup_description(run, now, cx);
+                div().child(if targets.len() > 1 { format!("{}: {text}", target.label) } else { text })
+            })).into_any_element()
+        } else {
+            div().child(t(cx, model::NO_RULES)).into_any_element()
+        };
+        let delete_now = Row::new("storage-delete-now", t(cx, "Delete now")).description_content(description)
+            .highlighted(self.is_target("storage-delete-now")).control(
+                Button::new("storage-delete-now-button", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, if pending { "Deleting…" } else { "Delete now" }))
+                    .disabled(pending || !has_rules || !allowed)
+                    .on_click(cx.listener(|this, _, _, cx| this.run_storage_cleanup(cx))),
+            );
+        let mut content = v_flex().gap(r(10.)).child(section_title(t(cx, "Cleanup"))).child(group(vec![delete_now.into_any_element()], cx));
+        let reports: Vec<_> = targets.iter().filter_map(|target| {
+            let entry = self.maintenance.storage.get(&target.id)?;
+            Some((*target, entry.last_run.report()?, &entry.results))
+        }).collect();
+        if let Some((_, first, _)) = reports.first() {
             let open = self.maintenance.last_run_open;
+            let counts = cleanup_counts(first, cx);
+            let summary = if machine_count <= 1 {
+                counts
+            } else if reports.len() == machine_count && reports.iter().all(|(_, report, _)| (report.removed, report.kept, report.failed) == (first.removed, first.kept, first.failed)) {
+                t_fmt(cx, "{counts} on every machine", &[("counts", IcuArg::from(&counts))])
+            } else {
+                reports.iter().map(|(target, report, _)| format!("{}: {}", target.label, cleanup_counts(report, cx))).collect::<Vec<_>>().join(" · ")
+            };
             let header = h_flex()
                 .id("storage-cleanup-last-run")
                 .min_h(r(44.))
@@ -1189,41 +1317,48 @@ impl SettingsView {
                 .gap(r(8.))
                 .cursor_pointer()
                 .child(icon(if open { Icon::ChevronDown } else { Icon::ChevronRight }, 16., hsla(p.muted_foreground)))
-                .child(div().flex_none().text_sm().font_weight(FontWeight::MEDIUM).child("Last run"))
-                .child(div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(report.counts()))
+                .child(div().flex_none().text_sm().font_weight(FontWeight::MEDIUM).child(t(cx, "Last run")))
+                .child(div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(summary))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.maintenance.last_run_open = !this.maintenance.last_run_open;
                     cx.notify();
                 }));
-            let folded =
-                v_flex().child(header).when(open, |this| this.child(div().border_t_1().border_color(hsla(p.border).opacity(0.5)).child(self.cleanup_results(&report, cx))));
+            let folded = v_flex().child(header).when(open, |this| this.children(reports.into_iter().map(|(target, report, list_state)| {
+                div().id(SharedString::from(format!("storage-cleanup-results-{}", target.id)))
+                    .border_t_1().border_color(hsla(p.border).opacity(0.5))
+                    .child(self.cleanup_results(report, &target.label, list_state, cx))
+            })));
             content = content.child(group(vec![folded.into_any_element()], cx));
         }
         content.into_any_element()
     }
 
     /// `CleanupResults`: one row per entry, then what was left out or that nothing needed it.
-    fn cleanup_results(&mut self, report: &CleanupReport, cx: &mut Context<Self>) -> AnyElement {
+    fn cleanup_results(&self, report: &CleanupReport, label: &str, list_state: &ListState, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let label = self.environment_label(cx);
         let note = |text: String| div().px(r(16.)).py(r(10.)).text_xs().text_color(hsla(p.muted_foreground)).child(text).into_any_element();
         let footer = if report.omitted_count > 0 {
-            Some(note(format!("{label}: {} more results.", model::format_count(report.omitted_count as f64))))
+            let text = t_fmt(cx, "{omitted, plural, one {{environment}: {count} more results.} other {{environment}: {count} more results.}}", &[
+                ("environment", IcuArg::from(label)),
+                ("omitted", IcuArg::Int(report.omitted_count as i64)),
+                ("count", IcuArg::from(model::format_count(report.omitted_count as f64))),
+            ]);
+            Some(note(text))
         } else if report.entries.is_empty() {
-            Some(note(format!("{label}: Nothing needed cleanup.")))
+            Some(note(t_fmt(cx, "{environmentLabel}: Nothing needed cleanup.", &[("environmentLabel", IcuArg::from(label))])))
         } else {
             None
         };
-        let entries = std::rc::Rc::new(report.entries.clone());
-        let body = if entries.len() <= INLINE_RESULTS {
-            v_flex().children(entries.iter().enumerate().map(|(index, entry)| self.cleanup_result(index, entry, &label, cx))).into_any_element()
+        let body = if report.entries.len() <= INLINE_RESULTS {
+            v_flex().children(report.entries.iter().enumerate().map(|(index, entry)| self.cleanup_result(index, entry, label, cx))).into_any_element()
         } else {
-            if self.maintenance.results.item_count() != entries.len() {
-                self.maintenance.results.reset(entries.len());
+            let entries = report.entries.clone();
+            if list_state.item_count() != entries.len() {
+                list_state.reset(entries.len());
             }
-            let label = label.clone();
+            let label = label.to_owned();
             list(
-                self.maintenance.results.clone(),
+                list_state.clone(),
                 cx.processor(move |this, index: usize, _, cx| match entries.get(index) {
                     Some(entry) => this.cleanup_result(index, entry, &label, cx),
                     None => div().into_any_element(),
@@ -1268,37 +1403,82 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// Delete now: one manual run; failures it reports, or its own failure, show as toasts.
+    /// A manual cleanup runs on every permitted environment in the selected scope.
     fn run_storage_cleanup(&mut self, cx: &mut Context<Self>) {
-        if self.maintenance.cleanup_pending || !self.maintenance_may(SETTINGS_WRITE_SCOPE, cx) {
+        if self.maintenance.cleanup_pending {
+            return;
+        }
+        let targets = self.storage_targets(cx);
+        if !targets.iter().any(|target| target.has_rules) {
+            return;
+        }
+        let requests: Vec<_> = targets.into_iter().filter(|target| target.can_clean).map(|target| {
+            let request = self.storage_rpc(&target, SETTINGS_WRITE_SCOPE, model::RUN_STORAGE_CLEANUP, cx);
+            async move { (target, request.await) }
+        }).collect();
+        if requests.is_empty() {
             return;
         }
         self.maintenance.cleanup_pending = true;
-        let label = self.scoped_raw_representative_config(cx).map(|cfg| cfg.environment.label).unwrap_or_default();
-        let target = self.maintenance_storage_target(cx);
-        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, model::RUN_STORAGE_CLEANUP, json!({}), cx);
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            for (target, result) in futures::future::join_all(requests).await {
+                let _ = this.update(cx, |this, cx| {
+                    let toast = match result {
+                        Ok(reply) => model::decode_report(&reply).and_then(|report| {
+                            report.failures().next().map(|entry| {
+                                Toast::new(ToastKind::Error, t_fmt(cx, "Cleanup failed on {label}", &[("label", IcuArg::from(&target.label))]))
+                                    .description(entry.reason.clone())
+                            })
+                        }),
+                        Err(error) => Some(Toast::new(ToastKind::Error, t_fmt(cx, "Could not run cleanup on {label}", &[("label", IcuArg::from(&target.label))]))
+                            .description(failure_text(&error, t(cx, "Try again.")))),
+                    };
+                    if let Some(toast) = toast {
+                        this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                    }
+                });
+            }
             let _ = this.update(cx, |this, cx| {
-                if this.maintenance_storage_target(cx) != target { return; }
                 this.maintenance.cleanup_pending = false;
-                let toast = match result {
-                    Ok(reply) => model::decode_report(&reply).and_then(|report| {
-                        let failure = report.failures().next().map(|entry| entry.reason.clone());
-                        this.maintenance.last_run = LastRun::Report(report);
-                        failure.map(|reason| Toast::new(ToastKind::Error, format!("Cleanup failed on {label}")).description(reason))
-                    }),
-                    Err(error) => Some(Toast::new(ToastKind::Error, format!("Could not run cleanup on {label}")).description(failure_text(&error, "Try again."))),
-                };
-                if let Some(toast) = toast {
-                    this.state.update(cx, |state, cx| state.show_toast(toast, cx));
-                }
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
         cx.notify();
     }
+}
+
+fn cleanup_counts(report: &CleanupReport, cx: &App) -> String {
+    let mut args = vec![
+        ("removed", IcuArg::Int(report.removed as i64)),
+        ("kept", IcuArg::Int(report.kept as i64)),
+    ];
+    let message = if report.failed > 0 {
+        args.push(("failed", IcuArg::Int(report.failed as i64)));
+        "{removed} removed, {kept} kept, {failed} failed"
+    } else {
+        "{removed} removed, {kept} kept"
+    };
+    t_fmt(cx, message, &args)
+}
+
+fn cleanup_description(run: &LastRun, now: i64, cx: &App) -> String {
+    let report = match run {
+        LastRun::Loading => return t(cx, "Loading last run…").to_owned(),
+        LastRun::Failed => return t(cx, "Could not load the last run.").to_owned(),
+        LastRun::None => return t(cx, "Cleanup hasn't run yet.").to_owned(),
+        LastRun::Report(report) => report,
+    };
+    let mut args = vec![
+        ("when", IcuArg::from(t3_core::settings::archive::relative_label(&report.finished_at, now))),
+        ("bytes", IcuArg::from(model::format_bytes(report.bytes_freed))),
+    ];
+    let message = if report.failed > 0 {
+        args.push(("count", IcuArg::Int(report.failed as i64)));
+        "{count, plural, one {Last run {when}. {bytes} recovered. {count} item couldn't be removed.} other {Last run {when}. {bytes} recovered. {count} items couldn't be removed.}}"
+    } else {
+        "Last run {when}. {bytes} recovered."
+    };
+    t_fmt(cx, message, &args)
 }
 
 fn environment_switch_inheritance(value: bool, default: bool, mixed: bool, cx: &App) -> SettingInheritance {
@@ -1324,6 +1504,95 @@ mod parity_tests {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div().relative().size_full().bg(hsla(palette(cx).background)).children(super::super::overlay(window, cx))
         }
+    }
+
+    #[gpui::test]
+    async fn cleanup_reads_and_runs_on_both_selected_machines(cx: &mut gpui::TestAppContext) {
+        use t3_client::environments::Environments;
+        use t3_client::session::StreamHandle;
+        use t3_client::supervisor::ClientFixture;
+        use t3_core::server_config::ServerConfigState;
+        use t3_core::shell::ShellState;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _active_fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+        });
+        let (connections, _events) = Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "settings:write"]
+        })).unwrap();
+        let mut fixtures = Vec::new();
+        for (id, label, logs) in [("saved-fixture", "Studio Mac", None), ("saved-linux", "Linux Box", Some(14))] {
+            let (client, fixture) = ClientFixture::handle(grants.clone());
+            let mut shell = ShellState::default();
+            shell.synchronized = true;
+            let mut config = ServerConfigState::default();
+            config.config = Some(serde_json::from_value(json!({
+                "environment": {
+                    "environmentId": id,
+                    "label": label,
+                    "capabilities": {"storageCleanup": true, "storageCleanupRun": true}
+                },
+                "settings": {"storageCleanup": {"logsAfterDays": logs}}
+            })).unwrap());
+            let install = state.update(cx, |state, _| {
+                state.connections.install_fixture(id, client, shell, config, ConnectionStatus::Connected)
+            });
+            fixtures.push((fixture, install.await));
+        }
+        state.update(cx, |state, cx| {
+            let fleet = state.connections.view().borrow().clone();
+            state.apply_fleet_view(fleet, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| SettingsView::new(state.clone(), Section::Maintenance, None, window, cx));
+        view.update(vcx, |view, cx| {
+            let targets = view.storage_targets(cx);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets.iter().filter(|target| target.has_rules).count(), 1);
+            view.ensure_maintenance_streams(&targets, cx);
+        });
+        let mut reports = Vec::new();
+        for (removed, (fixture, _)) in fixtures.iter_mut().enumerate() {
+            let (tag, reply) = fixture.next_stream().await;
+            assert_eq!(tag, model::GET_STORAGE_CLEANUP_REPORT);
+            let (handle, sender) = StreamHandle::fixture();
+            reply.send(Ok(handle)).ok().unwrap();
+            let report = json!({
+                "finishedAt": "2026-09-03T12:00:00.000Z",
+                "counts": {"removed": removed + 1, "kept": 0, "failed": 0},
+                "entries": []
+            });
+            sender.send(Ok(report.clone())).await.unwrap();
+            reports.push((sender, report));
+        }
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let removed = |id: &str| view.maintenance.storage[id].last_run.report().unwrap().removed;
+            assert_eq!(removed("saved-fixture"), 1);
+            assert_eq!(removed("saved-linux"), 2);
+        });
+        view.update(vcx, |view, cx| view.run_storage_cleanup(cx));
+        for ((fixture, _), (_, report)) in fixtures.iter_mut().zip(&reports) {
+            let (tag, input, reply) = fixture.next_request().await;
+            assert_eq!(tag, model::RUN_STORAGE_CLEANUP);
+            assert_eq!(input, json!({}));
+            reply.send(Ok(report.clone())).unwrap();
+        }
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| assert!(!view.maintenance.cleanup_pending));
     }
 
     #[test]
@@ -1435,7 +1704,7 @@ mod parity_tests {
 
         let view = cx.update(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view open"));
         view.read_with(&cx, |view, _| {
-            assert!(view.maintenance.database.as_ref().is_some_and(|db| db.can_reclaim));
+            assert!(view.maintenance.storage.values().any(|entry| entry.database.as_ref().is_some_and(|db| db.can_reclaim)));
         });
 
         if let Some(out) = std::env::var_os("T3_PARITY_386_SHOTS_DIR") {
@@ -1536,7 +1805,7 @@ mod parity_tests {
 
         // 3. Reclaim confirmation dialog opens, captures, and confirms RPC; permission missing blocks it.
         cx.update_window(window.into(), |_, window, cx| {
-            view.update(cx, |view, cx| view.open_reclaim_dialog(window, cx));
+            view.update(cx, |view, cx| view.open_reclaim_dialog("fixture-env", window, cx));
             window.refresh();
             window.draw(cx).clear();
         })
@@ -1562,12 +1831,12 @@ mod parity_tests {
         assert_eq!(payload, json!({}));
         let _ = reply.send(Ok(json!({})));
         drive(&mut cx);
-        view.read_with(&cx, |view, _| assert!(view.maintenance.reclaim_requested));
+        view.read_with(&cx, |view, _| assert!(view.maintenance.storage["fixture-env"].reclaim_requested));
 
         fixture.grants.send(Some(crate::context_menu::project_filter_tests::session(false))).unwrap();
         drive(&mut cx);
         cx.update_window(window.into(), |_, window, cx| {
-            view.update(cx, |view, cx| view.open_reclaim_dialog(window, cx));
+            view.update(cx, |view, cx| view.open_reclaim_dialog("fixture-env", window, cx));
         })
         .unwrap();
         view.read_with(&cx, |view, _| assert!(view.maintenance.reclaim_confirming.is_none()));

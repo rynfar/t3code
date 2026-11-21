@@ -469,6 +469,29 @@ pub struct UsageWindow {
     pub window_duration_mins: Option<u64>,
 }
 
+/// `ServerProviderResetCreditOption` from `packages/contracts/src/providerUsageLimits.ts`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCreditOption {
+    #[serde(deserialize_with = "nonblank_credit_text")]
+    pub credit_id: String,
+    #[serde(deserialize_with = "nonblank_credit_text")]
+    pub label: String,
+    #[serde(deserialize_with = "nonblank_credit_text")]
+    pub description: String,
+    pub available_count: u64,
+    pub expires_at: Option<String>,
+}
+
+fn nonblank_credit_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(serde::de::Error::custom("expected a non-blank string"));
+    }
+    Ok(if trimmed.len() == value.len() { value } else { trimmed.to_owned() })
+}
+
 /// `ServerProviderResetCredits`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -479,6 +502,8 @@ pub struct ResetCredits {
     pub next_expires_at: Option<String>,
     #[serde(default)]
     pub next_credit_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub options: Option<Vec<ResetCreditOption>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -503,6 +528,8 @@ pub struct UsageLimits {
     pub checked_at: String,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub windows: Vec<UsageWindow>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub zero_spend_cap: Option<bool>,
     #[serde(default)]
     pub credential_fingerprint: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]

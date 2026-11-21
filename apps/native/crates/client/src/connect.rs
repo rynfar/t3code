@@ -870,18 +870,20 @@ impl Cloud {
         Ok(identity)
     }
 
-    /// Lists environments linked to the signed-in T3 Connect account (`GET {relay}/v1/environments`).
-    pub async fn discover(&self) -> Result<Discovery, String> {
-        let config = self.config()?.clone();
-        let url = format!("{}/v1/environments", config.relay);
+    async fn relay_bearer_json(
+        &self,
+        method: reqwest::Method,
+        url: &url::Url,
+        network_error: &str,
+    ) -> Result<Value, String> {
         for attempt in 0..2 {
             let (token, generation, is_clerk) = self.bearer_token(attempt > 0).await?;
             let response = http()
-                .get(&url)
+                .request(method.clone(), url.clone())
                 .bearer_auth(token)
                 .send()
                 .await
-                .map_err(|_| "Could not load T3 Connect environments.")?;
+                .map_err(|_| network_error.to_owned())?;
             let status = response.status();
             let value = response.json::<Value>().await.unwrap_or(Value::Null);
             if !status.is_success() {
@@ -891,20 +893,47 @@ impl Cloud {
                 }
                 return Err(t3_core::relay::error_message(status.as_u16(), &value));
             }
-            #[derive(Deserialize)]
-            struct List {
-                environments: Vec<Environment>,
-            }
-            let list: List =
-                serde_json::from_value(value).map_err(|_| "Invalid T3 Connect environment list.")?;
             self.assert_account(generation).await?;
-            return Ok(Discovery {
-                listed: true,
-                environments: list.environments,
-                ..Default::default()
-            });
+            return Ok(value);
         }
-        unreachable!("discover loop exits within 2 attempts")
+        unreachable!("relay bearer request exits within 2 attempts")
+    }
+
+    /// Lists environments linked to the signed-in T3 Connect account (`GET {relay}/v1/environments`).
+    pub async fn discover(&self) -> Result<Discovery, String> {
+        let config = self.config()?;
+        let url = url::Url::parse(&format!("{}/v1/environments", config.relay))
+            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
+        let value = self.relay_bearer_json(reqwest::Method::GET, &url, "Could not load T3 Connect environments.").await?;
+        #[derive(Deserialize)]
+        struct List {
+            environments: Vec<Environment>,
+        }
+        let list: List =
+            serde_json::from_value(value).map_err(|_| "Invalid T3 Connect environment list.")?;
+        Ok(Discovery {
+            listed: true,
+            environments: list.environments,
+            ..Default::default()
+        })
+    }
+
+    /// Removes the canonical environment link from the relay after the host confirms unlink.
+    pub async fn unlink_environment(&self, environment_id: &str) -> Result<(), String> {
+        if self.config.is_err() || self.identity().await?.is_none() {
+            return Ok(());
+        }
+        let mut url = url::Url::parse(&self.config()?.relay)
+            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
+        url.path_segments_mut()
+            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?
+            .clear()
+            .extend(["v1", "client", "environment-links", environment_id]);
+        let value = self.relay_bearer_json(reqwest::Method::DELETE, &url, "Could not reach T3 Connect relay.").await?;
+        if value.get("ok").and_then(Value::as_bool).is_none() {
+            return Err("T3 Connect returned an invalid unlink response.".to_owned());
+        }
+        Ok(())
     }
 
     async fn exchange_dpop_token_internal(
@@ -1304,6 +1333,41 @@ mod tests {
             expires_at_epoch_ms: expires,
             identity: Some("Fixture account".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn unlink_uses_signed_in_bearer_and_canonical_environment_id() {
+        let mut fixture = Fixture::new().await;
+        let cloud = cloud(&fixture);
+        cloud.unlink_environment("test/id").await.unwrap();
+        assert!(fixture.requests.try_recv().is_err());
+
+        cloud.account.lock().await.clerk = Some(ClerkSession {
+            client_token: "client-jwt".into(),
+            session_id: "session".into(),
+            identity: None,
+        });
+        let jwt = fake_jwt("test", now_ms() / 1000 + 3_600);
+        fixture.reply_with(MockReply::json(200, json!({"jwt": jwt})));
+        fixture.reply_with(MockReply::json(200, json!({"ok": true})));
+
+        cloud.unlink_environment("test/id").await.unwrap();
+        assert!(fixture.request().await.starts_with("POST /v1/client/sessions/session/tokens/t3-relay"));
+        let unlink = fixture.request().await;
+        assert!(unlink.starts_with("DELETE /v1/client/environment-links/test%2Fid HTTP"), "{unlink}");
+        assert_eq!(header_value(&unlink, "authorization"), Some(format!("Bearer {jwt}").as_str()));
+
+        {
+            let mut account = cloud.account.lock().await;
+            account.clerk = None;
+            account.token = Some(token(now_ms() + 3_600_000));
+        }
+        fixture.reply_with(MockReply::json(200, json!({"ok": false})));
+        cloud.unlink_environment("test/id").await.unwrap();
+        let unlink = fixture.request().await;
+        assert!(unlink.starts_with("DELETE /v1/client/environment-links/test%2Fid HTTP"), "{unlink}");
+        assert_eq!(header_value(&unlink, "authorization"), Some("Bearer fixture-access"));
+        let _ = std::fs::remove_dir_all(cloud.home().unwrap());
     }
 
     fn fake_jwt(sub: &str, exp_secs: u64) -> String {
