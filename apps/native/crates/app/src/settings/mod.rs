@@ -41,12 +41,12 @@ use t3_client::supervisor::ConnectionStatus;
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::search::{self, Features, SearchAvailability, SearchItem, SearchScope, Section};
 use t3_core::settings::{
-    ALL_ENVIRONMENTS_VALUE, ALL_PROJECTS_VALUE, ResolvedScopeKind, ScopeCheckout, ScopeEnvironment,
+    ALL_CHECKOUTS_VALUE, ALL_ENVIRONMENTS_VALUE, ALL_PROJECTS_VALUE, ResolvedScopeKind, ScopeCheckout, ScopeEnvironment,
     ScopeProjectGroup, ServerSettingChange, SettingsScopeSearch, is_device_only_section,
     project_scope_menu_groups, scoped_model_disabled_reason, select_checkout_axis,
     select_environment_axis, select_project_axis, server_change_to_override_edit,
     settings_scope_checkout_choices, settings_scope_checkout_label,
-    settings_scope_environment_label,
+    settings_scope_environment_address, settings_scope_environment_label, settings_scope_environment_labels,
 };
 use t3_core::sidebar::grouping::{EnvironmentOwner, ScopedProject};
 
@@ -54,10 +54,10 @@ use crate::app_state::{AppEvent, AppState};
 use crate::i18n::{active_locale, t};
 use crate::icons::Icon;
 use crate::theme::{
-    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, theme_slot_background_layer,
+    ThemeSlot, ThemeSlotExt, ThemeSlotInteractiveExt as _, hsla, palette, theme_slot_background_layer,
 };
 use controls::{
-    Button, ButtonSize, ButtonVariant, ModalLayout, Select, SelectOption, focus_ring, group, icon,
+    Button, ButtonSize, ButtonVariant, ModalLayout, focus_ring, group, icon,
     r,
 };
 
@@ -368,6 +368,12 @@ fn open_at(section: Section, anchor: Option<String>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+const ONBOARDING_ACP_REGISTRY: &str = "onboarding-acp-registry";
+
+pub(crate) fn open_onboarding_registry(cx: &mut App) {
+    open_at(Section::Providers, Some(ONBOARDING_ACP_REGISTRY.to_owned()), cx);
+}
+
 pub fn open_voice(cx: &mut App) {
     open_at(Section::Voice, Some("voice-transcription-destination".to_owned()), cx);
 }
@@ -553,6 +559,10 @@ fn apply_pending(window: &mut Window, cx: &mut App) {
     }
 }
 
+pub(crate) fn is_open_or_pending(cx: &App) -> bool {
+    cx.try_global::<Host>().is_some_and(|host| host.view.is_some() || host.pending.is_some())
+}
+
 /// The modal layer, drawn by the workspace above everything else while settings are open.
 pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     apply_pending(window, cx);
@@ -673,6 +683,143 @@ pub(super) fn folded_section(
         .into_any_element()
 }
 
+fn scope_project_groups(groups: &[t3_core::sidebar::grouping::ScopedProjectGroup]) -> Vec<ScopeProjectGroup> {
+        groups
+            .iter()
+            .filter(|group| !group.is_scratch)
+            .filter_map(|group| {
+                let members: Vec<ScopeCheckout> = group
+                    .members
+                    .iter()
+                    .map(|member| ScopeCheckout {
+                        environment_id: member.project.owner.identity(),
+                        physical_project_key: member.physical_key.clone(),
+                        workspace_root: member.project.project.workspace_root.clone(),
+                    })
+                    .collect();
+                let workspace_root = members.first()?.workspace_root.clone();
+                Some(ScopeProjectGroup {
+                    project_key: group.key.clone(),
+                    display_name: group.label.clone(),
+                    workspace_root,
+                    archived: group.archived,
+                    members,
+                })
+            })
+            .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeAxis {
+    Project,
+    Environment,
+    Checkout,
+}
+
+impl ScopeAxis {
+    fn trigger_id(self) -> &'static str {
+        match self {
+            Self::Project => "settings-scope-project",
+            Self::Environment => "settings-scope-environment",
+            Self::Checkout => "settings-scope-checkout",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "Project scope",
+            Self::Environment => "Environment scope",
+            Self::Checkout => "Checkout scope",
+        }
+    }
+
+    fn search_label(self) -> &'static str {
+        match self {
+            Self::Project => "Search projects",
+            Self::Environment => "Search environments",
+            Self::Checkout => "Search checkouts",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ScopeIcon {
+    Glyph(Icon),
+    Project(crate::project_icon::ProjectVisual),
+}
+
+impl ScopeIcon {
+    fn render(&self, cx: &App) -> AnyElement {
+        let ink = hsla(palette(cx).icon_muted);
+        match self {
+            Self::Glyph(glyph) => icon(*glyph, 14., ink).into_any_element(),
+            Self::Project(visual) => visual.render(px(14.), ink, cx),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ScopeOption {
+    value: SharedString,
+    label: SharedString,
+    detail: SharedString,
+    icon: ScopeIcon,
+    offline: bool,
+    all: bool,
+}
+
+impl ScopeOption {
+    fn new(value: impl Into<SharedString>, label: impl Into<SharedString>, icon: ScopeIcon) -> Self {
+        Self {
+            value: value.into(), label: label.into(), detail: SharedString::default(),
+            icon, offline: false, all: false,
+        }
+    }
+
+    fn all(value: &'static str, label: &str) -> Self {
+        let mut option = Self::new(value, label.to_owned(), ScopeIcon::Glyph(Icon::Layers));
+        option.all = true;
+        option
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn scope_picker_switches_to_search_after_six_specific_options() {
+    let mut options = vec![ScopeOption::all(ALL_ENVIRONMENTS_VALUE, "All environments")];
+    options.extend((0..6).map(|index| {
+        ScopeOption::new(index.to_string(), "Machine", ScopeIcon::Glyph(Icon::Server))
+    }));
+    assert!(!scope_picker_searchable(&options));
+    options.push(ScopeOption::new("7", "Build machine", ScopeIcon::Glyph(Icon::Server)));
+    assert!(scope_picker_searchable(&options));
+}
+
+struct ScopePicker {
+    axis: ScopeAxis,
+    options: std::rc::Rc<Vec<ScopeOption>>,
+    selected: Option<usize>,
+    highlighted: usize,
+    scroll: ScrollHandle,
+    trigger: FocusHandle,
+}
+
+fn scope_picker_searchable(options: &[ScopeOption]) -> bool {
+    options.iter().filter(|option| !option.all).count() > 6
+}
+
+impl ScopePicker {
+    fn visible(&self, query: &str) -> impl Iterator<Item = &ScopeOption> {
+        let query = query.trim().to_lowercase();
+        self.options.iter().filter(move |option| {
+            query.is_empty()
+                || [&option.label, &option.detail, &option.value]
+                    .iter()
+                    .any(|field| field.to_lowercase().contains(&query))
+        })
+    }
+}
+
 pub struct SettingsView {
     state: Entity<AppState>,
     focus: FocusHandle,
@@ -682,6 +829,9 @@ pub struct SettingsView {
     scroll_to_target: bool,
     /// Scoped settings selection (`SettingsScopeSentence.tsx`, `useScopedSettings.ts`).
     scope: SettingsScopeSearch,
+    scope_picker: Option<ScopePicker>,
+    scope_search: Entity<InputState>,
+    scope_closed_on_mouse_down: Option<(ScopeAxis, std::time::Instant)>,
     /// Last active UI locale applied to the search input placeholder.
     last_locale: &'static str,
     search: Entity<InputState>,
@@ -727,7 +877,19 @@ impl SettingsView {
         let locale = active_locale(cx);
         let search_placeholder = t(cx, "Search").to_owned();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(search_placeholder));
+        let scope_search = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&scope_search, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    if let Some(picker) = this.scope_picker.as_mut() {
+                        picker.highlighted = 0;
+                        picker.scroll.set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    }
+                }
+                InputEvent::PressEnter { .. } => this.pick_highlighted_scope(window, cx),
+                _ => {}
+            }),
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
                     this.active_result = 0;
@@ -784,6 +946,9 @@ impl SettingsView {
             target: None,
             scroll_to_target: false,
             scope: SettingsScopeSearch::default(),
+            scope_picker: None,
+            scope_search,
+            scope_closed_on_mouse_down: None,
             last_locale: locale,
             search,
             active_result: 0,
@@ -802,6 +967,7 @@ impl SettingsView {
     }
 
     fn navigate(&mut self, section: Section, target: Option<String>, cx: &mut Context<Self>) {
+        self.scope_picker = None;
         self.providers.clear_setup_target();
         if section != Section::Providers { self.providers.leave(); }
         let changed = self.section != section;
@@ -909,7 +1075,7 @@ impl SettingsView {
     fn on_close(&mut self, _: &CloseSettings, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]
         self.removal_route_audit("route-escape", window, cx);
-        if self.dismiss_provider_removal(window, cx) {
+        if self.dismiss_scope_picker(window, cx) || self.dismiss_provider_removal(window, cx) {
             return;
         }
         if self.dismiss_project_icon_picker(window, cx) {
@@ -987,6 +1153,7 @@ impl SettingsView {
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]
         self.removal_route_audit("route-tab", window, cx);
+        self.dismiss_scope_picker(window, cx);
         if self.cycle_provider_removal_focus(forward, window, cx) {
             return;
         }
@@ -1048,6 +1215,13 @@ impl SettingsView {
                 return;
             }
             let _ = view.update(cx, |this, cx| {
+                if this.scope_picker.is_some() && this.scope_search.focus_handle(cx).is_focused(window) {
+                    if !crate::sidebar::is_composing(&this.scope_search, window, cx) {
+                        cx.stop_propagation();
+                        this.move_scope_highlight(key == "down", cx);
+                    }
+                    return;
+                }
                 if this.query(cx).trim().is_empty() || !this.search.focus_handle(cx).is_focused(window) {
                     return;
                 }
@@ -1068,6 +1242,7 @@ impl SettingsView {
         }
         [
             &self.search,
+            &self.scope_search,
             &self.threads.base_directory,
             &self.threads.auto_settle_days,
             &self.browser.custom_url,
@@ -1153,6 +1328,30 @@ impl SettingsView {
                     .when(labels, |this| this.child(search_row))
                     .child(body),
             )
+            .when(!layout.nav_compact, |nav| nav.child(self.render_account_footer(cx)))
+    }
+
+    fn render_account_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let identity = state.cloud.identity.clone();
+        let (label, glyph) = if let Some(identity) = identity {
+            (identity, Icon::UserRound)
+        } else {
+            (t(cx, "Sign in to T3 Connect").to_owned(), Icon::Cloud)
+        };
+        let state = self.state.clone();
+        div().border_t_1().border_color(hsla(palette(cx).sidebar_border)).p(r(8.)).child(
+            Button::new("settings-connect-account", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                .full_width()
+                .justify_between()
+                .icon(glyph)
+                .tooltip(label.clone())
+                .label(label)
+                .on_click(move |_, window, cx| {
+                    close(window, cx);
+                    state.update(cx, |state, cx| state.open_switcher(cx));
+                }),
+        )
     }
 
     fn render_sections(&self, labels: bool, rail: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1267,6 +1466,16 @@ impl SettingsView {
             .into_any_element()
     }
 
+    #[allow(dead_code, reason = "Provider page wiring lands during the native parity merge")]
+    pub(super) fn take_onboarding_registry_request(&mut self) -> bool {
+        if self.target.as_deref() != Some(ONBOARDING_ACP_REGISTRY) {
+            return false;
+        }
+        self.target = None;
+        self.scroll_to_target = false;
+        true
+    }
+
     fn single_environment_section(&self) -> bool {
         matches!(self.section, Section::Providers | Section::Secrets)
     }
@@ -1279,6 +1488,7 @@ impl SettingsView {
             let connected = fleet_entry
                 .is_some_and(|e| e.status == ConnectionStatus::Connected && e.config.config.is_some())
                 || (state.environments.active.as_deref() == Some(env.id.as_str())
+                    && state.phase == crate::app_state::Phase::Online(ConnectionStatus::Connected)
                     && state.server_config.config.is_some());
             let env_id = fleet_entry
                 .and_then(|e| e.summary.owner.canonical_id.clone())
@@ -1292,7 +1502,7 @@ impl SettingsView {
             envs.push(ScopeEnvironment {
                 environment_id: env_id,
                 label,
-                display_url: env.http_base.clone(),
+                display_url: env.address(),
                 connected,
             });
         }
@@ -1310,29 +1520,7 @@ impl SettingsView {
     }
 
     fn all_scope_project_groups(&self, cx: &App) -> Vec<ScopeProjectGroup> {
-        self.project_groups(cx)
-            .into_iter()
-            .filter(|group| !group.is_scratch)
-            .filter_map(|group| {
-                let members: Vec<ScopeCheckout> = group
-                    .members
-                    .into_iter()
-                    .map(|member| ScopeCheckout {
-                        environment_id: member.project.owner.identity(),
-                        physical_project_key: member.physical_key,
-                        workspace_root: member.project.project.workspace_root,
-                    })
-                    .collect();
-                let workspace_root = members.first()?.workspace_root.clone();
-                Some(ScopeProjectGroup {
-                    project_key: group.key,
-                    display_name: group.label,
-                    workspace_root,
-                    archived: group.archived,
-                    members,
-                })
-            })
-            .collect()
+        scope_project_groups(&self.project_groups(cx))
     }
 
     /// Resolves `self.scope` into a `ResolvedScopeKind` (`resolveSettingsScope`).
@@ -1903,183 +2091,355 @@ impl SettingsView {
             .map(|g| g.display_name)
     }
 
-    /// `SettingsScopeSentence.tsx`: rendered on every server-scoped settings page (all
-    /// non-device-only sections except Projects, which embeds its own synced project picker).
-    fn render_scope_sentence(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn scope_picker_query(&self, cx: &App) -> SharedString {
+        self.scope_search.read(cx).value()
+    }
+
+    fn dismiss_scope_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = self.scope_picker.take() else { return false };
+        picker.trigger.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    fn move_scope_highlight(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let query = self.scope_picker_query(cx);
+        let Some(picker) = self.scope_picker.as_mut() else { return };
+        let count = picker.visible(&query).count();
+        if count == 0 { return }
+        picker.highlighted = (picker.highlighted + if forward { 1 } else { count - 1 }) % count;
+        picker.scroll.scroll_to_item(picker.highlighted);
+        cx.notify();
+    }
+
+    fn pick_highlighted_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.scope_picker_query(cx);
+        if let Some((axis, value)) = self.scope_picker.as_ref().and_then(|picker| {
+            picker.visible(&query).nth(picker.highlighted).map(|option| (picker.axis, option.value.clone()))
+        }) {
+            self.pick_scope(axis, &value, window, cx);
+        }
+    }
+
+    fn pick_scope(&mut self, axis: ScopeAxis, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_scope_picker(window, cx);
+        self.scope = match axis {
+            ScopeAxis::Project => select_project_axis(&self.scope, value),
+            ScopeAxis::Environment => select_environment_axis(&self.scope, value),
+            ScopeAxis::Checkout => {
+                let groups = self.all_scope_project_groups(cx);
+                let checkout = groups.iter()
+                    .find(|group| Some(group.project_key.as_str()) == self.scope.project.as_deref())
+                    .and_then(|group| settings_scope_checkout_choices(group, &self.scope).into_iter()
+                        .find(|checkout| checkout.physical_project_key == value));
+                select_checkout_axis(&self.scope, checkout)
+            }
+        };
+        self.projects.selected = self.scope.project.clone();
+        cx.notify();
+    }
+
+    fn render_scope_trigger(
+        &self,
+        axis: ScopeAxis,
+        options: Vec<ScopeOption>,
+        value: &str,
+        trigger_label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let id = axis.trigger_id();
+        let focus = controls::focus_handle(&id.into(), window, cx);
+        let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+        let name = format!("{}: {trigger_label}", t(cx, axis.label()));
+        let selected = options.iter().position(|option| option.value == value);
+        let leading = selected.map(|index| options[index].icon.render(cx));
+        let open = self.scope_picker.as_ref().filter(|picker| picker.axis == axis);
+        let options = std::rc::Rc::new(options);
+        let trigger_focus = focus.clone();
+        let toggle = std::rc::Rc::new(cx.listener(move |this, _: &(), window, cx| {
+            if this.scope_picker.as_ref().is_some_and(|picker| picker.axis == axis) {
+                this.dismiss_scope_picker(window, cx);
+                return;
+            }
+            if this.scope_closed_on_mouse_down.take().is_some_and(|(closed, at)| {
+                closed == axis && at.elapsed() < std::time::Duration::from_millis(250)
+            }) {
+                return;
+            }
+            let searchable = scope_picker_searchable(&options);
+            if searchable || !this.scope_search.read(cx).value().is_empty() {
+                let placeholder = t(cx, axis.search_label()).to_owned();
+                this.scope_search.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.set_placeholder(placeholder, window, cx);
+                });
+            }
+            let scroll = ScrollHandle::new();
+            let highlighted = if searchable { 0 } else { selected.unwrap_or(0) };
+            scroll.scroll_to_item(highlighted);
+            this.scope_picker = Some(ScopePicker {
+                axis, options: options.clone(), selected, highlighted, scroll, trigger: trigger_focus.clone(),
+            });
+            if searchable {
+                this.scope_search.focus_handle(cx).focus(window, cx);
+            } else {
+                trigger_focus.focus(window, cx);
+            }
+            cx.notify();
+        }));
+        h_flex()
+            .relative()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .track_focus(&focus)
+                    .role(gpui::Role::Button)
+                    .aria_label(name)
+                    .aria_expanded(open.is_some())
+                    .min_w_0()
+                    .max_w(r(288.))
+                    .min_h(r(28.))
+                    .px(r(6.))
+                    .gap(r(6.))
+                    .rounded(r(6.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.foreground))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hsla(p.accent)))
+                    .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
+                    .theme_slot(ThemeSlot::SelectTrigger, cx)
+                    .children(leading)
+                    .child(div().min_w_0().truncate().child(trigger_label.to_owned()))
+                    .child(icon(Icon::ChevronDown, 14., hsla(p.muted_foreground)))
+                    .on_click({
+                        let toggle = toggle.clone();
+                        move |event, window, cx| {
+                            if !event.is_keyboard() { toggle(&(), window, cx); }
+                        }
+                    })
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        let picker_open = this.scope_picker.as_ref().is_some_and(|picker| picker.axis == axis);
+                        match event.keystroke.key.as_str() {
+                            "enter" | "space" if picker_open => this.pick_highlighted_scope(window, cx),
+                            "down" | "up" if picker_open => this.move_scope_highlight(event.keystroke.key == "down", cx),
+                            "enter" | "space" | "down" | "up" => toggle(&(), window, cx),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    })),
+            )
+            .children(open.map(|picker| self.render_scope_popup(picker, window, cx)))
+            .into_any_element()
+    }
+
+    fn render_scope_popup(&self, picker: &ScopePicker, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let axis = picker.axis;
+        let searchable = scope_picker_searchable(&picker.options);
+        let query = self.scope_picker_query(cx);
+        let selected = picker.selected.and_then(|index| picker.options.get(index));
+        let width = r(if searchable { 320. } else { 288. }).to_pixels(window.rem_size()).min(window.viewport_size().width - px(16.));
+        let mut rows = v_flex().id("settings-scope-options").overflow_y_scroll().track_scroll(&picker.scroll).min_h_0();
+        for (index, option) in picker.visible(&query).enumerate() {
+            let checked = selected.is_some_and(|chosen| chosen.value == option.value);
+            let value = option.value.clone();
+            let detail = (!option.detail.is_empty()).then(|| {
+                div().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(option.detail.clone())
+            });
+            rows = rows.child(
+                v_flex()
+                    .child(
+                        h_flex()
+                            .id(("settings-scope-option", index))
+                            .min_h(r(28.))
+                            .px(r(8.))
+                            .py(r(4.))
+                            .gap(r(8.))
+                            .rounded(r(4.))
+                            .cursor_pointer()
+                            .when(index == picker.highlighted, |row| row.bg(hsla(p.accent)))
+                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                if let Some(picker) = this.scope_picker.as_mut()
+                                    && picker.axis == axis && picker.highlighted != index
+                                {
+                                    picker.highlighted = index;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| this.pick_scope(axis, &value, window, cx)))
+                            .child(option.icon.render(cx))
+                            .child(
+                                v_flex().flex_1().min_w_0()
+                                    .child(div().truncate().child(option.label.clone()))
+                                    .children(detail),
+                            )
+                            .when(option.offline, |row| {
+                                row.child(div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(t(cx, "Offline")))
+                            })
+                            .child(div().size(r(14.)).flex_none().children(checked.then(|| icon(Icon::Check, 14., hsla(p.foreground))))),
+                    )
+                    .when(option.all && picker.options.len() > 1 && query.trim().is_empty(), |row| {
+                        row.child(div().my(r(4.)).h(px(1.)).bg(hsla(p.border)))
+                    }),
+            );
+        }
+        if picker.visible(&query).next().is_none() {
+            rows = rows.child(div().p(r(8.)).text_color(hsla(p.muted_foreground)).child(t(cx, "No matches found.")));
+        }
+        div().absolute().bottom_0().left_0().child(
+            gpui::deferred(
+                gpui::anchored().anchor(gpui::Anchor::TopLeft).snap_to_window_with_margin(px(8.)).child(
+                    v_flex()
+                        .id("settings-scope-popup")
+                        .relative()
+                        .occlude()
+                        .w(width)
+                        .max_h(r(320.))
+                        .mt(r(4.))
+                        .p(r(4.))
+                        .rounded(r(8.))
+                        .border_1()
+                        .border_color(hsla(p.dropdown_border))
+                        .bg(hsla(p.popover))
+                        .text_sm()
+                        .text_color(hsla(p.popover_foreground))
+                        .theme_slot(ThemeSlot::PopoverPopup, cx)
+                        .theme_slot(ThemeSlot::MenuPopup, cx)
+                        .children(crate::theme::theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, r(8.).to_pixels(window.rem_size()), cx)
+                            .or_else(|| crate::theme::theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.).to_pixels(window.rem_size()), cx)))
+                        .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                            if this.scope_picker.as_ref().is_some_and(|picker| picker.axis == axis) {
+                                this.scope_picker = None;
+                                this.scope_closed_on_mouse_down = Some((axis, std::time::Instant::now()));
+                                cx.notify();
+                            }
+                        }))
+                        .when(searchable, |popup| {
+                            popup.child(
+                                div()
+                                    .id("settings-scope-search")
+                                    .debug_selector(|| "settings-scope-search".to_owned())
+                                    .child(Input::new(&self.scope_search).appearance(false).bordered(false)
+                                        .theme_slot(ThemeSlot::Input, cx)),
+                            )
+                        })
+                        .child(rows),
+                ),
+            ).with_priority(2),
+        ).into_any_element()
+    }
+
+    /// `SettingsScopeSentence.tsx`: inline scope across server settings.
+    fn render_scope_sentence(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if is_device_only_section(self.section) || self.section == Section::Projects {
             return None;
         }
         let envs = self.scope_environments(cx);
-        let all_groups = self.all_scope_project_groups(cx);
+        let groups = self.project_groups(cx);
+        let all_groups = scope_project_groups(&groups);
         if envs.is_empty() && all_groups.is_empty() {
             return None;
         }
-        let p = palette(cx);
+        let state = self.state.read(cx);
         let single_env = self.single_environment_section() || envs.len() <= 1;
         let visible_groups = project_scope_menu_groups(&all_groups, self.scope.machine.as_deref());
-        let selected_project = self
-            .scope
-            .project
-            .as_deref()
-            .and_then(|key| all_groups.iter().find(|g| g.project_key == key));
-        let project_value = selected_project
-            .map(|g| g.project_key.clone())
-            .unwrap_or_else(|| ALL_PROJECTS_VALUE.to_owned());
-        let mut project_options = vec![SelectOption::new(ALL_PROJECTS_VALUE, "All projects")];
-        for g in &visible_groups {
-            let label = if g.archived {
-                format!("{} (archived)", g.display_name)
+        let project_value = self.scope.project.as_deref().unwrap_or(ALL_PROJECTS_VALUE);
+        let selected_project = all_groups.iter().find(|group| group.project_key == project_value);
+        let mut project_options = vec![ScopeOption::all(ALL_PROJECTS_VALUE, t(cx, "All projects"))];
+        let project_refs: std::collections::HashMap<_, _> = groups.iter()
+            .map(|item| (item.key.as_str(), &item.representative)).collect();
+        for group in &visible_groups {
+            let visual = project_refs.get(group.project_key.as_str()).map(|target| {
+                crate::project_icon::ProjectVisual::for_scoped_project(state, target)
+            }).unwrap_or_default();
+            let mut option = ScopeOption::new(group.project_key.clone(), group.display_name.clone(), ScopeIcon::Project(visual));
+            option.detail = if group.archived {
+                format!("{} · {}", t(cx, "Archived"), group.workspace_root).into()
             } else {
-                g.display_name.clone()
+                group.workspace_root.clone().into()
             };
-            project_options.push(SelectOption::new(g.project_key.clone(), label));
+            project_options.push(option);
         }
 
-        let env_options_source: Vec<&ScopeEnvironment> = if let Some(project) = selected_project {
-            envs.iter()
-                .filter(|e| project.members.iter().any(|m| m.environment_id == e.environment_id))
-                .collect()
-        } else {
-            envs.iter().collect()
-        };
-        let env_value = self
-            .scope
-            .machine
-            .as_deref()
-            .filter(|id| env_options_source.iter().any(|e| e.environment_id == *id))
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                if single_env {
-                    env_options_source
-                        .first()
-                        .map(|e| e.environment_id.clone())
-                        .unwrap_or_else(|| ALL_ENVIRONMENTS_VALUE.to_owned())
-                } else {
-                    ALL_ENVIRONMENTS_VALUE.to_owned()
-                }
-            });
+        let envs_for_project: Vec<_> = envs.iter().filter(|env| {
+            selected_project.is_none_or(|project| project.members.iter().any(|member| member.environment_id == env.environment_id))
+        }).collect();
+        let env_value = self.scope.machine.as_deref().unwrap_or_else(|| {
+            if single_env {
+                envs_for_project.first().map_or(ALL_ENVIRONMENTS_VALUE, |env| env.environment_id.as_str())
+            } else {
+                ALL_ENVIRONMENTS_VALUE
+            }
+        });
+        let selected_environment = envs_for_project.iter().find(|env| env.environment_id == env_value);
+        let env_label = selected_environment.map_or_else(
+            || t(cx, if self.scope.machine.is_some() { "Unavailable environment" } else { "All environments" }).to_owned(),
+            |env| settings_scope_environment_label(env, &envs),
+        );
         let mut env_options = Vec::new();
         if !single_env {
-            env_options.push(SelectOption::new(ALL_ENVIRONMENTS_VALUE, "All environments"));
+            env_options.push(ScopeOption::all(ALL_ENVIRONMENTS_VALUE, t(cx, "All environments")));
         }
-        for env in &env_options_source {
-            let mut label = settings_scope_environment_label(env, &envs);
-            if !env.connected {
-                label.push_str(" (Offline)");
-            }
-            env_options.push(SelectOption::new(env.environment_id.clone(), label));
+        for env in envs_for_project {
+            let (label, detail) = settings_scope_environment_labels(env, &envs);
+            let glyph = crate::context_chip::environment_machine_icon(state, &env.environment_id);
+            let mut option = ScopeOption::new(env.environment_id.clone(), label, ScopeIcon::Glyph(glyph));
+            option.offline = !env.connected;
+            option.detail = if detail.is_empty() { settings_scope_environment_address(env) } else { detail }.into();
+            env_options.push(option);
         }
-        let env_preposition = if self.scope.machine.is_some()
-            || self.resolved_scope_kind(cx) == ResolvedScopeKind::Checkout
-            || single_env
-        {
-            "on"
+        let env_preposition = if self.scope.machine.is_some() || single_env { "on" } else { "across" };
+
+        let checkouts = selected_project.map(|group| settings_scope_checkout_choices(group, &self.scope)).unwrap_or_default();
+        let checkout_value = self.scope.checkout.as_deref().unwrap_or(ALL_CHECKOUTS_VALUE);
+        let checkout_trigger = if checkouts.is_empty() {
+            None
         } else {
-            "across"
-        };
-
-        let checkouts: Vec<ScopeCheckout> = selected_project
-            .map(|g| {
-                settings_scope_checkout_choices(g, &self.scope)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let checkout_refs: Vec<&ScopeCheckout> = checkouts.iter().collect();
-        let checkout_select = (!checkouts.is_empty()).then(|| {
-            let mut opts = vec![SelectOption::new("__all__", "All checkouts")];
-            for ch in &checkouts {
-                opts.push(SelectOption::new(
-                    ch.physical_project_key.clone(),
-                    settings_scope_checkout_label(ch, &checkout_refs),
-                ));
+            let selected = checkouts.iter().find(|checkout| checkout.physical_project_key == checkout_value);
+            let label = selected.map_or_else(
+                || t(cx, if self.scope.checkout.is_some() { "Unavailable checkout" } else { "All checkouts" }).to_owned(),
+                |checkout| settings_scope_checkout_label(checkout, &checkouts),
+            );
+            let mut options = vec![ScopeOption::all(ALL_CHECKOUTS_VALUE, t(cx, "All checkouts"))];
+            for checkout in &checkouts {
+                let mut option = ScopeOption::new(
+                    checkout.physical_project_key.clone(),
+                    t3_core::files::basename(&checkout.workspace_root).to_owned(),
+                    ScopeIcon::Glyph(Icon::Folder),
+                );
+                option.detail = checkout.workspace_root.clone().into();
+                options.push(option);
             }
-            let selected_checkout = self
-                .scope
-                .checkout
-                .as_deref()
-                .filter(|k| checkouts.iter().any(|c| c.physical_project_key == *k))
-                .unwrap_or("__all__")
-                .to_owned();
-            let checkouts_for_cb = checkouts.clone();
-            let weak = cx.entity().downgrade();
-            h_flex()
-                .gap(r(6.))
-                .items_center()
-                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("in"))
-                .child(
-                    Select::new("settings-scope-checkout", opts)
-                        .selected(selected_checkout)
-                        .width(160.)
-                        .on_change(move |value, _, cx| {
-                            let chosen = checkouts_for_cb
-                                .iter()
-                                .find(|c| c.physical_project_key == value)
-                                .cloned();
-                            let _ = weak.update(cx, |this, cx| {
-                                this.scope = select_checkout_axis(&this.scope, chosen.as_ref());
-                                cx.notify();
-                            });
-                        }),
-                )
-        });
-
-        let weak_proj = cx.entity().downgrade();
-        let weak_env = cx.entity().downgrade();
-        Some(
-            h_flex()
-                .id("settings-scope-sentence")
-                .debug_selector(|| "settings-scope-sentence".to_owned())
-                .flex_wrap()
-                .gap(r(6.))
-                .items_center()
-                .px(r(12.))
-                .py(r(8.))
-                .rounded(r(10.))
-                .border_1()
-                .border_color(hsla(p.border))
-                .bg(hsla(p.card))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(hsla(p.muted_foreground))
-                        .child("Applying settings for"),
-                )
-                .child(
-                    Select::new("settings-scope-project", project_options)
-                        .selected(project_value)
-                        .width(168.)
-                        .on_change(move |value, _, cx| {
-                            let _ = weak_proj.update(cx, |this, cx| {
-                                this.scope = select_project_axis(&this.scope, &value);
-                                this.projects.selected = this.scope.project.clone();
-                                cx.notify();
-                            });
-                        }),
-                )
-                .when(!env_options.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(hsla(p.muted_foreground))
-                            .child(env_preposition),
-                    )
-                    .child(
-                        Select::new("settings-scope-environment", env_options)
-                            .selected(env_value)
-                            .width(168.)
-                            .on_change(move |value, _, cx| {
-                                let _ = weak_env.update(cx, |this, cx| {
-                                    this.scope = select_environment_axis(&this.scope, &value);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                })
-                .children(checkout_select)
-                .into_any_element(),
-        )
+            Some(self.render_scope_trigger(ScopeAxis::Checkout, options, checkout_value, &label, window, cx))
+        };
+        let project_label = selected_project.map_or_else(
+            || t(cx, if self.scope.project.is_some() { "Unavailable project" } else { "All projects" }),
+            |project| project.display_name.as_str(),
+        );
+        let mut sentence = h_flex()
+            .id("settings-scope-sentence")
+            .debug_selector(|| "settings-scope-sentence".to_owned())
+            .flex_wrap()
+            .gap(r(6.))
+            .items_center()
+            .px(r(16.))
+            .text_sm()
+            .text_color(hsla(palette(cx).muted_foreground))
+            .child(h_flex().min_w_0().gap(r(6.))
+                .child(div().flex_none().child(t(cx, "Applying settings for")))
+                .child(self.render_scope_trigger(ScopeAxis::Project, project_options, project_value, project_label, window, cx)));
+        if !env_options.is_empty() {
+            sentence = sentence.child(h_flex().min_w_0().gap(r(6.))
+                .child(div().flex_none().child(t(cx, env_preposition)))
+                .child(self.render_scope_trigger(ScopeAxis::Environment, env_options, env_value, &env_label, window, cx)));
+        }
+        Some(sentence.children(checkout_trigger.map(|trigger| {
+            h_flex().min_w_0().gap(r(6.)).child(div().flex_none().child(t(cx, "in"))).child(trigger)
+        })).into_any_element())
     }
 
     /// `SettingsScopeBoundary` (`_chat.settings.tsx:71-87`): when a search jump lands on a target
@@ -2110,6 +2470,7 @@ impl SettingsView {
                 for env in &envs {
                     let env_id = env.environment_id.clone();
                     let label = settings_scope_environment_label(env, &envs);
+                    let glyph = crate::context_chip::environment_machine_icon(self.state.read(cx), &env_id);
                     let weak = weak.clone();
                     choice_rows.push(
                         h_flex()
@@ -2132,7 +2493,7 @@ impl SettingsView {
                                     cx.notify();
                                 });
                             })
-                            .child(icon(Icon::Server, 16., hsla(p.muted_foreground)))
+                            .child(icon(glyph, 16., hsla(p.muted_foreground)))
                             .child(div().flex_1().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(label))
                             .child(icon(Icon::ChevronRight, 16., hsla(p.muted_foreground)))
                             .into_any_element(),
@@ -2191,7 +2552,7 @@ impl SettingsView {
                                 cx.notify();
                             });
                         })
-                        .child(icon(Icon::Server, 16., hsla(p.muted_foreground)))
+                        .child(icon(Icon::Layers, 16., hsla(p.muted_foreground)))
                         .child(div().flex_1().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Open all environments"))
                         .child(icon(Icon::ChevronRight, 16., hsla(p.muted_foreground)))
                         .into_any_element(),
@@ -2364,7 +2725,7 @@ impl Render for SettingsView {
             };
             (blocks, archive_list)
         };
-        let scope_sentence = self.render_scope_sentence(cx);
+        let scope_sentence = self.render_scope_sentence(window, cx);
         if self.scroll_to_target {
             self.scroll_to_target = false;
             if let Some(index) = self.target.as_deref().and_then(|target| blocks.iter().position(|block| block.anchors.iter().any(|anchor| anchor.as_ref() == target))) {
@@ -2445,6 +2806,14 @@ impl Render for SettingsView {
             .key_context("SettingsModal")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_close))
+            .capture_action(cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                if this.scope_search.focus_handle(cx).is_focused(window)
+                    && !crate::sidebar::is_composing(&this.scope_search, window, cx)
+                    && this.dismiss_scope_picker(window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(|this, _: &crate::thread_view::FindInThread, window, cx| {
                 cx.stop_propagation();

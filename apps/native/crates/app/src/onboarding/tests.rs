@@ -16,10 +16,12 @@ impl Drop for Server {
 #[tokio::test]
 async fn onboarding_rpc_retries_ambiguous_creates_and_partial_history_without_duplicates() {
     let mut child = Command::new("node").arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/onboarding/tests/rpc-server.cjs")).stdout(Stdio::piped()).spawn().unwrap();
-    let mut port = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
+    let stdout = child.stdout.take().unwrap();
     let _server = Server(child);
-    let url = format!("ws://127.0.0.1:{}", port.trim());
+    let mut port = String::new();
+    BufReader::new(stdout).read_line(&mut port).unwrap();
+    let port: u16 = port.trim().parse().expect("onboarding RPC fixture did not report its listening port");
+    let url = format!("ws://127.0.0.1:{port}");
     let mut session = Session::connect(&url).await.unwrap();
     let scan: model::Scan = serde_json::from_value(session.request(model::SCAN, json!({})).await.unwrap()).unwrap();
     let candidate = &scan.candidates[0];

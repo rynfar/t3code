@@ -5,7 +5,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{AppContext, AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
 use gpui_component::{h_flex, v_flex};
 use t3_core::onboarding::{
-    AgentState, OnboardingAgent, agent_display_name, agent_state, group_welcome_agents, install_command, login_command, onboarding_agents,
+    AgentState, OnboardingAgent, agent_display_name, agent_state, group_welcome_agents, install_command, is_broken_version, login_command, onboarding_agents,
     welcome_agent_state,
 };
 use t3_core::providers::accent_color;
@@ -23,46 +23,70 @@ use crate::theme::{hsla, palette};
 struct AgentRow {
     id: SharedString,
     instance_id: Option<String>,
-    driver: &'static str,
+    driver: String,
     name: String,
     mark: ProviderMark,
     state: AgentState,
     /// "Ready to code.", or the summary's headline and detail.
     line: String,
-    headline: String,
+    broken: bool,
     /// What Install or Sign in runs: the login command once installed, else the installer.
     command: Option<String>,
 }
 
 impl AgentRow {
     fn of(agent: &OnboardingAgent, config: Option<&ServerConfig>) -> AgentRow {
-        let provider = agent.provider;
-        let name = agent_display_name(agent.driver, provider);
-        let state = agent_state(provider);
-        let summary = model::summary(provider, provider.is_none_or(|provider| provider.enabled));
+        Self::for_driver(agent.driver, agent.provider, config)
+    }
+
+    fn for_driver(driver: &str, provider: Option<&t3_core::server_config::ServerProvider>, config: Option<&ServerConfig>) -> Self {
+        let name = agent_display_name(driver, provider);
+        let state = provider.map_or(AgentState::Checking, |provider| welcome_agent_state(provider, config.map(|config| &config.settings)));
+        let summary = model::summary(provider, state != AgentState::Disabled);
         let line = match (state, &summary.detail) {
             (AgentState::Ready, _) => "Ready to code.".to_owned(),
             (_, Some(detail)) => format!("{} · {detail}", summary.headline),
-            (_, None) => summary.headline.clone(),
+            (_, None) => summary.headline,
         };
         let os = config.and_then(|config| config.environment.platform.as_ref()).map_or("unknown", |platform| platform.os.as_str());
-        let command = match (provider, config) {
-            (Some(provider), Some(config)) if provider.installed => Some(login_command(provider, &config.settings, os)),
-            (Some(_), Some(_)) => install_command(agent.driver, os).map(str::to_owned),
+        let command = match (driver, provider, config) {
+            ("codex" | "claudeAgent", Some(provider), Some(config)) if provider.installed => Some(login_command(provider, &config.settings, os)),
+            (_, Some(_), Some(_)) => install_command(driver, os).map(str::to_owned),
             _ => None,
         };
-        AgentRow {
+        Self {
             instance_id: provider.map(|provider| provider.instance_id.clone()),
-            id: format!("welcome-agent-setup-{}", provider.map_or(agent.driver, |provider| provider.instance_id.as_str())).into(),
-            driver: agent.driver,
-            mark: ProviderMark::configured(agent.driver, &name, provider.and_then(accent_color)),
+            id: format!("welcome-agent-setup-{}", provider.map_or(driver, |provider| provider.instance_id.as_str())).into(),
+            driver: driver.to_owned(),
+            mark: ProviderMark::configured(driver, &name, provider.and_then(accent_color)),
             name,
             state,
             line,
-            headline: summary.headline,
+            broken: provider.is_some_and(is_broken_version),
             command,
         }
     }
+
+    fn action(&self) -> AgentAction {
+        match self.state {
+            AgentState::Disabled => AgentAction::Enable,
+            _ if self.broken => AgentAction::Settings("Update"),
+            AgentState::Ready | AgentState::Checking => AgentAction::Status,
+            AgentState::Install | AgentState::SignIn if self.command.is_some() => AgentAction::Terminal,
+            AgentState::Attention => AgentAction::Settings("Details"),
+            AgentState::SignIn => AgentAction::Settings("Sign in"),
+            AgentState::Install => AgentAction::Settings("Set up"),
+        }
+    }
+
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AgentAction {
+    Status,
+    Enable,
+    Terminal,
+    Settings(&'static str),
 }
 
 /// A reply describes the environment it was asked on: after a switch to another, it is dropped.
@@ -111,30 +135,50 @@ impl WelcomeWizard {
 
     fn render_agent(&self, row: AgentRow, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let quiet = |text: String| div().text_xs().text_color(hsla(p.muted_foreground)).child(text).into_any_element();
-        let status = match row.state {
-            AgentState::Ready => h_flex()
+        let t = crate::i18n::t;
+        let status = match row.action() {
+            AgentAction::Status if row.state == AgentState::Ready => h_flex()
                 .gap(r(6.))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(p.success_foreground))
                 .child(Icon::Check.render(px(14.), hsla(p.success_foreground)))
-                .child("Ready")
+                .child(t(cx, "Ready"))
                 .into_any_element(),
-            AgentState::Checking => quiet("Checking...".to_owned()),
-            AgentState::Disabled => quiet("Disabled".to_owned()),
-            AgentState::Attention => quiet(row.headline),
-            AgentState::Install | AgentState::SignIn => {
-                let open = self.setup.as_ref().is_some_and(|setup| setup.driver == row.driver);
-                let (driver, instance_id) = (row.driver, row.instance_id);
+            AgentAction::Status => div().text_xs().text_color(hsla(p.muted_foreground))
+                .child(t(cx, "Checking...")).into_any_element(),
+            AgentAction::Enable => {
+                let instance_id = row.instance_id;
+                let disabled = instance_id.as_ref().is_none_or(|id| {
+                    self.enabling_agents.contains(id) || !self.can_enable_agent(id, &row.driver, cx)
+                });
+                Button::new(row.id, ButtonVariant::Outline, ButtonSize::Xs)
+                    .label("Turn on")
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(id) = &instance_id { this.enable_agent(id, &row.driver, cx); }
+                    }))
+                    .into_any_element()
+            }
+            AgentAction::Terminal => {
+                let instance_id = row.instance_id;
+                let open = self.setup.as_ref().is_some_and(|setup| Some(&setup.instance_id) == instance_id.as_ref());
                 Button::new(row.id, ButtonVariant::Ghost, ButtonSize::Xs)
                     .icon(Icon::Terminal)
                     .label(if row.state == AgentState::SignIn { "Sign in" } else { "Install" })
-                    .disabled(open || row.command.is_none() || !self.terminal_access)
+                    .disabled(open || instance_id.is_none() || !self.terminal_access)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(instance_id) = &instance_id {
-                            this.open_agent_terminal(driver, instance_id, cx);
-                        }
+                        if let Some(instance_id) = &instance_id { this.open_agent_terminal(instance_id, cx); }
+                    }))
+                    .into_any_element()
+            }
+            AgentAction::Settings(label) => {
+                let instance_id = row.instance_id;
+                Button::new(row.id, ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(label)
+                    .disabled(instance_id.is_none())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(instance_id) = &instance_id { this.open_agent_settings(instance_id, cx); }
                     }))
                     .into_any_element()
             }
@@ -153,6 +197,66 @@ impl WelcomeWizard {
             )
             .child(div().flex_none().child(status))
             .into_any_element()
+    }
+
+    fn can_manage_agents(&self, cx: &gpui::App) -> bool {
+        self.state.read(cx).client_handle().is_some_and(|client| {
+            client.session_state().borrow().as_ref().is_some_and(|session| {
+                session.grants(t3_core::usage::PROVIDERS_MANAGE_SCOPE)
+            })
+        })
+    }
+
+    fn can_enable_agent(&self, instance_id: &str, driver: &str, cx: &gpui::App) -> bool {
+        self.can_manage_agents(cx) && self.state.read(cx).server_config.config.as_ref().is_some_and(|config| {
+            t3_core::onboarding::managed_driver_allowed(config.managed_policy.as_ref(), driver)
+                && !t3_core::managed_policy::setting_locked(config.managed_policy.as_ref(), &format!("providerInstances.{instance_id}"))
+        })
+    }
+
+    fn enable_agent(&mut self, instance_id: &str, driver: &str, cx: &mut Context<Self>) {
+        if !self.can_enable_agent(instance_id, driver, cx) || !self.enabling_agents.insert(instance_id.to_owned()) {
+            return;
+        }
+        let app = self.state.read(cx);
+        let config = app.server_config.config.as_ref().expect("provider settings available");
+        let previous = config.settings.provider_instances.get(instance_id).cloned().unwrap_or_else(|| {
+            t3_core::server_config::ProviderInstanceConfig { driver: driver.to_owned(), ..Default::default() }
+        });
+        let mut next = model::with_enabled(&previous, true);
+        if next.config.as_ref().and_then(|config| config.get("enabled")) == Some(&serde_json::Value::Bool(false)) {
+            next = model::form::with_field(&next, "enabled", serde_json::Value::Bool(true));
+        }
+        let payload = model::upsert_payload(&config.settings, instance_id, &previous, &next);
+        let asked_on = app.connection_id();
+        let instance = instance_id.to_owned();
+        let wizard = cx.entity().downgrade();
+        crate::settings::store::update_server_then(
+            &self.state,
+            t3_core::settings::ServerSettingChange::Prepared(payload),
+            move |error, cx| {
+                let _ = wizard.update(cx, |this, cx| {
+                    if !answers_current(asked_on, this.state.read(cx).connection_id()) { return; }
+                    this.enabling_agents.remove(&instance);
+                    if error.is_none() { this.refresh_providers_for(Some(&instance), cx); }
+                    cx.notify();
+                });
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn open_agent_settings(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let target = crate::composer::ProviderTarget {
+            environment: crate::composer::ProviderTarget::environment(state),
+            connection: state.connection_id(),
+            thread: None,
+            instance: Some(instance_id.to_owned()),
+        };
+        self.dismiss_for_settings(cx);
+        crate::settings::open_provider_setup(target, cx);
     }
 
     pub(super) fn watch_terminal_grants(&mut self, cx: &mut Context<Self>) {
@@ -209,7 +313,6 @@ impl WelcomeWizard {
 
     fn open_agent_terminal(
         &mut self,
-        driver: &'static str,
         instance_id: &str,
         cx: &mut Context<Self>,
     ) {
@@ -221,32 +324,16 @@ impl WelcomeWizard {
         let Some(config) = app.server_config.config.as_ref() else {
             return;
         };
-        let agent = config
-            .providers
-            .iter()
-            .find(|provider| provider.driver == driver && provider.instance_id == instance_id)
-            .map(|provider| OnboardingAgent { driver, provider: Some(provider) })
-            .or_else(|| {
-                onboarding_agents(&config.providers, config.managed_policy.as_ref())
-                    .into_iter()
-                    .find(|agent| {
-                        agent.driver == driver
-                            && agent
-                                .provider
-                                .is_some_and(|provider| provider.instance_id == instance_id)
-                    })
-            });
-        let Some(row) = agent.map(|agent| AgentRow::of(&agent, Some(config))) else {
-            return;
-        };
+        let Some(provider) = config.providers.iter().find(|provider| provider.instance_id == instance_id) else { return };
+        let row = AgentRow::for_driver(&provider.driver, Some(provider), Some(config));
         let Some(command) = row.command else { return };
         let (cwd, runtime) = (config.cwd.clone(), app.runtime().clone());
         let instance_id = instance_id.to_owned();
         let session = t3_core::onboarding::terminal::Session {
-            driver: driver.to_owned(),
+            driver: provider.driver.clone(),
             command,
             cwd,
-            provider_instance_id: instance_id,
+            provider_instance_id: instance_id.clone(),
         };
         let terminal = cx.new(|cx| AgentInstallTerminal::new(session, client, runtime, cx));
         let closed = cx.subscribe(&terminal, |this, _, _: &Closed, cx| {
@@ -258,7 +345,7 @@ impl WelcomeWizard {
             this.refresh_providers_for(event.instance_id.as_deref(), cx);
         });
         self.setup = Some(AgentSetup {
-            driver,
+            instance_id,
             terminal,
             _closed: closed,
             _finished: Some(finished),
@@ -268,7 +355,7 @@ impl WelcomeWizard {
 
     pub(super) fn render_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let (machine, ready_count, mut primary_rows, more_rows, can_add, existing) = {
+        let (machine, ready_count, mut primary_rows, more_rows, can_add, existing, registry) = {
             let app = self.state.read(cx);
             let config = app.server_config.config.as_ref();
             let machine = app
@@ -292,32 +379,14 @@ impl WelcomeWizard {
                 grouped
                     .found
                     .iter()
-                    .map(|provider| {
-                        let driver: &'static str = match provider.driver.as_str() {
-                            "codex" => "codex",
-                            "claudeAgent" => "claudeAgent",
-                            _ => "other",
-                        };
-                        let mut row = AgentRow::of(&OnboardingAgent { driver, provider: Some(provider) }, config);
-                        row.state = welcome_agent_state(provider, settings);
-                        row
-                    })
+                    .map(|provider| AgentRow::for_driver(&provider.driver, Some(provider), config))
                     .collect()
             };
 
             let more_rows: Vec<AgentRow> = grouped
                 .available
                 .iter()
-                .map(|provider| {
-                    let driver: &'static str = match provider.driver.as_str() {
-                        "codex" => "codex",
-                        "claudeAgent" => "claudeAgent",
-                        _ => "other",
-                    };
-                    let mut row = AgentRow::of(&OnboardingAgent { driver, provider: Some(provider) }, config);
-                    row.state = welcome_agent_state(provider, settings);
-                    row
-                })
+                .map(|provider| AgentRow::for_driver(&provider.driver, Some(provider), config))
                 .collect();
 
             if let Some(id) = &self.created_chatgpt {
@@ -328,7 +397,8 @@ impl WelcomeWizard {
             }
             let can_add = providers.unwrap_or_default().iter().any(|p| p.driver == "codex" && agent_state(Some(p)) == AgentState::Ready);
             let existing = config.map(|c| c.settings.provider_instances.iter().filter(|(_, p)| t3_core::settings::providers::chatgpt::existing_chosen(p.config.as_ref())).map(|(id, _)| id.to_owned()).collect::<Vec<_>>()).unwrap_or_default();
-            (machine, grouped.ready_count, primary_rows, more_rows, can_add, existing)
+            let registry = t3_core::onboarding::managed_driver_allowed(policy, model::ACP_REGISTRY);
+            (machine, grouped.ready_count, primary_rows, more_rows, can_add, existing, registry)
         };
         self.chatgpt.retain(|id, _| !existing.contains(id));
 
@@ -412,6 +482,17 @@ impl WelcomeWizard {
                         .when(more_open, |list| list.child(v_flex().gap(r(6.)).children(more_cards))),
                 )
             })
+            .when(registry, |section| section.child(
+                h_flex().gap(r(8.)).child(Icon::PackagePlus.render(px(16.), hsla(p.icon_muted)))
+                    .child(div().flex_1().min_w_0().text_sm().child(crate::i18n::t(cx, "More agents in the ACP Registry")))
+                    .child(Button::new("welcome-acp-registry", ButtonVariant::Outline, ButtonSize::Xs)
+                        .label("Browse")
+                        .disabled(!self.can_manage_agents(cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.dismiss_for_settings(cx);
+                            crate::settings::open_onboarding_registry(cx);
+                        }))),
+            ))
             .children(setup)
             .into_any_element()
     }
@@ -420,6 +501,24 @@ impl WelcomeWizard {
 #[cfg(test)]
 mod tests {
     use super::answers_current;
+
+    #[test]
+    fn non_primary_agents_keep_their_driver_and_setup_actions() {
+        use super::{AgentAction, AgentRow};
+        let row = |enabled, installed, advisory| {
+            let provider: t3_core::server_config::ServerProvider = serde_json::from_value(serde_json::json!({
+                "driver": "pi", "instanceId": "pi-work", "enabled": enabled, "installed": installed,
+                "status": "ready", "compatibilityAdvisory": advisory,
+            })).unwrap();
+            AgentRow::for_driver(&provider.driver, Some(&provider), None)
+        };
+        let disabled = row(false, true, serde_json::Value::Null);
+        assert_eq!(disabled.driver, "pi");
+        assert_eq!(disabled.action(), AgentAction::Enable);
+        assert_eq!(row(true, false, serde_json::Value::Null).action(), AgentAction::Settings("Set up"));
+        let advisory = serde_json::json!({"status": "broken", "targetVersion": "1.2.3"});
+        assert_eq!(row(true, true, advisory).action(), AgentAction::Settings("Update"));
+    }
 
     #[test]
     fn a_provider_reply_after_a_switch_is_dropped() {
