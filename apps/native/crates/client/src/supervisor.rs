@@ -562,7 +562,9 @@ async fn supervise(
     let mut attempt: u32 = 0;
     let mut last_failure = String::new();
     let mut awaiting_approval = false;
+    let route_progress = crate::status::RouteProgressPublisher::new(&credentials.http_base);
     loop {
+        route_progress.publish(None, None);
         // An attempt after a failure still reads as reconnecting, with the reason it failed.
         let _ = events.send(ClientEvent::Status(if attempt == 0 {
             ConnectionStatus::Connecting
@@ -614,6 +616,7 @@ async fn supervise(
                 };
                 generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
+                route_progress.publish(Some(&active_route.id), None);
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
                 let mut fetch = SessionStateFetch::new(&active_credentials, &grants);
                 fetch.start();
@@ -690,12 +693,13 @@ async fn supervise(
         attempt += 1;
         last_failure = reason.clone();
         awaiting_approval = is_approval;
+        let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
+        route_progress.publish(None, Some(delay));
         let _ = events.send(ClientEvent::Status(if is_approval {
             ConnectionStatus::AwaitingApproval { reason, attempt }
         } else {
             ConnectionStatus::Reconnecting { reason, attempt }
         })).await;
-        let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
         match wait_draining(Some(delay), &mut commands, &mut wakeup_rx, &mut resume).await {
             WaitOutcome::Elapsed => {}
             WaitOutcome::RetryNow => {

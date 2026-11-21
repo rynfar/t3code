@@ -1088,6 +1088,9 @@ impl SettingsView {
             dialog.update(cx,|dialog,cx|dialog.close(window,cx));
             return;
         }
+        if self.dismiss_appearance_popover(cx) {
+            return;
+        }
         if self.dismiss_about_overlay(window, cx)
             || self.dismiss_auto_settle_days(window, cx)
             || self.dismiss_environments_overlay(window, cx)
