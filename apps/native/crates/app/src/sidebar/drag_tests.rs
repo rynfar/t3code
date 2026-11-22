@@ -1231,3 +1231,408 @@ async fn sidebar_folder_drop_targets_local_environment_and_unarchives(cx: &mut g
     assert_eq!(state.read_with(cx, |s, _| s.draft_project.clone()), Some("proj-archived".into()));
     state.update(cx, |s, _| s.stop_pump());
 }
+
+fn redraw(vcx: &mut gpui::VisualTestContext) {
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear();
+    });
+}
+
+fn take_dispatch_types(fix: &mut ClientFixture) -> Vec<String> {
+    fix.take_requests()
+        .0
+        .into_iter()
+        .filter(|(method, _, _)| *method == t3_core::commands::method::DISPATCH_COMMAND)
+        .filter_map(|(_, payload, _)| payload.get("type").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect()
+}
+
+async fn setup_folder_mode_fixture<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    runtime: &tokio::runtime::Runtime,
+    client_settings: serde_json::Value,
+) -> (
+    Entity<AppState>,
+    Entity<SidebarPane>,
+    &'a mut gpui::VisualTestContext,
+    ClientFixture,
+    tokio::sync::mpsc::Receiver<t3_client::environments::EnvironmentEvent>,
+) {
+    use t3_client::environments::{EnvironmentEvent, Environments};
+    let (state, _base_fixture) = setup_app(cx, runtime);
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(
+            &state,
+            serde_json::from_value(client_settings).unwrap(),
+            cx,
+        );
+    });
+    let (connections, mut output) = Environments::start(runtime.handle(), false);
+    let rw_session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+        "authenticated": true,
+        "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE]
+    }))
+    .unwrap();
+    let (client, fix) = ClientFixture::handle(rw_session.clone());
+    fix.grants.send_replace(Some(rw_session));
+    let mut th_a = thread_json("th-a", "First Alpha", "idle", "2026-01-02T00:02:00.000Z");
+    th_a["projectId"] = json!("proj-alpha");
+    let mut th_b = thread_json("th-b", "Second Beta", "idle", "2026-01-02T00:01:00.000Z");
+    th_b["projectId"] = json!("proj-beta");
+    let mut shell = t3_core::shell::ShellState::default();
+    shell.apply(
+        serde_json::from_value(json!({
+            "kind": "snapshot",
+            "snapshot": {
+                "snapshotSequence": 1,
+                "projects": [
+                    {"id": "proj-alpha", "title": "Alpha", "workspaceRoot": "/alpha", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"},
+                    {"id": "proj-beta", "title": "Beta", "workspaceRoot": "/beta", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}
+                ],
+                "threads": [th_a, th_b]
+            }
+        }))
+        .unwrap(),
+    );
+    shell.synchronized = true;
+    let mut config = t3_core::server_config::ServerConfigState::default();
+    config.apply(
+        serde_json::from_value(json!({
+            "type": "snapshot",
+            "config": {
+                "environment": {"environmentId": "srv-1", "label": "Local", "platform": {"os": "macos", "arch": "arm64"}, "capabilities": {"projectOrganization": true}},
+                "cwd": "/",
+                "settings": {}
+            }
+        }))
+        .unwrap(),
+    );
+    state.update(cx, |s, _| {
+        s.stop_pump();
+        s.connections = connections;
+        s.environments = serde_json::from_value(json!({
+            "active": "env-1",
+            "environments": [{
+                "id": "env-1",
+                "environmentId": "srv-1",
+                "label": "Local",
+                "httpBase": "http://fixture.invalid",
+                "accessToken": "",
+                "disabled": false,
+                "local": true
+            }]
+        }))
+        .unwrap();
+    });
+    let mut view = state.read_with(cx, |s, _| s.connections.view());
+    let install = state.update(cx, |s, _| {
+        s.connections.install_fixture("env-1", client, shell, config, ConnectionStatus::Connected)
+    });
+    let _ev = runtime.spawn(install).await.unwrap();
+    let fleet_view = view.borrow_and_update().clone();
+    state.update(cx, |s, cx| {
+        s.apply_fleet_view(fleet_view, cx);
+        s.environments.active = Some("env-1".into());
+        s.connections.activate(Some("env-1"));
+    });
+    let (ev, output) = runtime
+        .spawn(async move {
+            loop {
+                let ev = output.recv().await.unwrap();
+                if matches!(&ev, EnvironmentEvent::Activated { id, .. } if id == "env-1") {
+                    return (ev, output);
+                }
+            }
+        })
+        .await
+        .unwrap();
+    state.update(cx, |s, cx| {
+        s.apply_environment_event(ev, cx);
+        s.rebuild_sidebar(cx);
+    });
+    cx.run_until_parked();
+
+    let (root, vcx) = cx.add_window_view(|window, cx| {
+        let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+        let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+        let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+        let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), confirm, snooze, window, cx));
+        DragHost { pane, composer, menu, height: px(600.) }
+    });
+    let pane = root.read_with(vcx, |host, _| host.pane.clone());
+    vcx.run_until_parked();
+    redraw(vcx);
+    vcx.executor().advance_clock(shift_guard::GRACE);
+    redraw(vcx);
+    (state, pane, vcx, fix, output)
+}
+
+#[gpui::test]
+async fn click_with_jitter_opens_thread_without_pinning(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, pane, vcx, mut fix, _output) = setup_folder_mode_fixture(
+        cx,
+        &runtime,
+        json!({"boringSidebarEnabled": true}),
+    )
+    .await;
+    let _ = fix.take_commands();
+
+    let key_a = t3_core::sidebar::tag_filter::ThreadKey::new("env-1", "th-a");
+    let key_b = t3_core::sidebar::tag_filter::ThreadKey::new("env-1", "th-b");
+    let row_a_id: &'static str = Box::leak(format!("thread-row-{:?}-th-a", Some(&key_a)).into_boxed_str());
+    let row_b_id: &'static str = Box::leak(format!("thread-row-{:?}-th-b", Some(&key_b)).into_boxed_str());
+    let pos_a = vcx.debug_bounds(row_a_id).expect("th-a rendered").center();
+
+    // 1) Exact 0px click opens th-a without starting drag or pinning.
+    vcx.simulate_mouse_move(pos_a, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: pos_a,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: pos_a,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("th-a".into()));
+    assert!(pane.read_with(vcx, |p, _| p.drag.is_none()));
+    assert!(vcx.debug_bounds("sidebar-drag-marker-pinned-header").is_none());
+    assert!(!take_dispatch_types(&mut fix).iter().any(|t| t == "thread.pin"));
+
+    // 2) Click with ~3.9px jitter (crosses GPUI's 2px threshold but stays <= 6px) must still open th-b cleanly.
+    let pos_b = vcx.debug_bounds(row_b_id).expect("th-b rendered").center();
+    let jitter_b = gpui::point(pos_b.x + px(3.), pos_b.y + px(2.5));
+    vcx.simulate_mouse_move(pos_b, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: pos_b,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_mouse_move(jitter_b, Some(gpui::MouseButton::Left), Default::default());
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert!(
+        pane.read_with(vcx, |p, _| {
+            p.drag.is_none()
+                && p.pending_thread_press
+                    .as_ref()
+                    .is_some_and(|press| press.drag_attached && !press.activated.load(std::sync::atomic::Ordering::Relaxed))
+        }),
+        "3.9px move must defer drag activation without splicing Pinned markers"
+    );
+    assert!(vcx.debug_bounds("sidebar-drag-marker-pinned-header").is_none());
+
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: jitter_b,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("th-b".into()));
+    assert!(pane.read_with(vcx, |p, _| p.drag.is_none() && p.pending_thread_press.is_none()));
+    assert!(!vcx.update(|_, cx| cx.has_active_drag()));
+    assert!(vcx.debug_bounds("sidebar-drag-marker-pinned-header").is_none());
+    assert!(!take_dispatch_types(&mut fix).iter().any(|t| t == "thread.pin"));
+
+    // 3) Search result click with ~3.9px jitter opens the thread too.
+    pane.update(vcx, |p, cx| {
+        p.search.set_query("First Alpha".into(), &p.state, cx);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    redraw(vcx);
+    let search_row_id: &'static str = Box::leak(format!("search-result-{:?}", key_a).into_boxed_str());
+    let search_pos = vcx.debug_bounds(search_row_id).expect("search result rendered").center();
+    let search_jitter = gpui::point(search_pos.x + px(3.), search_pos.y + px(2.5));
+    vcx.simulate_mouse_move(search_pos, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: search_pos,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_mouse_move(search_jitter, Some(gpui::MouseButton::Left), Default::default());
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: search_jitter,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.clone()), Some("th-a".into()));
+    assert!(pane.read_with(vcx, |p, _| p.drag.is_none() && p.pending_thread_press.is_none()));
+    assert!(!take_dispatch_types(&mut fix).iter().any(|t| t == "thread.pin"));
+    state.update(vcx, |s, _| s.stop_pump());
+}
+
+#[gpui::test]
+async fn intentional_drag_past_threshold_activates_and_pins(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, pane, vcx, mut fix, _output) = setup_folder_mode_fixture(
+        cx,
+        &runtime,
+        json!({"boringSidebarEnabled": true}),
+    )
+    .await;
+    let _ = fix.take_commands();
+
+    let key_a = t3_core::sidebar::tag_filter::ThreadKey::new("env-1", "th-a");
+    let row_a_id: &'static str = Box::leak(format!("thread-row-{:?}-th-a", Some(&key_a)).into_boxed_str());
+    let pos_a = vcx.debug_bounds(row_a_id).expect("th-a rendered").center();
+    let past_threshold = gpui::point(pos_a.x + px(10.), pos_a.y - px(2.));
+
+    vcx.simulate_mouse_move(pos_a, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: pos_a,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_mouse_move(past_threshold, Some(gpui::MouseButton::Left), Default::default());
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert!(pane.read_with(vcx, |p, _| p.drag.is_some()), "moving >6px with Left held must activate sidebar drag");
+    let pinned_header = vcx
+        .debug_bounds("sidebar-drag-marker-pinned-header")
+        .expect("PinnedHeader drop marker must render once activated")
+        .center();
+
+    vcx.simulate_mouse_move(pinned_header, Some(gpui::MouseButton::Left), Default::default());
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert_eq!(pane.read_with(vcx, |p, _| p.drop_target()), Some(t3_core::sidebar::Section::Pinned));
+
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: pinned_header,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    let (method, payload, reply) = fix.next_request().await;
+    assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+    assert_eq!(payload["type"], "thread.pin");
+    assert_eq!(payload["threadId"], "th-a");
+    let _ = reply.send(Ok(json!({ "sequence": 2 })));
+    vcx.run_until_parked();
+    state.update(vcx, |s, _| s.stop_pump());
+}
+
+#[gpui::test]
+async fn stale_mouse_move_without_left_button_never_starts_drag(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, pane, vcx, mut fix, _output) = setup_folder_mode_fixture(
+        cx,
+        &runtime,
+        json!({"boringSidebarEnabled": true}),
+    )
+    .await;
+    let _ = fix.take_commands();
+
+    let key_a = t3_core::sidebar::tag_filter::ThreadKey::new("env-1", "th-a");
+    let row_a_id: &'static str = Box::leak(format!("thread-row-{:?}-th-a", Some(&key_a)).into_boxed_str());
+    let pos_a = vcx.debug_bounds(row_a_id).expect("th-a rendered").center();
+
+    vcx.simulate_mouse_move(pos_a, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: pos_a,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    // Simulate a lost MouseUp followed by hover movement (pressed_button: None).
+    vcx.simulate_mouse_move(
+        gpui::point(pos_a.x + px(15.), pos_a.y),
+        None::<gpui::MouseButton>,
+        Default::default(),
+    );
+    vcx.run_until_parked();
+    redraw(vcx);
+    assert!(pane.read_with(vcx, |p, _| p.drag.is_none() && p.pending_thread_press.is_none()));
+    assert!(!vcx.update(|_, cx| cx.has_active_drag()));
+    assert!(vcx.debug_bounds("sidebar-drag-marker-pinned-header").is_none());
+    assert!(!fix.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+    state.update(vcx, |s, _| s.stop_pump());
+}
+
+#[gpui::test]
+async fn project_folder_click_with_jitter_toggles_instead_of_dragging(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, pane, vcx, _fix, _output) = setup_folder_mode_fixture(
+        cx,
+        &runtime,
+        json!({
+            "boringSidebarEnabled": true,
+            "sidebarProjectGroupingMode": "separate",
+            "sidebarProjectSortOrder": "manual"
+        }),
+    )
+    .await;
+
+    let alpha_group = state
+        .read_with(vcx, |s, cx| {
+            s.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx)
+                .into_iter()
+                .find(|g| g.label == "Alpha")
+                .expect("Alpha project group")
+        });
+    let was_expanded = state.read_with(vcx, |s, _| s.project_preferences.expanded(&alpha_group));
+    assert!(pane.read_with(vcx, |p, _| {
+        p.row_keys.iter().any(|k| matches!(k, PaneRowKey::Scoped(t3_core::sidebar::fleet::ScopedRowKey::Folder(key)) if key == &alpha_group.key))
+    }));
+    let folder_pos = pane.read_with(vcx, |p, _| {
+        let idx = p
+            .row_keys
+            .iter()
+            .position(|k| matches!(k, PaneRowKey::Scoped(t3_core::sidebar::fleet::ScopedRowKey::Folder(key)) if key == &alpha_group.key))
+            .unwrap();
+        p.list.bounds_for_item(idx).expect("Alpha folder bounds").center()
+    });
+    let jitter_pos = gpui::point(folder_pos.x + px(3.), folder_pos.y + px(2.5));
+
+    vcx.simulate_mouse_move(folder_pos, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: folder_pos,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_mouse_move(jitter_pos, Some(gpui::MouseButton::Left), Default::default());
+    vcx.run_until_parked();
+    assert!(pane.read_with(vcx, |p, _| p.project_drag.is_none()));
+
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: jitter_pos,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    redraw(vcx);
+    let now_expanded = state.read_with(vcx, |s, _| s.project_preferences.expanded(&alpha_group));
+    assert_eq!(now_expanded, !was_expanded, "4px jitter click must toggle manual-sorted project folder");
+    assert!(pane.read_with(vcx, |p, _| p.project_drag.is_none() && p.pending_project_press.is_none()));
+    assert!(!vcx.update(|_, cx| cx.has_active_drag()));
+    state.update(vcx, |s, _| s.stop_pump());
+}

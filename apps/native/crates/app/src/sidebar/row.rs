@@ -321,6 +321,9 @@ impl SidebarPane {
         let debug_row_id = row_id.clone();
         let hover_bounds_id = row_id.clone();
         let hover_row_id = row_id.clone();
+        let press_row_id = row_id.clone();
+        let press_id = thread.id.clone();
+        let press_key = key.cloned();
         let focus_key = ElementId::Name(row_id.clone());
         let row_focus = self.tree.focus(&TreeRow::Thread(key.cloned().unwrap_or_else(|| {
             t3_core::sidebar::tag_filter::ThreadKey::new("", &thread.id)
@@ -398,20 +401,33 @@ impl SidebarPane {
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);
             }))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.hover.dismiss(cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                this.hover.dismiss(cx);
+                if draggable {
+                    this.record_thread_press(super::drag::PendingThreadPress {
+                        id: press_id.clone(),
+                        key: press_key.clone(),
+                        row_id: press_row_id.clone(),
+                        down_pos: event.position,
+                        click_count: event.click_count,
+                        reorderable,
+                        search_result: false,
+                        left_held: true,
+                        drag_attached: false,
+                        activated: Default::default(),
+                        preview: None,
+                    });
+                }
+            }))
             .child(measure_menu)
             .when(draggable, |this| {
-                this.on_drag(DraggedThread { id: thread.id.clone(), key: key.cloned() }, move |dragged, _, _, cx| {
-                    let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
-                    if let Some(pane) = pane.upgrade() {
-                        pane.update(cx, |pane, cx| {
-                            pane.hover.dismiss(cx);
-                            if reorderable {
-                                pane.begin_drag(&dragged.id, dragged.key.as_ref(), preview.clone(), cx);
-                            }
-                        });
-                    }
-                    preview
+                this.on_drag(DraggedThread::new(thread.id.clone(), key.cloned()), move |dragged, _, window, cx| {
+                    let Some(pane) = pane.upgrade() else {
+                        return cx.new(|_| ThreadDragPreview::new_hidden(preview.0.clone(), preview.1.clone(), preview.2.clone()));
+                    };
+                    pane.update(cx, |pane, cx| {
+                        pane.attach_thread_drag(dragged, preview.0.clone(), preview.1.clone(), preview.2.clone(), window, cx)
+                    })
                 })
             })
             .drag_over::<gpui::ExternalPaths>(move |style, paths, _, _| {
@@ -492,27 +508,42 @@ impl SidebarPane {
                 }
             }))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                this.hover.dismiss(cx);
-                let modifiers = event.modifiers();
-                if event.click_count() > 1 && !modifiers.shift && !modifiers.platform && !modifiers.control && !modifiers.alt {
-                    let allowed = can_operate_thread(this.state.read(cx), clicked_key.as_ref())
-                        && this.rename.as_ref().is_none_or(|(renaming, _)| *renaming != id || this.rename_key.as_ref() != clicked_key.as_ref());
-                    if allowed {
-                        if let Some(key) = &clicked_key { this.start_scoped_rename(key, window, cx); }
-                        else { this.start_rename(&id, window, cx); }
-                    }
-                    return;
-                }
-                this.state.update(cx, |state, cx| match &clicked_key {
-                    Some(key) => state.click_scoped_sidebar_thread(key, modifiers, cx),
-                    None => state.click_sidebar_thread(&id, modifiers, cx),
-                });
+                this.activate_thread_row_click(&id, clicked_key.as_ref(), event.modifiers(), event.click_count(), window, cx);
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                 window.focus(&row_focus, cx);
                 this.open_row_menu(menu_key.as_ref(), &menu_id, event.position, window, cx);
                 cx.stop_propagation();
             }))
+    }
+
+    pub(super) fn activate_thread_row_click(
+        &mut self,
+        id: &str,
+        key: Option<&t3_core::sidebar::tag_filter::ThreadKey>,
+        modifiers: gpui::Modifiers,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_thread_press = None;
+        self.hover.dismiss(cx);
+        if click_count > 1 && !modifiers.shift && !modifiers.platform && !modifiers.control && !modifiers.alt {
+            let allowed = can_operate_thread(self.state.read(cx), key)
+                && self.rename.as_ref().is_none_or(|(renaming, _)| *renaming != id || self.rename_key.as_ref() != key);
+            if allowed {
+                if let Some(key) = key {
+                    self.start_scoped_rename(key, window, cx);
+                } else {
+                    self.start_rename(id, window, cx);
+                }
+            }
+            return;
+        }
+        self.state.update(cx, |state, cx| match key {
+            Some(key) => state.click_scoped_sidebar_thread(key, modifiers, cx),
+            None => state.click_sidebar_thread(id, modifiers, cx),
+        });
     }
 
     fn open_row_menu(&mut self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread_id: &str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -599,6 +630,7 @@ impl SidebarPane {
                 .child(Icon::Pin.sized(px(12.)).text_color(hsla(p.muted_foreground).opacity(0.65)).group_hover("unpin", |this| this.invisible()))
                 .child(div().absolute().top_0().invisible().group_hover("unpin", |this| this.visible()).child(Icon::PinOff.sized(px(12.)).text_color(hsla(p.foreground))))
                 .relative()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     if let Some(key) = &key {
@@ -913,6 +945,7 @@ impl SidebarPane {
             .text_color(hsla(color))
             .child(Icon::AlarmClock.render(icon_size, hsla(color)))
             .child(crate::i18n::t(cx, "Woke"))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 if let Some(woke_at) = woke_at {
@@ -1060,6 +1093,7 @@ impl SidebarPane {
                     .relative()
                     .child(measure)
                     .child(Icon::Clock.render(px(12.), hsla(p.muted_foreground)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         let Some(bounds) = bounds.get() else { return };

@@ -3,7 +3,12 @@
 //! dimmed; a raised copy follows the pointer with the drop badge, and a line marks the gap the
 //! row will land in. Drop resolution and planning live in `t3_core::sidebar::drag`.
 
-use gpui::{AnyElement, App, Context, DragMoveEvent, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use gpui::{AnyElement, App, Context, DragMoveEvent, Entity, FontWeight, IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, Point, Render, SharedString, Styled, Window, div, prelude::*, px};
 use t3_core::sidebar::Section;
 use t3_core::sidebar::drag::{DropVerb, Marker, SweepAction, resolve_drop_verb, sweep_keys};
 use t3_core::sidebar::selection::BulkAction;
@@ -17,11 +22,28 @@ use crate::theme::{Palette, hsla, palette};
 const PREVIEW_WIDTH: f32 = 240.;
 const BOUNDARY_HEIGHT: f32 = 24.;
 const PLACEHOLDER_HEIGHT: f32 = 36.;
+pub(super) const SIDEBAR_DRAG_DISTANCE: f32 = 6.;
+
+fn pointer_distance(a: Point<Pixels>, b: Point<Pixels>) -> f32 {
+    let delta = a - b;
+    f32::from(delta.x).hypot(f32::from(delta.y))
+}
 
 /// The drag payload of a sidebar thread row.
 pub struct DraggedThread {
     pub id: String,
     pub key: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub activated: Arc<AtomicBool>,
+}
+
+impl DraggedThread {
+    pub(super) fn new(id: String, key: Option<ThreadKey>) -> Self {
+        Self { id, key, activated: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub(crate) fn is_activated(&self) -> bool {
+        self.activated.load(Ordering::Relaxed)
+    }
 }
 
 /// The pointer's gap while dragging: the row it is over, below its midpoint when `after`.
@@ -31,6 +53,21 @@ pub(super) struct PaneDrag {
     /// The section a drop at `at` lands in, when it would change anything.
     pub target: Option<Section>,
     pub preview: Option<Entity<ThreadDragPreview>>,
+    pub pointer_drag: bool,
+}
+
+pub(super) struct PendingThreadPress {
+    pub id: String,
+    pub key: Option<ThreadKey>,
+    pub row_id: SharedString,
+    pub down_pos: Point<Pixels>,
+    pub click_count: usize,
+    pub reorderable: bool,
+    pub search_result: bool,
+    pub left_held: bool,
+    pub drag_attached: bool,
+    pub activated: Arc<AtomicBool>,
+    pub preview: Option<Entity<ThreadDragPreview>>,
 }
 
 pub struct ThreadDragPreview {
@@ -38,11 +75,23 @@ pub struct ThreadDragPreview {
     project: Option<SharedString>,
     verb: Option<DropVerb>,
     visual: crate::project_icon::ProjectVisual,
+    visible: bool,
 }
 
 impl ThreadDragPreview {
     pub fn new(title: String, project: Option<String>, visual: crate::project_icon::ProjectVisual) -> Self {
-        ThreadDragPreview { title: title.into(), project: project.map(Into::into), verb: None, visual }
+        ThreadDragPreview { title: title.into(), project: project.map(Into::into), verb: None, visual, visible: true }
+    }
+
+    pub fn new_hidden(title: String, project: Option<String>, visual: crate::project_icon::ProjectVisual) -> Self {
+        ThreadDragPreview { title: title.into(), project: project.map(Into::into), verb: None, visual, visible: false }
+    }
+
+    pub(super) fn show(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.visible = true;
+            cx.notify();
+        }
     }
 }
 
@@ -77,6 +126,9 @@ pub(super) fn drop_verb_badge(verb: DropVerb, p: Palette) -> gpui::Div {
 
 impl Render for ThreadDragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
         let p = palette(cx);
         let badge = self.verb.map(|verb| drop_verb_badge(verb, p));
         div()
@@ -100,10 +152,52 @@ impl Render for ThreadDragPreview {
                     .children(badge),
             )
             .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title.clone()))
+            .into_any_element()
     }
 }
 
 impl SidebarPane {
+    pub(super) fn record_thread_press(&mut self, press: PendingThreadPress) {
+        self.pending_project_press = None;
+        self.pending_thread_press = Some(press);
+    }
+
+    pub(super) fn record_project_press(&mut self, press: PendingProjectPress) {
+        self.pending_thread_press = None;
+        self.pending_project_press = Some(press);
+    }
+
+    pub(super) fn observe_pointer_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_thread_press.is_none() && self.pending_project_press.is_none() {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            if let Some(press) = self.pending_thread_press.take()
+                && press.drag_attached
+            {
+                cx.stop_active_drag(window);
+                if press.activated.load(Ordering::Relaxed) {
+                    self.finish_drag(false, cx);
+                }
+            }
+            if let Some(press) = self.pending_project_press.take()
+                && press.drag_attached
+            {
+                cx.stop_active_drag(window);
+                if press.activated.load(Ordering::Relaxed) {
+                    self.finish_project_drag(false, cx);
+                }
+            }
+            return;
+        }
+        if let Some(press) = self.pending_thread_press.as_mut() {
+            press.left_held = true;
+        }
+        if let Some(press) = self.pending_project_press.as_mut() {
+            press.left_held = true;
+        }
+    }
+
     /// The drag constructor ran: the list shows its drop markers.
     pub(super) fn begin_drag(&mut self, thread_id: &str, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
         // Set pane drag before controller updates emit AppEvent::Shell so sync_list_rows sees an active drag for #293 scroll preservation.
@@ -118,6 +212,132 @@ impl SidebarPane {
             self.drag = None;
         }
         cx.notify();
+    }
+
+    pub(super) fn begin_pointer_drag(&mut self, thread_id: &str, key: Option<&ThreadKey>, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
+        self.begin_drag(thread_id, key, preview, cx);
+        if let Some(drag) = self.drag.as_mut() {
+            drag.pointer_drag = true;
+        }
+    }
+
+    pub(super) fn attach_thread_drag(
+        &mut self,
+        dragged: &DraggedThread,
+        title: String,
+        project: Option<String>,
+        visual: crate::project_icon::ProjectVisual,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ThreadDragPreview> {
+        let Some(press) = self
+            .pending_thread_press
+            .as_mut()
+            .filter(|press| press.id == dragged.id && press.key == dragged.key && press.left_held)
+        else {
+            window.defer(cx, |window, cx| {
+                cx.stop_active_drag(window);
+            });
+            return cx.new(|_| ThreadDragPreview::new_hidden(title, project, visual));
+        };
+        let down_pos = press.down_pos;
+        let reorderable = press.reorderable;
+        let search_result = press.search_result;
+        press.drag_attached = true;
+        press.activated = dragged.activated.clone();
+        let crossed = pointer_distance(window.mouse_position(), down_pos) > SIDEBAR_DRAG_DISTANCE;
+        let preview = cx.new(|_| {
+            if crossed {
+                ThreadDragPreview::new(title, project, visual)
+            } else {
+                ThreadDragPreview::new_hidden(title, project, visual)
+            }
+        });
+        if let Some(press) = self.pending_thread_press.as_mut() {
+            press.preview = Some(preview.clone());
+        }
+        if crossed {
+            dragged.activated.store(true, Ordering::Relaxed);
+            self.hover.dismiss(cx);
+            if reorderable && !search_result {
+                self.begin_pointer_drag(&dragged.id, dragged.key.as_ref(), preview.clone(), cx);
+            }
+        }
+        preview
+    }
+
+    pub(super) fn activate_thread_drag_if_ready(
+        &mut self,
+        event: &DragMoveEvent<DraggedThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.event.pressed_button != Some(MouseButton::Left) {
+            self.pending_thread_press = None;
+            cx.stop_active_drag(window);
+            self.finish_drag(false, cx);
+            return;
+        }
+        if event.drag(cx).is_activated() {
+            return;
+        }
+        let Some(press) = self.pending_thread_press.as_mut() else {
+            cx.stop_active_drag(window);
+            self.finish_drag(false, cx);
+            return;
+        };
+        if pointer_distance(event.event.position, press.down_pos) <= SIDEBAR_DRAG_DISTANCE {
+            return;
+        }
+        press.activated.store(true, Ordering::Relaxed);
+        event.drag(cx).activated.store(true, Ordering::Relaxed);
+        let id = press.id.clone();
+        let key = press.key.clone();
+        let reorderable = press.reorderable;
+        let search_result = press.search_result;
+        let preview = press.preview.clone();
+        if let Some(preview) = preview.as_ref() {
+            preview.update(cx, |preview, cx| preview.show(cx));
+        }
+        self.hover.dismiss(cx);
+        if reorderable && !search_result
+            && let Some(preview) = preview
+        {
+            self.begin_pointer_drag(&id, key.as_ref(), preview, cx);
+        }
+    }
+
+    pub(super) fn finish_thread_drop(&mut self, drop: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Leave `cx.active_drag` untouched on Capture `mouse_up_out` so Composer's Bubble `on_drop` can still receive activated drags.
+        let pending = self.pending_thread_press.take();
+        if let Some(press) = pending
+            && !press.activated.load(Ordering::Relaxed)
+        {
+            self.finish_drag(false, cx);
+            if drop {
+                let pos = window.mouse_position();
+                if pointer_distance(pos, press.down_pos) <= SIDEBAR_DRAG_DISTANCE
+                    && self.hover.row_bounds_for(&press.row_id).is_none_or(|b| b.contains(&pos))
+                {
+                    if press.search_result {
+                        let key = press.key.unwrap_or_else(|| ThreadKey::new("", &press.id));
+                        self.hover.dismiss(cx);
+                        self.activate_search_result(key, window, cx);
+                    } else {
+                        self.activate_thread_row_click(
+                            &press.id,
+                            press.key.as_ref(),
+                            window.modifiers(),
+                            press.click_count,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        self.finish_drag(drop, cx);
     }
 
     fn settled_placeholder_row_index(&self) -> Option<usize> {
@@ -161,7 +381,7 @@ impl SidebarPane {
 
     /// Tracks the gap under the pointer; listeners on every rendered row see each move.
     pub(super) fn drag_moved(&mut self, row: usize, event: &DragMoveEvent<DraggedThread>, cx: &mut Context<Self>) {
-        if !event.bounds.contains(&event.event.position) {
+        if !event.drag(cx).is_activated() || !event.bounds.contains(&event.event.position) {
             return;
         }
         let after = event.event.position.y > event.bounds.center().y;
@@ -257,6 +477,17 @@ impl SidebarPane {
 /// The drag payload when manually reordering project folders in the sidebar.
 pub struct DraggedProject {
     pub group_key: String,
+    pub activated: Arc<AtomicBool>,
+}
+
+impl DraggedProject {
+    pub(super) fn new(group_key: String) -> Self {
+        Self { group_key, activated: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub(super) fn is_activated(&self) -> bool {
+        self.activated.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]
@@ -265,21 +496,48 @@ pub(super) struct PaneProjectDrag {
     pub at: Option<(String, bool)>,
     #[allow(dead_code)]
     pub preview: Option<Entity<ProjectDragPreview>>,
+    pub pointer_drag: bool,
+}
+
+pub(super) struct PendingProjectPress {
+    pub group: t3_core::sidebar::grouping::ScopedProjectGroup,
+    pub expanded: bool,
+    pub down_pos: Point<Pixels>,
+    pub bounds: super::TriggerBounds,
+    pub left_held: bool,
+    pub drag_attached: bool,
+    pub activated: Arc<AtomicBool>,
+    pub preview: Option<Entity<ProjectDragPreview>>,
 }
 
 pub struct ProjectDragPreview {
     label: SharedString,
     visual: crate::project_icon::ProjectVisual,
+    visible: bool,
 }
 
 impl ProjectDragPreview {
     pub fn new(label: String, visual: crate::project_icon::ProjectVisual) -> Self {
-        ProjectDragPreview { label: label.into(), visual }
+        ProjectDragPreview { label: label.into(), visual, visible: true }
+    }
+
+    pub fn new_hidden(label: String, visual: crate::project_icon::ProjectVisual) -> Self {
+        ProjectDragPreview { label: label.into(), visual, visible: false }
+    }
+
+    pub(super) fn show(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.visible = true;
+            cx.notify();
+        }
     }
 }
 
 impl Render for ProjectDragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
         let p = palette(cx);
         div()
             .w(px(PREVIEW_WIDTH))
@@ -293,6 +551,7 @@ impl Render for ProjectDragPreview {
             .gap(px(8.))
             .child(self.visual.render(crate::project_icon::size(16., cx), hsla(p.sidebar_icon), cx))
             .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.label.clone()))
+            .into_any_element()
     }
 }
 
@@ -304,8 +563,113 @@ impl SidebarPane {
         cx: &mut Context<Self>,
     ) {
         self.hover.dismiss(cx);
-        self.project_drag = Some(PaneProjectDrag { group_key, at: None, preview: Some(preview) });
+        self.project_drag = Some(PaneProjectDrag { group_key, at: None, preview: Some(preview), pointer_drag: false });
         cx.notify();
+    }
+
+    pub(super) fn begin_pointer_project_drag_with_preview(
+        &mut self,
+        group_key: String,
+        preview: Entity<ProjectDragPreview>,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_project_drag_with_preview(group_key, preview, cx);
+        if let Some(drag) = self.project_drag.as_mut() {
+            drag.pointer_drag = true;
+        }
+    }
+
+    pub(super) fn attach_project_drag(
+        &mut self,
+        dragged: &DraggedProject,
+        label: String,
+        visual: crate::project_icon::ProjectVisual,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ProjectDragPreview> {
+        let Some(press) = self
+            .pending_project_press
+            .as_mut()
+            .filter(|press| press.group.key == dragged.group_key && press.left_held)
+        else {
+            window.defer(cx, |window, cx| {
+                cx.stop_active_drag(window);
+            });
+            return cx.new(|_| ProjectDragPreview::new_hidden(label, visual));
+        };
+        let down_pos = press.down_pos;
+        press.drag_attached = true;
+        press.activated = dragged.activated.clone();
+        let crossed = pointer_distance(window.mouse_position(), down_pos) > SIDEBAR_DRAG_DISTANCE;
+        let preview = cx.new(|_| {
+            if crossed {
+                ProjectDragPreview::new(label, visual)
+            } else {
+                ProjectDragPreview::new_hidden(label, visual)
+            }
+        });
+        if let Some(press) = self.pending_project_press.as_mut() {
+            press.preview = Some(preview.clone());
+        }
+        if crossed {
+            dragged.activated.store(true, Ordering::Relaxed);
+            self.begin_pointer_project_drag_with_preview(dragged.group_key.clone(), preview.clone(), cx);
+        }
+        preview
+    }
+
+    pub(super) fn activate_project_drag_if_ready(
+        &mut self,
+        event: &DragMoveEvent<DraggedProject>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.event.pressed_button != Some(MouseButton::Left) {
+            self.pending_project_press = None;
+            cx.stop_active_drag(window);
+            self.finish_project_drag(false, cx);
+            return;
+        }
+        if event.drag(cx).is_activated() {
+            return;
+        }
+        let Some(press) = self.pending_project_press.as_mut() else {
+            cx.stop_active_drag(window);
+            self.finish_project_drag(false, cx);
+            return;
+        };
+        if pointer_distance(event.event.position, press.down_pos) <= SIDEBAR_DRAG_DISTANCE {
+            return;
+        }
+        press.activated.store(true, Ordering::Relaxed);
+        event.drag(cx).activated.store(true, Ordering::Relaxed);
+        let group_key = press.group.key.clone();
+        let preview = press.preview.clone();
+        if let Some(preview) = preview.as_ref() {
+            preview.update(cx, |preview, cx| preview.show(cx));
+        }
+        if let Some(preview) = preview {
+            self.begin_pointer_project_drag_with_preview(group_key, preview, cx);
+        }
+    }
+
+    pub(super) fn finish_project_drop(&mut self, drop: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.pending_project_press.take();
+        if let Some(press) = pending
+            && !press.activated.load(Ordering::Relaxed)
+        {
+            self.finish_project_drag(false, cx);
+            if drop {
+                let pos = window.mouse_position();
+                if pointer_distance(pos, press.down_pos) <= SIDEBAR_DRAG_DISTANCE
+                    && press.bounds.get().is_none_or(|b| b.contains(&pos))
+                {
+                    self.toggle_project_folder(&press.group, !press.expanded, cx);
+                }
+            }
+            return;
+        }
+        self.finish_project_drag(drop, cx);
     }
 
     #[cfg(all(test, feature = "snapshot"))]
@@ -322,7 +686,7 @@ impl SidebarPane {
     }
 
     pub(super) fn project_drag_moved(&mut self, target_key: String, event: &DragMoveEvent<DraggedProject>, cx: &mut Context<Self>) {
-        if !event.bounds.contains(&event.event.position) {
+        if !event.drag(cx).is_activated() || !event.bounds.contains(&event.event.position) {
             return;
         }
         let after = event.event.position.y > event.bounds.center().y;

@@ -420,6 +420,10 @@ impl SidebarHoverState {
         self.active_row.is_some() || self.open.is_some()
     }
 
+    pub(super) fn row_bounds_for(&self, row_id: &SharedString) -> Option<Bounds<Pixels>> {
+        self.row_bounds.borrow().get(row_id).copied()
+    }
+
     pub(super) fn record_row_bounds(&self, row_id: SharedString, pane_id: EntityId) -> AnyElement {
         let bounds_map = self.row_bounds.clone();
         let visible_rows = self.visible_rows.clone();

@@ -39,20 +39,29 @@ pub const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / comman
 const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
 type Card = gpui::Stateful<gpui::Div>;
+type ThreadDropReader<T> = for<'a> fn(&'a T) -> Option<(&'a str, Option<&'a ThreadKey>)>;
 type InstallThreadDrop = dyn Fn(Card, Entity<Composer>, Hsla, Hsla) -> Card;
 struct ThreadDrop(std::rc::Rc<InstallThreadDrop>);
 impl gpui::Global for ThreadDrop {}
 
-pub(crate) fn register_thread_drop<T: 'static>(cx: &mut App, read: for<'a> fn(&'a T) -> (&'a str, Option<&'a ThreadKey>)) {
+pub(crate) fn register_thread_drop<T: 'static>(cx: &mut App, read: ThreadDropReader<T>) {
     if cx.has_global::<ThreadDrop>() {
         return;
     }
     cx.set_global(ThreadDrop(std::rc::Rc::new(move |card, composer, fill, ring| {
-        card.drag_over::<T>(move |style, _, _, _| style.bg(fill).border_color(ring))
-            .on_drop(move |drag: &T, window, cx| {
-                let (id, key) = read(drag);
+        card.drag_over::<T>(move |style, drag, _, _| {
+            if read(drag).is_some() {
+                style.bg(fill).border_color(ring)
+            } else {
+                style
+            }
+        })
+        .can_drop(move |drag, _, _| drag.downcast_ref::<T>().is_none_or(|drag| read(drag).is_some()))
+        .on_drop(move |drag: &T, window, cx| {
+            if let Some((id, key)) = read(drag) {
                 composer.update(cx, |composer, cx| composer.drop_thread_reference(id, key, window, cx));
-            })
+            }
+        })
     })));
 }
 

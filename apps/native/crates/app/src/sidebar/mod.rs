@@ -148,7 +148,9 @@ pub struct SidebarPane {
     live_rendered: bool,
     pub(crate) clock: Option<(ClockRate, Task<()>)>,
     drag: Option<drag::PaneDrag>,
+    pending_thread_press: Option<drag::PendingThreadPress>,
     project_drag: Option<drag::PaneProjectDrag>,
+    pending_project_press: Option<drag::PendingProjectPress>,
     sweep: Option<drag::PaneSweep>,
     pub(super) folder_drop_active: bool,
     #[cfg(all(test, feature = "snapshot"))]
@@ -395,7 +397,9 @@ impl SidebarPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        crate::composer::register_thread_drop(cx, |drag: &drag::DraggedThread| (drag.id.as_str(), drag.key.as_ref()));
+        crate::composer::register_thread_drop(cx, |drag: &drag::DraggedThread| {
+            drag.is_activated().then_some((drag.id.as_str(), drag.key.as_ref()))
+        });
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search")));
         let project_filter_search = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search projects...")));
         let project_filter_focus = cx.focus_handle();
@@ -642,7 +646,9 @@ impl SidebarPane {
             live_rendered: false,
             clock: None,
             drag: None,
+            pending_thread_press: None,
             project_drag: None,
+            pending_project_press: None,
             sweep: None,
             folder_drop_active: false,
             #[cfg(all(test, feature = "snapshot"))]
@@ -1160,7 +1166,15 @@ impl SidebarPane {
         if overlay_open {
             return false;
         }
-        if self.drag.is_some() || self.sweep.is_some() || self.project_drag.is_some() {
+        if self.drag.is_some()
+            || self.sweep.is_some()
+            || self.project_drag.is_some()
+            || self.pending_thread_press.is_some()
+            || self.pending_project_press.is_some()
+        {
+            self.pending_thread_press = None;
+            self.pending_project_press = None;
+            cx.stop_active_drag(window);
             self.finish_drag(false, cx);
             self.finish_sweep(false, cx);
             self.finish_project_drag(false, cx);
@@ -1769,8 +1783,20 @@ impl Render for SidebarPane {
             self.folder_multiline = multiline;
             self.list.remeasure();
         }
-        if self.folder_drop_active && !cx.has_active_drag() {
+        if !cx.has_active_drag() {
             self.folder_drop_active = false;
+            if self.pending_thread_press.as_ref().is_some_and(|press| press.drag_attached) {
+                self.pending_thread_press = None;
+            }
+            if self.pending_project_press.as_ref().is_some_and(|press| press.drag_attached) {
+                self.pending_project_press = None;
+            }
+            if self.drag.as_ref().is_some_and(|drag| drag.pointer_drag) {
+                self.finish_drag(false, cx);
+            }
+            if self.project_drag.as_ref().is_some_and(|drag| drag.pointer_drag) {
+                self.finish_project_drag(false, cx);
+            }
         }
         let (synchronized, no_projects, active_count, settled_count) = {
             let state = self.state.read(cx);
@@ -1893,9 +1919,9 @@ impl Render for SidebarPane {
                 .children(self.shelf_gap_probe(cx))
                 .child(shift_frame.finish())
                 .capture_key_down(cx.listener(Self::navigate_tree))
-                .on_drop(cx.listener(|this, _: &DraggedThread, _, cx| this.finish_drag(true, cx)))
+                .on_drop(cx.listener(|this, _: &DraggedThread, window, cx| this.finish_thread_drop(true, window, cx)))
                 .on_drop(cx.listener(|this, _: &drag::DraggedSweep, _, cx| this.finish_sweep(true, cx)))
-                .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)));
+                .on_drop(cx.listener(|this, _: &drag::DraggedProject, window, cx| this.finish_project_drop(true, window, cx)));
             if show_empty_notice {
                 div()
                     .flex_1()
@@ -1959,6 +1985,8 @@ impl Render for SidebarPane {
                     cx.notify();
                 }
             }))
+            .on_drag_move(cx.listener(Self::activate_thread_drag_if_ready))
+            .on_drag_move(cx.listener(Self::activate_project_drag_if_ready))
             .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style)
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
                 let active = event.bounds.contains(&event.event.position)
@@ -1973,18 +2001,37 @@ impl Render for SidebarPane {
                 this.state.update(cx, |state, cx| state.drop_folders_on_sidebar(paths.paths(), false, cx));
                 cx.notify();
             }))
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.finish_drag(false, cx);
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                this.finish_thread_drop(false, window, cx);
                 this.finish_sweep(false, cx);
-                this.finish_project_drag(false, cx);
+                this.finish_project_drop(false, window, cx);
             }))
-            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.finish_drag(false, cx);
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                this.finish_thread_drop(false, window, cx);
                 this.finish_sweep(false, cx);
-                this.finish_project_drag(false, cx);
+                this.finish_project_drop(false, window, cx);
             }))
             .children(inner_bg_layer)
             .child(self.hover.begin_frame_probe())
+            .child({
+                let pane = cx.weak_entity();
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let pane = pane.clone();
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = pane.update(cx, |this, cx| {
+                                this.observe_pointer_move(event, window, cx);
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+            })
             .child(self.render_header(window, cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))

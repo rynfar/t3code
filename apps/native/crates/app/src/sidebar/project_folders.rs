@@ -27,6 +27,7 @@ impl SidebarPane {
                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(badge.description.clone()).build(window, cx))
         });
         let toggle = group.clone();
+        let press_group = group.clone();
         let new_thread = group.clone();
         let context_group = group.clone();
         let keyboard_group = group.clone();
@@ -66,12 +67,27 @@ impl SidebarPane {
                         let drag_key = drag_key.clone();
                         let drag_label = drag_label.clone();
                         let drag_visual = drag_visual.clone();
-                        row.on_drag(super::drag::DraggedProject { group_key: drag_key.clone() }, move |_, _, _, cx| {
-                            let preview = cx.new(|_| super::drag::ProjectDragPreview::new(drag_label.clone(), drag_visual.clone()));
-                            let _ = pane.update(cx, |this, cx| {
-                                this.begin_project_drag_with_preview(drag_key.clone(), preview.clone(), cx);
+                        let press_group = press_group.clone();
+                        let press_bounds = bounds.clone();
+                        row.on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                            this.record_project_press(super::drag::PendingProjectPress {
+                                group: press_group.clone(),
+                                expanded,
+                                down_pos: event.position,
+                                bounds: press_bounds.clone(),
+                                left_held: true,
+                                drag_attached: false,
+                                activated: Default::default(),
+                                preview: None,
                             });
-                            preview
+                        }))
+                        .on_drag(super::drag::DraggedProject::new(drag_key.clone()), move |dragged, _, window, cx| {
+                            let Some(pane) = pane.upgrade() else {
+                                return cx.new(|_| super::drag::ProjectDragPreview::new_hidden(drag_label.clone(), drag_visual.clone()));
+                            };
+                            pane.update(cx, |this, cx| {
+                                this.attach_project_drag(dragged, drag_label.clone(), drag_visual.clone(), window, cx)
+                            })
                         })
                     })
                     .when(manual_sort, |row| {
@@ -80,8 +96,8 @@ impl SidebarPane {
                             .on_drag_move(cx.listener(move |this, event: &gpui::DragMoveEvent<super::drag::DraggedProject>, _, cx| {
                                 this.project_drag_moved(move_key.clone(), event, cx);
                             }))
-                            .on_drop(cx.listener(|this, _: &super::drag::DraggedProject, _, cx| {
-                                this.finish_project_drag(true, cx);
+                            .on_drop(cx.listener(|this, _: &super::drag::DraggedProject, window, cx| {
+                                this.finish_project_drop(true, window, cx);
                             }))
                     })
                     .children(drop_line)
@@ -97,6 +113,7 @@ impl SidebarPane {
                         .focus_visible(|style| style.opacity(1.).shadow(vec![gpui::BoxShadow { color:hsla(p.ring), offset:gpui::point(gpui::px(0.),gpui::px(0.)), blur_radius:gpui::px(0.), spread_radius:gpui::px(2.), inset:false }]))
                         .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(new_thread_tooltip.clone()).build(window, cx))
                         .child(Icon::SquarePen.render(crate::project_icon::size(14., cx), hsla(p.sidebar_muted_foreground)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.state.update(cx, |state, cx| state.run_scoped_project_action(&new_thread, t3_core::thread_actions::ProjectAction::NewThread, cx));
@@ -114,6 +131,7 @@ impl SidebarPane {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
+                        this.pending_project_press = None;
                         this.toggle_project_folder(&toggle, !expanded, cx);
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
