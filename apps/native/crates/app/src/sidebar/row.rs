@@ -397,6 +397,7 @@ impl SidebarPane {
             .when(dragging, |this| this.opacity(0.5))
             .children(row_bg_layer)
             .children(row_before_bar)
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::ThreadItem, cx))
             .child(self.hover.record_row_bounds(hover_bounds_id, cx.entity_id()))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);

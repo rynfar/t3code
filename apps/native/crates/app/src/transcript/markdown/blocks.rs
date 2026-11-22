@@ -1432,7 +1432,9 @@ fn render_code_block(
             });
         }
     }
-    card.child(code_view).into_any_element()
+    card.children(crate::theme::inspector_slot_probe(ThemeSlot::ChatMarkdownCodeblock, cx))
+        .child(code_view)
+        .into_any_element()
 }
 
 fn render_media_table_grid(

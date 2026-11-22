@@ -121,7 +121,7 @@ impl ChatHeader {
         let owner = self.rename_owner.take();
         if draft.trim().is_empty() {
             self.state.update(cx, |state, cx| {
-                state.show_toast(Toast::new(ToastKind::Warning, "Thread title cannot be empty"), cx);
+                state.show_toast(Toast::new(ToastKind::Warning, crate::i18n::t(cx, "Thread title cannot be empty")), cx);
             });
             cx.notify();
             return;
@@ -357,7 +357,13 @@ impl Render for ChatHeader {
                     .min_w_0()
                     .gap(px(12.))
                     .child(
-                        crumb("chat-header-project", Some(favicon), name.clone(), PROJECT_CRUMB_MAX_WIDTH, format!("New thread in {name}"))
+                        crumb(
+                            "chat-header-project",
+                            Some(favicon),
+                            name.clone(),
+                            PROJECT_CRUMB_MAX_WIDTH,
+                            crate::i18n::t_fmt(cx, "New thread in {project}", &[("project", name.as_str().into())]),
+                        )
                             .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_draft(&project_id, cx))),
                     )
                     .child(separator())
@@ -408,6 +414,7 @@ pub(crate) fn container_with_layout(left: Pixels, border: bool, cx: &App) -> gpu
         .border_color(cx.theme().border)
         .theme_slot_hover(ThemeSlot::ChatHeader, cx)
         .children(theme_slot_background_layer(ThemeSlot::ChatHeader, cx))
+        .children(crate::theme::inspector_slot_probe(ThemeSlot::ChatHeader, cx))
 }
 
 /// `PanelLayoutControls`: Thread details, Terminal (the drawer's toggle) and Right panel toggles
@@ -418,7 +425,10 @@ pub fn controls(state: &Entity<AppState>, terminal_toggle: Option<AnyElement>, w
     let panel_open = app.panel_thread().is_some_and(|thread| app.panels.panels.is_open(&thread));
     let details_available = thread_details::panel_key(app).is_some();
     let layout = thread_details::layout(state, window, cx);
-    let label = keymap::label("threadPanel.toggle", cx).map_or_else(|| "Toggle thread details".to_owned(), |key| format!("Toggle thread details ({key})"));
+    let label = keymap::label("threadPanel.toggle", cx).map_or_else(
+        || crate::i18n::t(cx, "Toggle thread details").to_owned(),
+        |key| crate::i18n::t_fmt(cx, "Toggle thread details ({shortcut})", &[("shortcut", key.into())]),
+    );
     h_flex()
         .flex_none()
         .gap(px(4.))

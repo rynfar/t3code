@@ -674,19 +674,21 @@ impl SnoozeDialog {
             },
         };
         let Some(until) = resolve_custom_snooze(&input, now_ms(), &SystemZone) else {
-            self.error = Some(if self.mode == Mode::Date {
+            self.error = Some(crate::i18n::t(cx, if self.mode == Mode::Date {
                 "Choose a valid date and time in the future."
             } else {
                 "Enter a positive duration."
-            });
+            }));
             return cx.notify();
         };
         let Some(request) = self.pending.clone() else {
             return;
         };
         if request.plan_for(self.state.read(cx), now_ms()).is_none() {
-            self.error =
-                Some("These threads can no longer be snoozed. Close this dialog and try again.");
+            self.error = Some(crate::i18n::t(
+                cx,
+                "These threads can no longer be snoozed. Close this dialog and try again.",
+            ));
             return cx.notify();
         }
         self.close(window, cx);

@@ -143,8 +143,13 @@ fn render_refused_routes_list(refused_route_ids: &[String], cx: &App) -> Div {
         }))
 }
 
-/// `ConnectionStatusDot`: an 8px dot in a 12px box. Static: the web's ping would repaint.
-pub fn status_dot(tone: Option<DotTone>, cx: &App) -> Div {
+/// Live-capable `StatusDot` wrapper respecting reduced motion when `live` is true.
+pub fn live_status_dot(
+    id: impl Into<gpui::ElementId>,
+    tone: Option<DotTone>,
+    live: bool,
+    cx: &App,
+) -> gpui::AnyElement {
     let p = palette(cx);
     let color = match tone {
         Some(DotTone::Success) => hsla(p.success),
@@ -152,7 +157,14 @@ pub fn status_dot(tone: Option<DotTone>, cx: &App) -> Div {
         Some(DotTone::Destructive) => hsla(p.destructive),
         None => hsla(p.muted_foreground).opacity(0.4),
     };
-    div().size(px(12.)).flex_none().flex().items_center().justify_center().child(div().size(px(8.)).rounded_full().bg(color))
+    div()
+        .size(px(12.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::components::motion::StatusDot::new(id, px(8.), color, live))
+        .into_any_element()
 }
 
 /// `EnvironmentMachineIcon` (`apps/web/src/components/EnvironmentMachineIcon.tsx`).
@@ -798,7 +810,7 @@ impl ConnectView {
                                                 h_flex()
                                                     .gap(px(4.))
                                                     .items_center()
-                                                    .child(status_dot(Some(tone), cx))
+                                                    .child(live_status_dot("connect-local-unavailable-dot", Some(tone), starting || stopping, cx))
                                                     .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
                                             )
                                         }),
@@ -872,7 +884,7 @@ impl ConnectView {
                                             h_flex()
                                                 .gap(px(4.))
                                                 .items_center()
-                                                .child(status_dot(Some(tone), cx))
+                                                .child(live_status_dot("connect-local-dot", Some(tone), starting || stopping || busy, cx))
                                                 .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
                                         )
                                     }),
@@ -1646,7 +1658,14 @@ impl ConnectView {
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                                 }),
-                        ),
+                        )
+                        .when(environment.is_relay_managed(), |row| {
+                            row.child(
+                                Button::new(SharedString::from(format!("diag-more-info-{id}")), ButtonVariant::Outline, ButtonSize::Compact)
+                                    .label(crate::i18n::t(cx, "More info"))
+                                    .on_click(|_, _, cx| cx.open_url(t3_core::relay::T3_CONNECT_TROUBLESHOOTING_URL)),
+                            )
+                        }),
                 )
         });
         v_flex()
@@ -1655,7 +1674,12 @@ impl ConnectView {
             .child(
                 h_flex()
                     .gap(px(10.))
-                    .child(status_dot(tone, cx))
+                    .child(live_status_dot(
+                        SharedString::from(format!("connect-saved-dot-{}", environment.id)),
+                        tone,
+                        tone == Some(DotTone::Warning),
+                        cx,
+                    ))
                     .child(
                         v_flex()
                             .flex_1()

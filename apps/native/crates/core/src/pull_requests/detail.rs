@@ -5,8 +5,38 @@
 
 use std::collections::HashSet;
 
-use super::wire::{Action, Activity, Actor, Check, CheckStatus, ChecksState, Comment, CommentKind, Detail, MergeMethod, Mergeability, PrState, ReviewThread, Stack};
+use super::wire::{Action, Activity, Actor, BaseComparison, Check, CheckStatus, ChecksState, Comment, CommentKind, Detail, MergeMethod, Mergeability, PrState, ReviewThread, Stack, UpdateMethod};
 use crate::timeline::parse_iso_ms;
+
+/// `resolveBaseFreshness` (`apps/web/src/components/pullRequest/pullRequestDetail.logic.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseFreshness {
+    pub behind_by: Option<u64>,
+    pub methods: Vec<UpdateMethod>,
+}
+
+pub fn resolve_base_freshness(detail: &Detail) -> Option<BaseFreshness> {
+    if detail.state != PrState::Open
+        || detail.base_comparison != Some(BaseComparison::Behind)
+        || detail.mergeability != Mergeability::Mergeable
+    {
+        return None;
+    }
+    let methods = detail
+        .capabilities
+        .update_methods
+        .iter()
+        .copied()
+        .filter(|method| {
+            *method != UpdateMethod::Unknown
+                && detail.viewer_permissions.update_methods.contains(method)
+        })
+        .collect();
+    Some(BaseFreshness {
+        behind_by: detail.behind_by,
+        methods,
+    })
+}
 
 /// `PULL_REQUEST_STATE_PRESENTATION` keys: an open draft reads as a draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

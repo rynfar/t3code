@@ -294,6 +294,14 @@ pub fn action_input(reference: &PrRef, action: Action, merge_method: Option<Merg
     payload
 }
 
+pub fn update_branch_input(reference: &PrRef, update_method: Option<wire::UpdateMethod>) -> Value {
+    let mut payload = action_input(reference, Action::UpdateBranch, None);
+    if let Some(method) = update_method.filter(|m| *m != wire::UpdateMethod::Unknown) {
+        payload["updateMethod"] = json!(method.as_str());
+    }
+    payload
+}
+
 /// What the page says for a failed pull request read, from the error's tag and fields
 /// (`PullRequestUnavailableError.message`, `PullRequestOperationError.message`). Tagged errors
 /// cross the wire without their message, so it is rebuilt here.
@@ -480,5 +488,48 @@ mod tests {
         let merge = action_input(&reference, Action::Merge, Some(MergeMethod::Squash));
         assert_eq!((merge["action"].as_str(), merge["mergeMethod"].as_str(), merge["replyWithSummary"].as_bool()), (Some("merge"), Some("squash"), Some(true)));
         assert!(action_input(&reference, Action::Close, Some(MergeMethod::Squash)).get("mergeMethod").is_none());
+        let update = update_branch_input(&reference, Some(wire::UpdateMethod::Rebase));
+        assert_eq!(update["action"], "update-branch");
+        assert_eq!(update["updateMethod"], "rebase");
+    }
+
+    #[test]
+    fn resolve_base_freshness_requires_open_behind_mergeable_and_intersects_update_methods() {
+        let detail: wire::Detail = serde_json::from_value(json!({
+            "provider": "github",
+            "capabilities": { "updateMethods": ["merge", "rebase"] },
+            "viewerPermissions": { "updateMethods": ["rebase"] },
+            "projectId": "p",
+            "projectTitle": "Proj",
+            "repository": "acme/app",
+            "number": 42,
+            "title": "Add freshness warning",
+            "url": "https://github.com/acme/app/pull/42",
+            "author": { "login": "alice" },
+            "state": "open",
+            "isDraft": false,
+            "mergeability": "mergeable",
+            "additions": 1,
+            "deletions": 0,
+            "changedFiles": 1,
+            "headBranch": "feat",
+            "baseBranch": "main",
+            "baseComparison": "behind",
+            "behindBy": 4,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let freshness = detail::resolve_base_freshness(&detail).expect("behind + mergeable PR shows freshness");
+        assert_eq!(freshness.behind_by, Some(4));
+        assert_eq!(freshness.methods, vec![wire::UpdateMethod::Rebase]);
+
+        let mut conflicting = detail.clone();
+        conflicting.mergeability = wire::Mergeability::Conflicting;
+        assert!(detail::resolve_base_freshness(&conflicting).is_none());
+
+        let mut up_to_date = detail.clone();
+        up_to_date.base_comparison = Some(wire::BaseComparison::UpToDate);
+        assert!(detail::resolve_base_freshness(&up_to_date).is_none());
     }
 }

@@ -486,6 +486,7 @@ impl Render for DetailsView {
                 px(16.),
                 cx,
             ))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::ThreadDetailsCard, cx))
             .child(crate::webview::occluder("thread-details-cover", crate::webview::Layer::TranscriptChrome))
             .when(popover, |this| {
                 let has_custom_shadow = card_slot.as_ref().is_some_and(|s| s.base.box_shadows.is_some());

@@ -21,9 +21,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    ClipboardItem, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels, Render,
-    Styled, Subscription, Task, UniformListScrollHandle, Window, div, point, prelude::*, px,
+    ClipboardItem, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ListAlignment, ListOffset,
+    ListState, MouseMoveEvent, ParentElement, Pixels, Render, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, point, prelude::*, px,
 };
+use gpui_component::input::Copy as ClipboardCopyAction;
 use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::composer::review::Side;
@@ -133,7 +135,21 @@ pub struct DiffPanel {
     _viewed_flush: Option<Task<()>>,
     /// Inline review conversations and resolved-avatar expansion state (`pingdotgg/t3code#34644`).
     pub(super) review_threads: InlineReviewThreadsState,
+    focus: FocusHandle,
+    pub(super) code_selection: Option<CodeLineSelection>,
+    pub(super) pending_code_press: Option<(usize, Side, usize)>,
+    pub(super) code_anchor: Option<(usize, Side, usize)>,
     _subscription: Subscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CodeLineSelection {
+    pub(super) file: usize,
+    pub(super) side: Side,
+    pub(super) anchor_row: usize,
+    pub(super) active_row: usize,
+    pub(super) multi_line: bool,
+    pub(super) dragging: bool,
 }
 
 type LoadWithheldCallback = Rc<dyn Fn(String, &mut gpui::App)>;
@@ -279,6 +295,10 @@ impl DiffPanel {
             last_viewed_file_key: None,
             _viewed_flush: None,
             review_threads: InlineReviewThreadsState::default(),
+            focus: cx.focus_handle(),
+            code_selection: None,
+            pending_code_press: None,
+            code_anchor: None,
             _subscription: subscription,
         };
         let entity = cx.entity().downgrade();
@@ -310,6 +330,7 @@ impl DiffPanel {
     pub fn show_external(&mut self, external: External, cx: &mut Context<Self>) {
         if self.external.as_ref().map(|existing| existing.key.as_str()) != Some(external.key.as_str()) {
             self.revealed_path = None;
+            self.clear_code_selection();
         }
         self.external = Some(external);
         self.rebuild(cx);
@@ -371,6 +392,7 @@ impl DiffPanel {
         let thread_id = state.selected_thread.clone();
         let thread_changed = thread_id != self.thread_id;
         if thread_changed {
+            self.clear_code_selection();
             self.comments = comments::Comments::default();
             self.thread_id = thread_id.clone();
             self.fingerprint = (0, None);
@@ -500,6 +522,9 @@ impl DiffPanel {
             || whitespace_changed
             || reconnected
             || ui != self.ui;
+        if thread_changed || request != self.request || scope != self.scope {
+            self.clear_code_selection();
+        }
         self.ui = ui;
         self.selection = selection;
         self.scope = scope;
@@ -753,6 +778,7 @@ impl DiffPanel {
         let scope_key = self.sync_scope_for_rebuild();
         let Some(parsed) = self.current() else {
             if self.view.take().is_some() {
+                self.clear_code_selection();
                 self.list.reset(0);
             }
             return;
@@ -765,10 +791,15 @@ impl DiffPanel {
         });
         if same {
             let hidden = self.hidden_files(parsed.files());
+            let mut updated_rows = None;
             if let Some(view) = self.view.as_mut()
                 && view.set_hidden(hidden, &self.tree_collapsed)
             {
-                self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+                updated_rows = Some(view.row_count());
+            }
+            if let Some(count) = updated_rows {
+                self.clear_code_selection();
+                self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT));
                 cx.notify();
             }
             self.reveal_requested(cx);
@@ -777,6 +808,7 @@ impl DiffPanel {
             }
             return;
         }
+        self.clear_code_selection();
         // A refresh of the scope on screen keeps the reader's place.
         let keep = self
             .view
@@ -1859,6 +1891,198 @@ fn error_line(error: String, p: Palette) -> gpui::Div {
     div().px(px(12.)).mb(px(8.)).text_size(px(11.)).text_color(hsla(p.error).opacity(0.8)).child(error)
 }
 
+impl DiffPanel {
+    pub(super) fn clear_code_selection(&mut self) {
+        self.code_selection = None;
+        self.pending_code_press = None;
+        self.code_anchor = None;
+    }
+
+    pub(super) fn is_code_row_selected(&self, file: usize, side: Side, row_ix: usize) -> bool {
+        let Some(sel) = self.code_selection.as_ref().filter(|sel| sel.multi_line) else {
+            return false;
+        };
+        let (start, end) = (sel.anchor_row.min(sel.active_row), sel.anchor_row.max(sel.active_row));
+        sel.file == file && sel.side == side && row_ix >= start && row_ix <= end
+    }
+
+    pub(super) fn begin_code_press(
+        &mut self,
+        file: usize,
+        side: Side,
+        row_ix: usize,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != gpui::MouseButton::Left {
+            return;
+        }
+        if event.modifiers.shift {
+            let anchor = self
+                .code_selection
+                .as_ref()
+                .filter(|sel| sel.file == file && sel.side == side)
+                .map(|sel| sel.anchor_row)
+                .or_else(|| {
+                    self.code_anchor
+                        .filter(|(f, s, _)| *f == file && *s == side)
+                        .map(|(_, _, r)| r)
+                });
+            if let Some(anchor_row) = anchor
+                && anchor_row != row_ix
+            {
+                self.pending_code_press = None;
+                self.code_selection = Some(CodeLineSelection {
+                    file,
+                    side,
+                    anchor_row,
+                    active_row: row_ix,
+                    multi_line: true,
+                    dragging: false,
+                });
+                crate::selectable_text::clear_active_selection(cx);
+                window.focus(&self.focus, cx);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
+        let had_selection = self.code_selection.take().is_some();
+        self.pending_code_press = Some((file, side, row_ix));
+        self.code_anchor = Some((file, side, row_ix));
+        if had_selection {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn drag_code_selection(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(gpui::MouseButton::Left) {
+            return;
+        }
+        let Some((anchor_file, anchor_side, anchor_row)) = self.pending_code_press.or_else(|| {
+            self.code_selection
+                .as_ref()
+                .filter(|sel| sel.dragging)
+                .map(|sel| (sel.file, sel.side, sel.anchor_row))
+        }) else {
+            return;
+        };
+        let viewport = self.list.viewport_bounds();
+        if !viewport.contains(&event.position) {
+            return;
+        }
+        let Some(view) = &self.view else { return };
+        let mut target_row = None;
+        for index in self.list.logical_scroll_top().item_ix..view.row_count() {
+            let Some(bounds) = self.list.bounds_for_item(index) else { break };
+            if bounds.bottom() < viewport.top() {
+                continue;
+            }
+            if bounds.top() > viewport.bottom() {
+                break;
+            }
+            if event.position.y >= bounds.top() && event.position.y <= bounds.bottom() {
+                if matches!(
+                    view.row(index),
+                    Some(t3_core::diff::DiffRow::Line { file, .. } | t3_core::diff::DiffRow::Split { file, .. }) if file == anchor_file
+                ) {
+                    target_row = Some(index);
+                }
+                break;
+            }
+        }
+        let Some(target_row) = target_row else { return };
+        if self.pending_code_press.is_some() {
+            if target_row == anchor_row {
+                return;
+            }
+            self.pending_code_press = None;
+            self.code_anchor = Some((anchor_file, anchor_side, anchor_row));
+            self.code_selection = Some(CodeLineSelection {
+                file: anchor_file,
+                side: anchor_side,
+                anchor_row,
+                active_row: target_row,
+                multi_line: true,
+                dragging: true,
+            });
+            crate::selectable_text::clear_active_selection(cx);
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        if let Some(sel) = self.code_selection.as_mut().filter(|sel| sel.dragging)
+            && sel.active_row != target_row
+        {
+            sel.active_row = target_row;
+            sel.multi_line = sel.anchor_row != target_row;
+            if sel.multi_line {
+                crate::selectable_text::clear_active_selection(cx);
+                window.focus(&self.focus, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn finish_code_selection(&mut self, cx: &mut Context<Self>) {
+        self.pending_code_press = None;
+        let Some(sel) = self.code_selection.as_mut() else {
+            return;
+        };
+        if sel.dragging {
+            sel.dragging = false;
+            if sel.multi_line {
+                crate::selectable_text::clear_active_selection(cx);
+            } else {
+                self.code_selection = None;
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn extract_code_selection_text(&self) -> Option<String> {
+        let sel = self.code_selection.as_ref().filter(|sel| sel.multi_line)?;
+        let view = self.view.as_ref()?;
+        let (start, end) = (sel.anchor_row.min(sel.active_row), sel.anchor_row.max(sel.active_row));
+        let mut lines = Vec::new();
+        for row_ix in start..=end {
+            match view.row(row_ix) {
+                Some(t3_core::diff::DiffRow::Line { file, hunk, line }) if file == sel.file => {
+                    if let Some(diff_line) = view.parsed.files().get(file)?.hunks.get(hunk)?.lines.get(line) {
+                        lines.push(diff_line.source_text.as_ref());
+                    }
+                }
+                Some(t3_core::diff::DiffRow::Split { file, hunk, left, right }) if file == sel.file => {
+                    let index = match sel.side {
+                        Side::Deletions => left,
+                        Side::Additions => right,
+                    };
+                    if let Some(index) = index
+                        && let Some(diff_line) = view.parsed.files().get(file)?.hunks.get(hunk)?.lines.get(index)
+                    {
+                        lines.push(diff_line.source_text.as_ref());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    fn copy_code_selection(&mut self, _: &ClipboardCopyAction, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.extract_code_selection_text() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.stop_propagation();
+    }
+}
 
 impl Render for DiffPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1872,6 +2096,16 @@ impl Render for DiffPanel {
         v_flex()
             .size_full()
             .min_h_0()
+            .key_context("SelectableText")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::copy_code_selection))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.code_selection.take().is_some() {
+                    this.pending_code_press = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
             .bg(hsla(p.background))
             .child(header::render(self, window, cx))
             .child(self.render_body(window, cx))

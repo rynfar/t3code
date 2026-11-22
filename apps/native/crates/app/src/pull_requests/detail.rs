@@ -17,11 +17,14 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::commands::method::DISPATCH_COMMAND;
-use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
+use t3_core::pull_requests::detail::{
+    BaseFreshness, MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate,
+    merge_method_label, primary_control, resolve_base_freshness, resolve_merge_method,
+};
 use t3_core::pull_requests::anchor::{Anchor, LinkedTab, anchor_matches_url, link_commit, parse_anchor, resolve_review_anchor};
 use t3_core::pull_requests::chat_context::{ChatSubject, build_comment_context_with_activity, build_pull_request_context};
 use t3_core::pull_requests::detail::EventKind;
@@ -42,9 +45,9 @@ use t3_core::pull_requests::selection::{SelectionDraft, change_batches};
 use t3_core::pull_requests::tasks::set_task_checked;
 use t3_core::pull_requests::wire::{
     Action, Activity, CommentKind, Detail, DiffResult, LabelCandidate, LabelCandidates, ListEntry, MergeMethod, PrState, ReactionContent, ReviewVerdict, ReviewerCandidate, ReviewerCandidates, Stack, Summary,
-    ThreadCommentsPage, decode,
+    ThreadCommentsPage, UpdateMethod, decode,
 };
-use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
+use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge, update_branch_input};
 use t3_core::sidebar::grouping::EnvironmentOwner;
 
 use super::code::CodeTab;
@@ -57,7 +60,7 @@ use super::{diff_for_owner, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::right_panel::{segment, segmented};
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt as _, hsla, palette, theme_slot_clipped_background_layer};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::markdown::MarkdownStore;
 
@@ -196,6 +199,7 @@ pub struct DetailView {
     pub(super) error: Option<String>,
     pub(super) activity_error: Option<String>,
     pub(super) checks_open: bool,
+    pub(super) base_freshness_open: bool,
     tab: Tab,
     /// This pull request's own merge method pick (`mergeMethodSelection`).
     merge_method: Option<MergeMethod>,
@@ -377,6 +381,7 @@ impl DetailView {
             error: None,
             activity_error: None,
             checks_open: false,
+            base_freshness_open: false,
             tab: Tab::Summary,
             merge_method: None,
             stack: None,
@@ -858,7 +863,8 @@ impl DetailView {
     fn disarm(&mut self, cx: &mut Context<Self>) {
         self._disarm = None;
         self._escape = None;
-        if self.armed.take().is_some() {
+        let closed_freshness = std::mem::take(&mut self.base_freshness_open);
+        if self.armed.take().is_some() || closed_freshness {
             cx.notify();
         }
     }
@@ -879,6 +885,20 @@ impl DetailView {
             let method = self.selected_merge_method(cx);
             self.run_action_pr(action_input(&self.reference, action, method), cx)
         };
+        self.settle_action(action, task, cx);
+    }
+
+    fn perform_update_branch(&mut self, update_method: UpdateMethod, cx: &mut Context<Self>) {
+        if !mutations::begin(&self.reference, Action::UpdateBranch, cx) {
+            return;
+        }
+        self.base_freshness_open = false;
+        let task = self.run_action_pr(update_branch_input(&self.reference, Some(update_method)), cx);
+        self.settle_action(Action::UpdateBranch, task, cx);
+        cx.notify();
+    }
+
+    fn settle_action(&mut self, action: Action, task: super::Read<Option<Summary>>, cx: &mut Context<Self>) {
         let term = self.term();
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
@@ -2241,7 +2261,16 @@ impl DetailView {
         let url = self.detail.as_ref().map(|d| d.url.clone()).or(self.entry.as_ref().map(|e| e.url.clone()));
         let meta = self.detail.as_ref().map(|d| {
             let author = d.author.as_ref().map_or("ghost".to_owned(), |a| a.login.clone());
-            (format!("{author} wants to merge into {} from {}", d.base_branch, d.head_branch), d.additions, d.deletions, d.changed_files)
+            let freshness = resolve_base_freshness(d);
+            let base = self.render_base_branch_segment(d, freshness, cx);
+            (
+                author,
+                base,
+                d.head_branch.clone(),
+                d.additions,
+                d.deletions,
+                d.changed_files,
+            )
         });
         let can_edit_title = self.can_edit_description(cx);
         let title_row: AnyElement = if self.title_editing && let Some(input) = &self.title_input {
@@ -2337,12 +2366,20 @@ impl DetailView {
                     .text_xs()
                     .text_color(hsla(p.muted_foreground))
                     .child(h_flex().flex_none().gap(px(4.)).text_color(color).child(icon.sized(px(14.))).child(kind.label()))
-                    .children(meta.map(|(text, additions, deletions, files)| {
+                    .children(meta.map(|(author, base, head_branch, additions, deletions, files)| {
                         h_flex()
                             .min_w_0()
                             .flex_1()
                             .gap(px(8.))
-                            .child(div().min_w_0().truncate().child(text))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap(px(4.))
+                                    .child(div().flex_none().child(format!("{author} wants to merge into")))
+                                    .child(base)
+                                    .child(div().min_w_0().truncate().child(format!("from {head_branch}"))),
+                            )
                             .child(diff_stat(additions, deletions, cx))
                             .child(div().flex_none().child(format!("{files} {}", if files == 1 { "file" } else { "files" })))
                     }))
@@ -2352,6 +2389,141 @@ impl DetailView {
                     })),
             )
             .child(self.render_tabs(window, cx))
+    }
+
+    fn render_base_branch_segment(
+        &self,
+        detail: &Detail,
+        freshness: Option<BaseFreshness>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let Some(freshness) = freshness else {
+            return div()
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .child(detail.base_branch.clone())
+                .into_any_element();
+        };
+        let trigger_bounds = std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::default()));
+        let measured = trigger_bounds.clone();
+        let trigger = h_flex()
+            .id("pr-base-freshness-trigger")
+            .debug_selector(|| "pr-base-freshness-trigger".into())
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .px(px(4.))
+            .py(px(1.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_color(hsla(p.warning_foreground))
+            .hover(|style| style.bg(hsla(p.warning).opacity(0.14)))
+            .tooltip(move |window, cx| crate::right_panel::tooltip_view("Branch is behind base".into(), window, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.base_freshness_open = !this.base_freshness_open;
+                cx.notify();
+            }))
+            .child(Icon::TriangleAlert.sized(px(12.)))
+            .child(div().font_weight(FontWeight::MEDIUM).child(detail.base_branch.clone()));
+
+        let open = self.base_freshness_open;
+        let popover = open.then(|| {
+            let pending = mutations::pending(&self.reference, cx);
+            let updating = pending == Some(Action::UpdateBranch);
+            let busy = pending.is_some();
+            let summary = match freshness.behind_by {
+                Some(1) => format!("1 commit behind {}", detail.base_branch),
+                Some(n) if n > 1 => format!("{n} commits behind {}", detail.base_branch),
+                _ => format!("Behind {}", detail.base_branch),
+            };
+            let entity = cx.entity().downgrade();
+            let buttons: Vec<AnyElement> = freshness
+                .methods
+                .into_iter()
+                .map(|method| {
+                    let (id, variant, text) = match method {
+                        UpdateMethod::Merge => ("pr-update-branch-merge", Variant::Default, "Update branch"),
+                        UpdateMethod::Rebase => ("pr-update-branch-rebase", Variant::Outline, "Update with rebase"),
+                        UpdateMethod::Unknown => return div().into_any_element(),
+                    };
+                    Button::new(id, variant, Size::Xs)
+                        .label(if updating { "Updating..." } else { text })
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| this.perform_update_branch(method, cx)))
+                        .debug_selector(move || id.into())
+                        .into_any_element()
+                })
+                .collect();
+            div().absolute().bottom_0().left_0().child(
+                gpui::deferred(
+                    gpui::anchored()
+                        .anchor(gpui::Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            v_flex()
+                                .id("pr-base-freshness-popover")
+                                .relative()
+                                .occlude()
+                                .w(px(272.))
+                                .mt(px(4.))
+                                .p(px(12.))
+                                .gap(px(8.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(hsla(p.dropdown_border))
+                                .bg(hsla(p.popover))
+                                .text_color(hsla(p.popover_foreground))
+                                .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
+                                .theme_slot(ThemeSlot::MenuPopup, cx)
+                                .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
+                                .on_mouse_down_out(move |event, _, cx| {
+                                    if !trigger_bounds.get().contains(&event.position)
+                                        && let Some(entity) = entity.upgrade()
+                                    {
+                                        entity.update(cx, |this, cx| {
+                                            this.base_freshness_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(hsla(p.foreground))
+                                                .child(summary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(hsla(p.muted_foreground))
+                                                .child("Changes can be cleanly merged."),
+                                        ),
+                                )
+                                .when(!buttons.is_empty(), |col| {
+                                    col.child(h_flex().flex_wrap().gap(px(6.)).children(buttons))
+                                }),
+                        ),
+                )
+                .with_priority(40),
+            )
+        });
+
+        div()
+            .relative()
+            .flex_none()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(first) = bounds.first() {
+                    measured.set(*first);
+                }
+            })
+            .child(trigger)
+            .children(popover)
+            .into_any_element()
     }
 
     fn render_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3101,5 +3273,104 @@ mod tests {
             let held_names: Vec<&str> = held_detail.labels.iter().map(|l| l.name.as_str()).collect();
             assert_eq!(held_names, vec!["docs"], "Held cache must also roll back on batch label failure");
         });
+    }
+
+    #[gpui::test]
+    fn base_freshness_warning_renders_when_behind_and_hides_otherwise(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": {
+                "actions": ["merge", "close", "update_branch"],
+                "mergeMethods": ["merge"],
+                "updateMethods": ["merge", "rebase"],
+                "edit": { "changeRequest": true, "comment": true },
+                "review": { "resolve": true },
+                "labels": true
+            },
+            "viewerPermissions": {
+                "actions": ["merge", "close", "update_branch"],
+                "updateMethods": ["merge", "rebase"],
+                "comment": true,
+                "resolve": true,
+                "labels": true
+            },
+            "projectId": "p1",
+            "projectTitle": "Local Fork",
+            "workspaceRoot": "/tmp/fork-checkout",
+            "repository": "upstream/repo",
+            "number": 42,
+            "title": "PR Title",
+            "body": "",
+            "url": "https://github.com/upstream/repo/pull/42",
+            "author": { "login": "alice" },
+            "viewer": "alice",
+            "state": "open",
+            "isDraft": false,
+            "mergeability": "mergeable",
+            "baseComparison": "behind",
+            "behindBy": 3,
+            "additions": 5,
+            "deletions": 2,
+            "changedFiles": 1,
+            "headBranch": "feat",
+            "baseBranch": "main",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100,
+            "mergedAt": null,
+            "closedAt": null,
+            "reviewers": [],
+            "labels": [],
+            "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        let reference = sample_ref();
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            DetailView::new(state, WeakEntity::new_invalid(), reference.clone(), None, cx)
+        });
+        view.update(vcx, |view, cx| {
+            view.detail = Some(detail.clone());
+            view.base_freshness_open = true;
+            cx.notify();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("pr-base-freshness-trigger").is_some());
+        assert!(vcx.debug_bounds("pr-update-branch-merge").is_some());
+        assert!(vcx.debug_bounds("pr-update-branch-rebase").is_some());
+
+        view.update(vcx, |view, cx| {
+            view.detail.as_mut().unwrap().base_comparison = Some(t3_core::pull_requests::wire::BaseComparison::UpToDate);
+            cx.notify();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("pr-base-freshness-trigger").is_none());
+
+        view.update(vcx, |view, cx| {
+            let d = view.detail.as_mut().unwrap();
+            d.base_comparison = Some(t3_core::pull_requests::wire::BaseComparison::Behind);
+            d.mergeability = t3_core::pull_requests::wire::Mergeability::Conflicting;
+            cx.notify();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("pr-base-freshness-trigger").is_none());
     }
 }

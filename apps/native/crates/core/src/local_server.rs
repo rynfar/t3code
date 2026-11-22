@@ -23,6 +23,10 @@ pub const SERVER_EXIT_CODE_STATE_DIR_OWNED: i32 = 78;
 
 /// Default loopback interface bound when hosting a local server (`DesktopBackendConfiguration.ts`).
 pub const DEFAULT_LOCAL_SERVER_HOST: &str = "127.0.0.1";
+/// Wildcard bind host when sharing the embedded local server on the local network.
+pub const LAN_BIND_HOST: &str = "0.0.0.0";
+/// Default HTTPS port used when exposing the local server with `--tailscale-serve`.
+pub const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 /// Default HTTP/WebSocket port (`ServerConfig.DEFAULT_PORT`).
 pub const DEFAULT_LOCAL_SERVER_PORT: u16 = 3773;
 /// Unauthenticated readiness & descriptor probe path (`BACKEND_READINESS_PATH`).
@@ -266,6 +270,43 @@ pub fn cli_failure_summary(stderr: &str, stdout: &str) -> String {
         .unwrap_or_else(|| "it exited without a message.".to_owned())
 }
 
+/// Persisted exposure preferences for the embedded local `t3 serve` subprocess.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalServerExposure {
+    #[serde(default)]
+    pub network_access: bool,
+    #[serde(default)]
+    pub tailscale_serve: bool,
+    #[serde(default)]
+    pub tailscale_serve_port: Option<u16>,
+}
+
+impl LocalServerExposure {
+    pub fn bind_host(&self) -> &'static str {
+        if self.network_access { LAN_BIND_HOST } else { DEFAULT_LOCAL_SERVER_HOST }
+    }
+
+    pub fn effective_tailscale_port(&self) -> Option<u16> {
+        self.tailscale_serve
+            .then_some(self.tailscale_serve_port.filter(|port| *port > 0).unwrap_or(DEFAULT_TAILSCALE_SERVE_PORT))
+    }
+}
+
+pub fn parse_tailscale_serve_port(raw: &str) -> Result<u16, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_TAILSCALE_SERVE_PORT);
+    }
+    let port: u16 = trimmed
+        .parse()
+        .map_err(|_| "Enter a valid port between 1 and 65535.".to_owned())?;
+    if port == 0 {
+        return Err("Enter a valid port between 1 and 65535.".to_owned());
+    }
+    Ok(port)
+}
+
 /// Parameters for launching an embedded local `t3 serve` subprocess (`apps/server/src/cli/server.ts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalServerLaunchSpec {
@@ -273,6 +314,8 @@ pub struct LocalServerLaunchSpec {
     pub default_home: PathBuf,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub tailscale_serve: bool,
+    pub tailscale_serve_port: Option<u16>,
 }
 
 /// Builds `t3 serve` CLI arguments for hosting the local server without opening a browser or
@@ -287,6 +330,12 @@ pub fn serve_args(spec: &LocalServerLaunchSpec) -> Vec<String> {
     }
     if let Some(port) = spec.port.filter(|port| *port > 0) {
         args.extend(["--port".to_owned(), port.to_string()]);
+    }
+    if spec.tailscale_serve {
+        args.push("--tailscale-serve".to_owned());
+        if let Some(ts_port) = spec.tailscale_serve_port.filter(|port| *port > 0) {
+            args.extend(["--tailscale-serve-port".to_owned(), ts_port.to_string()]);
+        }
     }
     args
 }
@@ -801,16 +850,37 @@ mod tests {
             default_home: default.clone(),
             host: Some("127.0.0.1".into()),
             port: None,
+            tailscale_serve: false,
+            tailscale_serve_port: None,
         });
         assert_eq!(args, ["serve", "--no-browser", "--host", "127.0.0.1"]);
 
         let custom = serve_args(&LocalServerLaunchSpec {
             home: PathBuf::from("/tmp/t3-custom"),
-            default_home: default,
+            default_home: default.clone(),
             host: Some("  ".into()),
             port: Some(4123),
+            tailscale_serve: true,
+            tailscale_serve_port: Some(8443),
         });
-        assert_eq!(custom, ["serve", "--no-browser", "--base-dir", "/tmp/t3-custom", "--port", "4123"]);
+        assert_eq!(
+            custom,
+            [
+                "serve",
+                "--no-browser",
+                "--base-dir",
+                "/tmp/t3-custom",
+                "--port",
+                "4123",
+                "--tailscale-serve",
+                "--tailscale-serve-port",
+                "8443",
+            ]
+        );
+        assert_eq!(parse_tailscale_serve_port(""), Ok(DEFAULT_TAILSCALE_SERVE_PORT));
+        assert_eq!(parse_tailscale_serve_port("8443"), Ok(8443));
+        assert!(parse_tailscale_serve_port("0").is_err());
+        assert!(parse_tailscale_serve_port("99999").is_err());
 
         assert_eq!(server_origin(None, 3773), "http://127.0.0.1:3773");
         assert_eq!(server_origin(Some("0.0.0.0"), 3773), "http://127.0.0.1:3773");

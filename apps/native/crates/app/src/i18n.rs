@@ -103,4 +103,33 @@ mod tests {
         );
         assert!(SUPPORTED_LOCALES.contains(&resolved));
     }
+
+    #[test]
+    fn phase2_swept_keys_translate_in_spanish_and_french() {
+        let keys = [
+            "What should we work on?",
+            "Thread title cannot be empty",
+            "Drag to resize sidebar",
+            "Checking for updates…",
+            "Choose a valid date and time in the future.",
+            "No terminal sessions for this thread yet.",
+            "Split Terminal Horizontally",
+        ];
+        for locale in ["es", "fr"] {
+            for key in keys {
+                let localized = translate(locale, key);
+                assert_ne!(
+                    localized, key,
+                    "expected localized {locale} translation for {key:?}"
+                );
+            }
+            let fmt = translate_fmt(
+                locale,
+                "New thread in {project}",
+                &[("project", "Repo".into())],
+            );
+            assert_ne!(fmt, "New thread in Repo");
+            assert!(fmt.contains("Repo"), "{fmt}");
+        }
+    }
 }

@@ -834,7 +834,9 @@ impl TerminalDrawer {
             return;
         }
         let (message, detail) = terminal::close_confirmation(&[self.label(&thread_id, terminal_id)]);
-        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Close", "Cancel"], cx);
+        let close_label = crate::i18n::t(cx, "Close");
+        let cancel_label = crate::i18n::t(cx, "Cancel");
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &[close_label, cancel_label], cx);
         let terminal_id = terminal_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(0) {

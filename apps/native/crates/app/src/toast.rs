@@ -63,6 +63,7 @@ pub enum ToastKind {
     Error,
     Warning,
     Info,
+    Loading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,25 +193,30 @@ impl Toast {
 
     fn render_content(&self, id: u64, copied: bool, expanded: bool, anchored: bool, state: &Entity<AppState>, cx: &App) -> AnyElement {
         let p = palette(cx);
-        let (icon, color) = if let Some(custom) = self.leading_icon {
+        let leading: AnyElement = if let Some(custom) = self.leading_icon {
             let color = match (self.kind, custom) {
                 (ToastKind::Success, _) => p.success,
                 (ToastKind::Error, _) => p.destructive,
                 (_, Icon::MessageCircleQuestion) => p.info,
                 (ToastKind::Warning, _) => p.warning,
                 (ToastKind::Info, _) => p.info,
-
+                (ToastKind::Loading, _) => p.muted_foreground,
             };
-            (custom, color)
+            custom.sized(px(16.)).text_color(hsla(color)).into_any_element()
         } else if self.github_star && self.kind != ToastKind::Success {
-            (Icon::Star, p.warning_foreground)
+            Icon::Star.sized(px(16.)).text_color(hsla(p.warning_foreground)).into_any_element()
         } else {
             match self.kind {
-                ToastKind::Success => (Icon::CircleCheck, p.success),
-                ToastKind::Error => (Icon::CircleAlert, p.destructive),
-                ToastKind::Warning => (Icon::TriangleAlert, p.warning),
-                ToastKind::Info => (Icon::Info, p.info),
-
+                ToastKind::Success => Icon::CircleCheck.sized(px(16.)).text_color(hsla(p.success)).into_any_element(),
+                ToastKind::Error => Icon::CircleAlert.sized(px(16.)).text_color(hsla(p.destructive)).into_any_element(),
+                ToastKind::Warning => Icon::TriangleAlert.sized(px(16.)).text_color(hsla(p.warning)).into_any_element(),
+                ToastKind::Info => Icon::Info.sized(px(16.)).text_color(hsla(p.info)).into_any_element(),
+                ToastKind::Loading => crate::components::motion::Spinner::new(
+                    ("toast-loading-spinner", id),
+                    px(16.),
+                    hsla(p.muted_foreground),
+                )
+                .into_any_element(),
             }
         };
         let show_copy = self.kind == ToastKind::Error && !self.hide_copy_button;
@@ -228,7 +234,7 @@ impl Toast {
             .py(px(12.))
             .text_sm()
             .text_color(hsla(p.popover_foreground))
-            .child(div().pt(px(2.)).child(icon.sized(px(16.)).text_color(hsla(color))))
+            .child(div().pt(px(2.)).child(leading))
             .child(
                 div()
                     .flex()
@@ -422,11 +428,12 @@ impl Toasts {
 
 impl AppState {
     pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        let holds_open = toast.persistent || toast.kind == ToastKind::Loading;
         if let Some(key) = toast.key.as_deref()
             && let Some(entry) = self.toasts.entries.iter_mut().find(|e| e.toast.key.as_deref() == Some(key))
         {
             let id = entry.id;
-            entry._timer = (!toast.persistent).then(|| toast_timer(id, cx));
+            entry._timer = (!holds_open).then(|| toast_timer(id, cx));
             entry.toast = toast;
             cx.emit(AppEvent::Notice);
             return;
@@ -440,7 +447,7 @@ impl AppState {
                 copied: false,
                 expanded: false,
                 _copy_reset: None,
-                _timer: (!toast.persistent).then(|| toast_timer(id, cx)),
+                _timer: (!holds_open).then(|| toast_timer(id, cx)),
                 toast,
             },
         );
@@ -1562,6 +1569,57 @@ mod tests {
         state.read_with(cx, |state, _| {
             assert!(state.toasts.entries.is_empty());
             assert!(state.toasts.anchored.is_empty());
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn loading_toast_persists_until_upserted_to_completion(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        struct Root(Entity<AppState>);
+        impl Render for Root {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().children(stack(&self.0, window, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        state.update(cx, |state, cx| {
+            state.show_toast(Toast::new(ToastKind::Loading, "Syncing environment").key("sync-op"), cx);
+        });
+        state.read_with(cx, |state, _| {
+            let entry = &state.toasts.entries[0];
+            assert_eq!(entry.toast.kind, ToastKind::Loading);
+            assert!(entry._timer.is_none(), "loading toast must not start an auto-dismiss timer");
+        });
+
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root(state.clone()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        state.update(cx, |state, cx| {
+            state.show_toast(Toast::new(ToastKind::Success, "Synced environment").key("sync-op"), cx);
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.toasts.entries.len(), 1);
+            let entry = &state.toasts.entries[0];
+            assert_eq!(entry.toast.kind, ToastKind::Success);
+            assert!(entry._timer.is_some(), "settled keyed upsert must arm the dismiss timer");
         });
 
         state.update(cx, |state, _| state.stop_pump());

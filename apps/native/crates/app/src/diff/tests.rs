@@ -598,3 +598,104 @@ fn withheld_file_banner_triggers_callback_and_cut_lines_disable_expansion(
     vcx.draw(point(px(0.), px(0.)), size(px(800.), px(240.)), |_, _| panel.clone().into_any_element());
     assert_eq!(*loaded_paths.lock().unwrap(), vec!["dist/bundle.js".to_owned()]);
 }
+
+#[gpui::test]
+fn multi_line_code_drag_selection_copies_raw_code_in_unified_and_split_views(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (_runtime, panel, mut vcx) = setup_panel(cx);
+
+    // 1. Unified layout: single-line drag leaves multi-line selection inactive; multi-line drag copies raw lines.
+    let unified_patch = Parsed::new(SAMPLE_PATCH, false, None, None, None);
+    panel.update(&mut vcx, |panel, cx| {
+        panel.show_external(
+            External { key: "copy:unified".into(), parsed: Some(unified_patch), pending: false, error: None },
+            cx,
+        );
+        panel.set_folded(0, false, cx);
+    });
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear();
+    });
+
+    let (b1, b3) = panel.read_with(&vcx, |panel, _| {
+        (panel.list.bounds_for_item(1).unwrap(), panel.list.bounds_for_item(3).unwrap())
+    });
+    let start_pt = point(b1.right() - px(40.), b1.center().y);
+    let same_row_pt = point(b1.right() - px(20.), b1.center().y);
+    let end_pt = point(b3.right() - px(40.), b3.center().y);
+
+    vcx.simulate_mouse_down(start_pt, gpui::MouseButton::Left, gpui::Modifiers::default());
+    vcx.simulate_mouse_move(same_row_pt, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    assert!(
+        panel.read_with(&vcx, |panel, _| panel.code_selection.is_none()),
+        "dragging within a single row preserves single-line SelectableText without activating multi-line mode"
+    );
+
+    vcx.simulate_mouse_move(end_pt, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    assert!(panel.read_with(&vcx, |panel, _| panel.code_selection.as_ref().is_some_and(|sel| sel.multi_line)));
+    vcx.simulate_mouse_up(end_pt, gpui::MouseButton::Left, gpui::Modifiers::default());
+
+    vcx.update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Copy), cx));
+    assert_eq!(
+        vcx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("fn one() {}\nfn two() {}\nfn three() {}".to_owned())
+    );
+
+    vcx.simulate_keystrokes("escape");
+    assert!(panel.read_with(&vcx, |panel, _| panel.code_selection.is_none()));
+
+    // 2. Split layout: drag restricts to the anchored side and skips empty filler halves.
+    let split_raw = "\
+diff --git a/src/split.rs b/src/split.rs
+index 1111111..2222222 100644
+--- a/src/split.rs
++++ b/src/split.rs
+@@ -1,2 +1,3 @@
+-old_line();
++new_line();
++extra_new();
+ shared_line();
+";
+    let split_patch = Parsed::new(split_raw, false, None, None, None);
+    panel.update(&mut vcx, |panel, cx| {
+        panel.set_layout(t3_core::diff::Layout::Split, cx);
+        panel.show_external(
+            External { key: "copy:split".into(), parsed: Some(split_patch), pending: false, error: None },
+            cx,
+        );
+        panel.set_folded(0, false, cx);
+        panel.rebuild(cx);
+    });
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear();
+    });
+
+    // Rows in split layout: 0 = FileHeader, 1 = (-old, +new), 2 = (filler, +extra), 3 = (shared, shared)
+    let (s1, s3) = panel.read_with(&vcx, |panel, _| {
+        (panel.list.bounds_for_item(1).unwrap(), panel.list.bounds_for_item(3).unwrap())
+    });
+    let right_start = point(s1.right() - px(40.), s1.center().y);
+    let right_end = point(s3.right() - px(40.), s3.center().y);
+    vcx.simulate_mouse_down(right_start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    vcx.simulate_mouse_move(right_end, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    vcx.simulate_mouse_up(right_end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    vcx.update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Copy), cx));
+    assert_eq!(
+        vcx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("new_line();\nextra_new();\nshared_line();".to_owned())
+    );
+
+    let left_start = point(s1.left() + s1.size.width * 0.4, s1.center().y);
+    let left_end = point(s3.left() + s3.size.width * 0.4, s3.center().y);
+    vcx.simulate_mouse_down(left_start, gpui::MouseButton::Left, gpui::Modifiers::default());
+    vcx.simulate_mouse_move(left_end, Some(gpui::MouseButton::Left), gpui::Modifiers::default());
+    vcx.simulate_mouse_up(left_end, gpui::MouseButton::Left, gpui::Modifiers::default());
+    vcx.update(|window, cx| window.dispatch_action(Box::new(gpui_component::input::Copy), cx));
+    assert_eq!(
+        vcx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+        Some("old_line();\nshared_line();".to_owned())
+    );
+}

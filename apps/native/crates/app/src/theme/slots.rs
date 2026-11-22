@@ -34,6 +34,117 @@ use super::{FontInventory, background_image, hsla};
 pub(super) struct ActiveSlotStylesheet(pub(super) Arc<SlotStylesheet>);
 impl Global for ActiveSlotStylesheet {}
 
+#[derive(Default)]
+pub(crate) struct InspectorRegistry {
+    active: bool,
+    entries: Vec<(ThemeSlot, Bounds<Pixels>)>,
+}
+impl Global for InspectorRegistry {}
+
+/// Enables or disables live slot bounds recording for the Theme Editor color inspector.
+pub(crate) fn set_inspector_active(active: bool, cx: &mut App) {
+    let registry = cx.default_global::<InspectorRegistry>();
+    registry.active = active;
+    if !active {
+        registry.entries.clear();
+    }
+}
+
+/// Returns whether the Theme Editor color inspector is currently collecting slot bounds.
+pub(crate) fn inspector_active(cx: &App) -> bool {
+    cx.try_global::<InspectorRegistry>().is_some_and(|r| r.active)
+}
+
+/// Clears the previous frame's slot bounds before painting a new frame while inspecting.
+pub(crate) fn begin_inspector_frame(cx: &mut App) {
+    if let Some(registry) = cx.try_global::<InspectorRegistry>()
+        && !registry.active
+    {
+        return;
+    }
+    if cx.has_global::<InspectorRegistry>() {
+        cx.global_mut::<InspectorRegistry>().entries.clear();
+    }
+}
+
+/// Records one painted `ThemeSlot`'s window bounds during inspector mode.
+pub(crate) fn record_inspector_slot(slot: ThemeSlot, bounds: Bounds<Pixels>, cx: &mut App) {
+    if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+        return;
+    }
+    if let Some(registry) = cx.try_global::<InspectorRegistry>()
+        && !registry.active
+    {
+        return;
+    }
+    let registry = cx.default_global::<InspectorRegistry>();
+    if registry.active {
+        registry.entries.push((slot, bounds));
+    }
+}
+
+/// Returns the recorded `(ThemeSlot, Bounds<Pixels>)` list from the latest frame.
+pub(crate) fn inspector_entries(cx: &App) -> &[(ThemeSlot, Bounds<Pixels>)] {
+    cx.try_global::<InspectorRegistry>().map_or(&[], |r| r.entries.as_slice())
+}
+
+/// Maps every `ThemeSlot` to its primary family role in `t3_core::themes::editor::FAMILIES`.
+pub(crate) fn theme_slot_primary_role(slot: ThemeSlot) -> &'static str {
+    match slot {
+        ThemeSlot::Sidebar | ThemeSlot::SidebarInner => "sidebar",
+        ThemeSlot::ThreadItem | ThemeSlot::ProjectMonogram => "sidebarRowSelected",
+        ThemeSlot::ChatHeader
+        | ThemeSlot::ConversationArea
+        | ThemeSlot::MessagesTimelineScroll
+        | ThemeSlot::TimelineRow => "canvas",
+        ThemeSlot::UserMessageRow | ThemeSlot::UserMessageBubble => "messageSurface",
+        ThemeSlot::AssistantMessageRow | ThemeSlot::ChatMarkdown => "text",
+        ThemeSlot::ChatMarkdownCodeblock => "codeBackground",
+        ThemeSlot::ChatComposerForm
+        | ThemeSlot::ComposerHost
+        | ThemeSlot::ComposerTiptap
+        | ThemeSlot::ThreadDetailsCard
+        | ThemeSlot::SettingsPageScroll
+        | ThemeSlot::SettingsGroup => "surface",
+        ThemeSlot::ThreadTerminalDrawer => "terminalBackground",
+        ThemeSlot::Button => "messageAction",
+        ThemeSlot::Input
+        | ThemeSlot::Switch
+        | ThemeSlot::SwitchThumb
+        | ThemeSlot::Checkbox
+        | ThemeSlot::SelectTrigger => "input",
+        ThemeSlot::DialogPopup
+        | ThemeSlot::PopoverPopup
+        | ThemeSlot::MenuPopup
+        | ThemeSlot::TooltipPopup => "surfaceOverlay",
+        ThemeSlot::ScrollAreaScrollbar | ThemeSlot::ScrollAreaThumb => "border",
+    }
+}
+
+/// Zero-overhead prepaint probe that records `slot` bounds only while the color inspector is active.
+pub(crate) fn inspector_slot_probe(slot: ThemeSlot, cx: &App) -> Option<AnyElement> {
+    if !inspector_active(cx) {
+        return None;
+    }
+    Some(
+        canvas(
+            move |bounds, _, cx| record_inspector_slot(slot, bounds, cx),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element(),
+    )
+}
+
+fn attach_inspector_probe(slot: ThemeSlot, layer: Option<AnyElement>, cx: &App) -> Option<AnyElement> {
+    let layer = layer?;
+    let Some(probe) = inspector_slot_probe(slot, cx) else {
+        return Some(layer);
+    };
+    Some(div().absolute().inset_0().child(layer).child(probe).into_any_element())
+}
+
 const GRADIENT_TEX_SIZE: u32 = 128;
 const GRADIENT_MAX_DIM: u32 = 128;
 const GRADIENT_MIN_DIM: u32 = 16;
@@ -1227,17 +1338,21 @@ pub fn theme_slot_state_background_layer(
     }
     let set = global.0.get(slot)?;
     let default_radius = default_radius.into();
-    if state != SlotState::Base {
+    let layer = if state != SlotState::Base {
         let state_ov = set.state(state);
         if state_ov.border_gradient.is_some()
             || state_ov.background.is_some()
             || state_ov.background_color.is_some()
             || state_ov.backdrop_blur.is_some()
         {
-            return render_override_background_layer(state_ov, &set.base, default_radius, cx);
+            render_override_background_layer(state_ov, &set.base, default_radius, cx)
+        } else {
+            render_override_background_layer(&set.base, &set.base, default_radius, cx)
         }
-    }
-    render_override_background_layer(&set.base, &set.base, default_radius, cx)
+    } else {
+        render_override_background_layer(&set.base, &set.base, default_radius, cx)
+    };
+    attach_inspector_probe(slot, layer, cx)
 }
 
 /// Renders an absolutely-positioned background layer for `slot` in `SlotState::Base` (multi-stop
@@ -1260,7 +1375,8 @@ pub fn theme_slot_clipped_background_layer(
         return None;
     }
     let set = global.0.get(slot)?;
-    render_override_background_layer(&set.base, &set.base, default_radius.into(), cx)
+    let layer = render_override_background_layer(&set.base, &set.base, default_radius.into(), cx);
+    attach_inspector_probe(slot, layer, cx)
 }
 
 /// Renders a compiled `::before` pseudo-element bar (e.g. an active thread row's 3px left accent

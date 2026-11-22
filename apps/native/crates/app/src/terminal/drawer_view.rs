@@ -173,9 +173,9 @@ impl TerminalDrawer {
         let group_target = if active_in_group { layout.active_terminal_id.clone() } else { group.terminal_ids[0].clone() };
         let split = group.terminal_ids.len() > 1;
         let (group_icon, group_label) = match (split, group.split_direction) {
-            (false, _) => (Icon::Square, "Single"),
-            (true, SplitDirection::Vertical) => (Icon::SquareSplitVertical, "Stacked"),
-            (true, SplitDirection::Horizontal) => (Icon::SquareSplitHorizontal, "Side by side"),
+            (false, _) => (Icon::Square, crate::i18n::t(cx, "Single")),
+            (true, SplitDirection::Vertical) => (Icon::SquareSplitVertical, crate::i18n::t(cx, "Stacked")),
+            (true, SplitDirection::Horizontal) => (Icon::SquareSplitHorizontal, crate::i18n::t(cx, "Side by side")),
         };
         let header_color = if active_in_group { hsla(p.foreground) } else { hsla(p.muted_foreground) };
         let header = div()
@@ -389,7 +389,7 @@ impl Render for TerminalDrawer {
                 .py_6()
                 .text_sm()
                 .text_color(hsla(p.muted_foreground))
-                .child("No terminal sessions for this thread yet.")
+                .child(crate::i18n::t(cx, "No terminal sessions for this thread yet."))
                 .child(
                     Button::new("terminal-empty-new")
                         .label(with_shortcut("New Terminal", "terminal.new", cx))
@@ -439,6 +439,7 @@ impl Render for TerminalDrawer {
                     }
                 })))
             .children(theme_slot_background_layer(ThemeSlot::ThreadTerminalDrawer, cx))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::ThreadTerminalDrawer, cx))
             .child(body)
             .children(floating)
             .when(is_open, |drawer| drawer.child(strip));

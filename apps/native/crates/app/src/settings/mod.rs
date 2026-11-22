@@ -6,7 +6,7 @@
 
 mod about;
 mod access;
-pub(crate) use access::link_access_relay;
+pub(crate) use access::{link_access_relay, link_access_relay_detailed};
 mod appearance;
 pub(crate) mod theme_import;
 mod archive;
@@ -2817,6 +2817,7 @@ impl Render for SettingsView {
             .flex_1()
             .min_h_0()
             .children(theme_slot_background_layer(ThemeSlot::SettingsPageScroll, cx))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::SettingsPageScroll, cx))
             .child(content);
         let icon_picker = self.project_icon_picker_overlay(window, cx);
         let action_editor = self.action_editor_overlay(window, cx);

@@ -117,6 +117,7 @@ impl Drop for TargetStream {
 
 /// The inline peer-link panel state (`LinkedEnvironmentsSettings.tsx` + `LinkMachineSelect.tsx`).
 struct LinkMachineForm {
+    focus: FocusHandle,
     choice: Option<String>,
     address: Entity<InputState>,
     pairing_code: Entity<InputState>,
@@ -221,10 +222,25 @@ pub(crate) struct AccessPageState {
     qr: RefCell<Option<(String, Rc<QrMatrix>)>>,
     /// Ticks once a second while a pairing link counts down.
     ticker: Option<Task<()>>,
+    /// Interactive local-server exposure drafts when hosting on this machine.
+    exposure_network_draft: Option<bool>,
+    exposure_tailscale_draft: Option<bool>,
+    tailscale_port: Entity<InputState>,
+    exposure_confirm_open: bool,
+    exposure_error: Option<String>,
 }
 
 impl AccessPageState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
+        let saved_exposure = t3_client::local::load_local_server_exposure();
+        let initial_port = saved_exposure
+            .tailscale_serve_port
+            .unwrap_or(t3_core::local_server::DEFAULT_TAILSCALE_SERVE_PORT);
+        let tailscale_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial_port.to_string())
+                .placeholder("443")
+        });
         AccessPageState {
             label: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Living room iPad")),
             selected_env: None,
@@ -263,6 +279,11 @@ impl AccessPageState {
             dismissed_legacy_notice: HashMap::new(),
             qr: RefCell::new(None),
             ticker: None,
+            exposure_network_draft: None,
+            exposure_tailscale_draft: None,
+            tailscale_port,
+            exposure_confirm_open: false,
+            exposure_error: None,
         }
     }
 
@@ -293,6 +314,10 @@ impl AccessPageState {
         self.linked_peer_ids.clear();
         self.linked_peers_task = None;
         self.credentials.clear();
+        self.exposure_network_draft = None;
+        self.exposure_tailscale_draft = None;
+        self.exposure_confirm_open = false;
+        self.exposure_error = None;
         self.sharing = None;
         self.newest_pairing_link_id = None;
         self.clients_open = false;
@@ -431,7 +456,7 @@ pub(super) fn session_permissions(session: Option<&AuthSessionState>, cx: &App) 
         .into_any_element()
 }
 
-pub(crate) async fn link_access_relay(
+pub(crate) async fn link_access_relay_detailed(
     client: &ClientHandle,
     cloud: std::sync::Arc<t3_client::connect::Cloud>,
     runtime: &tokio::runtime::Handle,
@@ -439,7 +464,11 @@ pub(crate) async fn link_access_relay(
     managed: bool,
     publish: bool,
     cx: &mut AsyncWindowContext,
-) -> Result<bool, String> {
+) -> Result<bool, t3_client::connect::LinkEnvironmentError> {
+    let err_plain = |message: String| t3_client::connect::LinkEnvironmentError {
+        message,
+        tunnel_limit: None,
+    };
     let sessions = client.session_state();
     let generations = client.connection_generation();
     let generation = *generations.borrow();
@@ -448,12 +477,12 @@ pub(crate) async fn link_access_relay(
     let permitted = || *generations.borrow() == generation && sessions.borrow().as_ref().is_some_and(|session| {
         session.grants(RELAY_READ) && session.grants(RELAY_WRITE) && access::can_configure_relay(session)
     });
-    let denied = || "This connection cannot manage T3 Connect.".to_owned();
+    let denied = || err_plain("This connection cannot manage T3 Connect.".to_owned());
     if !permitted() {
         return Err(denied());
     }
     if managed {
-        let status = client.relay_client_status().await?;
+        let status = client.relay_client_status().await.map_err(err_plain)?;
         match status["status"].as_str() {
             Some("available") => {}
             Some("missing") => {
@@ -463,27 +492,45 @@ pub(crate) async fn link_access_relay(
                     Some(t(cx, "T3 Code needs the relay client to make this environment available through T3 Connect.")),
                     &[t(cx, "Install"), t(cx, "Cancel")],
                     cx,
-                )).map_err(|error| error.to_string())?;
+                )).map_err(|error| err_plain(error.to_string()))?;
                 if answer.await.ok() != Some(0) {
                     return Ok(false);
                 }
                 if !permitted() {
                     return Err(denied());
                 }
-                client.install_relay_client().await?;
+                client.install_relay_client().await.map_err(err_plain)?;
             }
-            _ => return Err("The relay client is unavailable on this environment.".to_owned()),
+            _ => return Err(err_plain("The relay client is unavailable on this environment.".to_owned())),
         }
     }
     if !permitted() {
         return Err(denied());
     }
     let environment_id = environment_id.to_owned();
-    runtime.spawn(async move {
-        cloud.link_environment(&credentials, &primary_http_base, &environment_id, managed, publish).await
-    })
-        .await.map_err(|error| error.to_string())??;
+    runtime
+        .spawn(async move {
+            cloud
+                .link_environment_detailed(&credentials, &primary_http_base, &environment_id, managed, publish)
+                .await
+        })
+        .await
+        .map_err(|error| err_plain(error.to_string()))??;
     Ok(true)
+}
+
+pub(crate) async fn link_access_relay(
+    client: &ClientHandle,
+    cloud: std::sync::Arc<t3_client::connect::Cloud>,
+    runtime: &tokio::runtime::Handle,
+    environment_id: &str,
+    managed: bool,
+    publish: bool,
+    cx: &mut AsyncWindowContext,
+) -> Result<bool, String> {
+    link_access_relay_detailed(client, cloud, runtime, environment_id, managed, publish, cx)
+        .await
+        .map_err(|err| err.message)
 }
 
 impl SettingsView {
@@ -1066,19 +1113,31 @@ impl SettingsView {
     }
 
     fn access_network_row(&self, target: &ResolvedAccessTarget, cx: &Context<Self>) -> AnyElement {
+        let state = self.state.read(cx);
+        let hosted_local = state.is_hosted_local_target(&target.saved_id);
+        let persisted_exposure = state.local_server_exposure().clone();
+        let next_network = self.access.exposure_network_draft.unwrap_or(persisted_exposure.network_access);
+        let next_tailscale = self.access.exposure_tailscale_draft.unwrap_or(persisted_exposure.tailscale_serve);
         let auth_policy = target.extras.auth_policy.as_deref();
-        let network_accessible = is_server_network_accessible(
-            auth_policy,
-            target.extras.direct_endpoints.len(),
-        );
-        let network_description = if network_accessible {
+        let network_accessible = if hosted_local {
+            next_network
+        } else {
+            is_server_network_accessible(auth_policy, target.extras.direct_endpoints.len())
+        };
+        let network_description = if hosted_local {
+            if network_accessible {
+                t(cx, "Listening on the local network (0.0.0.0). Restart required to apply changes.")
+            } else {
+                t(cx, "Only this machine can connect (127.0.0.1). Enable to allow pairing on your LAN.")
+            }
+        } else if network_accessible {
             t(cx, "Remote access is already configured. Change network exposure where the server starts.")
         } else if auth_policy == Some("loopback-browser") {
             t(cx, "Only this machine can connect. Restart with a non-loopback host for remote pairing.")
         } else {
             t(cx, "Network exposure information is unavailable.")
         };
-        let show_network_switch = matches!(auth_policy, Some("remote-reachable" | "loopback-browser"));
+        let show_network_switch = hosted_local || matches!(auth_policy, Some("remote-reachable" | "loopback-browser"));
         let network_tooltip = t(cx, "Network exposure changes restart the backend and must be controlled where the server process is launched.");
         let tailscale_url = target.extras.direct_endpoint_entries.iter().find(|endpoint| {
             endpoint.kind.as_deref() == Some("tailnet") && endpoint.http_base_url.starts_with("https://")
@@ -1098,7 +1157,86 @@ impl SettingsView {
                 this.access.endpoints_open = !this.access.endpoints_open;
                 cx.notify();
             }));
+        let confirm_bar = (hosted_local && self.access.exposure_confirm_open).then(|| {
+            v_flex()
+                .gap(r(6.))
+                .p(r(10.))
+                .rounded(r(8.))
+                .border_1()
+                .border_color(hsla(p.warning).opacity(0.45))
+                .bg(hsla(p.warning).opacity(0.08))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(r(8.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(hsla(p.warning_foreground))
+                                .child(t(cx, "Restart local server to apply?")),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(r(6.))
+                                .child(
+                                    Button::new("access-exposure-cancel", ButtonVariant::Outline, ButtonSize::Xs)
+                                        .label(t(cx, "Cancel"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let saved = this.state.read(cx).local_server_exposure().clone();
+                                            let port = saved
+                                                .tailscale_serve_port
+                                                .unwrap_or(t3_core::local_server::DEFAULT_TAILSCALE_SERVE_PORT);
+                                            this.access.exposure_network_draft = None;
+                                            this.access.exposure_tailscale_draft = None;
+                                            this.access.exposure_confirm_open = false;
+                                            this.access.exposure_error = None;
+                                            this.access.tailscale_port.update(cx, |input, cx| {
+                                                input.set_value(port.to_string(), window, cx);
+                                            });
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("access-exposure-apply", ButtonVariant::Default, ButtonSize::Xs)
+                                        .label(t(cx, "Apply & restart"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let saved = this.state.read(cx).local_server_exposure().clone();
+                                            let next_network = this.access.exposure_network_draft.unwrap_or(saved.network_access);
+                                            let next_tailscale = this.access.exposure_tailscale_draft.unwrap_or(saved.tailscale_serve);
+                                            let raw_port = this.access.tailscale_port.read(cx).value().to_string();
+                                            let port = match t3_core::local_server::parse_tailscale_serve_port(&raw_port) {
+                                                Ok(port) => port,
+                                                Err(err) => {
+                                                    this.access.exposure_error = Some(err);
+                                                    cx.notify();
+                                                    return;
+                                                }
+                                            };
+                                            this.access.exposure_error = None;
+                                            this.access.exposure_confirm_open = false;
+                                            this.access.exposure_network_draft = None;
+                                            this.access.exposure_tailscale_draft = None;
+                                            let next = t3_core::local_server::LocalServerExposure {
+                                                network_access: next_network,
+                                                tailscale_serve: next_tailscale,
+                                                tailscale_serve_port: next_tailscale.then_some(port),
+                                            };
+                                            this.state.update(cx, |state, cx| {
+                                                state.apply_local_server_exposure(next, cx);
+                                            });
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .children(self.access.exposure_error.as_ref().map(|err| {
+                    div().text_xs().text_color(hsla(p.destructive_foreground)).child(err.clone())
+                }))
+        });
         let details = v_flex().gap(r(6.))
+            .children(confirm_bar)
             .when(!candidates.is_empty(), |el| el.child(div().child(toggle)))
             .when(self.access.endpoints_open, |el| el.children(candidates.iter().map(|origin| {
                 let is_default = current == Some(origin);
@@ -1122,22 +1260,91 @@ impl SettingsView {
             .description(network_description)
             .below(details);
         if show_network_switch {
-            network = network.control(
-                div()
-                    .id("access-network-control-hint")
-                    .tooltip(super::controls::tooltip(network_tooltip.into()))
-                    .child(Switch::new("access-network-switch", network_accessible).disabled(true)),
-            );
+            if hosted_local {
+                let network_entity = cx.entity().downgrade();
+                network = network.control(
+                    Switch::new("access-network-switch", network_accessible)
+                        .on_change(move |next, _, cx| {
+                            let _ = network_entity.update(cx, |this, cx| {
+                                this.access.exposure_network_draft = Some(next);
+                                this.access.exposure_confirm_open = true;
+                                this.access.exposure_error = None;
+                                cx.notify();
+                            });
+                        }),
+                );
+            } else {
+                network = network.control(
+                    div()
+                        .id("access-network-control-hint")
+                        .tooltip(super::controls::tooltip(network_tooltip.into()))
+                        .child(Switch::new("access-network-switch", network_accessible).disabled(true)),
+                );
+            }
         }
         v_flex()
             .child(network)
-            .when_some(tailscale_url, |el, url| {
+            .when(hosted_local, |el| {
+                let ts_desc = tailscale_url
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| t(cx, "Expose this machine over HTTPS on your tailnet.").to_owned());
+                let ts_entity = cx.entity().downgrade();
                 el.child(
                     div()
                         .border_t_1()
                         .border_color(hsla(p.border).opacity(0.5))
-                        .child(Row::new("access-tailscale-serve", t(cx, "Tailscale HTTPS")).description(url.to_owned())),
+                        .child(
+                            Row::new("access-tailscale-serve", t(cx, "Tailscale Serve"))
+                                .description(ts_desc)
+                                .control(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(r(8.))
+                                        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(t(cx, "Port")))
+                                        .child(
+                                            div()
+                                                .w(r(80.))
+                                                .child(
+                                                    Input::new(&self.access.tailscale_port)
+                                                        .small()
+                                                        .disabled(!next_tailscale)
+                                                        .theme_slot(ThemeSlot::Input, cx),
+                                                ),
+                                        )
+                                        .when(next_tailscale && !self.access.exposure_confirm_open, |row| {
+                                            row.child(
+                                                Button::new("access-tailscale-port-apply", ButtonVariant::Outline, ButtonSize::Xs)
+                                                    .label(t(cx, "Apply"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.access.exposure_confirm_open = true;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                        })
+                                        .child(
+                                            Switch::new("access-tailscale-serve-switch", next_tailscale)
+                                                .on_change(move |next, _, cx| {
+                                                    let _ = ts_entity.update(cx, |this, cx| {
+                                                        this.access.exposure_tailscale_draft = Some(next);
+                                                        this.access.exposure_confirm_open = true;
+                                                        this.access.exposure_error = None;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
                 )
+            })
+            .when(!hosted_local, |el| {
+                el.when_some(tailscale_url, |el, url| {
+                    el.child(
+                        div()
+                            .border_t_1()
+                            .border_color(hsla(p.border).opacity(0.5))
+                            .child(Row::new("access-tailscale-serve", t(cx, "Tailscale HTTPS")).description(url.to_owned())),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -1261,10 +1468,26 @@ impl SettingsView {
                 else { make_switch("access-relay-switch", managed, tunnel_reason, tunnel).into_any_element() },
             );
         }
-        let mut rows = vec![connect.into_any_element(), Row::new("access-publish-activity", t(cx, "Publish agent activity"))
-            .description(t(cx, "Send activity to mobile notifications and Live Activities."))
-            .control(make_switch("access-publish-activity-switch", link.publish_agent_activity, publish_reason, publish))
-            .into_any_element()];
+        let tunnel_usage = crate::cloud::render_tunnel_usage_meter(&self.state, cx);
+        let tunnel_alert = crate::cloud::render_tunnel_limit_alert(&self.state, cx);
+        let mut rows = vec![connect.into_any_element()];
+        if tunnel_usage.is_some() || tunnel_alert.is_some() {
+            rows.push(
+                v_flex()
+                    .px(r(16.))
+                    .py(r(10.))
+                    .gap(r(8.))
+                    .children(tunnel_usage)
+                    .children(tunnel_alert)
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            Row::new("access-publish-activity", t(cx, "Publish agent activity"))
+                .description(t(cx, "Send activity to mobile notifications and Live Activities."))
+                .control(make_switch("access-publish-activity-switch", link.publish_agent_activity, publish_reason, publish))
+                .into_any_element(),
+        );
         if link.managed_tunnel_active {
             let reason = if current_hold.is_none() {
                 Some(t(cx, "This server does not report a webhook queue preference.").to_owned())
@@ -1319,16 +1542,25 @@ impl SettingsView {
         self.access.relay_saving = true;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = link_access_relay(&client, service, &runtime, &environment_id, managed, publish, cx).await;
+            let result = link_access_relay_detailed(&client, service, &runtime, &environment_id, managed, publish, cx).await;
             let _ = this.update(cx, |this, cx| {
-                this.state.update(cx, |state, cx| state.refresh_cloud(cx));
+                this.state.update(cx, |state, cx| {
+                    state.refresh_cloud(cx);
+                    match &result {
+                        Ok(true) if managed => state.set_tunnel_limit_reached(None, cx),
+                        Err(err) if err.tunnel_limit.is_some() => {
+                            state.set_tunnel_limit_reached(err.tunnel_limit, cx);
+                        }
+                        _ => {}
+                    }
+                });
                 if this.access.active_target.as_deref() == Some(&id) {
                     this.access.relay_saving = false;
                     this.access.link_state_task = None;
                     cx.notify();
                 }
                 if let Err(error) = result {
-                    store::show_error(t(cx, &error).to_owned(), cx);
+                    store::show_error(t(cx, &error.message).to_owned(), cx);
                 }
             });
         }).detach();
@@ -1708,9 +1940,6 @@ impl SettingsView {
         if let Some(reason) = denial {
             rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::notice(reason, cx)).into_any_element());
         }
-        if self.access.link_machine.is_some() && !denied {
-            rows.push(self.link_machine_panel(target, cx));
-        }
         if !can_read {
             rows.push(div().px(r(16.)).py(r(12.)).child(muted_text("This connection can create access links but cannot view authorized clients.", cx)).into_any_element());
         }
@@ -1750,17 +1979,22 @@ impl SettingsView {
     }
 
     pub(super) fn dismiss_access_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.access.create.is_none() && self.access.revoke_device_confirm.is_none() {
+        if self.access.create.is_none()
+            && self.access.revoke_device_confirm.is_none()
+            && self.access.link_machine.is_none()
+        {
             return false;
         }
         if self.access.create.as_ref().is_some_and(|create| create.creating)
             || self.access.revoke_device_confirm.as_ref().is_some_and(|confirm| confirm.busy)
+            || self.access.link_machine.as_ref().is_some_and(|form| form.submitting)
         {
             return true;
         }
         self.access.create = None;
         self.access.revoke_device_confirm = None;
         self.access.revoke_focus = None;
+        self.access.link_machine = None;
         self.focus.focus(window, cx);
         cx.notify();
         true
@@ -1770,6 +2004,8 @@ impl SettingsView {
         let target = self.access.dialog_target.as_ref()?;
         let frame = if let Some(create) = self.access.create.as_ref() {
             self.create_link_frame(create, target, cx)
+        } else if let Some(form) = self.access.link_machine.as_ref() {
+            self.link_machine_frame(form, target, cx)
         } else {
             self.revoke_connect_frame(target, cx)?
         };
@@ -2037,7 +2273,10 @@ impl SettingsView {
                 }
             }),
         ];
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
         self.access.link_machine = Some(LinkMachineForm {
+            focus,
             choice: None,
             address,
             pairing_code,
@@ -2206,10 +2445,7 @@ impl SettingsView {
 
     /// Inline `"Link machine"` panel using `LinkMachineSelect`, `LinkAddressWarning`, and
     /// `mint_pairing_code_on` (`LinkedEnvironmentsSettings.tsx` + `LinkMachineSelect.tsx`).
-    fn link_machine_panel(&self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> AnyElement {
-        let Some(form) = self.access.link_machine.as_ref() else {
-            return div().into_any_element();
-        };
+    fn link_machine_frame(&self, form: &LinkMachineForm, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> DialogFrame {
         let p = palette(cx);
         let machines = self.access_linkable_machines(target, cx);
         let selected = form
@@ -2234,18 +2470,8 @@ impl SettingsView {
             extras: target.extras.clone(),
         };
 
-        v_flex()
-            .px(r(16.))
-            .py(r(14.))
-            .gap(r(10.))
-            .child(
-                v_flex()
-                    .gap(r(2.))
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Link an environment"))
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                        "Agents here can then launch, message and wait on threads there.",
-                    )),
-            )
+        let body = v_flex()
+            .gap(r(12.))
             .when(!machines.is_empty(), |this| {
                 this.child(crate::connect::render_link_machine_select(
                     "access-link-machine-select",
@@ -2296,29 +2522,32 @@ impl SettingsView {
                     }
                 }, cx))
             .children(form.error.clone().map(|error| div().text_xs().text_color(hsla(p.destructive_foreground)).child(error)))
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap(r(8.))
-                    .child(
-                        Button::new("access-link-machine-cancel", ButtonVariant::Ghost, ButtonSize::Sm)
-                            .label("Cancel")
-                            .disabled(form.submitting)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.access.link_machine = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("access-link-machine-submit", ButtonVariant::Default, ButtonSize::Sm)
-                            .label(if form.submitting { "Linking\u{2026}" } else { "Link" })
-                            .disabled(form.submitting || !ready)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.submit_access_link_machine(&submit_target, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
+            .into_any_element();
+
+        DialogFrame {
+            id: "access-link-machine-dialog",
+            title: t(cx, "Link an environment").into(),
+            description: t(cx, "Agents here can then launch, message and wait on threads there.").into(),
+            max_width: 520.,
+            body,
+            footer: dialog_footer(true, vec![
+                Button::new("access-link-machine-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+                    .label(t(cx, "Cancel"))
+                    .disabled(form.submitting)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dismiss_access_dialog(window, cx);
+                    }))
+                    .into_any_element(),
+                Button::new("access-link-machine-submit", ButtonVariant::Default, ButtonSize::Sm)
+                    .label(t(cx, if form.submitting { "Linking\u{2026}" } else { "Link" }))
+                    .disabled(form.submitting || !ready)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.submit_access_link_machine(&submit_target, cx);
+                    }))
+                    .into_any_element(),
+            ], cx).into_any_element(),
+            focus: form.focus.clone(),
+        }
     }
 
     fn create_link_frame(&self, create: &CreateLink, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> DialogFrame {
@@ -2961,5 +3190,77 @@ mod tests {
             "https://studio.tail.ts.net:3773"
         );
         assert_eq!(pairing_url("t3code://app/settings/connections", "CODE1"), None);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn link_machine_renders_as_modal_dialog_overlay_and_blocks_dismiss_while_submitting(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.environments.environments.push(t3_client::store::SavedEnvironment {
+                    id: "host-mac".into(),
+                    environment_id: Some("mac-env".into()),
+                    label: "Mac".into(),
+                    http_base: "http://127.0.0.1:3773".into(),
+                    access_token: Some("tok-host".into()),
+                    local: true,
+                    disabled: false,
+                    ssh: None,
+                    server_version: None,
+                });
+                state.environments.active = Some("host-mac".into());
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "mac-env", "label": "Mac" },
+                        "settings": { "threads": { "linkedEnvironmentsEnabled": true } }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+            crate::settings::open(super::super::Section::Access, cx);
+        });
+        let window = cx.add_window(|_, _| AccessSettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let view = vcx.read(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view"));
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let target = view.resolve_access_target(cx).1.expect("target");
+                view.access.dialog_target = Some(target.clone());
+                view.open_link_machine_form(target.saved_id, target.client, window, cx);
+                assert!(view.access_dialog_overlay(window, cx).is_some());
+                view.access.link_machine.as_mut().unwrap().submitting = true;
+                assert!(view.dismiss_access_dialog(window, cx));
+                assert!(view.access.link_machine.is_some(), "submitting blocks modal dismiss");
+                view.access.link_machine.as_mut().unwrap().submitting = false;
+                assert!(view.dismiss_access_dialog(window, cx));
+                assert!(view.access.link_machine.is_none());
+            });
+        });
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(_fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

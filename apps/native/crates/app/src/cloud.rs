@@ -1,17 +1,24 @@
 //! Connect screen account lifecycle, ported from web/cloud/managedAuth.tsx and relay discovery.
 use std::collections::HashMap;
 
-use gpui::Context;
+use gpui::{AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, Styled, div, px};
+use gpui_component::{h_flex, v_flex};
 use t3_client::connect::{
     ClerkAuthOutcome, PendingEmailSignIn, PendingSecondFactor,
 };
 use t3_core::connect::{
     CLERK_NATIVE_CALLBACK_SCHEME, FirstFactorKind, SecondFactorKind, SocialProvider,
 };
-use t3_core::relay::{Discovery, Environment, EnvironmentHealth, EnvironmentStatusValue};
+use t3_core::relay::{
+    Discovery, Environment, EnvironmentHealth, EnvironmentStatusValue, ManagedTunnelUpgrade,
+    T3CHAT_SUBSCRIPTION_URL, T3ChatLinkResponse, managed_tunnel_cap, tunnel_upgrade_copy,
+};
 
 use crate::app_state::{AppEvent, AppState};
 use crate::auth_session_macos::{self, ActiveAuthSession, AuthSessionError};
+use crate::icons::Icon;
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
+use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
 /// Active step of an interactive Clerk Native sign-in on the Connect screen.
@@ -37,6 +44,10 @@ pub struct CloudState {
     /// status checks and direct relay connections. False when only a legacy OAuth token exists.
     pub has_clerk_session: bool,
     pub discovery: Discovery,
+    pub t3_chat_link: Option<T3ChatLinkResponse>,
+    pub t3_chat_linking: bool,
+    pub last_tunnel_limit: Option<u32>,
+    pub pending_onboarding: bool,
     pub statuses: HashMap<String, EnvironmentHealth>,
     pub connecting_env_id: Option<String>,
     pub busy: bool,
@@ -56,6 +67,10 @@ impl Default for CloudState {
             identity: None,
             has_clerk_session: false,
             discovery: Default::default(),
+            t3_chat_link: None,
+            t3_chat_linking: false,
+            last_tunnel_limit: None,
+            pending_onboarding: false,
             statuses: HashMap::new(),
             connecting_env_id: None,
             busy: false,
@@ -112,12 +127,17 @@ impl AppState {
         let (service, generation) = (self.cloud.service.clone(), self.cloud.generation);
         let task = self.runtime().spawn(async move {
             let account = service.account_state().await?;
-            let discovery = if account.identity.is_some() {
-                service.discover().await
+            let (discovery, t3_chat) = if account.identity.is_some() {
+                if account.has_clerk_session {
+                    let (discovery, t3_chat) = tokio::join!(service.discover(), service.t3_chat_link());
+                    (discovery, t3_chat.ok())
+                } else {
+                    (service.discover().await, None)
+                }
             } else {
-                Ok(Discovery::default())
+                (Ok(Discovery::default()), None)
             };
-            Ok::<_, String>((account, discovery))
+            Ok::<_, String>((account, discovery, t3_chat))
         });
         self.cloud.task = Some(task.abort_handle());
         cx.emit(AppEvent::Phase);
@@ -132,9 +152,13 @@ impl AppState {
                 state.cloud.discovery.refreshing = false;
                 let mut should_probe_statuses = false;
                 match result {
-                    Ok(Ok((account, discovery))) => {
+                    Ok(Ok((account, discovery, t3_chat))) => {
                         state.cloud.identity = account.identity;
                         state.cloud.has_clerk_session = account.has_clerk_session;
+                        state.cloud.t3_chat_link = t3_chat;
+                        if state.cloud.identity.is_none() {
+                            state.cloud.pending_onboarding = false;
+                        }
                         match discovery {
                             Ok(d) => {
                                 should_probe_statuses =
@@ -337,14 +361,8 @@ impl AppState {
                 state.cloud.task = None;
                 match result {
                     Ok(Ok(ClerkAuthOutcome::Complete(session))) => {
-                        state.cloud.identity = Some(
-                            session
-                                .identity
-                                .unwrap_or_else(|| "T3 Connect account".into()),
-                        );
-                        state.cloud.has_clerk_session = true;
-                        state.cloud.auth_flow = CloudAuthFlow::Idle;
-                        state.refresh_cloud(cx);
+                        let was_signed_in = state.cloud.identity.is_some();
+                        state.complete_interactive_cloud_sign_in(was_signed_in, session.identity, cx);
                     }
                     Ok(Ok(ClerkAuthOutcome::NeedsSecondFactor(pending_2fa))) => {
                         state.cloud.auth_flow = CloudAuthFlow::SecondFactor(pending_2fa);
@@ -484,14 +502,8 @@ impl AppState {
                 state.cloud.task = None;
                 match result {
                     Ok(Ok(ClerkAuthOutcome::Complete(session))) => {
-                        state.cloud.identity = Some(
-                            session
-                                .identity
-                                .unwrap_or_else(|| "T3 Connect account".into()),
-                        );
-                        state.cloud.has_clerk_session = true;
-                        state.cloud.auth_flow = CloudAuthFlow::Idle;
-                        state.refresh_cloud(cx);
+                        let was_signed_in = state.cloud.identity.is_some();
+                        state.complete_interactive_cloud_sign_in(was_signed_in, session.identity, cx);
                     }
                     Ok(Ok(ClerkAuthOutcome::NeedsSecondFactor(pending_2fa))) => {
                         state.cloud.auth_flow = CloudAuthFlow::SecondFactor(pending_2fa);
@@ -538,14 +550,8 @@ impl AppState {
                 state.cloud.task = None;
                 match result {
                     Ok(Ok(session)) => {
-                        state.cloud.identity = Some(
-                            session
-                                .identity
-                                .unwrap_or_else(|| "T3 Connect account".into()),
-                        );
-                        state.cloud.has_clerk_session = true;
-                        state.cloud.auth_flow = CloudAuthFlow::Idle;
-                        state.refresh_cloud(cx);
+                        let was_signed_in = state.cloud.identity.is_some();
+                        state.complete_interactive_cloud_sign_in(was_signed_in, session.identity, cx);
                     }
                     Ok(Err(error)) => state.cloud.error = Some(error),
                     Err(_) => {}
@@ -701,6 +707,10 @@ impl AppState {
         self.cloud.identity = None;
         self.cloud.has_clerk_session = false;
         self.cloud.discovery = Default::default();
+        self.cloud.t3_chat_link = None;
+        self.cloud.t3_chat_linking = false;
+        self.cloud.last_tunnel_limit = None;
+        self.cloud.pending_onboarding = false;
         self.cloud.statuses.clear();
         self.cloud.error = None;
         self.cloud.busy = true;
@@ -723,6 +733,230 @@ impl AppState {
         })
         .detach();
     }
+
+    fn complete_interactive_cloud_sign_in(
+        &mut self,
+        was_signed_in: bool,
+        identity: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cloud.identity = Some(identity.unwrap_or_else(|| "T3 Connect account".into()));
+        self.cloud.has_clerk_session = true;
+        self.cloud.auth_flow = CloudAuthFlow::Idle;
+        if !was_signed_in && crate::connect_onboarding::should_open_on_fresh_sign_in() {
+            self.cloud.pending_onboarding = true;
+        }
+        self.refresh_cloud(cx);
+    }
+
+    pub fn set_tunnel_limit_reached(&mut self, limit: Option<u32>, cx: &mut Context<Self>) {
+        if self.cloud.last_tunnel_limit != limit {
+            self.cloud.last_tunnel_limit = limit;
+            cx.emit(AppEvent::Phase);
+        }
+    }
+
+    pub fn start_t3_chat_link(&mut self, cx: &mut Context<Self>) {
+        if self.cloud.t3_chat_linking || !self.cloud.has_clerk_session {
+            return;
+        }
+        self.cloud.t3_chat_linking = true;
+        let generation = self.cloud.generation;
+        let service = self.cloud.service.clone();
+        let task = self
+            .runtime()
+            .spawn(async move { service.create_t3_chat_link_request().await });
+        cx.emit(AppEvent::Phase);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |state, cx| {
+                if state.cloud.generation != generation {
+                    return;
+                }
+                state.cloud.t3_chat_linking = false;
+                match result {
+                    Ok(Ok(url)) => cx.open_url(&url),
+                    Ok(Err(error)) => {
+                        state.show_toast(
+                            Toast::new(ToastKind::Error, "Could not start T3 Chat link")
+                                .description(error),
+                            cx,
+                        );
+                    }
+                    Err(_) => {}
+                }
+                cx.emit(AppEvent::Phase);
+            });
+        })
+        .detach();
+    }
+}
+
+const MAX_USAGE_SEGMENTS: u32 = 10;
+
+fn tunnel_upgrade_cta(
+    id: &'static str,
+    upgrade: Option<ManagedTunnelUpgrade>,
+    linking: bool,
+    state: &Entity<AppState>,
+    cx: &App,
+) -> Option<AnyElement> {
+    match upgrade {
+        Some(ManagedTunnelUpgrade::Link) => {
+            let state = state.clone();
+            Some(
+                Button::new(id, ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(crate::i18n::t(cx, "Link T3 Chat"))
+                    .disabled(linking)
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |state, cx| state.start_t3_chat_link(cx));
+                    })
+                    .into_any_element(),
+            )
+        }
+        Some(ManagedTunnelUpgrade::Pro | ManagedTunnelUpgrade::Premier) => Some(
+            Button::new(id, ButtonVariant::Outline, ButtonSize::Xs)
+                .label(crate::i18n::t(cx, "Upgrade on T3 Chat"))
+                .on_click(|_, _, cx| cx.open_url(T3CHAT_SUBSCRIPTION_URL))
+                .into_any_element(),
+        ),
+        None => None,
+    }
+}
+
+/// Renders `"2 of 3 tunnels in use"` + segmented/continuous bar and T3 Chat upgrade prompt.
+pub fn render_tunnel_usage_meter(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    let cloud = &state.read(cx).cloud;
+    if !cloud.has_clerk_session || !cloud.discovery.listed {
+        return None;
+    }
+    let cap = managed_tunnel_cap(&cloud.discovery.environments, cloud.t3_chat_link.as_ref());
+    if cap.limit == 0 {
+        return None;
+    }
+    let p = palette(cx);
+    let full = cap.used as u32 >= cap.limit;
+    let fill = if full { hsla(p.warning) } else { hsla(p.foreground).opacity(0.72) };
+    let label_color = if full { hsla(p.warning_foreground) } else { hsla(p.foreground) };
+    let used_label = crate::i18n::t_fmt(
+        cx,
+        "{used} of {limit} tunnels in use",
+        &[("used", (cap.used as i64).into()), ("limit", i64::from(cap.limit).into())],
+    );
+    let action = tunnel_upgrade_cta("tunnel-usage-cta", cap.upgrade, cloud.t3_chat_linking, state, cx);
+    let bar = if cap.limit <= MAX_USAGE_SEGMENTS {
+        h_flex()
+            .h(px(6.))
+            .w_full()
+            .gap(px(4.))
+            .children((0..cap.limit).map(|index| {
+                div()
+                    .flex_1()
+                    .h_full()
+                    .rounded_full()
+                    .bg(if (index as usize) < cap.used { fill } else { hsla(p.muted) })
+            }))
+            .into_any_element()
+    } else {
+        let pct = (cap.used as f32 / cap.limit as f32).clamp(0.0, 1.0);
+        div()
+            .w_full()
+            .h(px(6.))
+            .rounded_full()
+            .bg(hsla(p.muted))
+            .overflow_hidden()
+            .child(div().h_full().rounded_full().bg(fill).w(gpui::relative(pct)))
+            .into_any_element()
+    };
+    Some(
+        v_flex()
+            .max_w(px(384.))
+            .gap(px(6.))
+            .child(
+                h_flex()
+                    .items_baseline()
+                    .justify_between()
+                    .gap(px(12.))
+                    .text_xs()
+                    .child(div().text_color(label_color).child(used_label))
+                    .children(action),
+            )
+            .child(bar)
+            .children(cap.upgrade.map(|upgrade| {
+                div()
+                    .text_xs()
+                    .text_color(hsla(p.muted_foreground))
+                    .child(tunnel_upgrade_copy(upgrade))
+            }))
+            .into_any_element(),
+    )
+}
+
+/// Warning alert shown when creating a managed tunnel failed at the account limit.
+pub fn render_tunnel_limit_alert(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    let cloud = &state.read(cx).cloud;
+    let _limit = cloud.last_tunnel_limit?;
+    let cap = managed_tunnel_cap(&cloud.discovery.environments, cloud.t3_chat_link.as_ref());
+    let p = palette(cx);
+    let title = crate::i18n::t(cx, "You're out of tunnels (they cost us money).");
+    let description = match cap.upgrade {
+        Some(ManagedTunnelUpgrade::Link) => crate::i18n::t(
+            cx,
+            "Switch to Tailscale or get more tunnels by linking your T3 Chat sub (sorry!)",
+        ),
+        Some(_) => crate::i18n::t(
+            cx,
+            "Switch to Tailscale or get more tunnels by upgrading your T3 Chat sub (sorry!)",
+        ),
+        None => crate::i18n::t(
+            cx,
+            "Switch to Tailscale or deregister an environment you no longer use (sorry!)",
+        ),
+    };
+    let cta = tunnel_upgrade_cta(
+        "tunnel-limit-alert-cta",
+        cap.upgrade,
+        cloud.t3_chat_linking,
+        state,
+        cx,
+    )
+    .unwrap_or_else(|| {
+        let state = state.clone();
+        Button::new("tunnel-limit-alert-dismiss", ButtonVariant::Outline, ButtonSize::Xs)
+            .label(crate::i18n::t(cx, "Dismiss"))
+            .on_click(move |_, _, cx| {
+                state.update(cx, |state, cx| state.set_tunnel_limit_reached(None, cx));
+            })
+            .into_any_element()
+    });
+    Some(
+        h_flex()
+            .w_full()
+            .items_start()
+            .gap(px(10.))
+            .p(px(12.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hsla(p.warning).opacity(0.45))
+            .bg(hsla(p.warning).opacity(0.08))
+            .child(div().pt(px(2.)).child(Icon::TriangleAlert.sized(px(14.)).text_color(hsla(p.warning_foreground))))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.warning_foreground))
+                            .child(title),
+                    )
+                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(description)),
+            )
+            .child(cta)
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]

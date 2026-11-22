@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use t3_core::compatibility::{ProtocolMismatch, protocol_mismatch};
 use t3_core::local_server::{
-    CliVersionRefusal, DEFAULT_LOCAL_SERVER_HOST, LocalServerEvent, LocalServerFailure, LocalServerFailureKind, LocalServerLaunchSpec,
-    LocalServerLifecycle, LocalServerPhase, SERVER_EXIT_CODE_MANAGED_POLICY, ServerRuntimeState, StartupExitKind, TERMINATE_GRACE_MS,
-    check_cli_version, classify_server_exit, cli_candidates, cli_failure_summary, managed_policy_diagnostic, matches_hosted_runtime, pair_args,
-    parse_pair_output, parse_runtime_state, runtime_state_paths, serve_args, server_origin, t3_home,
+    CliVersionRefusal, DEFAULT_LOCAL_SERVER_HOST, LocalServerEvent, LocalServerExposure, LocalServerFailure, LocalServerFailureKind,
+    LocalServerLaunchSpec, LocalServerLifecycle, LocalServerPhase, SERVER_EXIT_CODE_MANAGED_POLICY, ServerRuntimeState, StartupExitKind,
+    TERMINATE_GRACE_MS, check_cli_version, classify_server_exit, cli_candidates, cli_failure_summary, managed_policy_diagnostic,
+    matches_hosted_runtime, pair_args, parse_pair_output, parse_runtime_state, runtime_state_paths, serve_args, server_origin, t3_home,
 };
 use t3_core::pairing::PairingLink;
 use t3_core::server_config::EnvironmentDescriptor;
@@ -289,6 +289,26 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// UI state key storing local-server network & Tailscale Serve exposure preferences.
+const LOCAL_SERVER_EXPOSURE_KEY: &str = "local-server-exposure";
+
+/// Loads persisted local-server exposure settings (`LocalServerExposure`).
+pub fn load_local_server_exposure() -> LocalServerExposure {
+    if cfg!(test) {
+        return LocalServerExposure::default();
+    }
+    crate::store::load_ui_state(LOCAL_SERVER_EXPOSURE_KEY)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+/// Persists local-server exposure settings (`LocalServerExposure`).
+pub fn save_local_server_exposure(exposure: &LocalServerExposure) {
+    if !cfg!(test) {
+        crate::store::save_ui_state(LOCAL_SERVER_EXPOSURE_KEY, exposure);
+    }
+}
+
 /// Configuration for hosting a local `t3 serve` subprocess (`LocalServerHost`).
 #[derive(Debug, Clone)]
 pub struct LocalServerHostConfig {
@@ -296,6 +316,8 @@ pub struct LocalServerHostConfig {
     pub cli_override: Option<PathBuf>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub tailscale_serve: bool,
+    pub tailscale_serve_port: Option<u16>,
     pub readiness_timeout: Duration,
     pub terminate_grace: Duration,
 }
@@ -307,8 +329,19 @@ impl LocalServerHostConfig {
             cli_override: None,
             host: Some(DEFAULT_LOCAL_SERVER_HOST.to_owned()),
             port: None,
+            tailscale_serve: false,
+            tailscale_serve_port: None,
             readiness_timeout: DEFAULT_HOST_READINESS_TIMEOUT,
             terminate_grace: Duration::from_millis(TERMINATE_GRACE_MS),
+        }
+    }
+
+    pub fn for_home_with_exposure(home: PathBuf, exposure: &LocalServerExposure) -> Self {
+        Self {
+            host: Some(exposure.bind_host().to_owned()),
+            tailscale_serve: exposure.tailscale_serve,
+            tailscale_serve_port: exposure.effective_tailscale_port(),
+            ..Self::for_home(home)
         }
     }
 }
@@ -454,13 +487,27 @@ impl LocalServerHost {
         start_inner(self.inner.clone(), config).await
     }
 
-    /// Returns a `'static` future that starts the local server using the default `T3CODE_HOME`,
-    /// allowing callers (e.g. `AppState`) to keep unique ownership of `LocalServerHost` for `Drop`.
+    /// Returns a `'static` future that starts the local server using the default `T3CODE_HOME`
+    /// and persisted exposure preferences.
     pub fn start_future(&self) -> impl Future<Output = Result<LocalServer, LocalServerHostError>> + Send + 'static {
         let inner = self.inner.clone();
         async move {
             let home = home().ok_or(LocalServerHostError::HomeUnavailable)?;
-            start_inner(inner, LocalServerHostConfig::for_home(home)).await
+            let exposure = load_local_server_exposure();
+            start_inner(inner, LocalServerHostConfig::for_home_with_exposure(home, &exposure)).await
+        }
+    }
+
+    /// Stops any active managed child process and starts a fresh local server with `exposure`.
+    pub fn restart_with_exposure_future(
+        &self,
+        exposure: LocalServerExposure,
+    ) -> impl Future<Output = Result<LocalServer, LocalServerHostError>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move {
+            stop_inner(&inner).await;
+            let home = home().ok_or(LocalServerHostError::HomeUnavailable)?;
+            start_inner(inner, LocalServerHostConfig::for_home_with_exposure(home, &exposure)).await
         }
     }
 
@@ -578,6 +625,8 @@ async fn start_inner(
         default_home,
         host: config.host.clone(),
         port: config.port,
+        tailscale_serve: config.tailscale_serve,
+        tailscale_serve_port: config.tailscale_serve_port,
     });
 
     let mut command = tokio::process::Command::new(&cli);

@@ -2077,7 +2077,7 @@ impl UpdateControl {
             );
         }
         let checking = manual_check_status(cx) == ManualCheckStatus::Checking;
-        let label = if checking { "Checking for updates…" } else { "Check for updates" };
+        let raw_label = if checking { "Checking for updates…" } else { "Check for updates" };
         let state = self.state.clone();
         let button = keyboard_button(
             div()
@@ -2087,9 +2087,9 @@ impl UpdateControl {
                 .items_center()
                 .justify_center()
                 .rounded(rem(8.))
-                .aria_label(t(cx, label))
+                .aria_label(t(cx, raw_label))
                 .when(!checking, |button| button.cursor_pointer().hover(|style| style.bg(hsla(p.sidebar_row_hover))))
-                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(t(cx, label)).build(window, cx))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(t(cx, raw_label)).build(window, cx))
                 .child(if checking {
                     Spinner::new("checking-for-updates", px(14.), hsla(p.sidebar_icon)).into_any_element()
                 } else {

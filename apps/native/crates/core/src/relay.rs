@@ -5,6 +5,104 @@ use serde_json::Value;
 pub const CONNECTION_UNAVAILABLE: &str = "Connecting through T3 Connect is not supported with native sign-in yet. Use a pairing link or SSH.";
 pub const LEGACY_OAUTH_NOTICE: &str = "Sign in with T3 Connect to enable direct relay connections.";
 
+pub const DEFAULT_MANAGED_TUNNEL_LIMIT: u32 = 3;
+pub const T3CHAT_PRO_TUNNEL_LIMIT: u32 = 10;
+pub const T3CHAT_PREMIER_TUNNEL_LIMIT: u32 = 100;
+pub const T3CHAT_SUBSCRIPTION_URL: &str = "https://t3.chat/settings/subscription";
+pub const T3_CONNECT_TROUBLESHOOTING_URL: &str = "https://github.com/pingdotgg/t3code/blob/main/docs/user/t3-connect-troubleshooting.md";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum T3ChatPlan {
+    Free,
+    Pro,
+    Premier,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3ChatLink {
+    #[serde(default)]
+    pub email: Option<String>,
+    pub plan: T3ChatPlan,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3ChatLinkResponse {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub link: Option<T3ChatLink>,
+    #[serde(default)]
+    pub max_tunnels_override: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedTunnelUpgrade {
+    Link,
+    Pro,
+    Premier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedTunnelCap {
+    pub used: usize,
+    pub limit: u32,
+    pub upgrade: Option<ManagedTunnelUpgrade>,
+}
+
+pub fn managed_tunnel_cap(environments: &[Environment], t3_chat: Option<&T3ChatLinkResponse>) -> ManagedTunnelCap {
+    let used = environments
+        .iter()
+        .filter(|env| env.endpoint.provider_kind == "cloudflare_tunnel")
+        .count();
+    let (limit, upgrade) = match t3_chat {
+        Some(cfg) if cfg.max_tunnels_override.is_some() => (cfg.max_tunnels_override.unwrap_or(DEFAULT_MANAGED_TUNNEL_LIMIT), None),
+        Some(cfg) if !cfg.available => (DEFAULT_MANAGED_TUNNEL_LIMIT, None),
+        Some(cfg) => match cfg.link.as_ref().map(|link| link.plan) {
+            Some(T3ChatPlan::Premier) => (T3CHAT_PREMIER_TUNNEL_LIMIT, None),
+            Some(T3ChatPlan::Pro) => (T3CHAT_PRO_TUNNEL_LIMIT, Some(ManagedTunnelUpgrade::Premier)),
+            Some(T3ChatPlan::Free | T3ChatPlan::Other) => (DEFAULT_MANAGED_TUNNEL_LIMIT, Some(ManagedTunnelUpgrade::Pro)),
+            None => (DEFAULT_MANAGED_TUNNEL_LIMIT, Some(ManagedTunnelUpgrade::Link)),
+        },
+        None => (DEFAULT_MANAGED_TUNNEL_LIMIT, None),
+    };
+    ManagedTunnelCap { used, limit, upgrade }
+}
+
+pub fn tunnel_upgrade_copy(upgrade: ManagedTunnelUpgrade) -> String {
+    match upgrade {
+        ManagedTunnelUpgrade::Link => format!(
+            "Link T3 Chat Pro for up to {T3CHAT_PRO_TUNNEL_LIMIT} tunnels, or Premier for up to {T3CHAT_PREMIER_TUNNEL_LIMIT}."
+        ),
+        ManagedTunnelUpgrade::Pro => format!(
+            "Upgrade to T3 Chat Pro for up to {T3CHAT_PRO_TUNNEL_LIMIT} tunnels, or Premier for up to {T3CHAT_PREMIER_TUNNEL_LIMIT}."
+        ),
+        ManagedTunnelUpgrade::Premier => {
+            format!("Upgrade to T3 Chat Premier for up to {T3CHAT_PREMIER_TUNNEL_LIMIT} tunnels.")
+        }
+    }
+}
+
+pub fn extract_tunnel_limit_error(status: u16, error: &Value) -> Option<u32> {
+    if !(400..500).contains(&status) {
+        return None;
+    }
+    if error["_tag"].as_str() != Some("RelayManagedTunnelLimitReachedError") {
+        return None;
+    }
+    Some(
+        error["maxTunnels"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MANAGED_TUNNEL_LIMIT),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Endpoint {
@@ -152,6 +250,13 @@ pub fn error_message(status: u16, error: &Value) -> String {
             "Relay encountered an internal error ({}).",
             error["reason"].as_str().unwrap_or("unknown")
         ),
+        "RelayManagedTunnelLimitReachedError" => {
+            let max = error["maxTunnels"]
+                .as_u64()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default();
+            format!("You have reached the T3 Connect tunnel limit{max}.")
+        }
         _ if status == 504 => {
             "Relay timed out before it finished the request (HTTP 504). Try again in a few minutes. If it keeps failing, copy the trace ID when you report it."
                 .into()
@@ -218,5 +323,64 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(connect.expires_at_epoch_ms(), Some(1_795_197_600_000));
+    }
+
+    #[test]
+    fn managed_tunnel_cap_and_limit_errors_follow_t3chat_plan_rules() {
+        let envs = vec![
+            Environment {
+                environment_id: "e1".into(),
+                label: "One".into(),
+                endpoint: Endpoint {
+                    http_base_url: "https://e1.t3.codes".into(),
+                    ws_base_url: "wss://e1.t3.codes/ws".into(),
+                    provider_kind: "cloudflare_tunnel".into(),
+                },
+            },
+            Environment {
+                environment_id: "e2".into(),
+                label: "Two".into(),
+                endpoint: Endpoint {
+                    http_base_url: "https://e2.ts.net".into(),
+                    ws_base_url: "wss://e2.ts.net/ws".into(),
+                    provider_kind: "manual".into(),
+                },
+            },
+        ];
+        let cap_unlinked = managed_tunnel_cap(
+            &envs,
+            Some(&T3ChatLinkResponse { available: true, link: None, max_tunnels_override: None }),
+        );
+        assert_eq!(
+            cap_unlinked,
+            ManagedTunnelCap { used: 1, limit: 3, upgrade: Some(ManagedTunnelUpgrade::Link) }
+        );
+        let cap_pro = managed_tunnel_cap(
+            &envs,
+            Some(&T3ChatLinkResponse {
+                available: true,
+                link: Some(T3ChatLink { email: None, plan: T3ChatPlan::Pro }),
+                max_tunnels_override: None,
+            }),
+        );
+        assert_eq!(
+            cap_pro,
+            ManagedTunnelCap { used: 1, limit: 10, upgrade: Some(ManagedTunnelUpgrade::Premier) }
+        );
+        let cap_override = managed_tunnel_cap(
+            &envs,
+            Some(&T3ChatLinkResponse {
+                available: true,
+                link: Some(T3ChatLink { email: None, plan: T3ChatPlan::Free }),
+                max_tunnels_override: Some(25),
+            }),
+        );
+        assert_eq!(cap_override, ManagedTunnelCap { used: 1, limit: 25, upgrade: None });
+        assert_eq!(
+            extract_tunnel_limit_error(403, &json!({"_tag": "RelayManagedTunnelLimitReachedError", "maxTunnels": 3})),
+            Some(3)
+        );
+        assert_eq!(extract_tunnel_limit_error(403, &json!({"_tag": "Other"})), None);
+        assert!(tunnel_upgrade_copy(ManagedTunnelUpgrade::Pro).contains("10"));
     }
 }

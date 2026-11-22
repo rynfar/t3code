@@ -331,6 +331,7 @@ impl RenderOnce for Button {
                     })
             })
             .children(theme_slot_clipped_background_layer(ThemeSlot::Button, r(radius), cx))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::Button, cx))
             .children(leading)
             .children(self.label.map(|label| {
                 div().relative().min_w_0().truncate()
@@ -448,6 +449,7 @@ impl RenderOnce for Switch {
                     })
             })
             .children(switch_bg_layer)
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::Switch, cx))
             .child(
                 div()
                     .relative()
@@ -979,6 +981,7 @@ pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
         .shadow(control_shadow())
         .theme_slot(ThemeSlot::SettingsGroup, cx)
         .children(theme_slot_clipped_background_layer(ThemeSlot::SettingsGroup, r(12.), cx))
+        .children(crate::theme::inspector_slot_probe(ThemeSlot::SettingsGroup, cx))
         .children(rows.into_iter().enumerate().map(move |(index, row)| {
             div().relative().when(index > 0 && index < count, |this| this.border_t_1().border_color(divider)).child(row)
         }))
@@ -1617,6 +1620,7 @@ impl RenderOnce for NumberField {
             .flex_1()
             .min_w_0()
             .children(background)
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::Input, cx))
             .child(
                 NumberInput::new(&self.state)
                     .appearance(!custom)

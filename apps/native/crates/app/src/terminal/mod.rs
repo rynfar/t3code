@@ -75,15 +75,26 @@ pub fn header_toggle(drawer: &Entity<TerminalDrawer>, cx: &App) -> impl IntoElem
         .cursor_pointer()
         .when_some(open.then_some(hsla(p.accent)), |this, fill| this.bg(fill))
         .hover(move |style| style.bg(hsla(p.accent)))
-        .tooltip(|window, cx| Tooltip::new(SharedString::from(with_shortcut("Toggle terminal", "terminal.toggle", cx))).build(window, cx))
+        .tooltip(|window, cx| {
+            Tooltip::new(SharedString::from(with_shortcut("Toggle terminal drawer", "terminal.toggle", cx))).build(window, cx)
+        })
         .on_click(move |_, window, cx| drawer.update(cx, |drawer, cx| drawer.toggle(window, cx)))
         .child(div().opacity(0.8).child(Icon::SquareTerminal.render(px(16.), hsla(p.foreground))))
 }
 
 /// `New Terminal (⌘N)`: the label with the command's current shortcut, as the web words them.
 fn with_shortcut(name: &str, command: &str, cx: &App) -> String {
+    let translated = crate::i18n::t(cx, name);
     match crate::keymap::label(command, cx) {
-        Some(shortcut) => format!("{name} ({shortcut})"),
-        None => name.to_owned(),
+        Some(shortcut) => {
+            let template = format!("{name} ({{shortcut}})");
+            let formatted = crate::i18n::t_fmt(cx, &template, &[("shortcut", shortcut.as_str().into())]);
+            if formatted != template.replace("{shortcut}", &shortcut) {
+                formatted
+            } else {
+                format!("{translated} ({shortcut})")
+            }
+        }
+        None => translated.to_owned(),
     }
 }

@@ -630,13 +630,19 @@ impl UpdateTrackSwitchDialog {
             (lookup, state.runtime().clone())
         };
         let Some((_env_id, client_fut)) = lookup else {
-            self.phase = TrackSwitchPhase::Error("Connect to a server to check releases.".into());
+            self.phase = TrackSwitchPhase::Error(crate::i18n::t(cx, "Connect to a server to check releases.").into());
             cx.notify();
             return;
         };
+        let fallback_err = crate::i18n::t(
+            cx,
+            "Could not check this environment's npm registry. Check the connection and registry settings.",
+        )
+        .to_owned();
+        let connect_err = crate::i18n::t(cx, "Connect to a server to check releases.").to_owned();
         let task = runtime.spawn(async move {
             let Some(client) = client_fut.await else {
-                return Err("Connect to a server to check releases.".to_owned());
+                return Err(connect_err);
             };
             match client
                 .request(
@@ -676,19 +682,19 @@ impl UpdateTrackSwitchDialog {
                         t3_client::session::RpcError::Failure(f) if !f.message.trim().is_empty() => {
                             f.message
                         }
-                        _ => "Could not check this environment's npm registry. Check the connection and registry settings.".to_owned(),
+                        _ => fallback_err.clone(),
                     };
                     Err(msg)
                 }
             }
         });
+        let timeout_err = crate::i18n::t(
+            cx,
+            "Could not check this environment's npm registry. Check the connection and registry settings.",
+        )
+        .to_owned();
         self._fetch = Some(cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|_| {
-                Err(
-                    "Could not check this environment's npm registry. Check the connection and registry settings."
-                        .to_owned(),
-                )
-            });
+            let result = task.await.unwrap_or(Err(timeout_err));
             let _ = this.update(cx, |this, cx| {
                 this._fetch = None;
                 this.apply_release_result(result, cx);
@@ -791,7 +797,7 @@ impl UpdateTrackSwitchDialog {
             captures,
         } = &self.phase
         else {
-            return Some("Checking releases…".into());
+            return Some(crate::i18n::t(cx, "Checking releases…").into());
         };
         let (idle, _, _) = self.idle_outcome(cx)?;
         if let Some(reason) = idle.disabled_reason {
@@ -957,7 +963,7 @@ impl Render for UpdateTrackSwitchDialog {
                     }
                     if crosses_local && updates_off {
                         notes.push(
-                            "This app's updates are off here, so reinstall it yourself to switch."
+                            crate::i18n::t(cx, "This app's updates are off here, so reinstall it yourself to switch.")
                                 .to_owned(),
                         );
                     }

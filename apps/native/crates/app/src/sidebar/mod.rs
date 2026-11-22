@@ -2012,6 +2012,7 @@ impl Render for SidebarPane {
                 this.finish_project_drop(false, window, cx);
             }))
             .children(inner_bg_layer)
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::SidebarInner, cx))
             .child(self.hover.begin_frame_probe())
             .child({
                 let pane = cx.weak_entity();

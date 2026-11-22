@@ -421,10 +421,10 @@ impl TerminalPane {
                     .occlude()
                     .on_mouse_down_out(cx.listener(|pane, _, _, cx| pane.dismiss_selection_menu(cx)))
                     .child(
-                        MenuItem::new("terminal-selection-add-to-chat", "Add to chat")
+                        MenuItem::new("terminal-selection-add-to-chat", crate::i18n::t(cx, "Add to chat"))
                             .on_click(cx.listener(|pane, _, window, cx| pane.add_to_chat(&AddToChat, window, cx))),
                     )
-                    .child(MenuItem::new("terminal-selection-copy", "Copy").on_click(cx.listener(|pane, _, window, cx| {
+                    .child(MenuItem::new("terminal-selection-copy", crate::i18n::t(cx, "Copy")).on_click(cx.listener(|pane, _, window, cx| {
                         pane.dismiss_selection_menu(cx);
                         pane.copy(&Copy, window, cx);
                         window.focus(&pane.focus, cx);

@@ -4,8 +4,8 @@
 //! stick to the top, 24px hunk separators, and a 4px change bar in the gutter.
 
 use gpui::{
-    AnyElement, App, Context, Div, FontWeight, Hsla, IntoElement, ParentElement, Pixels, ScrollWheelEvent, SharedString,
-    Styled, Window, div, list, prelude::*, px,
+    AnyElement, App, Context, Div, FontWeight, Hsla, IntoElement, MouseMoveEvent, ParentElement, Pixels,
+    ScrollWheelEvent, SharedString, Styled, Window, div, list, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -108,12 +108,19 @@ impl DiffPanel {
                     this.cancel_navigation_on_interaction();
                 }
             }))
-            .on_mouse_move(cx.listener(Self::drag_comment_selection))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.drag_comment_selection(event, window, cx);
+                this.drag_code_selection(event, window, cx);
+            }))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
                 this.track_comment_pointer(event.position, cx);
                 this.finish_selection(window, cx);
+                this.finish_code_selection(cx);
             }))
-            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.finish_selection(window, cx)))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                this.finish_selection(window, cx);
+                this.finish_code_selection(cx);
+            }))
             .child(list(self.list.clone(), cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx))).size_full())
             .children(sticky.map(|file| div().absolute().top_0().left_0().right_0().child(self.render_file_header(file, cx))))
             .vertical_scrollbar(&self.list)
@@ -169,7 +176,7 @@ impl DiffPanel {
                 let p = palette(cx);
                 let highlighted = self.is_revealed_line(file, &content, None);
                 self.code_row(line_colors(content.kind, p).row, cx)
-                    .child(self.half((file, hunk), Some((&content, line)), digits, true, highlighted, cx))
+                    .child(self.half((file, hunk), ix, Some((&content, line)), digits, true, Side::Additions, highlighted, cx))
                     .into_any_element()
             }
             DiffRow::Split { file, hunk, left, right } => {
@@ -183,8 +190,8 @@ impl DiffPanel {
                 let left_hi = left.is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(Side::Deletions)));
                 let right_hi = right.is_some_and(|(line, _)| self.is_revealed_line(file, line, Some(Side::Additions)));
                 self.code_row(hsla(p.background), cx)
-                    .child(self.half((file, hunk), left, digits, false, left_hi, cx))
-                    .child(self.half((file, hunk), right, digits, true, right_hi, cx))
+                    .child(self.half((file, hunk), ix, left, digits, false, Side::Deletions, left_hi, cx))
+                    .child(self.half((file, hunk), ix, right, digits, true, Side::Additions, right_hi, cx))
                     .into_any_element()
             }
             DiffRow::NoNewline { file, hunk, line } => {
@@ -229,7 +236,18 @@ impl DiffPanel {
 
     /// One side of a row: a gutter with the line number and change bar, then the code. In the
     /// stacked layout deletions show their old number and everything else its new one.
-    fn half(&self, (file, hunk): (usize, usize), entry: Option<(&DiffLine, usize)>, digits: usize, new_side: bool, highlighted: bool, cx: &mut Context<Self>) -> Div {
+    #[allow(clippy::too_many_arguments)]
+    fn half(
+        &self,
+        (file, hunk): (usize, usize),
+        row_ix: usize,
+        entry: Option<(&DiffLine, usize)>,
+        digits: usize,
+        new_side: bool,
+        col_side: Side,
+        highlighted: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let line = entry.map(|(line, _)| line);
         let p = palette(cx);
         let char_width = self.char_width.unwrap_or(px(7.8));
@@ -287,11 +305,17 @@ impl DiffPanel {
                     .map(|gutter| self.comment_gutter(gutter, file, line, new_side, cx)),
             )
             .child({
+                let selected_code = self.is_code_row_selected(file, col_side, row_ix);
                 let column = div()
+                    .id(("diff-code-col", (row_ix << 1) | usize::from(new_side)))
                     .flex_1()
                     .min_w_0()
                     .px(px(CODE_PADDING))
-                    .text_color(hsla(p.code_foreground));
+                    .text_color(hsla(p.code_foreground))
+                    .when(selected_code, |col| col.bg(hsla(p.primary).opacity(0.16)))
+                    .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        this.begin_code_press(file, col_side, row_ix, event, window, cx);
+                    }));
                 if self.wrap {
                     column.children(text)
                 } else {

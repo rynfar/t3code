@@ -79,7 +79,8 @@ impl PanelAction {
             PanelAction::Close => "Close Terminal",
         };
         if self.at_limit(at_limit) {
-            return format!("{name} (max {MAX_TERMINALS_PER_GROUP} per group)");
+            let translated = crate::i18n::t(cx, name);
+            return format!("{translated} (max {MAX_TERMINALS_PER_GROUP} per group)");
         }
         with_shortcut(name, self.command(), cx)
     }
@@ -294,7 +295,9 @@ impl PanelTerminalView {
         }
         let label = terminal_label(&self.thread_id, terminal_id, cx);
         let (message, detail) = terminal::close_confirmation(&[label]);
-        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Close", "Cancel"], cx);
+        let close_label = crate::i18n::t(cx, "Close");
+        let cancel_label = crate::i18n::t(cx, "Cancel");
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &[close_label, cancel_label], cx);
         let terminal_id = terminal_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(0) {

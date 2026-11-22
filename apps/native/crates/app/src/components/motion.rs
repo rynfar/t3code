@@ -350,15 +350,38 @@ macro_rules! animated_extent {
             id: ElementId,
             extent: Pixels,
             open: bool,
+            align_end: bool,
             duration: Duration,
             content: AnyElement,
         }
 
         impl $name {
             /// Wraps a child at its full extent and animates the visible area to or from zero.
+            #[allow(dead_code)]
             $(#[$attr])*
             pub fn new(id: impl Into<ElementId>, extent: Pixels, open: bool, duration: Duration, content: impl IntoElement) -> Self {
-                Self { id: id.into(), extent: extent.max(px(0.)), open, duration, content: content.into_any_element() }
+                Self { id: id.into(), extent: extent.max(px(0.)), open, align_end: false, duration, content: content.into_any_element() }
+            }
+
+            /// Aligns the inner full-size child to the trailing edge of the visible clip.
+            #[allow(dead_code)]
+            pub fn align_end(mut self, align_end: bool) -> Self {
+                self.align_end = align_end;
+                self
+            }
+
+            /// Renders a static or externally driven clip of `visible` along the primary axis while
+            /// keeping `full` unshrunk inside an overflow-hidden container.
+            #[allow(dead_code)]
+            pub fn clipped(visible: Pixels, full: Pixels, align_end: bool, content: impl IntoElement) -> gpui::Div {
+                div()
+                    .flex()
+                    .flex_none()
+                    .$cross()
+                    .$extent(visible.max(px(0.)))
+                    .overflow_hidden()
+                    .when(align_end, |clip| clip.justify_end())
+                    .child(div().flex_none().$cross().$extent(full.max(px(0.))).child(content))
             }
         }
 
@@ -368,6 +391,7 @@ macro_rules! animated_extent {
                 let visible = transition((self.id.clone(), $axis), target, self.duration, window, cx);
                 div().id(self.id).flex().flex_none().$cross().$extent(px(visible))
                     .overflow_hidden()
+                    .when(self.align_end, |clip| clip.justify_end())
                     .child(div().flex_none().$cross().$extent(self.extent).when(visible == 0., |inner| inner.hidden()).child(self.content))
             }
         }
@@ -375,11 +399,12 @@ macro_rules! animated_extent {
 }
 
 animated_extent!(AnimatedHeight, h, w_full, "height");
+animated_extent!(AnimatedWidth, w, h_full, "width");
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{Context, Render, TestAppContext};
 
     #[gpui::test]
     fn honors_gpui_reduce_motion(cx: &mut TestAppContext) {
@@ -387,5 +412,53 @@ mod tests {
             cx.set_reduce_motion(true);
             assert!(prefers_reduced_motion(cx));
         });
+    }
+
+    #[gpui::test]
+    fn animated_width_honors_reduced_motion_and_preserves_inner_width(cx: &mut TestAppContext) {
+        struct WidthHost {
+            open: bool,
+        }
+        impl Render for WidthHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().flex().flex_row().size_full().child(
+                    div()
+                        .id("test-animated-width-outer")
+                        .debug_selector(|| "test-animated-width-outer".into())
+                        .h_full()
+                        .child(
+                            AnimatedWidth::new(
+                                "test-animated-width",
+                                px(240.),
+                                self.open,
+                                Duration::from_millis(200),
+                                div()
+                                    .id("test-animated-width-inner")
+                                    .size_full()
+                                    .debug_selector(|| "test-animated-width-inner".into()),
+                            )
+                            .align_end(true),
+                        ),
+                )
+            }
+        }
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, vcx) = cx.add_window_view(|_, _| WidthHost { open: true });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert_eq!(vcx.debug_bounds("test-animated-width-inner").unwrap().size.width, px(240.));
+
+        view.update(vcx, |host, cx| {
+            host.open = false;
+            cx.notify();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert_eq!(vcx.debug_bounds("test-animated-width-outer").unwrap().size.width, px(0.));
     }
 }

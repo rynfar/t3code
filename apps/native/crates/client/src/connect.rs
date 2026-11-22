@@ -433,6 +433,29 @@ impl ClerkClient {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkEnvironmentError {
+    pub message: String,
+    pub tunnel_limit: Option<u32>,
+}
+
+impl LinkEnvironmentError {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            tunnel_limit: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LinkEnvironmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LinkEnvironmentError {}
+
 pub struct Cloud {
     config: Result<Config, String>,
     account: Arc<Mutex<Account>>,
@@ -874,28 +897,34 @@ impl Cloud {
         Ok(identity)
     }
 
-    async fn relay_bearer_json(
+    async fn relay_bearer_json_raw(
         &self,
         method: reqwest::Method,
         url: &url::Url,
         network_error: &str,
         body: Option<&Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, LinkEnvironmentError> {
         let require_clerk = method == reqwest::Method::DELETE;
         for attempt in 0..2 {
-            let (token, generation, is_clerk) = self.bearer_token(attempt > 0, require_clerk).await?;
+            let (token, generation, is_clerk) = self
+                .bearer_token(attempt > 0, require_clerk)
+                .await
+                .map_err(LinkEnvironmentError::plain)?;
             let mut request = http()
                 .request(method.clone(), url.clone())
                 .bearer_auth(token);
             if let Some(body) = body {
                 if !is_clerk {
-                    return Err("Sign in to T3 Connect before enabling this.".to_owned());
+                    return Err(LinkEnvironmentError::plain(
+                        "Sign in to T3 Connect before enabling this.",
+                    ));
                 }
                 request = request.json(body);
             }
-            let response = request.send()
+            let response = request
+                .send()
                 .await
-                .map_err(|_| network_error.to_owned())?;
+                .map_err(|_| LinkEnvironmentError::plain(network_error))?;
             let status = response.status();
             let value = response.json::<Value>().await.unwrap_or(Value::Null);
             if !status.is_success() {
@@ -903,12 +932,68 @@ impl Cloud {
                     self.account.lock().await.cached_jwt = None;
                     continue;
                 }
-                return Err(t3_core::relay::error_message(status.as_u16(), &value));
+                return Err(LinkEnvironmentError {
+                    message: t3_core::relay::error_message(status.as_u16(), &value),
+                    tunnel_limit: t3_core::relay::extract_tunnel_limit_error(status.as_u16(), &value),
+                });
             }
-            self.assert_account(generation).await?;
+            self.assert_account(generation)
+                .await
+                .map_err(LinkEnvironmentError::plain)?;
             return Ok(value);
         }
         unreachable!("relay bearer request exits within 2 attempts")
+    }
+
+    async fn relay_bearer_json(
+        &self,
+        method: reqwest::Method,
+        url: &url::Url,
+        network_error: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        self.relay_bearer_json_raw(method, url, network_error, body)
+            .await
+            .map_err(|err| err.message)
+    }
+
+    pub async fn t3_chat_link(&self) -> Result<t3_core::relay::T3ChatLinkResponse, String> {
+        if self.config.is_err() || !self.has_clerk_session().await? {
+            return Ok(t3_core::relay::T3ChatLinkResponse::default());
+        }
+        let url = url::Url::parse(&format!("{}/v1/client/t3chat-link", self.config()?.relay))
+            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
+        let value = self
+            .relay_bearer_json(
+                reqwest::Method::GET,
+                &url,
+                "Could not load T3 Chat link status.",
+                None,
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|_| "Invalid T3 Chat link response.".to_owned())
+    }
+
+    pub async fn create_t3_chat_link_request(&self) -> Result<String, String> {
+        let url = url::Url::parse(&format!(
+            "{}/v1/client/t3chat-link-requests",
+            self.config()?.relay
+        ))
+        .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
+        let empty = serde_json::json!({});
+        let value = self
+            .relay_bearer_json(
+                reqwest::Method::POST,
+                &url,
+                "Could not start T3 Chat linking.",
+                Some(&empty),
+            )
+            .await?;
+        value["url"]
+            .as_str()
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "Invalid T3 Chat link request response.".to_owned())
     }
 
     /// Lists environments linked to the signed-in T3 Connect account (`GET {relay}/v1/environments`).
@@ -958,26 +1043,53 @@ impl Cloud {
         managed_tunnel: bool,
         publish: bool,
     ) -> Result<(), String> {
-        let relay_url = &self.config()?.relay;
+        self.link_environment_detailed(
+            credentials,
+            primary_http_base,
+            environment_id,
+            managed_tunnel,
+            publish,
+        )
+        .await
+        .map_err(|err| err.message)
+    }
+
+    pub async fn link_environment_detailed(
+        &self,
+        credentials: &crate::auth::Credentials,
+        primary_http_base: &str,
+        environment_id: &str,
+        managed_tunnel: bool,
+        publish: bool,
+    ) -> Result<(), LinkEnvironmentError> {
+        let relay_url = &self.config().map_err(LinkEnvironmentError::plain)?.relay;
         let endpoint = url::Url::parse(primary_http_base)
-            .map_err(|_| "Invalid environment URL.".to_owned())?;
-        let port = endpoint.port_or_known_default().ok_or("Invalid environment port.")?;
+            .map_err(|_| LinkEnvironmentError::plain("Invalid environment URL."))?;
+        let port = endpoint
+            .port_or_known_default()
+            .ok_or_else(|| LinkEnvironmentError::plain("Invalid environment port."))?;
         let mut socket = endpoint.clone();
         let scheme = match endpoint.scheme() {
             "http" => "ws",
             "https" => "wss",
-            _ => return Err("Invalid environment URL.".to_owned()),
+            _ => return Err(LinkEnvironmentError::plain("Invalid environment URL.")),
         };
-        socket.set_scheme(scheme).map_err(|_| "Invalid environment URL.")?;
+        socket
+            .set_scheme(scheme)
+            .map_err(|_| LinkEnvironmentError::plain("Invalid environment URL."))?;
         let provider = if managed_tunnel { "cloudflare_tunnel" } else { "manual" };
         let mut capabilities = serde_json::json!({
             "notificationsEnabled": true,
             "liveActivitiesEnabled": true,
             "managedTunnelsEnabled": managed_tunnel,
         });
-        let challenge = self.post_relay_link("environment-link-challenges", &capabilities).await?;
-        let challenge = challenge["challenge"].as_str().filter(|value| !value.is_empty())
-            .ok_or("Invalid T3 Connect link challenge.")?;
+        let challenge = self
+            .post_relay_link_raw("environment-link-challenges", &capabilities)
+            .await?;
+        let challenge = challenge["challenge"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| LinkEnvironmentError::plain("Invalid T3 Connect link challenge."))?;
         let timeout = Duration::from_secs(60);
         let proof = crate::auth::post_access_with_timeout(credentials, "/api/connect/link-proof", Some(serde_json::json!({
             "challenge": challenge,
@@ -988,16 +1100,20 @@ impl Cloud {
                 "providerKind": provider,
             },
             "origin": {"localHttpHost": "127.0.0.1", "localHttpPort": port},
-        })), Some(timeout)).await?;
+        })), Some(timeout))
+        .await
+        .map_err(LinkEnvironmentError::plain)?;
         if proof.as_str().is_none_or(str::is_empty) {
-            return Err("Invalid environment link proof.".to_owned());
+            return Err(LinkEnvironmentError::plain("Invalid environment link proof."));
         }
         capabilities["proof"] = proof;
-        let link = self.post_relay_link("environment-links", &capabilities).await?;
+        let link = self.post_relay_link_raw("environment-links", &capabilities).await?;
         let link: t3_core::relay::EnvironmentLinkResponse = serde_json::from_value(link)
-            .map_err(|_| "Invalid T3 Connect link response.".to_owned())?;
+            .map_err(|_| LinkEnvironmentError::plain("Invalid T3 Connect link response."))?;
         if !link.ok || link.environment_id != environment_id || link.endpoint.provider_kind != provider {
-            return Err("Relay returned credentials for a different environment or endpoint provider.".to_owned());
+            return Err(LinkEnvironmentError::plain(
+                "Relay returned credentials for a different environment or endpoint provider.",
+            ));
         }
         let applied = crate::auth::post_access_with_timeout(credentials, "/api/connect/relay-config", Some(serde_json::json!({
             "relayUrl": relay_url,
@@ -1006,20 +1122,37 @@ impl Cloud {
             "environmentCredential": link.environment_credential,
             "cloudMintPublicKey": link.cloud_mint_public_key,
             "endpointRuntime": link.endpoint_runtime,
-        })), Some(timeout)).await?;
+        })), Some(timeout))
+        .await
+        .map_err(LinkEnvironmentError::plain)?;
         if applied["ok"] != true {
-            return Err("Could not configure environment relay access.".to_owned());
+            return Err(LinkEnvironmentError::plain(
+                "Could not configure environment relay access.",
+            ));
         }
         crate::auth::post_access(credentials, "/api/connect/preferences", Some(serde_json::json!({
             "publishAgentActivity": publish,
-        }))).await?;
+        })))
+        .await
+        .map_err(LinkEnvironmentError::plain)?;
         Ok(())
     }
 
-    async fn post_relay_link(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let url = url::Url::parse(&format!("{}/v1/client/{path}", self.config()?.relay))
-            .map_err(|_| "Invalid T3 Connect relay URL.".to_owned())?;
-        self.relay_bearer_json(reqwest::Method::POST, &url, "Could not reach T3 Connect relay.", Some(body)).await
+    async fn post_relay_link_raw(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, LinkEnvironmentError> {
+        let relay = &self.config().map_err(LinkEnvironmentError::plain)?.relay;
+        let url = url::Url::parse(&format!("{relay}/v1/client/{path}"))
+            .map_err(|_| LinkEnvironmentError::plain("Invalid T3 Connect relay URL."))?;
+        self.relay_bearer_json_raw(
+            reqwest::Method::POST,
+            &url,
+            "Could not reach T3 Connect relay.",
+            Some(body),
+        )
+        .await
     }
 
     async fn exchange_dpop_token_internal(
@@ -2096,5 +2229,49 @@ mod tests {
         assert_eq!(reg_ws.access_token, "env-cred-live");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn link_environment_detailed_captures_tunnel_limit_and_t3_chat_endpoints_work() {
+        let relay = Fixture::new().await;
+        let host = Fixture::new().await;
+        let cloud = cloud(&relay);
+        cloud.account.lock().await.clerk = Some(ClerkSession {
+            client_token: "clerk-client".into(),
+            session_id: "sess_limit".into(),
+            identity: None,
+        });
+        let jwt = fake_jwt("user_alice", now_ms() / 1000 + 300);
+        relay.reply(200, json!({"jwt": jwt}));
+        relay.reply(200, json!({"challenge": "challenge-1", "expiresAt": "2030-01-01T00:00:00Z"}));
+        relay.reply(403, json!({"_tag": "RelayManagedTunnelLimitReachedError", "maxTunnels": 3}));
+        relay.reply(200, json!({"available": true, "link": {"email": "a@example.com", "plan": "pro"}}));
+        relay.reply(200, json!({"url": "https://t3.chat/link?token=abc"}));
+        host.reply(200, json!("signed-host-proof"));
+
+        let err = cloud
+            .link_environment_detailed(
+                &crate::auth::Credentials {
+                    http_base: host.base.clone(),
+                    access_token: "host-token".into(),
+                },
+                "https://studio.example:3773",
+                "env-studio",
+                true,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.tunnel_limit, Some(3));
+        assert!(err.message.contains("tunnel limit"));
+
+        let link = cloud.t3_chat_link().await.unwrap();
+        assert!(link.available);
+        assert_eq!(
+            link.link.as_ref().map(|l| l.plan),
+            Some(t3_core::relay::T3ChatPlan::Pro)
+        );
+        let url = cloud.create_t3_chat_link_request().await.unwrap();
+        assert_eq!(url, "https://t3.chat/link?token=abc");
     }
 }

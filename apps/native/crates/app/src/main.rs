@@ -5,6 +5,7 @@ mod components;
 mod chat_header;
 mod composer;
 mod connect;
+mod connect_onboarding;
 mod context_menu;
 mod context_chip;
 mod device;

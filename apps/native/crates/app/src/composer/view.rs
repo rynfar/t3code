@@ -988,6 +988,7 @@ impl Render for Composer {
                         })
                         .children(host_bg_layer)
                         .children(host_before_bar)
+                        .children(crate::theme::inspector_slot_probe(ThemeSlot::ComposerHost, cx))
                         // Files dragged in from Finder (`isDragOverComposer`) or file-tree mentions (`composerMentionDragHandlers`).
                         .when(!rewinding, |this| {
                             this.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))

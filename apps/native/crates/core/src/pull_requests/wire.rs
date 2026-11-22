@@ -34,6 +34,8 @@ literals!(ReviewDecision { Approved = "approved", ChangesRequested = "changes-re
 literals!(ChecksState { Passing = "passing", Failing = "failing", Pending = "pending" });
 literals!(Mergeability { Mergeable = "mergeable", Conflicting = "conflicting" });
 literals!(MergeMethod { Merge = "merge", Squash = "squash", Rebase = "rebase", FastForward = "fast-forward" });
+literals!(UpdateMethod { Merge = "merge", Rebase = "rebase" });
+literals!(BaseComparison { UpToDate = "up-to-date", Behind = "behind" });
 literals!(
     /// `PullRequestAction`.
     Action {
@@ -443,6 +445,8 @@ pub struct Capabilities {
     pub comment: bool,
     #[serde(default)]
     pub actions: Vec<Action>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub update_methods: Vec<UpdateMethod>,
     #[serde(default)]
     pub merge_methods: Vec<MergeMethod>,
     #[serde(default)]
@@ -478,6 +482,8 @@ pub struct Capabilities {
 pub struct ViewerPermissions {
     #[serde(default)]
     pub actions: Vec<Action>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub update_methods: Vec<UpdateMethod>,
     #[serde(default)]
     pub comment: bool,
     #[serde(default)]
@@ -652,6 +658,8 @@ pub struct Detail {
     pub merge_capabilities: MergeCapabilities,
     #[serde(default)]
     pub viewer: Option<String>,
+    #[serde(default)]
+    pub base_comparison: Option<BaseComparison>,
     #[serde(default)]
     pub behind_by: Option<u64>,
     /// Absent means the host does not report auto-merge state, not that it is off.

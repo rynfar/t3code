@@ -1491,6 +1491,8 @@ impl SettingsView {
                     }))
             });
         v_flex().mt(r(10.)).gap(r(5.)).child(heading)
+            .children(crate::cloud::render_tunnel_usage_meter(&self.state, cx))
+            .children(crate::cloud::render_tunnel_limit_alert(&self.state, cx))
             .children(cloud.error.as_ref().map(|error| muted_text(error.clone(), cx)))
             .children(cloud.discovery.environments.iter().filter_map(|entry| {
                 let saved = state.environments.find_by_environment_id(&entry.environment_id);

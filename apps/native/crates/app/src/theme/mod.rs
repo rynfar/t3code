@@ -21,6 +21,7 @@ use serde_json::json;
 use t3_core::client_settings::typography::{FontDefaults, FontRole, MONO_STACK, Typography, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
+pub(crate) use slots::inspector_slot_probe;
 #[allow(unused_imports)]
 pub use slots::{
     SlotPseudoBar, SlotState, SlotStyleOverride, SlotStyleSet, SlotStylesheet, ThemeSlot,

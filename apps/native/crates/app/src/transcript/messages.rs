@@ -1045,6 +1045,7 @@ pub fn user_row(
                 px(16.),
                 cx,
             ))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::UserMessageBubble, cx))
             .children(bubble_chips)
             .children(media_in_bubble)
             .children(bubble_files)
@@ -1562,14 +1563,16 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
     };
     v_flex()
         .group(ROW_GROUP)
+        .relative()
         .w_full()
         .min_w_0()
         .px(px(4.))
         .py(px(2.))
         .theme_slot_hover(ThemeSlot::AssistantMessageRow, cx)
         .when_some(theme_slot_background_layer(ThemeSlot::AssistantMessageRow, cx), |this, layer| {
-            this.relative().overflow_hidden().child(layer)
+            this.overflow_hidden().child(layer)
         })
+        .children(crate::theme::inspector_slot_probe(ThemeSlot::AssistantMessageRow, cx))
         .child(body)
         .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
         .when(!show_meta && message.item.as_ref().is_some_and(|i| i.status == "interrupted"), |this| {

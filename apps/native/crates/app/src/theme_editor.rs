@@ -75,6 +75,7 @@ fn close(cx: &mut App) {
     let host = cx.global_mut::<Host>();
     host.view = None;
     host.pending = None;
+    theme::slots::set_inspector_active(false, cx);
     theme::preview(None, cx);
     cx.refresh_windows();
 }
@@ -104,6 +105,9 @@ struct Editor {
     panel_bounds: Rc<Cell<Bounds<Pixels>>>,
     picker_epoch: usize,
     minimized: bool,
+    inspecting: bool,
+    hovered_inspection: Option<(Bounds<Pixels>, &'static str)>,
+    scroll: ScrollHandle,
     picker: Option<color_picker::Picker>,
     selected: Option<&'static str>,
     position: Option<Point<Pixels>>,
@@ -215,6 +219,9 @@ impl Editor {
             panel_bounds: Rc::default(),
             picker_epoch: 0,
             minimized: false,
+            inspecting: false,
+            hovered_inspection: None,
+            scroll: ScrollHandle::new(),
             picker: None,
             selected: None,
             position: None,
@@ -245,6 +252,112 @@ impl Editor {
         self.session.set_css(edit.text);
         self.apply_preview(cx);
         cx.notify();
+    }
+
+    fn sync_inspector_state(&self, cx: &mut Context<Self>) {
+        theme::slots::set_inspector_active(self.inspecting || self.selected.is_some(), cx);
+    }
+
+    fn toggle_selected_role(&mut self, role: &'static str, cx: &mut Context<Self>) {
+        self.selected = if self.selected == Some(role) { None } else { Some(role) };
+        self.sync_inspector_state(cx);
+        cx.notify();
+    }
+
+    fn clear_inspector_selection(&mut self, cx: &mut Context<Self>) {
+        self.inspecting = false;
+        self.hovered_inspection = None;
+        self.selected = None;
+        self.sync_inspector_state(cx);
+        cx.notify();
+    }
+
+    fn toggle_inspecting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inspecting {
+            self.clear_inspector_selection(cx);
+            return;
+        }
+        self.end_picker(false, window, cx);
+        self.inspecting = true;
+        self.hovered_inspection = None;
+        self.sync_inspector_state(cx);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn pick_inspection_target(
+        pos: Point<Pixels>,
+        viewport: Size<Pixels>,
+        panel_bounds: Bounds<Pixels>,
+        cx: &App,
+    ) -> Option<(Bounds<Pixels>, &'static str)> {
+        if panel_bounds.size.width > px(0.) && panel_bounds.contains(&pos) {
+            return None;
+        }
+        let picked = theme::slots::inspector_entries(cx)
+            .iter()
+            .filter(|(_, bounds)| bounds.contains(&pos))
+            .min_by(|(_, a), (_, b)| {
+                let area_a = f32::from(a.size.width) * f32::from(a.size.height);
+                let area_b = f32::from(b.size.width) * f32::from(b.size.height);
+                area_a.total_cmp(&area_b)
+            })
+            .map(|(slot, bounds)| (*bounds, theme::slots::theme_slot_primary_role(*slot)));
+        Some(picked.unwrap_or((Bounds::new(point(px(0.), px(0.)), viewport), "canvas")))
+    }
+
+    fn apply_inspected_role(&mut self, role: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspecting = false;
+        self.hovered_inspection = None;
+        self.selected = Some(role);
+        if !matches!(role, "canvas" | "accent") && !self.session.advanced {
+            self.session.set_advanced(true);
+        }
+        let query = self.query.read(cx).value().to_string();
+        if !query.trim().is_empty()
+            && !FAMILIES.iter().find(|f| f.role == role).is_some_and(|f| f.matches(&query))
+        {
+            self.syncing = true;
+            self.query.update(cx, |input, cx| input.set_value("", window, cx));
+            self.syncing = false;
+        }
+        if let Some(focus) = self.swatches.get(role) {
+            focus.focus(window, cx);
+        }
+        self.sync_inspector_state(cx);
+        self.sync(window, cx);
+    }
+
+    fn matching_inspection_bounds(&self, role: &'static str, cx: &App) -> Vec<Bounds<Pixels>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let target_hex = self.session.colors()[role].trim().to_ascii_lowercase();
+        let family_roles: &[&str] = FAMILIES
+            .iter()
+            .find(|f| f.role == role)
+            .map_or(&[], |f| f.roles);
+        for &(slot, bounds) in theme::slots::inspector_entries(cx) {
+            let slot_role = theme::slots::theme_slot_primary_role(slot);
+            let matches = if self.session.advanced {
+                slot_role == role || family_roles.contains(&slot_role)
+            } else {
+                slot_role == role
+                    || self.session.colors()[slot_role].trim().to_ascii_lowercase() == target_hex
+            };
+            if !matches {
+                continue;
+            }
+            let key = (
+                f32::from(bounds.origin.x).round() as i32,
+                f32::from(bounds.origin.y).round() as i32,
+                f32::from(bounds.size.width).round() as i32,
+                f32::from(bounds.size.height).round() as i32,
+            );
+            if seen.insert(key) {
+                out.push(bounds);
+            }
+        }
+        out
     }
 
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -343,13 +456,16 @@ impl Editor {
         let invalid = picker::hex(&self.session.colors()[role]).is_none();
         let swatch_bounds = self.swatch_bounds[role].clone();
         h_flex()
+            .id(ElementId::Name(format!("theme-role-row-{role}").into()))
             .gap(r(8.))
             .px(r(8.))
             .py(r(6.))
             .rounded(r(8.))
+            .cursor_pointer()
             .when(self.selected == Some(role), |d| {
                 d.bg(hsla(p.accent).opacity(0.6))
             })
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_selected_role(role, cx)))
             .child(
                 div()
                     .flex_1()
@@ -732,6 +848,32 @@ impl Render for Editor {
                 );
         }
         body = body.child(css_section);
+        let matched_bounds = self
+            .selected
+            .filter(|_| !self.inspecting)
+            .map(|role| self.matching_inspection_bounds(role, cx))
+            .unwrap_or_default();
+        let inspector_subtitle: Option<String> = if self.minimized {
+            None
+        } else if self.inspecting {
+            Some(crate::i18n::t(cx, "Select an element \u{00b7} Esc to cancel").to_owned())
+        } else if let Some(role) = self.selected {
+            let label = FAMILIES
+                .iter()
+                .find(|f| f.role == role)
+                .map_or(role, |f| crate::i18n::t(cx, f.label));
+            let count = matched_bounds.len() as i64;
+            Some(crate::i18n::t_fmt(
+                cx,
+                "{label} \u{00b7} {count, plural, one {{count} use} other {{count} uses}}",
+                &[
+                    ("label", label.into()),
+                    ("count", t3_core::i18n::IcuArg::Int(count)),
+                ],
+            ))
+        } else {
+            None
+        };
         let header = h_flex()
             .gap(r(8.))
             .px(r(12.))
@@ -744,7 +886,22 @@ impl Render for Editor {
                     .flex_1()
                     .min_w_0()
                     .cursor_move()
-                    .child(title)
+                    .child(
+                        h_flex()
+                            .gap(r(8.))
+                            .items_baseline()
+                            .child(div().flex_none().font_weight(FontWeight::MEDIUM).child(title))
+                            .when_some(inspector_subtitle, |row, subtitle| {
+                                row.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(hsla(p.muted_foreground))
+                                        .child(subtitle),
+                                )
+                            }),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -752,6 +909,22 @@ impl Render for Editor {
                             cx.notify();
                         }),
                     ),
+            )
+            .child(
+                Button::new(
+                    "inspect-theme-colors",
+                    if self.inspecting { ButtonVariant::Secondary } else { ButtonVariant::Ghost },
+                    ButtonSize::Xs,
+                )
+                .icon(Icon::MousePointerClick)
+                .label(if self.inspecting { "Cancel" } else { "Inspect" })
+                .tooltip(if self.inspecting {
+                    "Cancel inspecting app colors"
+                } else {
+                    "Pick a color from the app"
+                })
+                .disabled(self.saving)
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_inspecting(window, cx))),
             )
             .child(
                 Button::new("minimize-editor", ButtonVariant::Ghost, ButtonSize::IconXs)
@@ -850,6 +1023,7 @@ impl Render for Editor {
                 d.child(
                     div()
                         .id("theme-editor-scroll")
+                        .track_scroll(&self.scroll)
                         .flex_auto()
                         .min_h_0()
                         .overflow_y_scroll()
@@ -886,15 +1060,121 @@ impl Render for Editor {
                     if this.picker.is_some() {
                         this.end_picker(true, window, cx);
                         cx.stop_propagation();
+                    } else if this.inspecting || this.selected.is_some() {
+                        this.clear_inspector_selection(cx);
+                        cx.stop_propagation();
                     } else if !this.saving {
                         close(cx);
                         cx.stop_propagation();
                     }
                 }
             }));
+        let hover_target = self.hovered_inspection;
+        let hover_label = hover_target.map(|(_, role)| {
+            FAMILIES
+                .iter()
+                .find(|f| f.role == role)
+                .map_or(role, |f| crate::i18n::t(cx, f.label))
+                .to_owned()
+        });
+        let hover_badge = hover_target.zip(hover_label).map(|((bounds, _), label)| {
+            let below = f32::from(bounds.top()) < 32.;
+            let top = if below { bounds.bottom() + px(6.) } else { (bounds.top() - px(28.)).max(px(6.)) };
+            let left = bounds.left().clamp(px(8.), (viewport.width - px(180.)).max(px(8.)));
+            div()
+                .absolute()
+                .top(top)
+                .left(left)
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .bg(hsla(p.primary))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.primary_foreground))
+                .shadow_md()
+                .child(label)
+        });
+        let inspector_layer: Option<AnyElement> = if self.inspecting {
+            let ring_color = hsla(p.primary);
+            let fill_color = ring_color.opacity(0.12);
+            let vp = viewport;
+            Some(
+                div()
+                    .id("theme-inspector-capture")
+                    .debug_selector(|| "theme-inspector-capture".into())
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .cursor(CursorStyle::Crosshair)
+                    .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
+                        let next = Self::pick_inspection_target(e.position, vp, this.panel_bounds.get(), cx);
+                        if this.hovered_inspection != next {
+                            this.hovered_inspection = next;
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            if let Some((_, role)) = Self::pick_inspection_target(e.position, vp, this.panel_bounds.get(), cx) {
+                                this.apply_inspected_role(role, window, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, (), window, _| {
+                                if let Some((bounds, _)) = hover_target {
+                                    window.paint_quad(
+                                        gpui::fill(bounds, fill_color)
+                                            .corner_radii(px(6.))
+                                            .border_widths(px(2.))
+                                            .border_color(ring_color),
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .children(hover_badge)
+                    .into_any_element(),
+            )
+        } else if !matched_bounds.is_empty() {
+            let ring_color = hsla(p.primary).opacity(0.85);
+            let fill_color = hsla(p.primary).opacity(0.08);
+            Some(
+                canvas(
+                    |_, _, _| {},
+                    move |_, (), window, _| {
+                        for bounds in &matched_bounds {
+                            let padded = Bounds::new(
+                                bounds.origin - point(px(3.), px(3.)),
+                                bounds.size + size(px(6.), px(6.)),
+                            );
+                            window.paint_quad(
+                                gpui::fill(padded, fill_color)
+                                    .corner_radii(px(8.))
+                                    .border_widths(px(2.))
+                                    .border_color(ring_color),
+                            );
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0()
+                .into_any_element(),
+            )
+        } else {
+            None
+        };
         div()
             .absolute()
             .inset_0()
+            .children(inspector_layer)
             .child(panel)
             .children(self.render_picker(left, width, window, cx))
             .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
@@ -1136,6 +1416,124 @@ mod tests {
             close(cx);
             assert_eq!(palette(cx).background, saved_bg);
         });
+        std::mem::forget(runtime);
+    }
+
+    #[gpui::test]
+    fn color_inspector_picks_innermost_slot_suppresses_click_and_cancels_on_escape(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{MouseButton, MouseDownEvent, div, point, prelude::*, px, size};
+        use std::{cell::Cell, rc::Rc};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            store::init(cx);
+            cx.set_global(
+                serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                    "provider": {"instanceId":"test","driver":"test","enabled":false,"installed":false,"status":"unavailable"},
+                    "auth": {"phase":"idle"},
+                    "install": {"phase":"idle"}
+                }))
+                .unwrap(),
+            );
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            init(state.clone(), cx);
+            state
+        });
+        assert!(cx.update(|cx| !theme::slots::inspector_active(cx)));
+
+        struct HostHarness {
+            editor: gpui::Entity<Editor>,
+            underlying_clicked: Rc<Cell<bool>>,
+        }
+        impl gpui::Render for HostHarness {
+            fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let clicked = self.underlying_clicked.clone();
+                crate::theme::slots::begin_inspector_frame(cx);
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("harness-sidebar")
+                            .relative()
+                            .w(px(300.))
+                            .h(px(400.))
+                            .children(crate::theme::inspector_slot_probe(crate::theme::ThemeSlot::Sidebar, cx))
+                            .child(
+                                div()
+                                    .id("harness-button")
+                                    .relative()
+                                    .mt(px(40.))
+                                    .ml(px(40.))
+                                    .w(px(100.))
+                                    .h(px(40.))
+                                    .children(crate::theme::inspector_slot_probe(crate::theme::ThemeSlot::Button, cx))
+                                    .on_mouse_down(MouseButton::Left, move |_, _, _| clicked.set(true)),
+                            ),
+                    )
+                    .child(self.editor.clone())
+            }
+        }
+
+        let underlying_clicked = Rc::new(Cell::new(false));
+        let (harness, vcx) = cx.add_window_view(|window, cx| {
+            let session = Session::new(None, None, None, true);
+            let editor = cx.new(|cx| Editor::new(state.clone(), session, window, cx));
+            cx.global_mut::<Host>().view = Some(editor.clone());
+            HostHarness { editor, underlying_clicked: underlying_clicked.clone() }
+        });
+        let editor = harness.read_with(vcx, |h, _| h.editor.clone());
+        vcx.run_until_parked();
+
+        // Start inspect mode and draw one frame to collect slot bounds.
+        vcx.update(|window, cx| {
+            editor.update(cx, |ed, cx| ed.toggle_inspecting(window, cx));
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.update(|_, cx| theme::slots::inspector_active(cx)));
+        assert!(!vcx.update(|_, cx| theme::slots::inspector_entries(cx).is_empty()));
+
+        // Click inside the nested Button slot (at 80, 55): picks "messageAction" (Button) over "sidebar"
+        // and blocks underlying click handler.
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(80.), px(55.)),
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        vcx.run_until_parked();
+        assert!(!underlying_clicked.get(), "inspector must block clicks to underlying app");
+        editor.read_with(vcx, |ed, _| {
+            assert!(!ed.inspecting);
+            assert_eq!(ed.selected, Some("messageAction"));
+            assert!(ed.session.advanced);
+        });
+
+        // Escape clears the spotlight selection without closing the Theme Editor.
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        editor.read_with(vcx, |ed, cx| {
+            assert!(ed.selected.is_none());
+            assert!(!theme::slots::inspector_active(cx));
+        });
+        assert!(vcx.update(|_, cx| cx.global::<Host>().view.is_some()));
+
+        // Close clears inspector state too.
+        vcx.update(|_, cx| {
+            close(cx);
+            assert!(!theme::slots::inspector_active(cx));
+        });
+        let _ = size(px(0.), px(0.));
         std::mem::forget(runtime);
     }
 }

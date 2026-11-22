@@ -173,7 +173,7 @@ fn can_pin_scoped_group(state: &AppState, group: &ScopedProjectGroup) -> bool {
 }
 
 fn pin_tooltip_label(pinned: bool, label: &str, cx: &App) -> String {
-    let action = if pinned { "Unpin" } else { "Pin" };
+    let action = t(cx, if pinned { "Unpin" } else { "Pin" });
     match crate::keymap::label("thread.pin", cx) {
         Some(shortcut) => format!("{action} {label} ({shortcut})"),
         None => format!("{action} {label}"),
@@ -181,7 +181,7 @@ fn pin_tooltip_label(pinned: bool, label: &str, cx: &App) -> String {
 }
 
 fn inline_heading_width(project_title: &str, window: &mut Window, cx: &App) -> f32 {
-    let text = format!("What should we build in {project_title}?");
+    let text = crate::i18n::t_fmt(cx, "What should we build in {project}?", &[("project", project_title.into())]);
     let font = gpui::font(cx.theme().font_family.clone());
     let run = TextRun { len: text.len(), font, color: gpui::black(), background_color: None, underline: None, strikethrough: None };
     let shaped = window.text_system().shape_line(SharedString::from(text), px(30.), &[run], None);
@@ -250,7 +250,8 @@ impl DraftHero {
         if let Some(search) = &self.search {
             return search.clone();
         }
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
+        let placeholder = t(cx, "Search projects...");
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscription = cx.subscribe_in(&search, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 this.sync_highlight(cx);
@@ -542,7 +543,7 @@ impl DraftHero {
                     }
                     Err(description) => {
                         hero.state.update(cx, |state, cx| {
-                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Could not switch machine").description(description), cx);
+                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, t(cx, "Could not switch machine")).description(description), cx);
                         });
                     }
                 }
@@ -616,10 +617,10 @@ impl DraftHero {
                         hero.composer.update(cx, |composer, cx| composer.focus(window, cx));
                     }
                     None => {
-                        let description = result.err().map_or_else(|| "An error occurred.".to_owned(), |error| error.to_string());
                         hero.state.update(cx, |state, cx| {
+                            let description = result.err().map_or_else(|| t(cx, "An error occurred.").to_owned(), |error| error.to_string());
                             state.show_toast(
-                                crate::toast::Toast::new(crate::toast::ToastKind::Error, "Could not start without a project").description(description),
+                                crate::toast::Toast::new(crate::toast::ToastKind::Error, t(cx, "Could not start without a project")).description(description),
                                 cx,
                             );
                         });
@@ -663,7 +664,7 @@ impl DraftHero {
             .active_environment()
             .map(|env| env.label.clone())
             .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| "This machine".to_owned());
+            .unwrap_or_else(|| t(cx, "This machine").to_owned());
         let server_version = app
             .server_config
             .config
@@ -817,9 +818,9 @@ impl DraftHero {
             Some(_) => {
                 let hero = cx.entity().downgrade();
                 trigger
-                    .context_menu(move |menu, _, _| {
+                    .context_menu(move |menu, _, cx| {
                         let hero = hero.clone();
-                        menu.item(PopupMenuItem::new("Project settings").on_click(move |_, _, cx| {
+                        menu.item(PopupMenuItem::new(t(cx, "Project settings")).on_click(move |_, _, cx| {
                             let _ = hero.update(cx, |hero, cx| {
                                 hero.open_project_settings_for_draft(cx);
                             });
@@ -966,10 +967,10 @@ impl DraftHero {
                             .children(pin_el)
                             .children(badge_el)
                             .on_click(cx.listener(move |this, _, window, cx| this.select_entry(select.clone(), window, cx)))
-                            .context_menu(move |menu, _, _| {
+                            .context_menu(move |menu, _, cx| {
                                 let menu_entry = menu_entry.clone();
                                 let hero_view = hero_view.clone();
-                                menu.item(PopupMenuItem::new("Project settings").on_click(move |_, window, cx| {
+                                menu.item(PopupMenuItem::new(t(cx, "Project settings")).on_click(move |_, window, cx| {
                                     let _ = hero_view.update(cx, |this, cx| {
                                         this.open_project_settings_for_entry(&menu_entry, window, cx);
                                     });
@@ -1216,7 +1217,7 @@ impl Render for DraftHero {
                 .into_any_element(),
             None => {
                 let trigger = self.picker_trigger(
-                    if can_choose { "Choose a project" } else { "Add a project" }.into(),
+                    t(cx, if can_choose { "Choose a project" } else { "Add a project" }).into(),
                     None,
                     can_choose,
                     None,
@@ -1250,7 +1251,7 @@ impl Render for DraftHero {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(hsla(p.muted_foreground))
                     .hover(|this| this.underline().text_color(hsla(p.foreground)))
-                    .child("or start without a project")
+                    .child(t(cx, "or start without a project"))
                     .when_some(shortcut, |this, shortcut| this.tooltip(move |window, cx| Tooltip::new(shortcut.clone()).build(window, cx)))
                     .on_click(cx.listener(|this, _, window, cx| this.start_without_project(window, cx)))
                     .into_any_element(),

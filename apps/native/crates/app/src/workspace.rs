@@ -11,7 +11,7 @@ use gpui::{
     div, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_client::status::{HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
+use t3_client::status::{DotTone, HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::keybindings::{WorkspaceFocusArea, next_workspace_focus_area};
 use t3_core::pairing::session_has_legacy_permissions;
@@ -22,7 +22,8 @@ use crate::app_state::{AppEvent, AppState, Phase};
 use crate::chat_header::{self, ChatHeader};
 use crate::composer::{Composer, FocusPrompt, OpenPermissions, ToggleModelPicker};
 use crate::connect::ConnectView;
-use crate::components::motion::{prefers_reduced_motion, transition};
+use crate::connect_onboarding::ConnectOnboardingDialog;
+use crate::components::motion::{AnimatedWidth, prefers_reduced_motion, transition};
 use crate::git::GitDialogs;
 use crate::new_thread::{self, DraftHero};
 use crate::context_menu::ContextMenu;
@@ -99,14 +100,7 @@ pub(crate) fn panel_width_clip(
     align_right: bool,
     content: impl IntoElement,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .flex_none()
-        .h_full()
-        .w(visible)
-        .overflow_hidden()
-        .when(align_right, |clip| clip.justify_end())
-        .child(div().flex_none().h_full().w(full).child(content))
+    AnimatedWidth::clipped(visible, full, align_right, content)
 }
 
 fn workspace_for_window(window: &Window, cx: &gpui::App) -> Option<Entity<Workspace>> {
@@ -118,12 +112,17 @@ fn workspace_for_window(window: &Window, cx: &gpui::App) -> Option<Entity<Worksp
 pub(crate) fn measure_draft_composer(composer: impl IntoElement, window: &Window, cx: &gpui::App) -> gpui::Div {
     let measurement = workspace_for_window(window, cx).map(|workspace| {
         let workspace = workspace.read(cx);
-        (workspace.draft_composer_height.clone(), workspace.terminal.entity_id())
+        (
+            workspace.draft_composer_height.clone(),
+            workspace.draft_composer_origin_y.clone(),
+            workspace.terminal.entity_id(),
+        )
     });
-    div().relative().w_full().child(composer).when_some(measurement, |container, (height, drawer)| {
+    div().relative().w_full().child(composer).when_some(measurement, |container, (height, origin_y, drawer)| {
         container.child(
             gpui::canvas(
                 move |bounds, window, _| {
+                    origin_y.set(Some(f32::from(bounds.origin.y)));
                     let next = f32::from(bounds.size.height).ceil();
                     if height.replace(next) != next {
                         window.on_next_frame(move |_, cx| cx.notify(drawer));
@@ -201,6 +200,10 @@ pub struct Workspace {
     lineage: Entity<crate::lineage::ComposerLineage>,
     composer_overlay_height: std::rc::Rc<std::cell::Cell<f32>>,
     draft_composer_height: std::rc::Rc<std::cell::Cell<f32>>,
+    draft_composer_origin_y: std::rc::Rc<std::cell::Cell<Option<f32>>>,
+    resting_composer_origin_y: std::rc::Rc<std::cell::Cell<Option<f32>>>,
+    was_draft_route: bool,
+    draft_launch_started: Option<Instant>,
     composer_replaced: bool,
     draft: Entity<DraftHero>,
     prompt_links: Entity<crate::prompt_links::PromptLinks>,
@@ -210,6 +213,7 @@ pub struct Workspace {
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
     guest_share: Entity<crate::guest_share::GuestShareDialog>,
+    connect_onboarding: Entity<ConnectOnboardingDialog>,
     mcp: Entity<crate::mcp::McpDialogs>,
     palette: Entity<CommandPalette>,
     snooze: Entity<SnoozeDialog>,
@@ -241,6 +245,7 @@ impl Workspace {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
         let guest_share = cx.new(|cx| crate::guest_share::GuestShareDialog::new(state.clone(), window, cx));
+        let connect_onboarding = cx.new(|cx| ConnectOnboardingDialog::new(state.clone(), window, cx));
         let dialog = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
         let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
         let thread = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
@@ -442,6 +447,10 @@ impl Workspace {
             lineage,
             composer_overlay_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
             draft_composer_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
+            draft_composer_origin_y: std::rc::Rc::new(std::cell::Cell::new(None)),
+            resting_composer_origin_y: std::rc::Rc::new(std::cell::Cell::new(None)),
+            was_draft_route: false,
+            draft_launch_started: None,
             composer_replaced: false,
             draft,
             prompt_links,
@@ -451,6 +460,7 @@ impl Workspace {
             menu,
             dialog,
             guest_share,
+            connect_onboarding,
             mcp,
             palette,
             snooze,
@@ -518,7 +528,12 @@ impl Workspace {
                                     cx.notify();
                                 }))
                         })
-                        .child(crate::connect::status_dot(Some(status.dot()), cx))
+                        .child(crate::connect::live_status_dot(
+                            "workspace-connection-dot",
+                            Some(status.dot()),
+                            status.dot() == DotTone::Warning,
+                            cx,
+                        ))
                         .child(
                             div()
                                 .text_xs()
@@ -534,7 +549,7 @@ impl Workspace {
                         crate::right_panel::Button::new("connection-retry")
                             .variant(crate::right_panel::Variant::GhostMuted)
                             .size(crate::right_panel::Size::Xs)
-                            .label("Retry")
+                            .label(crate::i18n::t(cx, "Retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.state.read(cx).retry_connection())),
                     )
                 })
@@ -558,6 +573,7 @@ impl Workspace {
         let diag = diagnose(status, &host)?;
         let copy_text = connection_diagnosis_text(&host, &diag);
         let can_retry = status.can_retry();
+        let is_relay_managed = state.active_environment().is_some_and(|env| env.is_relay_managed());
         let attempt = status.attempt();
         let subtitle = if attempt > 0 { format!("{host} \u{00b7} Attempt {attempt}") } else { host };
         let p = palette(cx);
@@ -584,7 +600,12 @@ impl Workspace {
                         h_flex()
                             .items_start()
                             .gap(px(8.))
-                            .child(div().pt(px(2.)).child(crate::connect::status_dot(Some(status.dot()), cx)))
+                            .child(div().pt(px(2.)).child(crate::connect::live_status_dot(
+                                "workspace-diagnosis-dot",
+                                Some(status.dot()),
+                                status.dot() == DotTone::Warning,
+                                cx,
+                            )))
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -627,7 +648,7 @@ impl Workspace {
                         this.child(
                             v_flex()
                                 .gap(px(3.))
-                                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("What to try"))
+                                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "What to try")))
                                 .children(
                                     diag.steps
                                         .iter()
@@ -657,7 +678,7 @@ impl Workspace {
                                     crate::right_panel::Button::new("connection-diagnosis-retry")
                                         .variant(crate::right_panel::Variant::Ghost)
                                         .size(crate::right_panel::Size::Xs)
-                                        .label("Retry now")
+                                        .label(crate::i18n::t(cx, "Retry now"))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.connection_diagnosis_open = false;
                                             this.state.read(cx).retry_connection();
@@ -669,11 +690,11 @@ impl Workspace {
                                 crate::right_panel::Button::new("connection-diagnosis-copy")
                                     .variant(crate::right_panel::Variant::GhostMuted)
                                     .size(crate::right_panel::Size::Xs)
-                                    .label("Copy diagnostics")
+                                    .label(crate::i18n::t(cx, "Copy diagnostics"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                                         this.state.update(cx, |state, cx| {
-                                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, "Diagnostics copied"), cx);
+                                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, crate::i18n::t(cx, "Diagnostics copied")), cx);
                                         });
                                     })),
                             )
@@ -686,7 +707,16 @@ impl Workspace {
                                         this.connection_diagnosis_open = false;
                                         this.state.update(cx, |state, cx| state.open_switcher(cx));
                                     })),
-                            ),
+                            )
+                            .when(is_relay_managed, |row| {
+                                row.child(
+                                    crate::right_panel::Button::new("connection-diagnosis-more-info")
+                                        .variant(crate::right_panel::Variant::GhostMuted)
+                                        .size(crate::right_panel::Size::Xs)
+                                        .label(crate::i18n::t(cx, "More info"))
+                                        .on_click(|_, _, cx| cx.open_url(t3_core::relay::T3_CONNECT_TROUBLESHOOTING_URL)),
+                                )
+                            }),
                     ),
             );
         Some(
@@ -747,9 +777,11 @@ impl Render for Workspace {
                 .child(crate::github_star_prompt::activity_listener(self.state.clone()))
                 .child(screen)
                 .child(self.ssh_prompt.clone())
+                .child(self.connect_onboarding.clone())
                 .children(crate::quit_hold::hint(cx))
                 .into_any_element();
         }
+        crate::theme::slots::begin_inspector_frame(cx);
         let settings = crate::settings::overlay(window, cx);
         let usage = crate::usage::overlay(window, cx);
         let theme_editor = crate::theme_editor::overlay(window, cx);
@@ -809,6 +841,35 @@ impl Render for Workspace {
         let on_utility_page = on_pull_requests || on_issues;
         let show_right_panel = !on_utility_page || state.uses_shared_utility_panel();
         let composer_replaced = self.composer_replaced;
+        if self.was_draft_route && has_thread && !prefers_reduced_motion(cx) {
+            self.draft_launch_started = Some(Instant::now());
+        } else if !has_thread || prefers_reduced_motion(cx) {
+            self.draft_launch_started = None;
+        }
+        self.was_draft_route = has_draft;
+        let (draft_launch_lift, thread_launch_opacity) = if let Some(started) = self.draft_launch_started {
+            const DURATION_SECS: f32 = 0.22;
+            let progress = (started.elapsed().as_secs_f32() / DURATION_SECS).min(1.0);
+            if progress >= 1.0 {
+                self.draft_launch_started = None;
+                (0.0_f32, 1.0_f32)
+            } else {
+                window.request_animation_frame();
+                let eased = 1.0 - (1.0 - progress).powi(3);
+                let to_y = self
+                    .resting_composer_origin_y
+                    .get()
+                    .unwrap_or_else(|| pane_height - self.draft_composer_height.get().max(110.));
+                let delta = self
+                    .draft_composer_origin_y
+                    .get()
+                    .map_or(180.0_f32, |from_y| (to_y - from_y).clamp(0.0, 500.0));
+                (delta * (1.0 - eased), eased)
+            }
+        } else {
+            (0.0_f32, 1.0_f32)
+        };
+        let resting_origin_y = self.resting_composer_origin_y.clone();
         let inline_progress = transition(
             "inline-sidebar",
             f32::from(sidebar_open),
@@ -968,12 +1029,17 @@ impl Render for Workspace {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.connect_onboarding.update(cx, |dialog, cx| dialog.handle_escape(cx)) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.project_dialogs.update(cx, |dialogs, cx| dialogs.dismiss(cx)) {
                         cx.stop_propagation();
                         return;
                     }
                     let overlay_open = this.menu.read(cx).is_open()
                         || this.dialog.read(cx).is_open()
+                        || this.connect_onboarding.read(cx).is_open()
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
                         || this.project_dialogs.read(cx).is_open()
@@ -1001,6 +1067,7 @@ impl Render for Workspace {
                 {
                     let overlay_open = this.menu.read(cx).is_open()
                         || this.dialog.read(cx).is_open()
+                        || this.connect_onboarding.read(cx).is_open()
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
                         || this.project_dialogs.read(cx).is_open()
@@ -1080,23 +1147,36 @@ impl Render for Workspace {
                                 .pr(px(details_layout.lane_inset))
                                 .theme_slot_hover(ThemeSlot::ConversationArea, cx)
                                 .children(theme_slot_background_layer(ThemeSlot::ConversationArea, cx))
+                                .children(crate::theme::inspector_slot_probe(ThemeSlot::ConversationArea, cx))
                                 // An uncached shell lets minimap frames reuse the transcript's row cache.
                                 .child(
                                     div()
                                         .relative()
                                         .flex_1()
                                         .min_h_0()
-                                        .child(div().track_focus(&self.area_focus.conversation).size_full().child(self.thread.clone()))
-                                        .child(ThreadView::floating_bottom_overlay(
-                                            &self.thread,
-                                            self.composer_overlay_height.clone(),
-                                            v_flex()
-                                                .w_full()
-                                                .child(self.lineage.clone())
-                                                .when(!composer_replaced, |this| {
-                                                    this.child(div().track_focus(&self.area_focus.composer).w_full().child(self.composer.clone()))
-                                                }),
-                                        )),
+                                        .child(div().track_focus(&self.area_focus.conversation).size_full().opacity(thread_launch_opacity).child(self.thread.clone()))
+                                        .child(
+                                            ThreadView::floating_bottom_overlay(
+                                                &self.thread,
+                                                self.composer_overlay_height.clone(),
+                                                v_flex()
+                                                    .relative()
+                                                    .w_full()
+                                                    .child(
+                                                        gpui::canvas(
+                                                            move |bounds, _, _| resting_origin_y.set(Some(f32::from(bounds.origin.y))),
+                                                            |_, _, _, _| {},
+                                                        )
+                                                        .absolute()
+                                                        .inset_0(),
+                                                    )
+                                                    .child(self.lineage.clone())
+                                                    .when(!composer_replaced, |this| {
+                                                        this.child(div().track_focus(&self.area_focus.composer).w_full().child(self.composer.clone()))
+                                                    }),
+                                            )
+                                            .when(draft_launch_lift > 0.0, |overlay| overlay.bottom(px(draft_launch_lift))),
+                                        ),
                                 )
                                 .child(self.details.clone()),
                         )
@@ -1118,6 +1198,7 @@ impl Render for Workspace {
                                 .pr(px(details_layout.lane_inset))
                                 .theme_slot_hover(ThemeSlot::ConversationArea, cx)
                                 .children(theme_slot_background_layer(ThemeSlot::ConversationArea, cx))
+                                .children(crate::theme::inspector_slot_probe(ThemeSlot::ConversationArea, cx))
                                 .child(div().track_focus(&self.area_focus.composer).flex_1().min_h_0().child(self.draft.clone()))
                                 .child(self.details.clone()),
                         )
@@ -1148,6 +1229,7 @@ impl Render for Workspace {
             .child(self.prompt_links.clone())
             .child(self.menu.clone())
             .child(self.dialog.clone())
+            .child(self.connect_onboarding.clone())
             .child(self.guest_share.clone())
             .child(self.mcp.clone())
             .child(self.git_dialogs.clone())
@@ -1205,7 +1287,7 @@ impl Workspace {
             .left(px(sidebar_width - layout::RAIL_WIDTH / 2.))
             .w(px(layout::RAIL_WIDTH))
             .cursor_ew_resize()
-            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Drag to resize sidebar").build(window, cx))
+            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, "Drag to resize sidebar")).build(window, cx))
             .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| EmptyView))
             .on_drag_move(cx.listener(Self::resize_sidebar))
             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
@@ -1238,6 +1320,7 @@ impl Workspace {
             .border_color(hsla(p.sidebar_edge))
             .theme_slot_hover(ThemeSlot::Sidebar, cx)
             .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
+            .children(crate::theme::inspector_slot_probe(ThemeSlot::Sidebar, cx))
             .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full()))
     }
 
@@ -1372,13 +1455,18 @@ impl Workspace {
             AppearanceMode::Dark => AppearanceMode::System,
         };
         crate::settings::store::update_client(&self.state, ClientSettingChange::AppearanceMode(next), cx);
-        let label = match next {
-            AppearanceMode::System => "System",
-            AppearanceMode::Light => "Light",
-            AppearanceMode::Dark => "Dark",
+        let mode = match next {
+            AppearanceMode::System => "system",
+            AppearanceMode::Light => "light",
+            AppearanceMode::Dark => "dark",
         };
+        let toast = crate::i18n::t_fmt(
+            cx,
+            "{mode, select, system {Appearance: System} light {Appearance: Light} other {Appearance: Dark}}",
+            &[("mode", mode.into())],
+        );
         self.state.update(cx, |state, cx| {
-            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, format!("Appearance: {label}")), cx);
+            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, toast), cx);
         });
     }
 
@@ -1517,7 +1605,7 @@ impl Workspace {
         {
             self.state.update(cx, |state, cx| {
                 state.show_toast(
-                    crate::toast::Toast::new(crate::toast::ToastKind::Warning, "Invalid keybindings configuration")
+                    crate::toast::Toast::new(crate::toast::ToastKind::Warning, crate::i18n::t(cx, "Invalid keybindings configuration"))
                         .description(message)
                         .open_keybindings_config(),
                     cx,
@@ -1707,9 +1795,12 @@ impl Workspace {
                 state.show_toast(
                     crate::toast::Toast::new(
                         crate::toast::ToastKind::Warning,
-                        format!("Permissions have changed for {label}"),
+                        crate::i18n::t_fmt(cx, "Permissions have changed for {label}", &[("label", label.as_str().into())]),
                     )
-                    .description("This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need.")
+                    .description(crate::i18n::t(
+                        cx,
+                        "This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need.",
+                    ))
                     .permission_update(env_key),
                     cx,
                 );
@@ -1810,6 +1901,7 @@ impl Workspace {
         self.connection_diagnosis_open
             || self.menu.read(cx).is_open()
             || self.dialog.read(cx).is_open()
+            || self.connect_onboarding.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
             || self.project_dialogs.read(cx).is_open()

@@ -196,6 +196,7 @@ pub struct AppState {
     pub(crate) local_host: t3_client::local::LocalServerHost,
     pub local_host_phase: t3_core::local_server::LocalServerPhase,
     pub local_server_auto_start: bool,
+    pub local_server_exposure: t3_core::local_server::LocalServerExposure,
     _local_host_pump: Option<Task<()>>,
     /// SSH password prompts waiting for an answer, oldest first, each with its sequence number.
     pub ssh_prompts: VecDeque<(u64, PasswordRequest)>,
@@ -350,6 +351,7 @@ impl AppState {
             local_host,
             local_host_phase,
             local_server_auto_start,
+            local_server_exposure: t3_client::local::load_local_server_exposure(),
             _local_host_pump: Some(local_host_pump),
             ssh_prompts: VecDeque::new(),
             ssh_prompt_sequence: 0,
@@ -1658,6 +1660,79 @@ impl AppState {
     /// Whether this app is currently hosting the local `t3 serve` subprocess (`CN-LOCAL`).
     pub fn is_hosting_local_server(&self) -> bool {
         self.local_host_phase.is_running()
+    }
+
+    /// Whether `saved_id` is the local environment hosted by this app (`Settings > Sharing & access`).
+    pub fn is_hosted_local_target(&self, saved_id: &str) -> bool {
+        self.is_hosting_local_server()
+            && self.environments.get(saved_id).is_some_and(|env| env.local)
+    }
+
+    /// Current persisted local-server network access and Tailscale Serve configuration.
+    pub fn local_server_exposure(&self) -> &t3_core::local_server::LocalServerExposure {
+        &self.local_server_exposure
+    }
+
+    /// Persists updated local-server exposure settings and restarts the managed server if active.
+    pub fn apply_local_server_exposure(
+        &mut self,
+        exposure: t3_core::local_server::LocalServerExposure,
+        cx: &mut Context<Self>,
+    ) {
+        self.local_server_exposure = exposure.clone();
+        t3_client::local::save_local_server_exposure(&exposure);
+        cx.emit(AppEvent::Phase);
+        if !self.local_host_phase.is_active() {
+            return;
+        }
+        let reconnect_local = self
+            .environments
+            .active
+            .as_deref()
+            .and_then(|id| self.environments.get(id))
+            .is_some_and(|env| env.local);
+        let restart_future = self.local_host.restart_with_exposure_future(exposure);
+        let task = self.runtime.spawn(restart_future);
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| {
+                Err(t3_client::local::LocalServerHostError::ProcessFailed(
+                    "Local server restart task stopped unexpectedly.".to_owned(),
+                ))
+            });
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(server) => {
+                    state.connect.local_server = Some(server);
+                    state.show_toast(
+                        crate::toast::Toast::new(
+                            crate::toast::ToastKind::Success,
+                            "Local server restarted",
+                        ),
+                        cx,
+                    );
+                    cx.emit(AppEvent::Phase);
+                    if reconnect_local {
+                        state.connect_local(cx);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not restart local server with new exposure");
+                    state.show_toast(
+                        crate::toast::Toast::new(
+                            crate::toast::ToastKind::Error,
+                            "Could not restart local server",
+                        )
+                        .description(error.to_string()),
+                        cx,
+                    );
+                    state.fail_pairing(
+                        crate::environments::PairingSource::Local,
+                        error.to_string(),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     /// Persists whether the native app automatically starts a local server on launch when unpaired.
