@@ -368,6 +368,7 @@ pub fn open_thread_link(target: &ThreadLinkTarget, state: &Entity<AppState>, cx:
 #[derive(Default)]
 pub struct ThreadLinkMetadataGlobal {
     pub by_thread_id: HashMap<String, t3_core::markdown::links::ThreadLinkMetadata>,
+    pub revision: u64,
 }
 
 impl Global for ThreadLinkMetadataGlobal {}
@@ -409,6 +410,7 @@ pub fn prefetch_thread_link_metadata(state: &Entity<AppState>, owner: EntityId, 
                 }
                 cx.update_global::<ThreadLinkMetadataGlobal, _>(|global, _| {
                     global.by_thread_id.extend(map);
+                    global.revision = global.revision.wrapping_add(1);
                 });
                 cx.notify(owner);
             });

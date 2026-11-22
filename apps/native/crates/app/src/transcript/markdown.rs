@@ -43,6 +43,8 @@ struct Cached {
     cwd: Option<String>,
     math_enabled: bool,
     mentions_hash: u64,
+    has_dynamic_links: bool,
+    link_env_revision: u64,
     math_enabled_flag: SharedMathEnabled,
     state: Entity<TextViewState>,
     drawn: u64,
@@ -417,9 +419,41 @@ fn has_media_syntax(prepared: &str, parse_raw_html: bool) -> bool {
     prepared.contains("![") || (parse_raw_html && has_image_syntax(prepared))
 }
 
+fn has_dynamic_link_tokens(text: &str) -> bool {
+    text.contains("model:") || text.contains("t3-thread://") || text.contains("app.t3.codes")
+}
+
+fn current_link_env_revision(action_ctx: Option<&MarkdownActionContext>, cx: &App) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Some(ctx) = action_ctx {
+        let app = ctx.state.read(cx);
+        app.server_config_revision.hash(&mut hasher);
+        app.thread_titles_revision.hash(&mut hasher);
+        app.shell.snapshot.as_ref().map_or(0, |s| s.threads.len()).hash(&mut hasher);
+        if let Some(cfg) = app.server_config.config.as_ref() {
+            (cfg.providers.as_ptr() as usize).hash(&mut hasher);
+            cfg.providers.len().hash(&mut hasher);
+        } else {
+            0usize.hash(&mut hasher);
+        }
+    }
+    if let Some(global) = cx.try_global::<links::ThreadLinkMetadataGlobal>() {
+        global.revision.hash(&mut hasher);
+        global.by_thread_id.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 struct CachedContext {
     text: Arc<str>,
     presentation: Arc<t3_core::composer::records::SentPresentation>,
+    drawn: u64,
+}
+
+struct CachedUserBreaks {
+    raw: Arc<str>,
+    display: String,
+    formatted: Arc<str>,
     drawn: u64,
 }
 
@@ -427,6 +461,7 @@ struct CachedContext {
 pub struct MarkdownStore {
     states: HashMap<String, Cached>,
     contexts: HashMap<String, CachedContext>,
+    user_breaks: HashMap<String, CachedUserBreaks>,
     frame: u64,
     owner: EntityId,
 }
@@ -434,7 +469,11 @@ pub struct MarkdownStore {
 impl MarkdownStore {
     /// Background parsing changes measured row heights, so it also notifies the list owner.
     pub fn new(owner: EntityId) -> Self {
-        Self { states: HashMap::new(), contexts: HashMap::new(), frame: 0, owner }
+        Self { states: HashMap::new(), contexts: HashMap::new(), user_breaks: HashMap::new(), frame: 0, owner }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty() && self.contexts.is_empty() && self.user_breaks.is_empty()
     }
 
     /// Called once per transcript render, before rows draw.
@@ -448,6 +487,29 @@ impl MarkdownStore {
             let frame = self.frame;
             self.contexts.retain(|_, cached| cached.drawn + KEEP_FRAMES >= frame);
         }
+        if self.user_breaks.len() > SOFT_LIMIT {
+            let frame = self.frame;
+            self.user_breaks.retain(|_, cached| cached.drawn + KEEP_FRAMES >= frame);
+        }
+    }
+
+    pub fn user_text_with_line_breaks(&mut self, key: &str, raw: &Arc<str>, display: &str) -> Arc<str> {
+        if !display.contains('\n') && display.as_ptr() == raw.as_ptr() && display.len() == raw.len() {
+            return raw.clone();
+        }
+        if let Some(cached) = self.user_breaks.get_mut(key)
+            && Arc::ptr_eq(&cached.raw, raw)
+            && cached.display == display
+        {
+            cached.drawn = self.frame;
+            return cached.formatted.clone();
+        }
+        let formatted: Arc<str> = Arc::from(super::messages::with_line_breaks(display));
+        self.user_breaks.insert(
+            key.to_owned(),
+            CachedUserBreaks { raw: raw.clone(), display: display.to_owned(), formatted: formatted.clone(), drawn: self.frame },
+        );
+        formatted
     }
 
     /// The state for `key`, brought up to `text`. Appends stream; anything else replaces.
@@ -484,10 +546,16 @@ impl MarkdownStore {
 
         if let Some(cached) = self.states.get_mut(key) {
             cached.drawn = self.frame;
+            let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
+            let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
+            let has_dynamic_links = if text_changed { has_dynamic_link_tokens(text) } else { cached.has_dynamic_links };
+            let current_link_rev = if has_dynamic_links {
+                current_link_env_revision(action_ctx.as_ref(), cx)
+            } else {
+                0
+            };
             let (prepared_next, next_mentions_hash) = {
-                let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
-                let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
-                if text_changed || env_changed || text.contains("model:") || text.contains("t3-thread://") || text.contains("app.t3.codes") {
+                if text_changed || env_changed || (has_dynamic_links && cached.link_env_revision != current_link_rev) {
                     let (prepared, mentions_hash) = prepare_surface_markdown(
                         key,
                         text,
@@ -504,6 +572,8 @@ impl MarkdownStore {
                     (None, cached.mentions_hash)
                 }
             };
+            cached.has_dynamic_links = has_dynamic_links;
+            cached.link_env_revision = current_link_rev;
             *cached.action_ctx.lock().unwrap() = action_ctx;
             *cached.media_scope.lock().unwrap() = media_scope;
             if let Some(prepared) = prepared_next {
@@ -557,6 +627,12 @@ impl MarkdownStore {
         }
 
         let source_key: Arc<str> = Arc::from(key);
+        let has_dynamic_links = has_dynamic_link_tokens(text);
+        let link_env_revision = if has_dynamic_links {
+            current_link_env_revision(action_ctx.as_ref(), cx)
+        } else {
+            0
+        };
         let (prepared, mentions_hash) = prepare_surface_markdown(
             key,
             text,
@@ -591,6 +667,7 @@ impl MarkdownStore {
         };
         let extensions = attach_rich_extensions_with_media_options(
             media_ext,
+            blocks::hash_source_key(key),
             shared_ctx.clone(),
             nested_views.clone(),
             code_meta.clone(),
@@ -609,6 +686,8 @@ impl MarkdownStore {
                 cwd,
                 math_enabled,
                 mentions_hash,
+                has_dynamic_links,
+                link_env_revision,
                 math_enabled_flag,
                 state: state.clone(),
                 drawn: self.frame,
@@ -688,6 +767,7 @@ impl MarkdownStore {
     pub fn clear(&mut self) {
         self.states.clear();
         self.contexts.clear();
+        self.user_breaks.clear();
     }
 }
 

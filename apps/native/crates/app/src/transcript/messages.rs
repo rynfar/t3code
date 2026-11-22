@@ -19,10 +19,11 @@ use t3_core::timeline::{
     DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, EDIT_FROM_HERE, FORK_LABEL, ProposedPlan, RowKind,
     SentMessageEntry, TimelineRow, build_collapsed_proposed_plan_preview_markdown,
     build_proposed_plan_markdown_filename, can_fork, codex_artifact_template_presentation_label,
-    format_duration, is_workflow_script_message, normalize_plan_markdown_for_export,
-    partition_user_attachments, proposed_plan_title, render_codex_directives_for_copy,
-    resolve_model_switch_change, resolve_user_message_presentation,
-    split_codex_assistant_segments, strip_displayed_plan_markdown, user_message_file_label,
+    format_duration, has_codex_assistant_directives, is_workflow_script_message,
+    normalize_plan_markdown_for_export, partition_user_attachments, proposed_plan_title,
+    render_codex_directives_for_copy, resolve_model_switch_change,
+    resolve_user_message_presentation, split_codex_assistant_segments,
+    strip_displayed_plan_markdown, user_message_file_label,
 };
 
 use super::markdown::{MarkdownStore, prose, user_markdown_view};
@@ -961,7 +962,7 @@ pub fn user_row(
     let body = if body_text.trim().is_empty() || display_text.trim().is_empty() {
         None
     } else {
-        let source: Arc<str> = Arc::from(with_line_breaks(display_text));
+        let source = markdown.user_text_with_line_breaks(&format!("user:{id}"), &message.text, display_text);
         let state = markdown.marked_state(&format!("user:{id}"), &source, Some(action_ctx), &message.id, env, cx);
         Some(user_markdown_view(&state, &source, cx))
     };
@@ -1535,31 +1536,36 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         message.text.clone()
     };
     let action_ctx = action_context(env, cx);
-    let segments = split_codex_assistant_segments(&text);
-    let body = if segments.len() == 1
-        && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
-    {
-        let source: Arc<str> = Arc::from(rewritten.as_str());
-        let state = markdown.marked_state(&format!("assistant:{id}"), &source, Some(action_ctx), &message.id, env, cx);
-        citable_prose(SharedString::from(format!("assistant-select:{id}")), &state, &message.id, &source, cx).into_any_element()
+    let body = if !has_codex_assistant_directives(&text) {
+        let state = markdown.marked_state(&format!("assistant:{id}"), &text, Some(action_ctx), &message.id, env, cx);
+        citable_prose(SharedString::from(format!("assistant-select:{id}")), &state, &message.id, &text, cx).into_any_element()
     } else {
-        let thread_id = env.thread_id.map(str::to_owned);
-        v_flex()
-            .gap(px(8.))
-            .children(segments.into_iter().enumerate().map(|(seg_idx, segment)| match segment {
-                CodexAssistantSegment::Markdown(seg_text) => {
-                    let seg_arc: Arc<str> = Arc::from(seg_text);
-                    let state = markdown.marked_state(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), &message.id, env, cx);
-                    citable_prose(SharedString::from(format!("assistant-select:{id}:{seg_idx}")), &state, &message.id, &seg_arc, cx).into_any_element()
-                }
-                CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(
-                    SharedString::from(format!("use-template:{id}:{seg_idx}")),
-                    template,
-                    thread_id.clone(),
-                    cx,
-                ),
-            }))
-            .into_any_element()
+        let segments = split_codex_assistant_segments(&text);
+        if segments.len() == 1
+            && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
+        {
+            let source: Arc<str> = Arc::from(rewritten.as_str());
+            let state = markdown.marked_state(&format!("assistant:{id}"), &source, Some(action_ctx), &message.id, env, cx);
+            citable_prose(SharedString::from(format!("assistant-select:{id}")), &state, &message.id, &source, cx).into_any_element()
+        } else {
+            let thread_id = env.thread_id.map(str::to_owned);
+            v_flex()
+                .gap(px(8.))
+                .children(segments.into_iter().enumerate().map(|(seg_idx, segment)| match segment {
+                    CodexAssistantSegment::Markdown(seg_text) => {
+                        let seg_arc: Arc<str> = Arc::from(seg_text);
+                        let state = markdown.marked_state(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), &message.id, env, cx);
+                        citable_prose(SharedString::from(format!("assistant-select:{id}:{seg_idx}")), &state, &message.id, &seg_arc, cx).into_any_element()
+                    }
+                    CodexAssistantSegment::ArtifactTemplate(template) => render_artifact_template_card(
+                        SharedString::from(format!("use-template:{id}:{seg_idx}")),
+                        template,
+                        thread_id.clone(),
+                        cx,
+                    ),
+                }))
+                .into_any_element()
+        }
     };
     v_flex()
         .group(ROW_GROUP)

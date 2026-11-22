@@ -269,10 +269,17 @@ fn rewrite_inline_for_display(line: &str) -> String {
     out
 }
 
+/// Returns whether `markdown` contains any Codex assistant directive tokens requiring segmentation.
+pub fn has_codex_assistant_directives(markdown: &str) -> bool {
+    markdown.contains(CITATION_PREFIX)
+        || markdown.contains(FOLLOW_UP_PREFIX)
+        || markdown.contains(ARTIFACT_PREFIX)
+}
+
 /// Rewrite `:codex-file-citation` and `:codex-followup` directives into display markdown and split
 /// standalone `::artifact-template` lines into structured segments (`ChatMarkdown.tsx`).
 pub fn split_codex_assistant_segments(markdown: &str) -> Vec<CodexAssistantSegment> {
-    if !markdown.contains(CITATION_PREFIX) && !markdown.contains(FOLLOW_UP_PREFIX) && !markdown.contains(ARTIFACT_PREFIX) {
+    if !has_codex_assistant_directives(markdown) {
         return vec![CodexAssistantSegment::Markdown(markdown.to_owned())];
     }
     let mut segments = Vec::new();

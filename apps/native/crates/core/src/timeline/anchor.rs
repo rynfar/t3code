@@ -418,6 +418,7 @@ impl TimelineFollow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedThreadPosition {
     pub row_id: Option<String>,
+    pub row_index_hint: usize,
     pub offset_within_row: f32,
     pub scroll_top: f32,
     pub at_end: bool,

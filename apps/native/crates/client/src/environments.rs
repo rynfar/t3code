@@ -389,6 +389,14 @@ fn publish(entries: &HashMap<String, Entry>, changed: &str, material: bool, outp
     }
 }
 
+fn is_coalesceable_thread_event(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Thread { item, .. }
+            if matches!(item.as_ref(), t3_core::thread::ThreadStreamItem::Event { .. })
+    )
+}
+
 async fn relay_events(
     mut events: mpsc::Receiver<ClientEvent>,
     mut grants: watch::Receiver<Option<AuthSessionState>>,
@@ -397,6 +405,8 @@ async fn relay_events(
     key: String,
     epoch: u64,
 ) {
+    const STREAM_COALESCE_WINDOW: Duration = Duration::from_millis(8);
+    let mut last_stream_flush: Option<tokio::time::Instant> = None;
     loop {
         let frame = tokio::select! {
             event = events.recv() => {
@@ -404,6 +414,32 @@ async fn relay_events(
                 let mut batch = vec![first];
                 while batch.len() < 512 {
                     match events.try_recv() { Ok(event) => batch.push(event), Err(_) => break }
+                }
+                if batch.len() < 512
+                    && batch.iter().all(is_coalesceable_thread_event)
+                    && let Some(prev) = last_stream_flush
+                    && let Some(remaining) = STREAM_COALESCE_WINDOW.checked_sub(prev.elapsed())
+                {
+                    let deadline = tokio::time::Instant::now() + remaining;
+                    while batch.len() < 512 {
+                        let Ok(recv) = tokio::time::timeout_at(deadline, events.recv()).await else {
+                            break;
+                        };
+                        let Some(next) = recv else { break };
+                        let coalesceable = is_coalesceable_thread_event(&next);
+                        batch.push(next);
+                        if !coalesceable {
+                            break;
+                        }
+                    }
+                    while batch.len() < 512 {
+                        match events.try_recv() { Ok(event) => batch.push(event), Err(_) => break }
+                    }
+                }
+                if batch.iter().any(is_coalesceable_thread_event) {
+                    last_stream_flush = Some(tokio::time::Instant::now());
+                } else {
+                    last_stream_flush = None;
                 }
                 RelayFrame::Events(batch)
             }

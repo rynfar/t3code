@@ -281,6 +281,7 @@ fn remembered_positions_enforces_lru_cap_and_updates_recency() {
     let mut cache = RememberedPositions::default();
     let make = |offset: f32| SavedThreadPosition {
         row_id: Some("row".to_owned()),
+        row_index_hint: 0,
         offset_within_row: offset,
         scroll_top: offset,
         at_end: false,

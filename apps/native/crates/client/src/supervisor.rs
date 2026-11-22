@@ -108,7 +108,7 @@ pub enum ClientEvent {
 }
 
 enum Command {
-    OpenThread(String),
+    OpenThread { thread_id: String, sequence: Option<u64> },
     CloseThread(String),
     CloseAllThreads,
     RefreshSessionState,
@@ -267,7 +267,7 @@ impl ClientFixture {
         loop {
             match self.commands.recv().await.expect("fixture request channel closed") {
                 Command::Request { method, payload, reply, .. } => return (method, payload, reply),
-                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::Stream { .. } => {},
+                Command::OpenThread { .. } | Command::CloseThread(_) | Command::CloseAllThreads | Command::Stream { .. } => {},
                 _ => panic!("unexpected fixture command before request"),
             }
         }
@@ -280,7 +280,7 @@ impl ClientFixture {
                 Command::Request { reply, .. } => {
                     let _ = reply.send(Ok(serde_json::json!({})));
                 }
-                Command::OpenThread(_)
+                Command::OpenThread { .. }
                 | Command::CloseThread(_)
                 | Command::CloseAllThreads
                 | Command::RefreshSessionState
@@ -294,7 +294,7 @@ impl ClientFixture {
         let mut commands = Vec::new();
         while let Ok(command) = self.commands.try_recv() {
             commands.push(match command {
-                Command::OpenThread(_) => "open-thread",
+                Command::OpenThread { .. } => "open-thread",
                 Command::CloseThread(_) => "close-thread",
                 Command::CloseAllThreads => "close-all-threads",
                 Command::RefreshSessionState => "refresh-session",
@@ -313,7 +313,7 @@ impl ClientFixture {
             match command {
                 Command::Request { method, payload, reply, .. } => requests.push((method, payload, reply)),
                 Command::Stream { method, reply, .. } => streams.push((method, reply)),
-                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::RefreshSessionState | Command::RetryNow | Command::Wakeup(_) => {}
+                Command::OpenThread { .. } | Command::CloseThread(_) | Command::CloseAllThreads | Command::RefreshSessionState | Command::RetryNow | Command::Wakeup(_) => {}
             }
         }
         (requests, streams)
@@ -327,7 +327,14 @@ impl ClientHandle {
     }
 
     pub fn open_thread(&self, thread_id: &str) {
-        let _ = self.commands.send(Command::OpenThread(thread_id.to_owned()));
+        self.open_thread_from(thread_id, None);
+    }
+
+    pub fn open_thread_from(&self, thread_id: &str, sequence: Option<u64>) {
+        let _ = self.commands.send(Command::OpenThread {
+            thread_id: thread_id.to_owned(),
+            sequence,
+        });
     }
 
     pub fn close_thread(&self, thread_id: &str) {
@@ -852,8 +859,8 @@ async fn connect_draining(
 /// A command that arrives while there is no session.
 fn drain_command(command: Command, resume: &mut Resume) {
     match command {
-        Command::OpenThread(id) => {
-            resume.threads.entry(id).or_insert(None);
+        Command::OpenThread { thread_id, sequence } => {
+            resume.threads.entry(thread_id).or_insert(sequence);
         }
         Command::CloseAllThreads => { resume.threads.clear(); }
         Command::CloseThread(id) => {
@@ -1689,9 +1696,9 @@ async fn run_session(
             }
             command = commands.recv() => match command {
                 None => break SessionEnd::Dropped,
-                Some(Command::OpenThread(thread_id)) => {
+                Some(Command::OpenThread { thread_id, sequence }) => {
                     if !forwarders.contains_key(&thread_id) {
-                        let sequence = *resume.threads.entry(thread_id.clone()).or_insert(None);
+                        let sequence = *resume.threads.entry(thread_id.clone()).or_insert(sequence);
                         forwarders.insert(thread_id.clone(), forward_thread(session, &thread_id, sequence, thread_tx.clone()));
                     }
                 }
@@ -2337,6 +2344,47 @@ mod parity_tests {
         assert_eq!(rebuilt[0]["models"][0]["slug"], "gpt-5.4");
         assert_eq!(rebuilt[0]["slashCommands"][0]["name"], "review");
         assert_eq!(rebuilt[0]["skills"][0]["name"], "rust");
+    }
+
+    #[test]
+    fn open_thread_from_seeds_resume_sequence_and_close_clears_it() {
+        let mut resume = Resume {
+            shell: None,
+            shell_options: None,
+            threads: HashMap::new(),
+        };
+        drain_command(
+            Command::OpenThread { thread_id: "thr-1".to_owned(), sequence: Some(42) },
+            &mut resume,
+        );
+        assert_eq!(resume.threads.get("thr-1"), Some(&Some(42)));
+        drain_command(Command::CloseThread("thr-1".to_owned()), &mut resume);
+        assert!(!resume.threads.contains_key("thr-1"));
+
+        let (commands, mut received) = mpsc::unbounded_channel();
+        let (_, session_state) = watch::channel(None);
+        let (_, connection_generation) = watch::channel(1);
+        let (_, active_credentials) = watch::channel(None);
+        let handle = ClientHandle {
+            refs: Default::default(),
+            commands,
+            credentials: Arc::new(Credentials {
+                http_base: "http://127.0.0.1:1".into(),
+                access_token: String::new(),
+            }),
+            active_credentials,
+            session_state,
+            connection_generation,
+        };
+        handle.open_thread_from("thr-2", Some(99));
+        let cmd = received.try_recv().expect("queued command");
+        match cmd {
+            Command::OpenThread { thread_id, sequence } => {
+                assert_eq!(thread_id, "thr-2");
+                assert_eq!(sequence, Some(99));
+            }
+            _ => panic!("expected Command::OpenThread"),
+        }
     }
 }
 

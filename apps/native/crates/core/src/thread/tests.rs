@@ -300,3 +300,65 @@ fn pending_background_turn_items_and_settle_only_active_local_items() {
     assert_eq!(proj.turn_items[1].status, "completed");
     assert_eq!(proj.visible_turn_items.last().unwrap().item.status, "running");
 }
+
+#[test]
+fn apply_classified_distinguishes_streaming_deltas_from_structural_updates() {
+    let mut state = ThreadState::default();
+    assert_eq!(state.apply_classified(ThreadStreamItem::Synchronized), ThreadApplyKind::Structure);
+    assert_eq!(state.apply_classified(ThreadStreamItem::Synchronized), ThreadApplyKind::Unchanged);
+
+    let mut asst_streaming = assistant("a1", 1, Some("r1"), "Hello");
+    asst_streaming["status"] = json!("running");
+    asst_streaming["streaming"] = json!(true);
+
+    let mut reasoning_streaming = base_item("rsn1", 2, Some("r1"));
+    reasoning_streaming["type"] = json!("reasoning");
+    reasoning_streaming["status"] = json!("running");
+    reasoning_streaming["text"] = json!("Thinking");
+    reasoning_streaming["streaming"] = json!(true);
+
+    let snap = ThreadStreamItem::Snapshot {
+        snapshot_sequence: 10,
+        projection: Box::new(projection(vec![asst_streaming.clone(), reasoning_streaming.clone()], vec![run("r1", "running")])),
+        history_cursor: None,
+        has_more_history: Some(false),
+        latest_local_turn_ordinal: None,
+        turn_items_omit_local_visible: None,
+    };
+    assert_eq!(state.apply_classified(snap), ThreadApplyKind::Structure);
+
+    let upsert_event = |seq: u64, value: Value| ThreadStreamItem::Event {
+        sequence: seq,
+        event: Box::new(DomainEvent {
+            id: format!("ev-{seq}"),
+            thread_id: "t1".into(),
+            occurred_at: T.into(),
+            body: EventBody::TurnItemUpserted(Arc::new(serde_json::from_value(value).unwrap())),
+        }),
+    };
+
+    // Stale sequence is ignored cleanly.
+    assert_eq!(state.apply_classified(upsert_event(10, asst_streaming.clone())), ThreadApplyKind::Unchanged);
+
+    // In-place assistant & reasoning text deltas classify as StreamingDelta.
+    let mut asst_delta = asst_streaming.clone();
+    asst_delta["text"] = json!("Hello world");
+    assert_eq!(state.apply_classified(upsert_event(11, asst_delta)), ThreadApplyKind::StreamingDelta);
+
+    let mut reasoning_delta = reasoning_streaming.clone();
+    reasoning_delta["text"] = json!("Thinking deeply");
+    assert_eq!(state.apply_classified(upsert_event(12, reasoning_delta)), ThreadApplyKind::StreamingDelta);
+
+    // Brand-new item classifies as Structure.
+    let mut asst_new = assistant("a2", 3, Some("r1"), "Second");
+    asst_new["status"] = json!("running");
+    asst_new["streaming"] = json!(true);
+    assert_eq!(state.apply_classified(upsert_event(13, asst_new)), ThreadApplyKind::Structure);
+
+    // Completing an item (streaming: true -> false) classifies as Structure.
+    let mut asst_done = asst_streaming;
+    asst_done["text"] = json!("Hello world!");
+    asst_done["streaming"] = json!(false);
+    asst_done["status"] = json!("completed");
+    assert_eq!(state.apply_classified(upsert_event(14, asst_done)), ThreadApplyKind::Structure);
+}

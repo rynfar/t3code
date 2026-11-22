@@ -135,12 +135,14 @@ pub(super) struct RichMarkdownMedia {
 struct ChildTextState {
     last_body: String,
     entity: Entity<TextViewState>,
+    extensions: MarkdownExtensions,
 }
 
 struct DetailsUiState {
     open: bool,
     last_body: String,
     entity: Entity<TextViewState>,
+    extensions: MarkdownExtensions,
 }
 
 struct MathUiState {
@@ -383,8 +385,40 @@ fn mermaid_cache(cx: &mut App) -> Entity<MermaidStore> {
     cache
 }
 
+pub(super) fn hash_source_key(key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn salt_source_hash(base: u64, key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn update_child_text(entity: &Entity<TextViewState>, previous: &mut String, next: &str, cx: &mut App) -> bool {
+    if previous.as_str() == next {
+        return false;
+    }
+    if !previous.is_empty()
+        && let Some(delta) = next.strip_prefix(previous.as_str())
+        && !delta.is_empty()
+    {
+        previous.push_str(delta);
+        entity.update(cx, |tv, cx| tv.push_str(delta, cx));
+        return true;
+    }
+    *previous = next.to_owned();
+    entity.update(cx, |tv, cx| tv.set_text(next, cx));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn attach_rich_extensions_with_media_options(
     base: MarkdownExtensions,
+    source_hash: u64,
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
@@ -394,6 +428,7 @@ pub(super) fn attach_rich_extensions_with_media_options(
 ) -> MarkdownExtensions {
     attach_extensions_inner(
         base,
+        source_hash,
         action_ctx,
         nested_views,
         code_meta,
@@ -419,6 +454,7 @@ fn child_media_base(media: Option<&RichMarkdownMedia>, body: &str) -> MarkdownEx
 #[allow(clippy::too_many_arguments)]
 fn attach_extensions_inner(
     base: MarkdownExtensions,
+    source_hash: u64,
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
@@ -436,6 +472,7 @@ fn attach_extensions_inner(
 
     let with_parsers = base.block_parser(move |node, context| {
         parse_rich_block(
+            source_hash,
             node,
             context,
             intercept_tables,
@@ -483,17 +520,17 @@ fn attach_extensions_inner(
     with_parsers
         .block_renderer(ALERT_NODE, move |node, window, cx| {
             let Some(data) = node.data::<AlertNodeData>() else { return div().into_any_element() };
-            let env = RichBlockEnv { action_ctx: &ctx_alert, nested_views: &nested_alert, code_meta: &meta_alert, math_enabled: &math_alert, media: media_alert.as_ref() };
+            let env = RichBlockEnv { source_hash, action_ctx: &ctx_alert, nested_views: &nested_alert, code_meta: &meta_alert, math_enabled: &math_alert, media: media_alert.as_ref() };
             render_alert_block(data, env, window, cx)
         })
         .block_renderer(DETAILS_NODE, move |node, window, cx| {
             let Some(data) = node.data::<DetailsNodeData>() else { return div().into_any_element() };
-            let env = RichBlockEnv { action_ctx: &ctx_details, nested_views: &nested_details, code_meta: &meta_details, math_enabled: &math_details, media: media_details.as_ref() };
+            let env = RichBlockEnv { source_hash, action_ctx: &ctx_details, nested_views: &nested_details, code_meta: &meta_details, math_enabled: &math_details, media: media_details.as_ref() };
             render_details_block(data, env, window, cx)
         })
         .block_renderer(ORDERED_LIST_NODE, move |node, window, cx| {
             let Some(data) = node.data::<OrderedListNodeData>() else { return div().into_any_element() };
-            let env = RichBlockEnv { action_ctx: &ctx_list, nested_views: &nested_list, code_meta: &meta_list, math_enabled: &math_list, media: media_list.as_ref() };
+            let env = RichBlockEnv { source_hash, action_ctx: &ctx_list, nested_views: &nested_list, code_meta: &meta_list, math_enabled: &math_list, media: media_list.as_ref() };
             render_ordered_list_block(data, env, window, cx)
         })
         .block_renderer(MATH_NODE, move |node, window, cx| {
@@ -506,12 +543,12 @@ fn attach_extensions_inner(
         })
         .block_renderer(TABLE_NODE, move |node, window, cx| {
             let Some(data) = node.data::<TableNodeData>() else { return div().into_any_element() };
-            let env = RichBlockEnv { action_ctx: &ctx_table, nested_views: &nested_table, code_meta: &meta_table, math_enabled: &math_table, media: media_table.as_ref() };
+            let env = RichBlockEnv { source_hash, action_ctx: &ctx_table, nested_views: &nested_table, code_meta: &meta_table, math_enabled: &math_table, media: media_table.as_ref() };
             render_table_block(data, env, window, cx)
         })
         .block_renderer(CODE_BLOCK_NODE, move |node, window, cx| {
             let Some(data) = node.data::<CodeBlockNodeData>() else { return div().into_any_element() };
-            let env = RichBlockEnv { action_ctx: &ctx_code, nested_views: &nested_code, code_meta: &meta_code, math_enabled: &math_code, media: media_code.as_ref() };
+            let env = RichBlockEnv { source_hash, action_ctx: &ctx_code, nested_views: &nested_code, code_meta: &meta_code, math_enabled: &math_code, media: media_code.as_ref() };
             render_code_block(data, env, window, cx)
         })
 }
@@ -553,6 +590,7 @@ fn fallback_code_fence(code: &mdast::Code) -> String {
 }
 
 fn parse_rich_block(
+    source_hash: u64,
     node: &mdast::Node,
     context: &MarkdownParseContext<'_>,
     intercept_tables: bool,
@@ -560,7 +598,7 @@ fn parse_rich_block(
     keep_ordered_list_numbers: bool,
     math_enabled: bool,
 ) -> Option<MarkdownNode> {
-    let key = node_key(node);
+    let key = node_key(source_hash, context.offset(), node);
     match node {
         mdast::Node::Blockquote(bq) => {
             let alert = parse_github_alert(bq, context.source())?;
@@ -673,28 +711,27 @@ fn parse_rich_block(
     }
 }
 
-fn node_key(node: &mdast::Node) -> String {
+fn node_key(source_hash: u64, context_offset: usize, node: &mdast::Node) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_hash.hash(&mut hasher);
     match node {
         mdast::Node::Blockquote(b) => {
             "bq".hash(&mut hasher);
-            b.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
+            b.position.as_ref().map(|p| context_offset.saturating_add(p.start.offset)).hash(&mut hasher);
         }
         mdast::Node::Table(t) => {
             "tbl".hash(&mut hasher);
-            t.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
-            t.children.len().hash(&mut hasher);
+            t.position.as_ref().map(|p| context_offset.saturating_add(p.start.offset)).hash(&mut hasher);
         }
         mdast::Node::Code(c) => {
             "code".hash(&mut hasher);
-            c.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
+            c.position.as_ref().map(|p| context_offset.saturating_add(p.start.offset)).hash(&mut hasher);
             c.lang.hash(&mut hasher);
             c.meta.hash(&mut hasher);
         }
         mdast::Node::List(l) => {
             "list".hash(&mut hasher);
-            l.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
-            l.children.len().hash(&mut hasher);
+            l.position.as_ref().map(|p| context_offset.saturating_add(p.start.offset)).hash(&mut hasher);
         }
         _ => {}
     }
@@ -703,6 +740,7 @@ fn node_key(node: &mdast::Node) -> String {
 
 #[derive(Clone, Copy)]
 struct RichBlockEnv<'a> {
+    source_hash: u64,
     action_ctx: &'a SharedActionContext,
     nested_views: &'a NestedViews,
     code_meta: &'a SharedCodeMeta,
@@ -716,7 +754,7 @@ fn render_alert_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let (accent, icon) = match data.alert.kind {
         AlertKind::Insight => (p.info, Icon::Star),
@@ -728,17 +766,33 @@ fn render_alert_block(
     };
 
     let body = data.alert.body_markdown.clone();
+    let child_hash = salt_source_hash(source_hash, &data.key);
+    let build_ext = |body: &str| {
+        attach_extensions_inner(
+            child_media_base(media, body),
+            child_hash,
+            action_ctx.clone(),
+            nested_views.clone(),
+            code_meta.clone(),
+            math_enabled.clone(),
+            media.cloned(),
+            true,
+            true,
+            false,
+        )
+    };
     let key = SharedString::from(format!("alert-body:{}", data.key));
     let state = window.use_keyed_state(key.clone(), cx, |_, cx| ChildTextState {
         last_body: body.clone(),
         entity: cx.new(|cx| TextViewState::markdown(&body, cx).selectable(true)),
+        extensions: build_ext(&body),
     });
-    let entity = state.update(cx, |s, cx| {
-        if s.last_body != body {
-            s.last_body = body.clone();
-            s.entity.update(cx, |tv, cx| tv.set_text(&body, cx));
+    let (entity, child_ext) = state.update(cx, |s, cx| {
+        let changed = update_child_text(&s.entity, &mut s.last_body, &body, cx);
+        if changed && media.is_some() {
+            s.extensions = build_ext(&body);
         }
-        s.entity.clone()
+        (s.entity.clone(), s.extensions.clone())
     });
     nested_views.lock().unwrap().insert(
         data.key.clone(),
@@ -749,17 +803,6 @@ fn render_alert_block(
         },
     );
 
-    let child_ext = attach_extensions_inner(
-        child_media_base(media, &body),
-        action_ctx.clone(),
-        nested_views.clone(),
-        code_meta.clone(),
-        math_enabled.clone(),
-        media.cloned(),
-        true,
-        true,
-        false,
-    );
     let view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -816,7 +859,7 @@ fn render_ordered_list_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let rows: Vec<AnyElement> = data
         .list
@@ -826,29 +869,34 @@ fn render_ordered_list_block(
         .map(|(index, item)| {
             let item_key = format!("ol:{}:{}", data.key, index);
             let body = item.body_markdown.clone();
+            let item_hash = salt_source_hash(source_hash, &item_key);
+            let build_ext = |body: &str| {
+                attach_extensions_inner(
+                    child_media_base(media, body),
+                    item_hash,
+                    action_ctx.clone(),
+                    nested_views.clone(),
+                    code_meta.clone(),
+                    math_enabled.clone(),
+                    media.cloned(),
+                    true,
+                    true,
+                    true,
+                )
+            };
             let state = window.use_keyed_state(SharedString::from(item_key.clone()), cx, |_, cx| ChildTextState {
                 last_body: body.clone(),
                 entity: cx.new(|cx| TextViewState::markdown(&body, cx).selectable(true)),
+                extensions: build_ext(&body),
             });
-            let entity = state.update(cx, |s, cx| {
-                if s.last_body != body {
-                    s.last_body = body.clone();
-                    s.entity.update(cx, |tv, cx| tv.set_text(&body, cx));
+            let (entity, child_ext) = state.update(cx, |s, cx| {
+                let changed = update_child_text(&s.entity, &mut s.last_body, &body, cx);
+                if changed && media.is_some() {
+                    s.extensions = build_ext(&body);
                 }
-                s.entity.clone()
+                (s.entity.clone(), s.extensions.clone())
             });
             nested_views.lock().unwrap().insert(item_key, NestedSelection::Markdown(entity.clone()));
-            let child_ext = attach_extensions_inner(
-                child_media_base(media, &body),
-                action_ctx.clone(),
-                nested_views.clone(),
-                code_meta.clone(),
-                math_enabled.clone(),
-                media.cloned(),
-                true,
-                true,
-                true,
-            );
             let view = super::style_markdown_internal(
                 TextView::new(&entity).markdown_extensions(child_ext),
                 action_ctx.lock().unwrap().clone(),
@@ -881,22 +929,38 @@ fn render_details_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let body = data.details.body_markdown.clone();
     let default_open = data.details.open;
+    let child_hash = salt_source_hash(source_hash, &data.key);
+    let build_ext = |body: &str| {
+        attach_extensions_inner(
+            child_media_base(media, body),
+            child_hash,
+            action_ctx.clone(),
+            nested_views.clone(),
+            code_meta.clone(),
+            math_enabled.clone(),
+            media.cloned(),
+            true,
+            true,
+            false,
+        )
+    };
     let key = SharedString::from(format!("details:{}", data.key));
     let state = window.use_keyed_state(key.clone(), cx, |_, cx| DetailsUiState {
         open: default_open,
         last_body: body.clone(),
         entity: cx.new(|cx| TextViewState::markdown(&body, cx).selectable(true)),
+        extensions: build_ext(&body),
     });
-    let (open, entity) = state.update(cx, |s, cx| {
-        if s.last_body != body {
-            s.last_body = body.clone();
-            s.entity.update(cx, |tv, cx| tv.set_text(&body, cx));
+    let (open, entity, child_ext) = state.update(cx, |s, cx| {
+        let changed = update_child_text(&s.entity, &mut s.last_body, &body, cx);
+        if changed && media.is_some() {
+            s.extensions = build_ext(&body);
         }
-        (s.open, s.entity.clone())
+        (s.open, s.entity.clone(), s.extensions.clone())
     });
     if open {
         nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
@@ -904,17 +968,6 @@ fn render_details_block(
         nested_views.lock().unwrap().remove(&data.key);
     }
 
-    let child_ext = attach_extensions_inner(
-        child_media_base(media, &body),
-        action_ctx.clone(),
-        nested_views.clone(),
-        code_meta.clone(),
-        math_enabled.clone(),
-        media.cloned(),
-        true,
-        true,
-        false,
-    );
     let body_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -1255,38 +1308,37 @@ fn render_table_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let has_media = data.cell_markdown.iter().flatten().any(|cell| super::has_image_syntax(cell));
     let table_view = if has_media {
         render_media_table_grid(data, env, window, cx)
     } else {
         let raw = data.raw_markdown.clone();
+        let child_hash = salt_source_hash(source_hash, &data.key);
         let key = SharedString::from(format!("table:{}", data.key));
         let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
             last_body: raw.clone(),
             entity: cx.new(|cx| TextViewState::markdown(&raw, cx).selectable(true)),
+            extensions: attach_extensions_inner(
+                MarkdownExtensions::default(),
+                child_hash,
+                action_ctx.clone(),
+                nested_views.clone(),
+                code_meta.clone(),
+                math_enabled.clone(),
+                media.cloned(),
+                false,
+                false,
+                false,
+            ),
         });
-        let entity = state.update(cx, |s, cx| {
-            if s.last_body != raw {
-                s.last_body = raw.clone();
-                s.entity.update(cx, |tv, cx| tv.set_text(&raw, cx));
-            }
-            s.entity.clone()
+        let (entity, child_ext) = state.update(cx, |s, cx| {
+            let _ = update_child_text(&s.entity, &mut s.last_body, &raw, cx);
+            (s.entity.clone(), s.extensions.clone())
         });
         nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
 
-        let child_ext = attach_extensions_inner(
-            MarkdownExtensions::default(),
-            action_ctx.clone(),
-            nested_views.clone(),
-            code_meta.clone(),
-            math_enabled.clone(),
-            media.cloned(),
-            false,
-            false,
-            false,
-        );
         super::style_markdown_internal(
             TextView::new(&entity).markdown_extensions(child_ext),
             action_ctx.lock().unwrap().clone(),
@@ -1345,36 +1397,35 @@ fn render_code_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let raw = data.raw_markdown.clone();
+    let child_hash = salt_source_hash(source_hash, &data.key);
     let key = SharedString::from(format!("code-block:{}", data.key));
     let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
         last_body: raw.clone(),
         entity: cx.new(|cx| TextViewState::markdown(&raw, cx).selectable(true)),
+        extensions: attach_extensions_inner(
+            MarkdownExtensions::default(),
+            child_hash,
+            action_ctx.clone(),
+            nested_views.clone(),
+            code_meta.clone(),
+            math_enabled.clone(),
+            media.cloned(),
+            false,
+            false,
+            false,
+        ),
     });
-    let entity = state.update(cx, |s, cx| {
-        if s.last_body != raw {
-            s.last_body = raw.clone();
-            s.entity.update(cx, |tv, cx| tv.set_text(&raw, cx));
-        }
-        s.entity.clone()
+    let (entity, child_ext) = state.update(cx, |s, cx| {
+        let _ = update_child_text(&s.entity, &mut s.last_body, &raw, cx);
+        (s.entity.clone(), s.extensions.clone())
     });
     nested_views
         .lock()
         .unwrap()
         .insert(format!("code:{}", data.key), NestedSelection::Markdown(entity.clone()));
 
-    let child_ext = attach_extensions_inner(
-        MarkdownExtensions::default(),
-        action_ctx.clone(),
-        nested_views.clone(),
-        code_meta.clone(),
-        math_enabled.clone(),
-        media.cloned(),
-        false,
-        false,
-        false,
-    );
     let code_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -1443,7 +1494,7 @@ fn render_media_table_grid(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let RichBlockEnv { source_hash, action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let cols = data.cell_markdown.iter().map(Vec::len).max().unwrap_or(0).max(data.data.align.len()).max(1);
     let row_count = data.cell_markdown.len();
@@ -1459,32 +1510,38 @@ fn render_media_table_grid(
             .when(row_idx + 1 < row_count, |row| row.border_b_1().border_color(hsla(p.border).opacity(0.6)));
         for col_idx in 0..cols {
             let cell_md = row_cells.get(col_idx).cloned().unwrap_or_default();
-            let key = SharedString::from(format!("table-cell:{}:{row_idx}:{col_idx}", data.key));
+            let cell_key = format!("{}:{row_idx}:{col_idx}", data.key);
+            let cell_hash = salt_source_hash(source_hash, &cell_key);
+            let build_ext = |cell_md: &str| {
+                attach_extensions_inner(
+                    child_media_base(media, cell_md),
+                    cell_hash,
+                    action_ctx.clone(),
+                    nested_views.clone(),
+                    code_meta.clone(),
+                    math_enabled.clone(),
+                    media.cloned(),
+                    false,
+                    true,
+                    false,
+                )
+            };
+            let key = SharedString::from(format!("table-cell:{cell_key}"));
             let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
                 last_body: cell_md.clone(),
                 entity: cx.new(|cx| TextViewState::markdown(&cell_md, cx).selectable(true)),
+                extensions: build_ext(&cell_md),
             });
-            let entity = state.update(cx, |s, cx| {
-                if s.last_body != cell_md {
-                    s.last_body = cell_md.clone();
-                    s.entity.update(cx, |tv, cx| tv.set_text(&cell_md, cx));
+            let (entity, child_ext) = state.update(cx, |s, cx| {
+                let changed = update_child_text(&s.entity, &mut s.last_body, &cell_md, cx);
+                if changed && media.is_some() {
+                    s.extensions = build_ext(&cell_md);
                 }
-                s.entity.clone()
+                (s.entity.clone(), s.extensions.clone())
             });
             nested_views.lock().unwrap().insert(
-                format!("{}:{row_idx}:{col_idx}", data.key),
+                cell_key,
                 NestedSelection::Markdown(entity.clone()),
-            );
-            let child_ext = attach_extensions_inner(
-                child_media_base(media, &cell_md),
-                action_ctx.clone(),
-                nested_views.clone(),
-                code_meta.clone(),
-                math_enabled.clone(),
-                media.cloned(),
-                false,
-                true,
-                false,
             );
             let cell_view = super::style_markdown_internal(
                 TextView::new(&entity).markdown_extensions(child_ext),
@@ -1660,6 +1717,7 @@ mod wheel_propagation_tests {
         let math_enabled: SharedMathEnabled = Arc::new(AtomicBool::new(false));
         let ext = attach_extensions_inner(
             MarkdownExtensions::default(),
+            hash_source_key("assistant:key-stability"),
             action_ctx,
             nested_views.clone(),
             code_meta,
@@ -1670,7 +1728,7 @@ mod wheel_propagation_tests {
             false,
         );
 
-        let two_identical = "```sh\necho hi\n```\n\n```sh\necho hi\n```\n";
+        let two_identical = "```sh\necho hi\n```\n\n```sh\necho hi";
         let (view, vcx) = cx.add_window_view(|_, cx| {
             let entity = cx.new(|cx| TextViewState::markdown(two_identical, cx).selectable(true));
             ProbeHarness { entity, ext: ext.clone() }
@@ -1696,11 +1754,14 @@ mod wheel_propagation_tests {
 
         // Append a streamed line to the second block (keeping both blocks' start offsets fixed).
         nested_views.lock().unwrap().clear();
-        let streamed = "```sh\necho hi\n```\n\n```sh\necho hi\necho more\n```\n";
         vcx.update(|window, cx| {
             view.update(cx, |h, cx| {
-                h.entity.update(cx, |tv, cx| tv.set_text(streamed, cx));
+                h.entity.update(cx, |tv, cx| tv.push_str("\necho more", cx));
             });
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
             window.draw(cx).clear();
         });
         let mut streamed_keys: Vec<String> = nested_views
@@ -1713,7 +1774,90 @@ mod wheel_propagation_tests {
         streamed_keys.sort();
         assert_eq!(
             streamed_keys, initial_keys,
-            "streaming content into a code block at the same start offset must keep its keyed state stable"
+            "streaming content into a code block via push_str must keep its keyed state stable"
+        );
+    }
+
+    #[gpui::test]
+    fn different_source_keys_isolate_blocks_and_rerenders_preserve_child_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+
+        let nested_a: NestedViews = Arc::new(Mutex::new(HashMap::new()));
+        let nested_b: NestedViews = Arc::new(Mutex::new(HashMap::new()));
+        let make_ext = |key: &str, nested: NestedViews| {
+            attach_extensions_inner(
+                MarkdownExtensions::default(),
+                hash_source_key(key),
+                Arc::new(Mutex::new(None)),
+                nested,
+                Arc::new(Mutex::new(CodeFenceMetaMap::default())),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                true,
+                true,
+                false,
+            )
+        };
+        let ext_a = make_ext("assistant:msg-a", nested_a.clone());
+        let ext_b = make_ext("assistant:msg-b", nested_b.clone());
+
+        struct DualHarness {
+            a: Entity<TextViewState>,
+            ext_a: MarkdownExtensions,
+            b: Entity<TextViewState>,
+            ext_b: MarkdownExtensions,
+            tick: usize,
+        }
+        impl Render for DualHarness {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let _ = self.tick;
+                gpui_component::v_flex()
+                    .w(px(500.))
+                    .child(TextView::new(&self.a).markdown_extensions(self.ext_a.clone()))
+                    .child(TextView::new(&self.b).markdown_extensions(self.ext_b.clone()))
+            }
+        }
+
+        let (view, vcx) = cx.add_window_view(|_, cx| DualHarness {
+            a: cx.new(|cx| TextViewState::markdown("```rs\nlet a = 1;\n```\n", cx).selectable(true)),
+            ext_a: ext_a.clone(),
+            b: cx.new(|cx| TextViewState::markdown("```rs\nlet a = 1;\n```\n", cx).selectable(true)),
+            ext_b: ext_b.clone(),
+            tick: 0,
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let keys_a: Vec<String> = nested_a.lock().unwrap().keys().cloned().collect();
+        let keys_b: Vec<String> = nested_b.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys_a.len(), 1);
+        assert_eq!(keys_b.len(), 1);
+        assert_ne!(keys_a, keys_b, "identical offset-0 code blocks across messages must use distinct keys");
+
+        let child_a = match nested_a.lock().unwrap().get(&keys_a[0]).cloned() {
+            Some(NestedSelection::Markdown(entity)) => entity,
+            _ => panic!("expected child markdown entity"),
+        };
+        vcx.update(|window, cx| {
+            child_a.update(cx, |tv, cx| tv.select_all(cx));
+            assert!(!child_a.read(cx).selected_text().is_empty());
+            view.update(cx, |h, cx| {
+                h.tick += 1;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let selected_after = child_a.read_with(vcx, |tv, _| tv.selected_text());
+        assert!(
+            selected_after.contains("let a = 1;"),
+            "re-rendering enclosing view must preserve cached MarkdownExtensions revision and child selection: got {selected_after:?}"
         );
     }
 }

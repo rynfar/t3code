@@ -463,6 +463,54 @@ pub struct ThreadState {
     pub(crate) merging: Option<Vec<DomainEvent>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadApplyKind {
+    Unchanged,
+    StreamingDelta,
+    Structure,
+}
+
+fn is_streaming_text_delta_item(previous: &TurnItem, next: &TurnItem) -> bool {
+    if previous.id != next.id
+        || previous.run_id != next.run_id
+        || previous.ordinal != next.ordinal
+        || previous.status != next.status
+        || previous.title != next.title
+        || previous.started_at != next.started_at
+        || previous.completed_at != next.completed_at
+        || next.text_omitted
+        || next.files_omitted
+        || next.prompt_omitted
+        || next.result_omitted
+        || (next.deferred_work.is_some() && next.deferred_work != previous.deferred_work)
+    {
+        return false;
+    }
+    match (&previous.kind, &next.kind) {
+        (
+            TurnItemKind::AssistantMessage {
+                message_id: prev_id,
+                streaming: true,
+                phase: prev_phase,
+                attachments: prev_att,
+                ..
+            },
+            TurnItemKind::AssistantMessage {
+                message_id: next_id,
+                streaming: true,
+                phase: next_phase,
+                attachments: next_att,
+                ..
+            },
+        ) => prev_id == next_id && prev_phase == next_phase && prev_att == next_att,
+        (
+            TurnItemKind::Reasoning { streaming: true, .. },
+            TurnItemKind::Reasoning { streaming: true, .. },
+        ) => true,
+        _ => false,
+    }
+}
+
 impl ThreadState {
     /// A diff source also respects deletion carried by a reconnect snapshot.
     pub fn source_deleted(&self) -> bool {
@@ -484,8 +532,20 @@ impl ThreadState {
 
     /// Returns true when visible state changed.
     pub fn apply(&mut self, item: ThreadStreamItem) -> bool {
+        self.apply_classified(item) != ThreadApplyKind::Unchanged
+    }
+
+    /// Applies one thread stream item and classifies whether it mutated only an existing
+    /// streaming assistant/reasoning item in-place (`StreamingDelta`) or changed structure.
+    pub fn apply_classified(&mut self, item: ThreadStreamItem) -> ThreadApplyKind {
         match item {
-            ThreadStreamItem::Synchronized => !std::mem::replace(&mut self.synchronized, true),
+            ThreadStreamItem::Synchronized => {
+                if !std::mem::replace(&mut self.synchronized, true) {
+                    ThreadApplyKind::Structure
+                } else {
+                    ThreadApplyKind::Unchanged
+                }
+            }
             ThreadStreamItem::Snapshot {
                 snapshot_sequence,
                 projection,
@@ -503,16 +563,39 @@ impl ThreadState {
                 self.replace_projection(Some(*projection));
                 self.deleted = false;
                 self.sequence = Some(snapshot_sequence);
-                true
+                ThreadApplyKind::Structure
             }
             ThreadStreamItem::Event { sequence, event } => {
                 if self.sequence.is_some_and(|current| sequence <= current) {
-                    return false;
+                    return ThreadApplyKind::Unchanged;
                 }
                 self.sequence = Some(sequence);
-                self.apply_live_event(*event)
+                let delta_meta = (!self.deleted && self.merging.is_none())
+                    .then(|| {
+                        let projection = self.projection.as_ref()?;
+                        let EventBody::TurnItemUpserted(new_item) = &event.body else {
+                            return None;
+                        };
+                        let candidate = projection
+                            .visible_turn_items
+                            .iter()
+                            .rev()
+                            .find(|row| row.source_item_id == new_item.id)
+                            .is_some_and(|row| is_streaming_text_delta_item(&row.item, new_item));
+                        candidate.then_some(projection.visible_turn_items.len())
+                    })
+                    .flatten();
+                if !self.apply_live_event(*event) {
+                    return ThreadApplyKind::Unchanged;
+                }
+                if let Some(prev_len) = delta_meta
+                    && self.projection.as_ref().is_some_and(|p| p.visible_turn_items.len() == prev_len)
+                {
+                    return ThreadApplyKind::StreamingDelta;
+                }
+                ThreadApplyKind::Structure
             }
-            ThreadStreamItem::Unknown => false,
+            ThreadStreamItem::Unknown => ThreadApplyKind::Unchanged,
         }
     }
 

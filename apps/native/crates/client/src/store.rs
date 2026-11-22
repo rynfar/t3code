@@ -487,6 +487,18 @@ pub fn load_last_thread() -> Option<String> {
 }
 
 pub fn save_last_thread(thread_id: &str) {
+    let thread_id = thread_id.to_owned();
+    if let Some(writer) = writer() {
+        let _ = writer.send(|_| {
+            WriteRequest::Update(Box::new(move |base| {
+                if let Some(base) = base {
+                    let _ = std::fs::create_dir_all(&base);
+                    let _ = std::fs::write(base.join("last-thread"), &thread_id);
+                }
+            }))
+        });
+        return;
+    }
     if let Some(base) = base() {
         let _ = std::fs::create_dir_all(&base);
         let _ = std::fs::write(base.join("last-thread"), thread_id);

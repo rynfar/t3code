@@ -1404,6 +1404,7 @@ mod selected_provider_tests {
         let state = cx.update(|cx| {
             let state = crate::boot(runtime.handle().clone(), cx);
             state.update(cx, |state, cx| {
+                state.stop_pump();
                 state.selected_thread = Some("main".into());
                 state.server_config.config = Some(serde_json::from_value(json!({
                     "environment": { "environmentId": "env-1", "label": "Local" },

@@ -193,43 +193,166 @@ pub struct FenceMeta {
     pub display_lang: Option<String>,
 }
 
+use std::collections::HashMap;
+use std::hash::{Hash as _, Hasher as _};
+
 /// Pre-indexed metadata for fenced code blocks in one rendered markdown document.
 #[derive(Debug, Clone, Default)]
 pub struct CodeFenceMetaMap {
-    by_lang_code: std::collections::HashMap<(Option<String>, String), FenceMeta>,
-    by_code: std::collections::HashMap<String, FenceMeta>,
+    by_lang_code: HashMap<u64, FenceMeta>,
+    by_code: HashMap<u64, FenceMeta>,
+}
+
+struct OpenFence {
+    fence_char: u8,
+    fence_len: usize,
+    indent: usize,
+    quote_depth: usize,
+    raw_lang: Option<String>,
+    title: Option<String>,
+    display_lang: Option<String>,
+    body: String,
+    has_body_line: bool,
+}
+
+fn hash_code(code: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_lang_code(lang: Option<&str>, code: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lang.filter(|s| !s.is_empty()).hash(&mut hasher);
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn strip_blockquote_prefixes(mut s: &str, max_depth: Option<usize>) -> (usize, &str) {
+    let mut depth = 0usize;
+    while max_depth.is_none_or(|limit| depth < limit) {
+        let indent = s.bytes().take(4).take_while(|&b| b == b' ').count();
+        if indent > 3 {
+            break;
+        }
+        let after_indent = &s[indent..];
+        let Some(after_gt) = after_indent.strip_prefix('>') else {
+            break;
+        };
+        s = after_gt.strip_prefix(' ').unwrap_or(after_gt);
+        depth += 1;
+    }
+    (depth, s)
+}
+
+fn parse_opening_fence(line: &str, quote_depth: usize) -> Option<OpenFence> {
+    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let after_indent = &line[indent..];
+    let fence_char = match after_indent.as_bytes().first().copied() {
+        Some(ch @ (b'`' | b'~')) => ch,
+        _ => return None,
+    };
+    let fence_len = after_indent.bytes().take_while(|&b| b == fence_char).count();
+    if fence_len < 3 {
+        return None;
+    }
+    let info = after_indent[fence_len..].trim();
+    if fence_char == b'`' && info.contains('`') {
+        return None;
+    }
+    let (raw_lang_str, meta_str) = if info.is_empty() {
+        (None, None)
+    } else if let Some(split_at) = info.find(char::is_whitespace) {
+        let lang = &info[..split_at];
+        let meta = info[split_at..].trim();
+        (Some(lang), (!meta.is_empty()).then_some(meta))
+    } else {
+        (Some(info), None)
+    };
+    let raw_lang = raw_lang_str.map(str::to_owned);
+    let display_lang = raw_lang.as_deref().and_then(normalize_language).or_else(|| raw_lang.clone());
+    let title = extract_fence_title(meta_str);
+    Some(OpenFence {
+        fence_char,
+        fence_len,
+        indent,
+        quote_depth,
+        raw_lang,
+        title,
+        display_lang,
+        body: String::new(),
+        has_body_line: false,
+    })
+}
+
+fn is_closing_fence(line: &str, fence_char: u8, min_len: usize) -> bool {
+    let indent = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let body = &line[indent..];
+    let close_len = body.bytes().take_while(|&b| b == fence_char).count();
+    close_len >= min_len && body[close_len..].trim().is_empty()
+}
+
+fn strip_up_to_spaces(s: &str, max_spaces: usize) -> &str {
+    let spaces = s.bytes().take(max_spaces).take_while(|&b| b == b' ').count();
+    &s[spaces..]
 }
 
 impl CodeFenceMetaMap {
     pub fn from_markdown(source: &str) -> Self {
         let mut map = Self::default();
-        let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
-            return map;
+        let mut open: Option<OpenFence> = None;
+
+        let commit = |map: &mut Self, fence: OpenFence, closed: bool| {
+            let entry = FenceMeta { title: fence.title, closed, display_lang: fence.display_lang };
+            map.by_lang_code
+                .entry(hash_lang_code(fence.raw_lang.as_deref(), &fence.body))
+                .or_insert_with(|| entry.clone());
+            map.by_code.entry(hash_code(&fence.body)).or_insert(entry);
         };
-        fn walk(node: &markdown::mdast::Node, source: &str, out: &mut CodeFenceMetaMap) {
-            if let markdown::mdast::Node::Code(code) = node {
-                let raw_lang = code.lang.clone();
-                let display_lang = raw_lang.as_deref().and_then(normalize_language).or_else(|| raw_lang.clone());
-                let title = extract_fence_title(code.meta.as_deref());
-                let closed = code.position.as_ref().is_some_and(|p| is_code_fence_closed(source, p.start.offset));
-                let entry = FenceMeta { title, closed, display_lang };
-                out.by_lang_code.entry((raw_lang, code.value.clone())).or_insert_with(|| entry.clone());
-                out.by_code.entry(code.value.clone()).or_insert(entry);
-                return;
-            }
-            if let Some(children) = node.children() {
-                for child in children {
-                    walk(child, source, out);
+
+        for raw_line in source.lines() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if let Some(mut fence) = open.take() {
+                let (depth, after_quote) = strip_blockquote_prefixes(line, Some(fence.quote_depth));
+                if depth < fence.quote_depth {
+                    commit(&mut map, fence, false);
+                    let (new_depth, rest) = strip_blockquote_prefixes(line, None);
+                    open = parse_opening_fence(rest, new_depth);
+                    continue;
                 }
+                if is_closing_fence(after_quote, fence.fence_char, fence.fence_len) {
+                    commit(&mut map, fence, true);
+                    continue;
+                }
+                if fence.has_body_line {
+                    fence.body.push('\n');
+                }
+                fence.body.push_str(strip_up_to_spaces(after_quote, fence.indent));
+                fence.has_body_line = true;
+                open = Some(fence);
+            } else {
+                let (quote_depth, rest) = strip_blockquote_prefixes(line, None);
+                open = parse_opening_fence(rest, quote_depth);
             }
         }
-        walk(&root, source, &mut map);
+
+        if let Some(fence) = open {
+            commit(&mut map, fence, false);
+        }
         map
     }
 
     pub fn lookup(&self, lang: Option<&str>, code: &str) -> Option<&FenceMeta> {
-        let lang_key = lang.filter(|s| !s.is_empty()).map(str::to_owned);
-        self.by_lang_code.get(&(lang_key, code.to_owned())).or_else(|| self.by_code.get(code))
+        let lang_key = lang.filter(|s| !s.is_empty());
+        self.by_lang_code
+            .get(&hash_lang_code(lang_key, code))
+            .or_else(|| self.by_code.get(&hash_code(code)))
     }
 }
 
@@ -277,5 +400,29 @@ mod tests {
         let sh = map.lookup(Some("sh"), "echo live").expect("streaming sh fence indexed");
         assert_eq!(sh.display_lang.as_deref(), Some("sh"));
         assert!(!sh.closed);
+    }
+
+    #[test]
+    fn indexes_tilde_indented_and_blockquote_nested_fences() {
+        let doc = "\
+> ~~~rs file='src/lib.rs'
+> fn helper() {}
+> ~~~
+>
+  ```py
+  print('ok')
+  ```
+";
+        let map = CodeFenceMetaMap::from_markdown(doc);
+        let rs = map.lookup(Some("rs"), "fn helper() {}").expect("blockquote tilde fence indexed");
+        assert_eq!(rs.title.as_deref(), Some("src/lib.rs"));
+        assert_eq!(rs.display_lang.as_deref(), Some("rust"));
+        assert!(rs.closed);
+
+        let py = map.lookup(Some("py"), "print('ok')").expect("indented backtick fence indexed");
+        assert_eq!(py.display_lang.as_deref(), Some("python"));
+        assert!(py.closed);
+        // Empty-lang fallback matches `by_code` as well.
+        assert!(map.lookup(None, "print('ok')").is_some());
     }
 }

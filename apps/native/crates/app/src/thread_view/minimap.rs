@@ -84,15 +84,15 @@ fn focus_handles(cx: &mut gpui::App) -> [FocusHandle; 3] {
 
 pub struct MinimapLayer {
     owner: WeakEntity<ThreadView>,
-    _subscriptions: [Subscription; 2],
+    _subscription: Subscription,
 }
 
 impl MinimapLayer {
-    pub fn new(owner: &Entity<ThreadView>, rows: &Entity<super::rows::TimelineRows>, cx: &mut Context<Self>) -> Self {
-        Self { owner: owner.downgrade(), _subscriptions: [
-            cx.observe(owner, |_, _, cx| cx.notify()),
-            cx.observe(rows, |_, _, cx| cx.notify()),
-        ] }
+    pub fn new(owner: &Entity<ThreadView>, _rows: &Entity<super::rows::TimelineRows>, cx: &mut Context<Self>) -> Self {
+        Self {
+            owner: owner.downgrade(),
+            _subscription: cx.observe_global::<gpui_component::Theme>(|_, cx| cx.notify()),
+        }
     }
 }
 
@@ -172,7 +172,7 @@ impl ListLayout {
 
     #[cfg(test)]
     fn observe(self, content: AnyElement, measured: Rc<Cell<Measured>>, repaint: gpui::EntityId, scroll: Rc<Cell<Option<Pixels>>>, on_scroll: impl Fn(&mut gpui::App) + Clone + 'static) -> AnyElement {
-        self.observe_with_groups(content, measured, repaint, scroll, None, Rc::default(), on_scroll, |_| {})
+        self.observe_with_groups(content, measured, repaint, scroll, None, Rc::default(), true, on_scroll, |_| {})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -184,18 +184,21 @@ impl ListLayout {
         scroll: Rc<Cell<Option<Pixels>>>,
         group_lists: Option<Rc<RefCell<HashMap<String, gpui::ListState>>>>,
         group_scrolls: Rc<RefCell<Vec<(String, Pixels)>>>,
+        observe_minimap: bool,
         on_scroll: impl Fn(&mut gpui::App) + Clone + 'static,
         on_list_scroll: impl Fn(&mut gpui::App) + Clone + 'static,
     ) -> AnyElement {
         // Descendants (including nested work-group lists) can resize or scroll without notifying
         // the minimap layer's cached owner.
         let measure = canvas(move |_, window, _| {
-            let next = self.measure();
-            if measured.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(repaint)); }
+            if observe_minimap {
+                let next = self.measure();
+                if measured.replace(next) != next { window.on_next_frame(move |_, cx| cx.notify(repaint)); }
+            }
             let position = self.list.scroll_px_offset_for_scrollbar().y;
             let main_scrolled = scroll.replace(Some(position)).is_some_and(|previous| previous != position);
             let mut descendant_scrolled = false;
-            if let Some(groups) = &group_lists {
+            if observe_minimap && let Some(groups) = &group_lists {
                 let mut current: Vec<(String, Pixels)> = groups
                     .borrow()
                     .iter()
@@ -214,7 +217,7 @@ impl ListLayout {
                 let on_list_scroll = on_list_scroll.clone();
                 window.on_next_frame(move |_, cx| on_list_scroll(cx));
             }
-            if main_scrolled || descendant_scrolled {
+            if observe_minimap && (main_scrolled || descendant_scrolled) {
                 let on_scroll = on_scroll.clone();
                 window.on_next_frame(move |_, cx| on_scroll(cx));
             }
@@ -253,7 +256,7 @@ pub struct MinimapUi {
 }
 
 impl MinimapUi {
-    pub fn set_items(&mut self, items: Vec<MinimapItem>) {
+    pub fn set_items(&mut self, items: Vec<MinimapItem>) -> bool {
         let same_text = |a: &MinimapItem, b: &MinimapItem| {
             Arc::ptr_eq(&a.user_text, &b.user_text)
                 && match (&a.assistant_text, &b.assistant_text) {
@@ -261,6 +264,12 @@ impl MinimapUi {
                     (a, b) => a.is_none() && b.is_none(),
                 }
         };
+        let changed = self.items.len() != items.len()
+            || self
+                .items
+                .iter()
+                .zip(&items)
+                .any(|(a, b)| a.id != b.id || a.row_index != b.row_index || !same_text(a, b));
         let keep = self.preview.as_ref().is_some_and(|(index, _)| self.items.get(*index).zip(items.get(*index)).is_some_and(|(a, b)| same_text(a, b)));
         if !keep {
             self.preview = None;
@@ -271,6 +280,18 @@ impl MinimapUi {
             self.nav_tooltip_task = None;
             self.tooltips = minimap::NavigationTooltips::default();
         }
+        changed
+    }
+
+    pub(super) fn update_last_assistant_text(&mut self, text: Arc<str>) -> bool {
+        let Some(last) = self.items.last_mut() else { return false };
+        last.assistant_text = Some(text);
+        let last_idx = self.items.len() - 1;
+        if self.preview.as_ref().is_some_and(|(index, _)| *index == last_idx) {
+            self.preview = None;
+            return true;
+        }
+        false
     }
 
     fn preview(&mut self, index: usize) -> MinimapPreview {
@@ -313,6 +334,7 @@ impl ThreadView {
             self.minimap.tooltip_scroll.clone(),
             Some(self.group_lists.clone()),
             self.minimap.group_scrolls.clone(),
+            has_minimap,
             move |cx| {
                 if has_minimap {
                     let _ = owner.update(cx, |view, cx| view.minimap_dismiss_tooltip(TooltipDismiss::Scroll, cx));
@@ -384,8 +406,8 @@ impl ThreadView {
         if before != (self.minimap.tooltips.visible(), self.minimap.tooltips.deadline()) { self.minimap_tooltip_changed(cx); }
     }
 
-    fn notify_minimap(&self, cx: &mut Context<Self>) {
-        if let Some(repaint) = self.minimap.repaint { gpui::App::notify(cx, repaint); }
+    pub(super) fn notify_minimap(&self, cx: &mut Context<Self>) {
+        gpui::App::notify(cx, self.minimap_layer.entity_id());
     }
 
     /// `onSelect`: smooth-scrolls the message to just below the top and leaves follow-to-bottom.
@@ -641,11 +663,17 @@ impl ThreadView {
         canvas(
             move |bounds, window, _| {
                 rail_cell.set(bounds);
-                let next = layout.measure();
-                measured_cell.set(next);
-                if next != rendered {
-                    window.on_next_frame(move |_, cx| cx.notify(view));
-                }
+                let current = measured_cell.get();
+                let next = if current.range.is_some() {
+                    current
+                } else {
+                    let measured = layout.measure();
+                    measured_cell.set(measured);
+                    if measured != rendered {
+                        window.on_next_frame(move |_, cx| cx.notify(view));
+                    }
+                    measured
+                };
                 (next.range, next.persistent, rows)
             },
             move |bounds, (range, persistent, rows), window, cx| {
@@ -1216,6 +1244,7 @@ mod tests {
                     Rc::default(),
                     Some(self.group_lists.clone()),
                     self.group_scrolls.clone(),
+                    true,
                     move |_| count.set(count.get() + 1),
                     |_| {},
                 )

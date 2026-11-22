@@ -4,9 +4,9 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, ElementId, Hsla, IntoElement, ParentElement, Pixels, RenderOnce,
-    Styled, Transformation, TransformationMatrix, Window, canvas, div, fill, linear_color_stop,
-    linear_gradient, percentage, point, prelude::*, px, radians, size,
+    AnyElement, App, Bounds, Context, ElementId, Entity, Hsla, IntoElement, ParentElement, Pixels,
+    Render, RenderOnce, Styled, Transformation, TransformationMatrix, Window, canvas, div, fill,
+    linear_color_stop, linear_gradient, percentage, point, prelude::*, px, radians, size,
 };
 
 use crate::icons::Icon;
@@ -107,15 +107,51 @@ impl Spinner {
     }
 }
 
-impl RenderOnce for Spinner {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let label = crate::i18n::t(cx, "Loading").to_owned();
+fn keyed_leaf_view<V: PartialEq + 'static>(
+    key: ElementId,
+    next: V,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<V> {
+    // Store leaf views in element state without `use_keyed_state`'s parent `cx.observe`,
+    // so stepped animation ticks only re-render the leaf entity itself.
+    let mut next = Some(next);
+    window.with_global_id(key, |global_id, window| {
+        window.with_element_state(global_id, |state: Option<Entity<V>>, _| {
+            let next_val = next.take().expect("initialized once");
+            if let Some(view) = state {
+                view.update(cx, |current, cx| {
+                    if *current != next_val {
+                        *current = next_val;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            } else {
+                let view = cx.new(|_| next_val);
+                (view.clone(), view)
+            }
+        })
+    })
+}
+
+#[derive(PartialEq)]
+struct SpinnerView {
+    id: ElementId,
+    size: Pixels,
+    color: Hsla,
+    label: String,
+}
+
+impl Render for SpinnerView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let clock_id = (self.id.clone(), "spinner-clock").into();
         let cycle = Duration::from_secs(1);
+        let color = self.color;
         div()
-            .id(self.id)
+            .id((self.id.clone(), "spinner-inner"))
             .role(gpui::Role::Status)
-            .aria_label(label)
+            .aria_label(self.label.clone())
             .size(self.size)
             .flex_none()
             .child(
@@ -135,13 +171,31 @@ impl RenderOnce for Spinner {
                             Icon::LoaderCircle.path().into(),
                             None,
                             transform,
-                            self.color,
+                            color,
                             cx,
                         );
                     },
                 )
                 .size_full(),
             )
+    }
+}
+
+impl RenderOnce for Spinner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let label = crate::i18n::t(cx, "Loading").to_owned();
+        let key: ElementId = (self.id.clone(), "spinner-view").into();
+        keyed_leaf_view(
+            key,
+            SpinnerView {
+                id: self.id,
+                size: self.size,
+                color: self.color,
+                label,
+            },
+            window,
+            cx,
+        )
     }
 }
 
@@ -218,51 +272,75 @@ impl Shimmer {
     }
 }
 
+#[derive(PartialEq)]
+struct ShimmerOverlay {
+    clock_id: ElementId,
+    half_width: Pixels,
+    color: Hsla,
+}
+
+impl Render for ShimmerOverlay {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let clock_id = self.clock_id.clone();
+        let half_width = self.half_width;
+        let color = self.color;
+        let cycle = Duration::from_millis(2200);
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                let Some(phase) = stepped_phase(clock_id, cycle, cycle, 30, bounds, window, cx)
+                else {
+                    return;
+                };
+                let center =
+                    bounds.left() - half_width + (bounds.size.width + half_width * 2.) * phase;
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    for (left, from, to) in [
+                        (center - half_width, color.opacity(0.), color),
+                        (center, color, color.opacity(0.)),
+                    ] {
+                        let beam =
+                            Bounds::new(point(left, bounds.top()), size(half_width, bounds.size.height));
+                        let gradient = linear_gradient(
+                            90.,
+                            linear_color_stop(from, 0.),
+                            linear_color_stop(to, 1.),
+                        );
+                        window.paint_quad(fill(beam, gradient));
+                    }
+                });
+            },
+        )
+        .size_full()
+    }
+}
+
 impl RenderOnce for Shimmer {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let color = hsla(p.foreground).opacity(0.16);
         let half_width = window.rem_size() * 2.25;
-        let cycle = Duration::from_millis(2200);
-        let clock_id = (self.id.clone(), "shine-clock").into();
+        let clock_id: ElementId = (self.id.clone(), "shine-clock").into();
+        let overlay = self.active.then(|| {
+            let key: ElementId = (self.id.clone(), "shimmer-view").into();
+            let view = keyed_leaf_view(
+                key,
+                ShimmerOverlay {
+                    clock_id,
+                    half_width,
+                    color,
+                },
+                window,
+                cx,
+            );
+            div().absolute().inset_0().child(view)
+        });
         div()
             .id(self.id)
             .relative()
             .when(self.active, |view| view.text_color(hsla(p.secondary_label)))
             .child(self.content)
-            .children(self.active.then(|| {
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, (), window, cx| {
-                        let Some(phase) =
-                            stepped_phase(clock_id, cycle, cycle, 30, bounds, window, cx)
-                        else {
-                            return;
-                        };
-                        let center = bounds.left() - half_width
-                            + (bounds.size.width + half_width * 2.) * phase;
-                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                            for (left, from, to) in [
-                                (center - half_width, color.opacity(0.), color),
-                                (center, color, color.opacity(0.)),
-                            ] {
-                                let beam = Bounds::new(
-                                    point(left, bounds.top()),
-                                    size(half_width, bounds.size.height),
-                                );
-                                let gradient = linear_gradient(
-                                    90.,
-                                    linear_color_stop(from, 0.),
-                                    linear_color_stop(to, 1.),
-                                );
-                                window.paint_quad(fill(beam, gradient));
-                            }
-                        });
-                    },
-                )
-                .absolute()
-                .inset_0()
-            }))
+            .children(overlay)
     }
 }
 
@@ -460,5 +538,77 @@ mod tests {
             window.draw(cx).clear();
         });
         assert_eq!(vcx.debug_bounds("test-animated-width-outer").unwrap().size.width, px(0.));
+    }
+
+    #[gpui::test]
+    fn shimmer_animates_in_leaf_overlay_without_notifying_enclosing_view(cx: &mut TestAppContext) {
+        use std::rc::Rc;
+
+        struct CachedSibling {
+            renders: Rc<Cell<usize>>,
+        }
+        impl Render for CachedSibling {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div().w(px(60.)).h(px(32.)).child("Cached")
+            }
+        }
+
+        struct ShimmerHost {
+            sibling: gpui::Entity<CachedSibling>,
+        }
+        impl Render for ShimmerHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .w(px(260.))
+                    .h(px(32.))
+                    .child(Shimmer::new(
+                        "leaf-isolated-shimmer",
+                        true,
+                        div().w(px(200.)).h(px(32.)).child("Working on it"),
+                    ))
+                    .child(self.sibling.clone().cached(gpui::StyleRefinement::default().w(px(60.)).h(px(32.))))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            cx.set_reduce_motion(false);
+        });
+        let sibling_renders = Rc::new(Cell::new(0));
+        let notifies = Rc::new(Cell::new(0));
+        let sr = sibling_renders.clone();
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let sibling = cx.new(|_| CachedSibling { renders: sr });
+            ShimmerHost { sibling }
+        });
+        let notifies_copy = notifies.clone();
+        let _sub = vcx.update(|_, cx| cx.observe(&view, move |_, _| notifies_copy.set(notifies_copy.get() + 1)));
+
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let baseline_sibling_renders = sibling_renders.get();
+        assert!(baseline_sibling_renders >= 1);
+        assert_eq!(notifies.get(), 0);
+
+        // Advance past multiple 73ms shimmer steps and draw queued frames.
+        for _ in 0..3 {
+            vcx.executor().advance_clock(Duration::from_millis(85));
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear();
+            });
+        }
+
+        assert_eq!(notifies.get(), 0, "Shimmer ticks must never notify enclosing parent view");
+        assert_eq!(
+            sibling_renders.get(),
+            baseline_sibling_renders,
+            "Shimmer ticks must never invalidate cached sibling views"
+        );
     }
 }

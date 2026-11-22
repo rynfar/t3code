@@ -5,7 +5,7 @@
 //! first row in view where it was (`t3_core::timeline::anchor`).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +42,7 @@ use crate::worktree_setup::{SetupEvent, WorktreeSetupStore};
 actions!(thread_view, [FindInThread]);
 
 const DETAIL_CACHE_LIMIT: usize = 64;
+const MARKDOWN_CACHE_CAPACITY: usize = 6;
 const SMOOTH_SCROLL_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy)]
@@ -76,6 +77,7 @@ pub struct ThreadView {
     activity: ThreadActivity,
     pub(crate) ui: TranscriptUi,
     markdown: MarkdownStore,
+    markdown_cache: VecDeque<(String, MarkdownStore)>,
     thread_id: Option<String>,
     workspace_root: Option<String>,
     workspace_mutation_id: Option<String>,
@@ -159,6 +161,9 @@ impl ThreadView {
                 this.sync(cx);
                 this.consume_pending_find(window, cx);
             }
+            AppEvent::ThreadDelta => {
+                this.sync_delta(cx);
+            }
             AppEvent::ThreadFind => {
                 this.sync(cx);
                 this.consume_pending_find(window, cx);
@@ -228,7 +233,8 @@ impl ThreadView {
             rows_cache: RowsCache::default(),
             activity: ThreadActivity::default(),
             ui: TranscriptUi::default(),
-            markdown: MarkdownStore::new(cx.entity_id()),
+            markdown: MarkdownStore::new(timeline_rows.entity_id()),
+            markdown_cache: VecDeque::new(),
             thread_id: None,
             workspace_root: None,
             workspace_mutation_id: None,
@@ -388,9 +394,11 @@ impl ThreadView {
             self.on_observed_list_scroll(cx);
         }
         if selected != self.thread_id {
-            if let Some(previous_id) = self.thread_id.take() && !self.rows.is_empty() {
+            let outgoing_id = self.thread_id.take();
+            if let Some(previous_id) = outgoing_id.as_ref() && !self.rows.is_empty() {
                 let (distance, viewport) = disclosure_end_distance(&self.list);
                 let top = self.list.logical_scroll_top();
+                let row_index_hint = top.item_ix.saturating_sub(self.header_count());
                 let row_id = top.item_ix.checked_sub(self.header_count()).and_then(|ix| self.rows.get(ix)).map(|r| r.id.clone());
                 let scroll_top = f32::from(-self.list.scroll_px_offset_for_scrollbar().y);
                 let at_end = if viewport > 0. { self.follow.is_following() || anchor::at_end(distance, viewport) } else { self.follow.is_following() };
@@ -398,6 +406,7 @@ impl ThreadView {
                     previous_id,
                     anchor::SavedThreadPosition {
                         row_id,
+                        row_index_hint,
                         offset_within_row: f32::from(top.offset_in_item),
                         scroll_top,
                         at_end,
@@ -419,9 +428,30 @@ impl ThreadView {
             self.dismiss_citation_selection(cx);
             crate::media::video::retire_owner(cx.entity_id(), cx);
             self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
-            self.thread_id = selected;
+            self.thread_id = selected.clone();
             self.ui = TranscriptUi::default();
-            self.markdown.clear();
+            let rows_owner = self.timeline_rows.entity_id();
+            if self.fixed.is_none() {
+                let stashed = std::mem::replace(&mut self.markdown, MarkdownStore::new(rows_owner));
+                if let Some(prev_id) = outgoing_id
+                    && !stashed.is_empty()
+                    && !self.state.read(cx).thread_shell(&prev_id).is_some_and(|t| t.deleted_at.is_some())
+                {
+                    self.markdown_cache.retain(|(id, _)| id != &prev_id);
+                    self.markdown_cache.push_back((prev_id, stashed));
+                    while self.markdown_cache.len() > MARKDOWN_CACHE_CAPACITY {
+                        self.markdown_cache.pop_front();
+                    }
+                }
+                if let Some(next_id) = selected.as_deref()
+                    && let Some(pos) = self.markdown_cache.iter().position(|(id, _)| id == next_id)
+                {
+                    let (_, cached_store) = self.markdown_cache.remove(pos).expect("markdown cache entry");
+                    self.markdown = cached_store;
+                }
+            } else {
+                self.markdown.clear();
+            }
             self.entries_cache = EntriesCache::default();
             self.rows_cache = RowsCache::default();
             self.details.clear();
@@ -431,6 +461,7 @@ impl ThreadView {
             self.history = None;
             self.find = None;
             self.minimap = minimap::MinimapUi::default();
+            self.notify_minimap(cx);
             self.reset_status();
             self.turn_diffs.clear();
             self.turn_diff_source = None;
@@ -467,6 +498,11 @@ impl ThreadView {
             cx.notify();
         }
         let state = self.state.read(cx);
+        if self.thread_state(state).source_deleted()
+            && let Some(id) = self.thread_id.as_deref()
+        {
+            self.markdown_cache.retain(|(cached_id, _)| cached_id != id);
+        }
         self.can_operate_thread = state.can_operate_threads();
         match self.thread_state(state).projection.as_ref() {
             Some(projection) => {
@@ -954,7 +990,7 @@ impl ThreadView {
         }
     }
 
-    fn rederive_rows(&mut self, cx: &mut Context<Self>) -> bool {
+    fn derive_next_rows(&mut self, cx: &gpui::App) -> Vec<Arc<TimelineRow>> {
         let mut tool_call_visibility = crate::settings::store::client(cx).tool_call_visibility();
         if tool_call_visibility == t3_core::client_settings::ToolCallVisibility::Zen && self.find.is_some() {
             tool_call_visibility = t3_core::client_settings::ToolCallVisibility::HideAll;
@@ -974,7 +1010,89 @@ impl ThreadView {
             tool_call_visibility,
             revealed_message_id,
         };
-        let next = derive_rows(&input, &mut self.rows_cache);
+        derive_rows(&input, &mut self.rows_cache)
+    }
+
+    fn sync_delta(&mut self, cx: &mut Context<Self>) {
+        {
+            let state = self.state.read(cx);
+            let selected = self.fixed.clone().or_else(|| state.selected_thread.clone());
+            if self.fixed.is_some()
+                || selected != self.thread_id
+                || self.pending_restore.is_some()
+                || self.find.is_some()
+            {
+                return self.sync(cx);
+            }
+            if self.thread_state(state).is_merging_history() {
+                return;
+            }
+        }
+        if self.pending_scroll_source.is_some() || self.list.is_scrollbar_dragging() {
+            self.on_observed_list_scroll(cx);
+        }
+        let state = self.state.read(cx);
+        let Some(projection) = self.thread_state(state).projection.as_ref() else {
+            return self.sync(cx);
+        };
+        #[cfg(feature = "snapshot")]
+        let fixture = crate::transcript::html_render::fixture::with_page(&projection.visible_turn_items);
+        #[cfg(feature = "snapshot")]
+        let mcp_fixture = crate::transcript::mcp_app::fixture::with_page(&fixture);
+        #[cfg(feature = "snapshot")]
+        let items: &[t3_core::thread::ProjectedTurnItem] = &mcp_fixture;
+        #[cfg(not(feature = "snapshot"))]
+        let items: &[t3_core::thread::ProjectedTurnItem] = &projection.visible_turn_items;
+        update_entries(&mut self.entries_cache, items, &projection.attempts, &projection.nodes, &projection.plans);
+
+        let next = self.derive_next_rows(cx);
+        let same = |a: &Arc<TimelineRow>, b: &Arc<TimelineRow>| Arc::ptr_eq(a, b) || rows_equal(a, b);
+        let prefix = self.rows.iter().zip(&next).take_while(|(a, b)| same(a, b)).count();
+        if prefix == self.rows.len() && prefix == next.len() {
+            return;
+        }
+        let max_suffix = self.rows.len().min(next.len()) - prefix;
+        let suffix = self.rows.iter().rev().zip(next.iter().rev()).take(max_suffix).take_while(|(a, b)| same(a, b)).count();
+        let offset = self.header_count();
+        let old_end = self.rows.len() - suffix;
+        let new_end = next.len() - suffix;
+        let old_range = offset + prefix..offset + old_end;
+        let new_count = new_end - prefix;
+        let in_place = old_range.len() == new_count
+            && new_count > 0
+            && self.rows[prefix..old_end].iter().zip(&next[prefix..new_end]).all(|(a, b)| a.id == b.id);
+        if !in_place {
+            return self.sync(cx);
+        }
+        let streamed_assistant_text = next
+            .get(new_end - 1)
+            .and_then(|row| match &row.kind {
+                RowKind::Message { message, .. } if message.role == Role::Assistant => Some(message.text.clone()),
+                _ => None,
+            })
+            .filter(|_| !next[new_end..].iter().any(|r| matches!(r.kind, RowKind::Message { .. })));
+
+        let paused = self.is_follow_paused(cx);
+        let follow = (!paused && self.disclosure.needs_follow_check()).then(|| disclosure_end_distance(&self.list));
+        self.rows = next;
+        self.list.remeasure_items(old_range);
+        if let Some(text) = streamed_assistant_text
+            && self.minimap.update_last_assistant_text(text)
+        {
+            self.notify_minimap(cx);
+        }
+        let follow_change = !paused && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
+        if (!paused && self.follow.is_following() && self.follow.anchored_user_message_id().is_none()) || follow_change {
+            self.smooth_scroll = None;
+            self.pending_scroll_source = None;
+            self.list.scroll_to_end();
+        }
+        self.disclosure.changed();
+        self.timeline_rows.update(cx, |_, cx| cx.notify());
+    }
+
+    fn rederive_rows(&mut self, cx: &mut Context<Self>) -> bool {
+        let next = self.derive_next_rows(cx);
         self.sync_timer(&next, cx);
         let same = |a: &Arc<TimelineRow>, b: &Arc<TimelineRow>| Arc::ptr_eq(a, b) || rows_equal(a, b);
         let prefix = self.rows.iter().zip(&next).take_while(|(a, b)| same(a, b)).count();
@@ -984,11 +1102,22 @@ impl ThreadView {
         let max_suffix = self.rows.len().min(next.len()) - prefix;
         let suffix = self.rows.iter().rev().zip(next.iter().rev()).take(max_suffix).take_while(|(a, b)| same(a, b)).count();
         let offset = self.header_count();
-        let old_range = offset + prefix..offset + self.rows.len() - suffix;
-        let new_count = next.len() - suffix - prefix;
+        let old_end = self.rows.len() - suffix;
+        let new_end = next.len() - suffix;
+        let old_range = offset + prefix..offset + old_end;
+        let new_count = new_end - prefix;
+        let in_place = old_range.len() == new_count
+            && new_count > 0
+            && self.rows[prefix..old_end].iter().zip(&next[prefix..new_end]).all(|(a, b)| a.id == b.id);
         self.rows = next;
-        self.list.splice(old_range, new_count);
-        self.minimap.set_items(t3_core::timeline::minimap::derive_minimap_items(&self.rows));
+        if in_place {
+            self.list.remeasure_items(old_range);
+        } else {
+            self.list.splice(old_range, new_count);
+        }
+        if self.minimap.set_items(t3_core::timeline::minimap::derive_minimap_items(&self.rows)) {
+            self.notify_minimap(cx);
+        }
         let open: std::collections::HashSet<&str> =
             self.rows.iter().filter(|row| matches!(row.kind, RowKind::Work { expanded_group: true, .. })).map(|row| row.id.as_str()).collect();
         self.group_lists.borrow_mut().retain(|id, _| open.contains(id.as_str()));
@@ -1885,7 +2014,8 @@ impl ThreadView {
             return true;
         }
         self.pending_scroll_top = Some(saved.scroll_top);
-        self.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        let hint_ix = self.header_count() + saved.row_index_hint.min(self.rows.len().saturating_sub(1));
+        self.list.scroll_to(ListOffset { item_ix: hint_ix, offset_in_item: px(0.) });
         true
     }
 
@@ -5049,6 +5179,175 @@ mod tests {
             crate::theme::set_background_image(None, cx);
             window.draw(cx).clear();
         });
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn sync_delta_uses_remeasure_items_preserving_scroll_offset_and_isolating_minimap(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let long_text = (0..64)
+            .map(|i| format!("Streaming paragraph line {i} with enough words across multiple lines to exceed viewport height reliably."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let items = vec![
+            test_user_item("t1", 0, "u1", "Prompt"),
+            serde_json::json!({
+                "position": 1,
+                "visibility": "local",
+                "sourceThreadId": "t1",
+                "sourceItemId": "a1",
+                "item": {
+                    "id": "a1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                    "ordinal": 2, "type": "assistant_message", "status": "running", "title": null,
+                    "startedAt": "2026-04-01T00:00:01.000Z", "completedAt": null,
+                    "updatedAt": "2026-04-01T00:00:02.000Z",
+                    "messageId": "a1", "text": long_text, "streaming": true
+                }
+            }),
+        ];
+        let snap = test_snapshot_json(
+            "t1",
+            serde_json::json!([{
+                "id": "r1", "threadId": "t1", "ordinal": 1, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"}, "providerThreadId": null,
+                "userMessageId": "u1", "rootNodeId": null, "activeAttemptId": null, "status": "running",
+                "requestedAt": "2026-04-01T00:00:00.000Z", "startedAt": null, "completedAt": null,
+                "checkpointId": null, "contextHandoffId": null
+            }]),
+            items,
+        );
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "Streaming Smoothness",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "running", "hasActionableProposedPlan": false, "itemCount": 2, "visibleItemCount": 2
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.resize(size(px(760.), px(200.)));
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        // Park scroll mid-way inside the streaming assistant row (`a1`) with non-zero offset.
+        let a1_ix = view.update(vcx, |view, cx| {
+            let a1_ix = view.header_count()
+                + view
+                    .rows
+                    .iter()
+                    .position(|r| matches!(&r.kind, RowKind::Message { message, .. } if message.id == "a1"))
+                    .expect("a1 assistant row must exist");
+            let now = view.follow_now(cx);
+            view.follow.on_user_navigation(anchor::ScrollSource::Wheel, false, now);
+            view.list.scroll_to(ListOffset { item_ix: a1_ix, offset_in_item: px(36.) });
+            cx.notify();
+            a1_ix
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let before_top = view.read_with(vcx, |view, _| view.list.logical_scroll_top());
+        assert_eq!(before_top.item_ix, a1_ix);
+        assert!(before_top.offset_in_item > px(10.));
+
+        let rows_notifies = Rc::new(Cell::new(0usize));
+        let minimap_notifies = Rc::new(Cell::new(0usize));
+        let rn = rows_notifies.clone();
+        let mn = minimap_notifies.clone();
+        let (_sub_rows, _sub_minimap) = view.update(vcx, |view, cx| {
+            (
+                cx.observe(&view.timeline_rows, move |_, _, _| rn.set(rn.get() + 1)),
+                cx.observe(&view.minimap_layer, move |_, _, _| mn.set(mn.get() + 1)),
+            )
+        });
+        rows_notifies.set(0);
+        minimap_notifies.set(0);
+
+        let updated_text = format!("{long_text}\n\nStreaming paragraph appended token.");
+        let delta_item: t3_core::thread::ThreadStreamItem = serde_json::from_value(serde_json::json!({
+            "kind": "event",
+            "sequence": 2,
+            "event": {
+                "id": "ev-2",
+                "threadId": "t1",
+                "occurredAt": "2026-04-01T00:00:06.000Z",
+                "type": "turn-item.updated",
+                "payload": {
+                    "id": "a1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                    "ordinal": 2, "type": "assistant_message", "status": "running", "title": null,
+                    "startedAt": "2026-04-01T00:00:01.000Z", "completedAt": null,
+                    "updatedAt": "2026-04-01T00:00:06.000Z",
+                    "messageId": "a1", "text": updated_text, "streaming": true
+                }
+            }
+        }))
+        .unwrap();
+        state.update(vcx, |s, cx| {
+            s.apply_batch(
+                vec![t3_client::supervisor::ClientEvent::Thread { thread_id: "t1".into(), item: Box::new(delta_item) }],
+                cx,
+            );
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        let after_top = view.read_with(vcx, |view, _| view.list.logical_scroll_top());
+        assert_eq!(after_top.item_ix, a1_ix);
+        assert!(
+            (after_top.offset_in_item - before_top.offset_in_item).abs() < px(1.),
+            "remeasure_items must preserve mid-message offset_in_item: before={before_top:?} after={after_top:?}"
+        );
+        assert!(rows_notifies.get() >= 1, "streaming delta must notify TimelineRows");
+        assert_eq!(minimap_notifies.get(), 0, "streaming delta must not notify MinimapLayer");
+
         state.update(vcx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

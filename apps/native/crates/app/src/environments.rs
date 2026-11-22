@@ -1363,6 +1363,7 @@ impl AppState {
     /// active permission-update notice toast for it (`pingdotgg/t3code#38980`).
     pub fn remove_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.environments.active.as_deref() == Some(id);
+        let http_base = self.environments.get(id).map(|environment| environment.http_base.clone());
         let ssh = self.environments.get(id).and_then(|environment| environment.ssh.clone());
         let canonical_id = self
             .environments
@@ -1378,6 +1379,10 @@ impl AppState {
             });
         if !self.environments.remove(id) {
             return;
+        }
+        self.evict_cached_env(id);
+        if let Some(http_base) = &http_base {
+            self.evict_cached_env(http_base);
         }
         self.record_environment_alternate_routes(id, Vec::new());
         self.withdraw_toast_by_key(&format!("permission-update:{id}"), cx);
@@ -1444,6 +1449,11 @@ impl AppState {
     /// The server rejected this device: drop the credential, keep the entry, and prompt to pair
     /// again. Runs inside the event pump, which ends on its own once the client stops.
     pub(crate) fn environment_credentials_rejected(&mut self, id: &str, reason: String, cx: &mut Context<Self>) {
+        let http_base = self.environments.get(id).map(|environment| environment.http_base.clone());
+        self.evict_cached_env(id);
+        if let Some(http_base) = &http_base {
+            self.evict_cached_env(http_base);
+        }
         let trace_id = t3_client::status::extract_trace_id(&reason).map(str::to_owned);
         let rejected = self.environments.get(id).map(|environment| Rejected {
             id: id.into(),

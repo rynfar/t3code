@@ -52,7 +52,8 @@ pub use activity::{
 pub use directives::{
     CodexArtifactTemplate, CodexAssistantSegment, codex_artifact_template_presentation_label,
     codex_artifact_template_prompt_to_append, codex_artifact_template_use_prompt,
-    render_codex_directives_for_copy, split_codex_assistant_segments,
+    has_codex_assistant_directives, render_codex_directives_for_copy,
+    split_codex_assistant_segments,
 };
 pub use plan::{
     DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, build_collapsed_proposed_plan_preview_markdown,
