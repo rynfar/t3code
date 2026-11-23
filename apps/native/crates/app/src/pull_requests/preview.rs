@@ -214,7 +214,7 @@ pub fn render_preview_card(card: &Preview, subject: Option<&LinkSubject>, from_h
                         .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(login.to_owned()))
                         .children(outcome.map(|o| {
                             let (o_icon, o_color) = outcome_glyph(o, cx);
-                            h_flex().gap(px(3.)).text_color(o_color).child(o_icon.sized(px(12.))).child(o.label())
+                            h_flex().gap(px(3.)).text_color(o_color).child(o_icon.sized(px(12.)).text_color(o_color)).child(o.label())
                         }))
                         .when(outcome.is_none(), |this| this.child("commented"))
                         .child("·")
@@ -285,7 +285,7 @@ pub fn render_preview_card(card: &Preview, subject: Option<&LinkSubject>, from_h
                 .child(div().min_w_0().truncate().child(card.repository.clone()))
                 .child(div().flex_none().child(format!("#{}", card.number)))
                 .child("·")
-                .child(h_flex().flex_none().gap(px(4.)).text_color(color).child(icon.sized(px(12.))).child(kind.label())),
+                .child(h_flex().flex_none().gap(px(4.)).text_color(color).child(icon.sized(px(12.)).text_color(color)).child(kind.label())),
         )
         .child(body)
         .into_any_element()

@@ -2022,6 +2022,7 @@ impl PullRequestsPage {
             return super::row::empty_state(self, window, cx).into_any_element();
         }
         list(self.list.clone(), cx.processor(|this, index: usize, window, cx| super::row::render(this, index, window, cx)))
+            .w_full()
             .flex_1()
             .into_any_element()
     }
@@ -2059,7 +2060,9 @@ impl Render for PullRequestsPage {
                     .relative()
                     .child(self.render_header(window, cx))
                     .child(
-                        h_flex()
+                        div()
+                            .flex()
+                            .flex_row()
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
@@ -2067,6 +2070,7 @@ impl Render for PullRequestsPage {
                             .child(
                                 v_flex()
                                     .flex_1()
+                                    .h_full()
                                     .min_w_0()
                                     .min_h_0()
                                     .child(super::toolbar::render(self, window, cx))
@@ -2088,7 +2092,7 @@ impl Render for PullRequestsPage {
                                             .child(format!("{error} Showing the last pull requests loaded."))
                                             .child(Button::new("pr-list-retry", Variant::Outline, Size::Xs).label("Retry").on_click(retry))
                                     }))
-                                    .child(div().flex_1().min_h_0().flex().flex_col().px(px(8.)).child(self.render_body(window, cx))),
+                                    .child(div().flex_1().min_h_0().w_full().flex().flex_col().px(px(8.)).child(self.render_body(window, cx))),
                             ),
                     )
                     .children(preview_card.map(|card| div().absolute().right(px(16.)).bottom(px(16.)).child(card))),

@@ -598,7 +598,7 @@ impl ThreadPullRequestsPanel {
                                         .bg(hsla(p.muted))
                                         .text_size(px(10.))
                                         .text_color(hsla(p.muted_foreground))
-                                        .child(Icon::Layers.sized(px(10.)))
+                                        .child(Icon::Layers.sized(px(10.)).text_color(hsla(p.muted_foreground)))
                                         .child(format!("{}", item.chain_size)),
                                 )
                             })

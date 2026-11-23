@@ -210,7 +210,7 @@ fn checkbox(index: usize, marker: Option<usize>, checked: bool, cx: &mut Context
         .border_1()
         .border_color(hsla(p.primary))
         .text_color(hsla(p.primary_foreground))
-        .when(checked, |this| this.bg(hsla(p.primary)).child(Icon::Check.sized(px(10.))))
+        .when(checked, |this| this.bg(hsla(p.primary)).child(Icon::Check.sized(px(10.)).text_color(hsla(p.primary_foreground))))
         .when_some(marker, |this, marker| {
             this.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -241,7 +241,7 @@ fn meta_row(icon: Icon, label: &'static str, value: impl IntoElement, cx: &App) 
         .min_h(px(24.))
         .gap(px(8.))
         .text_xs()
-        .child(h_flex().w(px(96.)).flex_none().gap(px(6.)).pt(px(2.)).text_color(hsla(p.muted_foreground)).child(icon.sized(px(14.))).child(label))
+        .child(h_flex().w(px(96.)).flex_none().gap(px(6.)).pt(px(2.)).text_color(hsla(p.muted_foreground)).child(icon.sized(px(14.)).text_color(hsla(p.muted_foreground))).child(label))
         .child(div().flex_1().min_w_0().text_color(hsla(p.foreground)).child(value))
 }
 

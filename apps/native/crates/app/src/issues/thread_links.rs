@@ -731,7 +731,7 @@ pub(crate) fn render_picker_overlay<V: 'static>(
                                 .gap(px(4.))
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child(Icon::Check.sized(px(12.)))
+                                .child(Icon::Check.sized(px(12.)).text_color(hsla(p.muted_foreground)))
                                 .child(t(cx, "Linked").to_owned()),
                         )
                     })

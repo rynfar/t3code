@@ -36,6 +36,7 @@ fn group_header(page: &PullRequestsPage, index: usize, cx: &App) -> AnyElement {
         GroupKey::Others => Icon::Users,
     };
     h_flex()
+        .w_full()
         .gap(px(8.))
         .px(px(12.))
         .pt(px(if index == 0 { 4. } else { 12. }))
@@ -43,7 +44,7 @@ fn group_header(page: &PullRequestsPage, index: usize, cx: &App) -> AnyElement {
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(hsla(p.muted_foreground).opacity(0.7))
-        .child(icon.sized(px(14.)))
+        .child(icon.sized(px(14.)).text_color(hsla(p.muted_foreground).opacity(0.7)))
         .child(group.label)
         .child(div().text_color(hsla(p.muted_foreground).opacity(0.5)).child(group.entries.len().to_string()))
         .child(div().flex_1().min_w(px(8.)).h(px(1.)).bg(hsla(p.border)))
@@ -116,6 +117,9 @@ fn entry_row(page: &mut PullRequestsPage, index: usize, window: &mut Window, cx:
         .child(lines(&entry, elsewhere, stack_popover, cx))
         .on_click(select);
     h_flex()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .h(px(super::page::ROW_HEIGHT))
         .rounded(px(6.))
         .when(selected, |this| this.bg(hsla(p.accent)))
@@ -158,14 +162,18 @@ fn lines(entry: &ListEntry, elsewhere: bool, stack_popover: Option<AnyElement>, 
         badge(text, kind, false, cx)
     });
     v_flex()
+        .w_full()
         .flex_1()
         .min_w_0()
+        .overflow_hidden()
         .child(
             h_flex()
+                .w_full()
                 .min_w_0()
+                .overflow_hidden()
                 .gap(px(6.))
                 .child(div().flex_none().font_family(mono).text_xs().text_color(hsla(p.muted_foreground)).child(format!("#{}", entry.number)))
-                .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(entry.title.clone()))
+                .child(div().min_w_0().flex_shrink(1.).overflow_hidden().truncate().text_sm().text_color(hsla(p.foreground)).child(entry.title.clone()))
                 .children(stack_popover)
                 .children((entry.visibility == Some(t3_core::pull_requests::wire::PullRequestVisibility::Private)).then(|| {
                     glyph(
@@ -183,11 +191,12 @@ fn lines(entry: &ListEntry, elsewhere: bool, stack_popover: Option<AnyElement>, 
                 .children(entry.review_decision.and_then(|decision| review_glyph(decision, cx)).map(|(icon, color, label)| {
                     glyph(SharedString::from(format!("pr-review-{key}")), icon, color, 14., label)
                 }))
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_0())
                 .when(entry.additions + entry.deletions > 0, |this| this.child(diff_stat(entry.additions, entry.deletions, cx))),
         )
         .child(
             h_flex()
+                .w_full()
                 .min_w_0()
                 .gap(px(6.))
                 .overflow_hidden()
@@ -204,14 +213,14 @@ fn lines(entry: &ListEntry, elsewhere: bool, stack_popover: Option<AnyElement>, 
                             .border_1()
                             .border_color(hsla(p.border).opacity(0.6))
                             .text_size(px(10.))
-                            .child(Icon::Search.sized(px(12.)))
+                            .child(Icon::Search.sized(px(12.)).text_color(hsla(p.muted_foreground)))
                             .child("matched in the description"),
                     )
                 })
                 .child(h_flex().flex_none().max_w(px(160.)).gap(px(4.)).child(avatar(&author, 14., cx)).child(div().truncate().child(author)))
                 .child(div().min_w_0().truncate().child(entry.repository.clone()))
                 .children(labels)
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_0())
                 .children(updated.map(|label| div().flex_none().whitespace_nowrap().child(label))),
         )
 }

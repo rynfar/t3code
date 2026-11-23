@@ -550,7 +550,7 @@ pub(super) fn thread_link_picker_modal(view: &mut DetailView, window: &mut Windo
                                                 .child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(thread.project_title.clone())),
                                         )
                                         .when(linked, |this| {
-                                            this.child(h_flex().gap(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child(Icon::Check.sized(px(12.))).child("Linked"))
+                                            this.child(h_flex().gap(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child(Icon::Check.sized(px(12.)).text_color(hsla(p.muted_foreground))).child("Linked"))
                                         })
                                 }))
                                 .into_any_element()

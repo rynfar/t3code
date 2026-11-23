@@ -1247,6 +1247,7 @@ impl IssuesPage {
             self.list.clone(),
             cx.processor(|this, index: usize, window, cx| super::row::render(this, index, window, cx)),
         )
+        .w_full()
         .flex_1()
         .into_any_element()
     }
@@ -1306,6 +1307,7 @@ impl Render for IssuesPage {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .w_full()
                     .flex()
                     .flex_col()
                     .px(px(8.))

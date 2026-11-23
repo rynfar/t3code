@@ -1506,7 +1506,7 @@ impl Render for IssueDetailPanel {
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(state_color)
-                .child(state_icon.sized(px(14.)))
+                .child(state_icon.sized(px(14.)).text_color(state_color))
                 .child(detail.state.name.clone())
                 .into_any_element()
         };
@@ -2060,7 +2060,7 @@ impl Render for IssueDetailPanel {
                                             .text_color(state_color)
                                             .on_click(move |_, _, cx| cx.open_url(&open_url))
                                             .child(detail.display_key.clone())
-                                            .child(Icon::ExternalLink.sized(px(11.))),
+                                            .child(Icon::ExternalLink.sized(px(11.)).text_color(state_color)),
                                     )
                                     .child(div().flex_1())
                                     .child(state_control)
@@ -2112,7 +2112,7 @@ impl Render for IssueDetailPanel {
                                                     .gap(px(6.))
                                                     .text_xs()
                                                     .text_color(hsla(p.muted_foreground))
-                                                    .child(Icon::Tag.sized(px(13.)))
+                                                    .child(Icon::Tag.sized(px(13.)).text_color(hsla(p.muted_foreground)))
                                                     .child(t(cx, "Labels").to_owned()),
                                             )
                                             .child(
@@ -2179,7 +2179,7 @@ impl Render for IssueDetailPanel {
                                                     .gap(px(6.))
                                                     .text_xs()
                                                     .text_color(hsla(p.muted_foreground))
-                                                    .child(Icon::Users.sized(px(13.)))
+                                                    .child(Icon::Users.sized(px(13.)).text_color(hsla(p.muted_foreground)))
                                                     .child(t(cx, "Assignees").to_owned()),
                                             )
                                             .child(

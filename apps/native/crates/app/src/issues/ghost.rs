@@ -73,7 +73,7 @@ pub(crate) fn render_ghost(seed: Option<&IssueListEntry>, cx: &App) -> AnyElemen
                             .gap(px(4.))
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
-                            .child(t_icon.sized(px(12.)))
+                            .child(t_icon.sized(px(12.)).text_color(hsla(p.muted_foreground)))
                             .child(div().min_w_0().truncate().child(entry.scope.clone())),
                     )
                     .child(

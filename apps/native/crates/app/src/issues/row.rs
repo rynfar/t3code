@@ -56,6 +56,7 @@ fn tracker_header(page: &IssuesPage, group_idx: usize, cx: &App) -> AnyElement {
         )
     );
     h_flex()
+        .w_full()
         .gap(px(6.))
         .px(px(12.))
         .pt(px(if group_idx == 0 { 4. } else { 14. }))
@@ -63,7 +64,11 @@ fn tracker_header(page: &IssuesPage, group_idx: usize, cx: &App) -> AnyElement {
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(hsla(p.muted_foreground))
-        .child(tracker_icon(&group.tracker.tracker).sized(px(14.)))
+        .child(
+            tracker_icon(&group.tracker.tracker)
+                .sized(px(14.))
+                .text_color(hsla(p.muted_foreground)),
+        )
         .child(provider_name.to_owned())
         .when(show_host, |this| {
             this.child(
@@ -206,6 +211,9 @@ fn entry_row(
         .on_click(select);
 
     h_flex()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .h(px(ROW_HEIGHT))
         .rounded(px(6.))
         .when(selected, |this| this.bg(hsla(p.accent)))
@@ -292,11 +300,15 @@ fn row_lines(
     let assignees = entry.assignees.iter().take(3).map(|actor| avatar(&actor.login, 16., cx));
 
     v_flex()
+        .w_full()
         .flex_1()
         .min_w_0()
+        .overflow_hidden()
         .child(
             h_flex()
+                .w_full()
                 .min_w_0()
+                .overflow_hidden()
                 .gap(px(6.))
                 .child(
                     div()
@@ -308,13 +320,14 @@ fn row_lines(
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
+                        .overflow_hidden()
                         .truncate()
                         .text_sm()
                         .text_color(hsla(p.foreground))
                         .child(entry.title.clone()),
                 )
-                .child(div().flex_1())
                 .when(!entry.assignees.is_empty(), |this| {
                     this.child(h_flex().flex_none().gap(px(2.)).children(assignees))
                 })
@@ -325,13 +338,18 @@ fn row_lines(
                             .gap(px(3.))
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
-                            .child(Icon::MessageSquare.sized(px(12.)))
+                            .child(
+                                Icon::MessageSquare
+                                    .sized(px(12.))
+                                    .text_color(hsla(p.muted_foreground)),
+                            )
                             .child(entry.comment_count.to_string()),
                     )
                 }),
         )
         .child(
             h_flex()
+                .w_full()
                 .min_w_0()
                 .gap(px(6.))
                 .overflow_hidden()
@@ -351,7 +369,11 @@ fn row_lines(
                         h_flex()
                             .flex_none()
                             .gap(px(3.))
-                            .child(tracker_icon(&entry.tracker).sized(px(12.))),
+                            .child(
+                                tracker_icon(&entry.tracker)
+                                    .sized(px(12.))
+                                    .text_color(hsla(p.muted_foreground)),
+                            ),
                     )
                 })
                 .when(show_scope, |this| {
@@ -361,7 +383,7 @@ fn row_lines(
                     this.child(div().min_w_0().truncate().child(label))
                 })
                 .children(labels)
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_0())
                 .children(updated.map(|label| div().flex_none().whitespace_nowrap().child(label))),
         )
 }

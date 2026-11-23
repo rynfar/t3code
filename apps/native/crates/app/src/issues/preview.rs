@@ -237,7 +237,7 @@ pub fn render_issue_preview_card(detail: &IssueDetail, cx: &App) -> AnyElement {
                                 .flex_none()
                                 .gap(px(4.))
                                 .text_color(color)
-                                .child(icon.sized(px(12.)))
+                                .child(icon.sized(px(12.)).text_color(color))
                                 .child(detail.state.name.clone()),
                         ),
                 )
@@ -305,7 +305,7 @@ pub fn render_issue_preview_entry(entry: &IssueListEntry, cx: &App) -> AnyElemen
                                 .flex_none()
                                 .gap(px(4.))
                                 .text_color(color)
-                                .child(icon.sized(px(12.)))
+                                .child(icon.sized(px(12.)).text_color(color))
                                 .child(entry.state.name.clone()),
                         ),
                 )

@@ -2409,7 +2409,7 @@ impl DetailView {
                         })
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .child(Icon::Lock.sized(px(12.)))
+                        .child(Icon::Lock.sized(px(12.)).text_color(hsla(p.muted_foreground)))
                         .child(crate::i18n::t(cx, "Private").to_owned())
                 });
         let ref_state = self.state.clone();
@@ -2478,7 +2478,7 @@ impl DetailView {
                     .min_w_0()
                     .text_xs()
                     .text_color(hsla(p.muted_foreground))
-                    .child(h_flex().flex_none().gap(px(4.)).text_color(color).child(icon.sized(px(14.))).child(kind.label()))
+                    .child(h_flex().flex_none().gap(px(4.)).text_color(color).child(icon.sized(px(14.)).text_color(color)).child(kind.label()))
                     .children(meta.map(|(author, base, head_branch, additions, deletions, files)| {
                         h_flex()
                             .min_w_0()
@@ -2550,7 +2550,7 @@ impl DetailView {
                 this.base_freshness_open = !this.base_freshness_open;
                 cx.notify();
             }))
-            .child(Icon::TriangleAlert.sized(px(12.)))
+            .child(Icon::TriangleAlert.sized(px(12.)).text_color(hsla(p.warning_foreground)))
             .child(div().font_weight(FontWeight::MEDIUM).child(detail.base_branch.clone()));
 
         let open = self.base_freshness_open;
