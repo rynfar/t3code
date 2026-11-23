@@ -161,6 +161,22 @@ impl TimestampLocale for SystemTimestampLocale {
     }
 }
 
+/// Formats `local` using `IntlTimestampClock` for an explicit app language locale tag
+/// (`pingdotgg/t3code#39494`), caching clocks per locale tag on the UI thread.
+pub(crate) fn format_time_for_locale(tag: &str, local: LocalTime, format: TimestampFormat) -> Option<String> {
+    use std::collections::HashMap;
+    thread_local! {
+        static CLOCKS: RefCell<HashMap<String, Option<IntlTimestampClock>>> = RefCell::new(HashMap::new());
+    }
+    CLOCKS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = cache
+            .entry(tag.to_owned())
+            .or_insert_with(|| IntlTimestampClock::new(tag));
+        entry.as_ref().map(|clock| clock.time(local, format))
+    })
+}
+
 /// Formats `ms` as local medium date + short time respecting `format` (for one-shot schedules and deliveries).
 pub(crate) fn once_label(ms: i64, format: TimestampFormat) -> String {
     use chrono::{Datelike, Local, TimeZone, Timelike};

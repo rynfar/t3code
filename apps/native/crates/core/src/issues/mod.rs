@@ -12,11 +12,38 @@ pub mod saved_views;
 pub mod selection;
 pub mod wire;
 
+/// Aggregates linked issue states for a sidebar thread row (`useSidebarLinkedIssueState`,
+/// `pingdotgg/t3code#39351`): returns the first open state immediately, returns `None` while any
+/// non-open state is still unloaded, otherwise returns the first non-completed closed state or the
+/// first state.
+pub fn aggregate_sidebar_issue_state(
+    states: &[Option<&wire::IssueState>],
+) -> Option<wire::IssueState> {
+    if let Some(open) = states
+        .iter()
+        .flatten()
+        .find(|state| state.category == wire::IssueStateCategory::Open)
+    {
+        return Some((*open).clone());
+    }
+    if states.iter().any(Option::is_none) {
+        return None;
+    }
+    states
+        .iter()
+        .flatten()
+        .find(|state| state.close_reason.as_deref() != Some("completed"))
+        .or_else(|| states.iter().flatten().next())
+        .map(|state| (*state).clone())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use serde_json::json;
+
+    use super::aggregate_sidebar_issue_state;
 
     use super::list::{
         HeldIssuePage, ISSUE_LIST_MAX_EXCLUDED_PROJECTS, IssueCandidatesTarget,
@@ -1378,5 +1405,38 @@ mod tests {
         assert!(thread_link_matches("resume", "Fix Résumé parser"));
         assert!(thread_link_matches("café", "Cafe notes"));
         assert!(!thread_link_matches("xyz", "Café layout bug"));
+
+        // `#39351`: grouped sidebar issue state aggregation.
+        let closed_completed = IssueState {
+            category: IssueStateCategory::Closed,
+            name: "Done".into(),
+            close_reason: Some("completed".into()),
+        };
+        let closed_wontfix = IssueState {
+            category: IssueStateCategory::Closed,
+            name: "Canceled".into(),
+            close_reason: Some("not_planned".into()),
+        };
+        let open_state = IssueState {
+            category: IssueStateCategory::Open,
+            name: "Open".into(),
+            close_reason: None,
+        };
+        assert_eq!(
+            aggregate_sidebar_issue_state(&[Some(&closed_completed), None, Some(&open_state)]),
+            Some(open_state)
+        );
+        assert_eq!(
+            aggregate_sidebar_issue_state(&[Some(&closed_completed), None]),
+            None
+        );
+        assert_eq!(
+            aggregate_sidebar_issue_state(&[Some(&closed_completed), Some(&closed_wontfix)]),
+            Some(closed_wontfix)
+        );
+        assert_eq!(
+            aggregate_sidebar_issue_state(&[Some(&closed_completed), Some(&closed_completed)]),
+            Some(closed_completed)
+        );
     }
 }

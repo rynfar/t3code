@@ -1378,6 +1378,64 @@ impl Workspace {
     }
 
     fn traverse(&mut self, next: bool, cx: &mut Context<Self>) {
+        let drafts = self.sidebar.read(cx).listed_drafts();
+        if !drafts.is_empty() {
+            enum Slot {
+                Draft(t3_core::composer::drafts::DraftRef),
+                Scoped(t3_core::sidebar::tag_filter::ThreadKey),
+                Local(String),
+            }
+            let target = {
+                let state = self.state.read(cx);
+                let mut slots: Vec<Slot> = drafts.iter().cloned().map(Slot::Draft).collect();
+                if !state.fleet.environments.is_empty() {
+                    for &index in &state.sidebar.fleet.ordered {
+                        slots.push(Slot::Scoped(state.sidebar.fleet.threads[index].key.clone()));
+                    }
+                } else {
+                    for &index in &state.sidebar.model.ordered {
+                        slots.push(Slot::Local(state.sidebar.model.threads[index].id.clone()));
+                    }
+                }
+                let current = if let Some(id) = state.selected_thread.as_deref() {
+                    if !state.fleet.environments.is_empty() {
+                        state.active_thread_key(id).and_then(|key| {
+                            slots.iter().position(|slot| matches!(slot, Slot::Scoped(k) if *k == key))
+                        })
+                    } else {
+                        slots.iter().position(|slot| matches!(slot, Slot::Local(tid) if tid == id))
+                    }
+                } else if let Some(route_key) = state.draft_route_key() {
+                    slots.iter().position(|slot| matches!(slot, Slot::Draft(draft) if draft.key() == route_key))
+                } else {
+                    None
+                };
+                let next_index = match current {
+                    None => if next { (!slots.is_empty()).then_some(0) } else { slots.len().checked_sub(1) },
+                    Some(index) => if next { (index + 1 < slots.len()).then_some(index + 1) } else { index.checked_sub(1) },
+                };
+                next_index.map(|index| slots.swap_remove(index))
+            };
+            if let Some(slot) = target {
+                self.state.update(cx, |state, cx| match slot {
+                    Slot::Draft(draft) => {
+                        state.clear_thread_selection(cx);
+                        state.open_saved_draft(draft, cx);
+                    }
+                    Slot::Scoped(key) => {
+                        if let Some(owner) = state.sidebar.fleet.thread(&key).map(|row| row.owner.clone()) {
+                            state.anchor_opened_scoped_thread(&key, cx);
+                            state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
+                        }
+                    }
+                    Slot::Local(id) => {
+                        state.anchor_opened_thread(&id, cx);
+                        state.select_thread(&id, cx);
+                    }
+                });
+            }
+            return;
+        }
         if !self.state.read(cx).fleet.environments.is_empty() {
             let target = { let state = self.state.read(cx); let selected = state.selected_thread.as_deref().and_then(|id| state.active_thread_key(id)); state.sidebar.fleet.adjacent_thread(selected.as_ref(), next).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key))) };
             if let Some((owner, key)) = target {
@@ -1401,8 +1459,17 @@ impl Workspace {
     }
 
     fn jump(&mut self, index: usize, cx: &mut Context<Self>) {
+        let drafts = self.sidebar.read(cx).listed_drafts();
+        if let Some(draft) = drafts.get(index).cloned() {
+            self.state.update(cx, |state, cx| {
+                state.clear_thread_selection(cx);
+                state.open_saved_draft(draft, cx);
+            });
+            return;
+        }
+        let thread_index = index - drafts.len();
         if !self.state.read(cx).fleet.environments.is_empty() {
-            let target = { let state = self.state.read(cx); state.sidebar.fleet.jump_target(index).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key))) };
+            let target = { let state = self.state.read(cx); state.sidebar.fleet.jump_target(thread_index).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key))) };
             if let Some((owner, key)) = target {
                 self.state.update(cx, |state, cx| {
                     state.anchor_opened_scoped_thread(&key, cx);
@@ -1411,7 +1478,7 @@ impl Workspace {
             }
             return;
         }
-        if let Some(id) = self.state.read(cx).sidebar.model.jump_target(index).map(str::to_owned) {
+        if let Some(id) = self.state.read(cx).sidebar.model.jump_target(thread_index).map(str::to_owned) {
             self.state.update(cx, |state, cx| {
                 state.anchor_opened_thread(&id, cx);
                 state.select_thread(&id, cx);
@@ -1430,6 +1497,9 @@ impl Workspace {
             if !state.fleet.environments.is_empty() {
                 let Some(key) = state.active_thread_key(&id) else { return };
                 let next = state.sidebar.fleet.adjacent_thread(Some(&key), true).or_else(|| state.sidebar.fleet.adjacent_thread(Some(&key), false)).and_then(|key| state.sidebar.fleet.thread(&key).map(|row| (row.owner.clone(), key)));
+                if next.is_some() {
+                    state.sidebar.departing_thread_key = Some(key.clone());
+                }
                 state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::Settle, &[], cx);
                 if let Some((owner, next_key)) = next {
                     state.anchor_opened_scoped_thread(&next_key, cx);
@@ -1438,6 +1508,9 @@ impl Workspace {
                 return;
             }
             let next = state.sidebar.model.adjacent_thread(Some(&id), true).or_else(|| state.sidebar.model.adjacent_thread(Some(&id), false)).map(str::to_owned);
+            if next.is_some() {
+                state.sidebar.departing_thread_id = Some(id.clone());
+            }
             state.settle_thread(&id, cx);
             if let Some(next) = next {
                 state.anchor_opened_thread(&next, cx);

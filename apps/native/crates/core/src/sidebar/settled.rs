@@ -189,6 +189,18 @@ pub fn default_time_label(time: LocalTime) -> String {
 pub type TimeFormat<'a> = &'a dyn Fn(LocalTime) -> String;
 
 pub fn resolve_snooze_preset(setting: &SnoozePresetSetting, now: Ms, zone: &dyn Zone, format_time: TimeFormat) -> Option<SnoozePreset> {
+    resolve_snooze_preset_in_locale(setting, now, zone, format_time, None)
+}
+
+/// Resolves a snooze preset, localizing weekday abbreviations against `locale` when supplied
+/// (`pingdotgg/t3code#39494`).
+pub fn resolve_snooze_preset_in_locale(
+    setting: &SnoozePresetSetting,
+    now: Ms,
+    zone: &dyn Zone,
+    format_time: TimeFormat,
+    locale: Option<&str>,
+) -> Option<SnoozePreset> {
     let local_now = to_local(now, zone);
     let (wake, label) = match *setting {
         SnoozePresetSetting::After { minutes } => (now + minutes * MINUTE_MS, format!("In {}", format_snooze_duration(minutes))),
@@ -220,21 +232,38 @@ pub fn resolve_snooze_preset(setting: &SnoozePresetSetting, now: Ms, zone: &dyn 
     let time = format_time(local_wake);
     let label_names_day = matches!(setting, SnoozePresetSetting::At { .. }) && label != "Next week";
     let same_day = (local_wake.year, local_wake.month, local_wake.day) == (local_now.year, local_now.month, local_now.day);
+    let when_label = if label_names_day || same_day {
+        time
+    } else {
+        let short_day = locale
+            .and_then(|tag| crate::timeline::format_short_weekday(tag, local_wake.year, local_wake.month, local_wake.day))
+            .unwrap_or_else(|| SHORT_WEEKDAYS[local_wake.weekday as usize].to_owned());
+        format!("{short_day} {time}")
+    };
     Some(SnoozePreset {
         id: snooze_preset_id(setting),
         label,
-        when_label: if label_names_day || same_day {
-            time
-        } else {
-            format!("{} {time}", SHORT_WEEKDAYS[local_wake.weekday as usize])
-        },
+        when_label,
         snoozed_until: wake,
     })
 }
 
 /// The snooze menu: soonest first, one row per wake minute.
 pub fn resolve_snooze_presets(settings: &[SnoozePresetSetting], now: Ms, zone: &dyn Zone, format_time: TimeFormat) -> Vec<SnoozePreset> {
-    let mut presets: Vec<SnoozePreset> = settings.iter().filter_map(|setting| resolve_snooze_preset(setting, now, zone, format_time)).collect();
+    resolve_snooze_presets_in_locale(settings, now, zone, format_time, None)
+}
+
+pub fn resolve_snooze_presets_in_locale(
+    settings: &[SnoozePresetSetting],
+    now: Ms,
+    zone: &dyn Zone,
+    format_time: TimeFormat,
+    locale: Option<&str>,
+) -> Vec<SnoozePreset> {
+    let mut presets: Vec<SnoozePreset> = settings
+        .iter()
+        .filter_map(|setting| resolve_snooze_preset_in_locale(setting, now, zone, format_time, locale))
+        .collect();
     let minute = |preset: &SnoozePreset| preset.snoozed_until.div_euclid(MINUTE_MS);
     presets.sort_by_key(minute);
     let mut seen = Vec::new();
@@ -250,11 +279,23 @@ pub fn resolve_snooze_presets(settings: &[SnoozePresetSetting], now: Ms, zone: &
 /// A menu choice as picked: a duration re-resolves so it starts at selection; a set time keeps
 /// the wake that was shown.
 pub fn pick_snooze_preset(shown: &[SnoozePreset], id: &str, now: Ms, settings: &[SnoozePresetSetting], zone: &dyn Zone, format_time: TimeFormat) -> Option<SnoozePreset> {
+    pick_snooze_preset_in_locale(shown, id, now, settings, zone, format_time, None)
+}
+
+pub fn pick_snooze_preset_in_locale(
+    shown: &[SnoozePreset],
+    id: &str,
+    now: Ms,
+    settings: &[SnoozePresetSetting],
+    zone: &dyn Zone,
+    format_time: TimeFormat,
+    locale: Option<&str>,
+) -> Option<SnoozePreset> {
     let ahead = shown.iter().find(|preset| preset.id == id && preset.snoozed_until > now).cloned();
     settings
         .iter()
         .find(|setting| matches!(setting, SnoozePresetSetting::After { .. }) && snooze_preset_id(setting) == id)
-        .and_then(|setting| resolve_snooze_preset(setting, now, zone, format_time))
+        .and_then(|setting| resolve_snooze_preset_in_locale(setting, now, zone, format_time, locale))
         .or(ahead)
 }
 

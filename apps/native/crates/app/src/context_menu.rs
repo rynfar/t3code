@@ -341,18 +341,22 @@ impl ContextMenu {
     }
 
     pub fn open_for_thread(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_thread(thread_id, position, true, window, cx);
+        self.open_thread(thread_id, position, true, true, window, cx);
+    }
+
+    pub fn open_for_search_thread(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_thread(thread_id, position, true, false, window, cx);
     }
 
     pub fn open_for_header(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_thread(thread_id, position, false, window, cx);
+        self.open_thread(thread_id, position, false, true, window, cx);
     }
 
     pub(crate) fn on_header_rename(&mut self, handler: impl Fn(&mut App) + 'static) {
         self.header_rename = self.open.as_ref().filter(|menu| menu.header).map(|_| Rc::new(handler) as HeaderRename);
     }
 
-    fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, can_rename: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.state.read(cx).sidebar.model.thread(thread_id).cloned().or_else(|| {
             self.state.read(cx).thread_shell(thread_id).map(|shell| t3_core::sidebar::thread::present_thread(shell, None))
         }) else {
@@ -369,12 +373,13 @@ impl ContextMenu {
         let thread = &thread;
         let project_filter = sidebar.then(|| ThreadProjectFilter::capture(state, thread_id)).flatten();
         let now = now_ms();
-        let presets = state.snooze_presets();
+        let presets = state.snooze_presets_for(cx);
         let caps = state.sidebar.capabilities;
         let loaded = caps.config_loaded;
         let supports = Supports { settlement: loaded, auto_settle_opt_out: caps.auto_settle_opt_out, snooze: loaded, pinning: loaded, title_regeneration: loaded };
         let items = build_menu(&ThreadActionMenuState {
             can_operate: ThreadMenuOwner::can_operate(state),
+            can_rename,
             can_find: !sidebar && state.selected_thread.as_deref() == Some(thread_id),
             can_share_with_guest: state.can_share_with_guest(),
             can_turn_into_project: state.can_turn_into_project(thread_id),
@@ -414,6 +419,14 @@ impl ContextMenu {
     }
 
     pub(crate) fn open_for_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_scoped_thread(key, position, true, window, cx);
+    }
+
+    pub(crate) fn open_for_scoped_search_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_scoped_thread(key, position, false, window, cx);
+    }
+
+    fn open_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, can_rename: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).scoped_thread(key).is_none() {
             self.state.update(cx, |state, cx| {
                 state.show_toast(
@@ -430,13 +443,15 @@ impl ContextMenu {
         let Some(environment) = state.scoped_environment(&key.environment_id) else { return; };
         let config = environment.config.config.as_ref();
         let settings = config.map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_default();
-        let presets = settled::resolve_snooze_presets(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &crate::sidebar::controller::time_label);
+        let locale = crate::i18n::active_formatting_locale(cx);
+        let time_label = |time| crate::sidebar::controller::snooze_time_label(time, cx);
+        let presets = settled::resolve_snooze_presets_in_locale(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &time_label, Some(&locale));
         let loaded = config.is_some();
         let project_ref = row.project_ref();
         let project_group = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx).into_iter().find(|group| group.member_refs.contains(&project_ref));
         let project_filter = project_group.as_ref().map(|group| (group.label.as_str(), state.scoped_project_scope(std::slice::from_ref(group)).contains(&group.key)));
         let items = build_menu(&ThreadActionMenuState {
-            can_operate: owner.can_operate_owner(state), can_find: false,
+            can_operate: owner.can_operate_owner(state), can_rename, can_find: false,
             can_share_with_guest: state.can_share_scoped(&owner), can_turn_into_project: state.can_promote_scoped(&owner),
             branch: row.thread.branch.as_deref(), project_filter, is_pinned: row.thread.pinned, is_settled: row.thread.is_settled(),
             auto_settle_enabled: !row.thread.auto_settle_disabled, is_snoozed: settled::effective_snoozed(&row.thread, now_ms()),
@@ -490,7 +505,9 @@ impl ContextMenu {
         let owners = state.sidebar.fleet.ordered.iter().map(|index| &state.sidebar.fleet.threads[*index]).filter(|row| state.sidebar.fleet_selection.contains(&row.key)).filter_map(|row| ThreadMenuOwner::capture_scoped(state, &row.key)).collect::<Vec<_>>();
         if owners.is_empty() { return; }
         let summary = t3_core::sidebar::selection::BulkSelection::from_targets(&owners.iter().filter_map(|owner| state.scoped_bulk_target(owner)).collect::<Vec<_>>());
-        let presets = owners.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).map(|settings| settled::resolve_snooze_presets(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &crate::sidebar::controller::time_label)).unwrap_or_default();
+        let locale = crate::i18n::active_formatting_locale(cx);
+        let time_label = |time| crate::sidebar::controller::snooze_time_label(time, cx);
+        let presets = owners.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).map(|settings| settled::resolve_snooze_presets_in_locale(&settings, now_ms(), &crate::sidebar::controller::SystemZone, &time_label, Some(&locale))).unwrap_or_default();
         let request = SnoozeRequest::capture_scoped(state, owners.iter().filter_map(ThreadMenuOwner::key).collect(), true, window.focused(cx));
         let items = build_bulk_menu(&summary, &presets).into_iter().map(|item| item.map(&MenuAction::Bulk)).collect();
         self.reset_popup();
@@ -506,7 +523,7 @@ impl ContextMenu {
         if selection.is_empty() {
             return;
         }
-        let presets = state.snooze_presets();
+        let presets = state.snooze_presets_for(cx);
         let snooze_request = SnoozeRequest::capture(state, selection.clone(), true, window.focused(cx));
         let can_snooze = snooze_request.plan_for(state, now_ms()).is_some();
         let items = build_bulk_menu(&summary, &presets).into_iter().map(|item| {
@@ -539,7 +556,7 @@ impl ContextMenu {
         let state = self.state.read(cx);
         let snooze_request = SnoozeRequest::capture(state, vec![thread_id.to_owned()], false, window.focused(cx));
         if snooze_request.plan_for(state, now_ms()).is_none() { return; }
-        let presets = state.snooze_presets();
+        let presets = state.snooze_presets_for(cx);
         let mut items: Vec<_> = presets
             .iter()
             .map(|preset| MenuItem {

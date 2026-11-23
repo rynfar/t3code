@@ -124,7 +124,16 @@ impl SidebarPane {
                                     .text_color(hsla(p.sidebar_secondary_label))
                                     .children(project),
                             )
-                            .child(
+                            .child(if self.jump_hints_visible() {
+                                gpui::div()
+                                    .h(px(20.))
+                                    .min_w(px(20.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .children((index < 9).then(|| super::row::render_jump_badge(index, cx)).flatten())
+                                    .into_any_element()
+                            } else {
                                 div()
                                     .id(discard_id)
                                     .size(px(20.))
@@ -141,8 +150,9 @@ impl SidebarPane {
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.discard_draft(&discard, window, cx);
-                                    })),
-                            ),
+                                    }))
+                                    .into_any_element()
+                            }),
                     )
                     .child(
                         div()
@@ -154,7 +164,9 @@ impl SidebarPane {
                             .child(row.preview.clone()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.composer.read(cx).sidebar_drafts().get(&open.key()).is_some() {
+                        if this.composer.read(cx).sidebar_drafts().get(&open.key()).is_some()
+                            || this.drafts.rows.iter().any(|candidate| candidate.key == open.key())
+                        {
                             this.state.update(cx, |state, cx| {
                                 state.clear_thread_selection(cx);
                                 state.open_saved_draft(open.clone(), cx);

@@ -193,15 +193,14 @@ fn hover_action(id: SharedString, p: Palette) -> gpui::Stateful<gpui::Div> {
 }
 
 /// What a row shows besides its status: the unsent-draft mark, running terminals, the provider
-/// stack and, for another environment's thread, its machine or shared scratch machine label.
+/// stack and the thread's environment machine label.
 struct RowExtras {
     draft: bool,
     config_loaded: bool,
     running: Vec<String>,
     /// Earlier instances first; the last is the current one, which carries the badge.
     stack: Vec<ProviderMark>,
-    remote: Option<Icon>,
-    scratch_machine: Option<(Icon, String)>,
+    environment: Option<(Icon, String)>,
     pr: Option<PrBadge>,
     issues: Vec<t3_core::issues::wire::ThreadIssueLink>,
 }
@@ -218,12 +217,32 @@ struct PrBadge {
 impl RowExtras {
     /// Only the trailing icons would remain, so the card moves them to the title line instead
     /// (`metaLineEmpty`; diff counts are not collected, as on the web).
-    fn meta_line_empty(&self, thread: &SidebarThread) -> bool {
-        thread.branch.as_deref().is_none_or(str::is_empty)
-            && self.scratch_machine.is_none()
+    fn meta_line_empty(&self) -> bool {
+        self.environment.is_none()
             && self.pr.is_none() && self.issues.is_empty()
             && self.running.is_empty()
     }
+}
+
+pub(super) fn render_jump_badge(position: usize, cx: &App) -> Option<AnyElement> {
+    let label = crate::keymap::label(t3_core::keybindings::thread_jump_command_for_index(position)?, cx)?;
+    let p = palette(cx);
+    Some(
+        div()
+            .h(px(20.))
+            .min_w(px(20.))
+            .px(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .bg(hsla(p.foreground).opacity(0.07))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(hsla(p.muted_foreground))
+            .child(label)
+            .into_any_element(),
+    )
 }
 
 pub(super) struct RowTarget<'a> {
@@ -690,13 +709,26 @@ impl SidebarPane {
             None
         };
         let machine_icon = config.map(Icon::machine).unwrap_or(Icon::Server);
-        let scratch_machine = key.filter(|_| thread.branch.as_deref().is_none_or(str::is_empty)).and_then(|key| {
-            let project_ref = t3_core::sidebar::grouping::ProjectRef {
-                environment_id: key.environment_id.clone(),
-                project_id: thread.project_id.clone(),
-            };
-            state.sidebar.fleet.scratch_machine_labels.get(&project_ref).map(|label| (machine_icon, label.clone()))
-        });
+        let env_label = match key {
+            Some(key) => config
+                .map(|cfg| cfg.environment.label.trim())
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    state.scoped_environment(&key.environment_id).and_then(|entry| {
+                        state.environments.environments.iter()
+                            .find(|saved| saved.id == entry.summary.owner.saved_id)
+                            .map(|saved| saved.label.trim())
+                            .filter(|label| !label.is_empty())
+                            .map(str::to_owned)
+                    })
+                }),
+            None => config
+                .map(|cfg| cfg.environment.label.trim())
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned),
+        };
+        let environment = env_label.map(|label| (machine_icon, label));
         let issues = key.map_or_else(
             || state.thread_shell(&thread.id),
             |key| state.scoped_thread(key).and_then(|row| super::search::scoped_thread_shell(state, &row.owner, &thread.id)),
@@ -706,8 +738,7 @@ impl SidebarPane {
             config_loaded,
             running,
             stack,
-            remote: (!current_environment && scratch_machine.is_none()).then_some(machine_icon),
-            scratch_machine,
+            environment,
             pr,
             issues,
         }
@@ -784,20 +815,27 @@ impl SidebarPane {
         let muted = hsla(p.sidebar_secondary_label);
         let environment = key.map(|key| key.environment_id.clone());
         let target = t3_core::right_panel::IssueTarget::from_thread_link(environment.clone(), first);
-        let detail = (issues.len() == 1).then(|| {
-            crate::issues::HeldIssueKey::of(self.state.read(cx), environment.as_deref(), &target.issue_ref())
+        let state_ref = self.state.read(cx);
+        let details: Vec<_> = issues.iter().map(|issue| {
+            let target = t3_core::right_panel::IssueTarget::from_thread_link(environment.clone(), issue);
+            crate::issues::HeldIssueKey::of(state_ref, environment.as_deref(), &target.issue_ref())
                 .and_then(|key| crate::issues::held_issue_detail(&key, cx))
-        }).flatten();
-        let (icon, ink) = detail.as_ref().map_or((Icon::CircleDot, muted), |detail| {
-            crate::issues::state_glyph(&detail.state, cx)
+        }).collect();
+        let states: Vec<Option<&t3_core::issues::wire::IssueState>> = details
+            .iter()
+            .map(|detail| detail.as_ref().map(|d| &d.state))
+            .collect();
+        let aggregated_state = t3_core::issues::aggregate_sidebar_issue_state(&states);
+        let (icon, ink) = aggregated_state.as_ref().map_or((Icon::CircleDot, muted), |issue_state| {
+            crate::issues::state_glyph(issue_state, cx)
         });
         let count = issues.len();
         let label = if count == 1 {
-            if let Some(detail) = &detail {
+            if let Some(issue_state) = &aggregated_state {
                 crate::i18n::t_fmt(cx, "Issue {key}: {title}, {state}", &[
                     ("key", first.display_key.as_str().into()),
                     ("title", first.title.as_str().into()),
-                    ("state", detail.state.name.as_str().into()),
+                    ("state", issue_state.name.as_str().into()),
                 ])
             } else {
                 crate::i18n::t_fmt(cx, "Issue {key}: {title}", &[
@@ -850,10 +888,10 @@ impl SidebarPane {
             .into_any_element())
     }
 
-    /// `SidebarProviderStack` with the remote machine before it: earlier instances small, faded and
-    /// gray; the current one compact with its instance badge.
+    /// `SidebarProviderStack`: earlier instances small, faded and gray; the current one compact
+    /// with its instance badge.
     fn render_trailing_icons(&self, extras: &RowExtras, cx: &App) -> Option<AnyElement> {
-        if extras.stack.is_empty() && extras.remote.is_none() { return None; }
+        if extras.stack.is_empty() { return None; }
         let p = palette(cx);
         let last = extras.stack.len().saturating_sub(1);
         let stack = extras.stack.iter().enumerate().map(|(index, mark)| {
@@ -863,7 +901,6 @@ impl SidebarPane {
         });
         Some(
             div().flex_none().flex().items_center().gap(px(4.))
-                .children(extras.remote.map(|icon| icon.render(px(14.), hsla(p.sidebar_muted_foreground).opacity(0.7))))
                 .child(div().flex().items_center().gap(px(6.)).children(stack))
                 .into_any_element(),
         )
@@ -917,21 +954,6 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    /// `ThreadWorktreeIndicator`.
-    fn render_worktree_icon(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, cx: &App) -> Option<AnyElement> {
-        let label: SharedString = thread.worktree_label()?.into();
-        let debug_id = scoped_id("thread-worktree-", key, &thread.id);
-        Some(
-            div()
-                .id(SharedString::from(debug_id.clone()))
-                .debug_selector(move || debug_id.clone())
-                .flex_none()
-                .child(Icon::FolderGit2.render(px(14.), hsla(palette(cx).icon_muted)))
-                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
-                .into_any_element(),
-        )
-    }
-
     fn render_woke_badge(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, id: &str, woke_at: Option<i64>, icon_size: Pixels, color: u32, cx: &mut Context<Self>) -> AnyElement {
         let debug_id = scoped_id("woke-", key, id);
         let id = id.to_owned();
@@ -972,18 +994,25 @@ impl SidebarPane {
     }
 
     fn render_meta_line(&self, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, thread: &SidebarThread, extras: &RowExtras, active: bool, trailing: Option<AnyElement>, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if extras.meta_line_empty(thread) {
+        if extras.meta_line_empty() {
             return None;
         }
         let p = palette(cx);
-        let branch = thread.branch.clone().filter(|branch| !branch.is_empty());
-        let (leading_icon, leading_label) = if let Some(branch) = branch {
-            (self.render_worktree_icon(key, thread, cx), Some(branch))
-        } else if let Some((icon, label)) = &extras.scratch_machine {
-            (Some(icon.render(px(12.), hsla(p.sidebar_secondary_label)).into_any_element()), Some(label.clone()))
-        } else {
-            (None, None)
-        };
+        let leading = extras.environment.as_ref().map(|(icon, label)| {
+            let debug_id = scoped_id("thread-env-", key, &thread.id);
+            div()
+                .id(SharedString::from(debug_id.clone()))
+                .debug_selector(move || debug_id.clone())
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(icon.render(px(14.), hsla(p.icon_muted)))
+                .child(div().min_w_0().truncate().child(label.clone()))
+                .into_any_element()
+        });
+        let spacer = leading.is_none().then(|| div().flex_1().min_w_0());
         Some(
             div()
                 .mt(px(2.))
@@ -993,8 +1022,8 @@ impl SidebarPane {
                 .min_w_0()
                 .text_xs()
                 .text_color(hsla(p.sidebar_secondary_label))
-                .children(leading_icon)
-                .child(div().flex_1().min_w_0().truncate().children(leading_label))
+                .children(leading)
+                .children(spacer)
                 .children(self.render_terminal_button(key, thread, &extras.running, cx))
                 .children(self.render_pr_badge(key, thread, extras.pr.as_ref(), active, cx))
                 .children(self.render_issue_badge(key, thread, &extras.issues, cx))
@@ -1122,7 +1151,7 @@ impl SidebarPane {
                     }));
                 this.child(self.attach_sweep_drag(button, key, &thread.id, section, SweepAction::Settle, cx))
             });
-        let meta_empty = extras.meta_line_empty(thread);
+        let meta_empty = extras.meta_line_empty();
         let trailing = self.render_trailing_icons(&extras, cx);
         let (title_icons, meta_icons) = if meta_empty { (trailing, None) } else { (None, trailing) };
         let meta = self.render_meta_line(key, thread, &extras, active, meta_icons, cx);
@@ -1266,7 +1295,7 @@ impl SidebarPane {
                 self.attach_sweep_drag(button, key, &thread.id, section, SweepAction::Settle, cx)
             }),
         };
-        let meta_empty = extras.meta_line_empty(thread);
+        let meta_empty = extras.meta_line_empty();
         let trailing = variant.multiline().then(|| self.render_trailing_icons(&extras, cx)).flatten();
         let (title_icons, meta_icons) = if meta_empty { (trailing, None) } else { (None, trailing) };
         let meta = if variant.multiline() { self.render_meta_line(key, thread, &extras, active, meta_icons, cx) } else { None };
@@ -1353,7 +1382,7 @@ impl SidebarPane {
         if muted { visual.render_receding(size, ink, cx) } else { visual.render(size, ink, cx) }
     }
 
-    fn jump_hints_visible(&self) -> bool {
+    pub(super) fn jump_hints_visible(&self) -> bool {
         self.jump_hints
     }
 
@@ -1365,24 +1394,7 @@ impl SidebarPane {
         let state = self.state.read(cx);
         let position = if let Some(key) = key { state.sidebar.fleet.ordered.iter().take(9).position(|index| state.sidebar.fleet.threads[*index].key == *key)? }
             else { let model = &state.sidebar.model; model.ordered.iter().take(9).position(|index| model.threads[*index].id == thread.id)? };
-        let label = crate::keymap::label(t3_core::keybindings::thread_jump_command_for_index(position)?, cx)?;
-        let p = palette(cx);
-        Some(
-            div()
-                .h(px(20.))
-                .min_w(px(20.))
-                .px(px(4.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .bg(hsla(p.foreground).opacity(0.07))
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(hsla(p.muted_foreground))
-                .child(label)
-                .into_any_element(),
-        )
+        render_jump_badge(self.drafts.rows.len() + position, cx)
     }
 
     fn render_shelf(&self, shelf: Shelf, count: usize, expanded: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

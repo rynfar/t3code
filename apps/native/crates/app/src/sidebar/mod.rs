@@ -406,8 +406,12 @@ impl SidebarPane {
         state.update(cx, |state, _| state.sidebar.search_input = Some(search_input.downgrade()));
         let subscriptions = vec![
             cx.subscribe(&composer, |this, _, event: &crate::composer::drafts::DraftsChanged, cx| {
+                let empty = std::collections::HashMap::new();
+                let terminal_labels = cx
+                    .try_global::<crate::terminal::RunningTerminals>()
+                    .map_or(&empty, |running| &running.first_label_by_thread);
                 let state = this.state.read(cx);
-                if this.drafts.update_draft(this.composer.read(cx).sidebar_drafts(), &event.key, state.sidebar.project_scope.as_ref()) {
+                if this.drafts.update_draft_with_terminals(this.composer.read(cx).sidebar_drafts(), &event.key, state.sidebar.project_scope.as_ref(), terminal_labels) {
                     this.sync_list_rows(cx);
                     cx.notify();
                 }
@@ -415,7 +419,8 @@ impl SidebarPane {
             cx.subscribe(&composer, |_, _, _: &crate::composer::drafts::ThreadDraftsChanged, cx| {
                 cx.notify();
             }),
-            cx.observe_global::<crate::terminal::RunningTerminals>(|_, cx| {
+            cx.observe_global::<crate::terminal::RunningTerminals>(|this, cx| {
+                this.sync_rows(cx);
                 cx.notify();
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
@@ -701,9 +706,20 @@ impl SidebarPane {
     }
 
     /// Splices the list so scroll position and measured heights survive streaming updates.
+    pub(crate) fn listed_drafts(&self) -> Vec<t3_core::composer::drafts::DraftRef> {
+        if self.search.is_active() {
+            return Vec::new();
+        }
+        self.drafts.rows.iter().map(|row| row.draft.clone()).collect()
+    }
+
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
+        let empty = std::collections::HashMap::new();
+        let terminal_labels = cx
+            .try_global::<crate::terminal::RunningTerminals>()
+            .map_or(&empty, |running| &running.first_label_by_thread);
         let state = self.state.read(cx);
-        self.drafts.update(self.composer.read(cx).sidebar_drafts(), state.draft_route_key().as_deref(), state.sidebar.project_scope.as_ref());
+        self.drafts.update_with_terminals(self.composer.read(cx).sidebar_drafts(), state.draft_route_key().as_deref(), state.sidebar.project_scope.as_ref(), terminal_labels);
         self.sync_list_rows(cx);
     }
 
@@ -1519,15 +1535,87 @@ impl SidebarPane {
                 .flex_none()
                 .items_center()
                 .when(project_groups > 0, |this| {
-                    this.child(self.render_project_filter_button(cx)).child(
-                        Self::header_button("add-project", Self::button_icon(Icon::FolderPlus, "add-project", cx), |cx| crate::i18n::t(cx, "Add project").to_owned(), true, cx)
-                            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
-                    )
+                    this.child(self.render_project_filter_button(cx))
                 })
                 .child(
                     Self::header_button("new-thread-sidebar", Self::button_icon(Icon::SquarePen, "new-thread-sidebar", cx), new_thread_label, has_any_projects, cx)
                         .when(has_any_projects, |this| this.on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                            let use_current = event.modifiers().shift || project_groups <= 1;
+                            let shift = event.modifiers().shift;
+                            let folder_mode = crate::settings::store::client(cx).boring_sidebar_enabled();
+                            let scoped_target = if !folder_mode && !shift {
+                                let state = this.state.read(cx);
+                                if !state.fleet.environments.is_empty() {
+                                    let all_groups = state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx);
+                                    let selected = state.scoped_project_scope(&all_groups);
+                                    let scoped_groups: Vec<_> = all_groups
+                                        .iter()
+                                        .filter(|group| !group.archived && (selected.is_empty() || selected.contains(&group.key)))
+                                        .collect();
+                                    let viewed = state
+                                        .selected_thread
+                                        .as_deref()
+                                        .and_then(|id| state.active_thread_key(id))
+                                        .and_then(|key| state.scoped_thread(&key).map(|row| row.project_ref()))
+                                        .or_else(|| {
+                                            state.active_draft().and_then(|draft| {
+                                                draft.environment_id
+                                                    .as_ref()
+                                                    .filter(|env| !env.is_empty())
+                                                    .map(|env| t3_core::sidebar::grouping::ProjectRef {
+                                                        environment_id: env.clone(),
+                                                        project_id: draft.project_id.clone(),
+                                                    })
+                                            })
+                                        });
+                                    t3_core::sidebar::grouping::resolve_scoped_new_thread_project_ref(shift, &scoped_groups, viewed.as_ref())
+                                        .map(|target_ref| (true, Some(target_ref), None))
+                                } else {
+                                    let groups = this.project_groups(cx);
+                                    let scoped: Vec<_> = match &state.sidebar.project_scope {
+                                        Some(scope) => groups.into_iter().filter(|group| scope.contains(&group.key)).collect(),
+                                        None => groups,
+                                    };
+                                    if scoped.len() == 1 {
+                                        let group = &scoped[0];
+                                        let viewed = state
+                                            .selected_thread
+                                            .as_deref()
+                                            .and_then(|id| state.thread_shell(id).map(|shell| shell.project_id.clone()))
+                                            .or_else(|| state.active_draft().map(|draft| draft.project_id));
+                                        let project_id = viewed
+                                            .filter(|id| group.member_project_ids.contains(id))
+                                            .unwrap_or_else(|| group.representative_id.clone());
+                                        Some((false, None, Some(project_id)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some((is_fleet, Some(target_ref), None)) = scoped_target {
+                                if is_fleet {
+                                    let scoped_project = this.state.read(cx).scoped_project(&target_ref).cloned();
+                                    this.state.update(cx, |state, cx| {
+                                        state.close_sidebar_sheet(cx);
+                                        if let Some(project) = scoped_project {
+                                            if state.scoped_ready(&project.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+                                                state.navigate_scoped(project.owner, crate::app_state::ScopedRouteAction::Draft(target_ref.project_id), cx);
+                                            } else {
+                                                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Project action stopped").description("The project destination is not connected or read access changed."), cx);
+                                            }
+                                        }
+                                    });
+                                    return;
+                                }
+                            } else if let Some((false, None, Some(project_id))) = scoped_target {
+                                this.state.update(cx, |state, cx| {
+                                    state.close_sidebar_sheet(cx);
+                                    state.start_draft(&project_id, cx);
+                                });
+                                return;
+                            }
+                            let use_current = shift || project_groups <= 1;
                             if use_current && crate::new_thread::default_project(this.state.read(cx)).is_some() {
                                 this.state.update(cx, |state, cx| {
                                     state.close_sidebar_sheet(cx);
@@ -3062,6 +3150,10 @@ mod sb_sections_pane_tests {
             window.focus(&popup_focus, cx);
         });
         draw_bounds(vcx);
+        assert!(
+            vcx.debug_bounds("scoped-project-add-project").is_some(),
+            "Add project item renders at the top when project filter query is empty"
+        );
 
         // With popup in the dispatch tree: focused-Input capture actions (`MoveDown`, `MoveUp`, `Escape`) route through `popup_id`.
         let dispatch_focused_action = |vcx: &mut gpui::VisualTestContext, action: Box<dyn gpui::Action>| {
@@ -3083,6 +3175,10 @@ mod sb_sections_pane_tests {
         assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some(beta_key.as_str()));
         dispatch_focused_action(vcx, Box::new(gpui_component::input::MoveUp));
         assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some("all"));
+        dispatch_focused_action(vcx, Box::new(gpui_component::input::MoveUp));
+        assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some("add-project"));
+        dispatch_focused_action(vcx, Box::new(gpui_component::input::MoveDown));
+        assert_eq!(pane.read_with(vcx, |p, _| p.project_filter_highlighted.clone()).as_deref(), Some("all"));
         dispatch_focused_action(vcx, Box::new(gpui_component::input::Escape));
         assert!(pane.read_with(vcx, |p, _| p.project_filter.is_none()), "Escape capture action must close project filter from focused Input");
 
@@ -3102,6 +3198,11 @@ mod sb_sections_pane_tests {
             assert_eq!(p.project_filter_search.read(cx).value(), "cloud");
             assert_eq!(p.project_filter_highlighted.as_deref(), Some(beta_key.as_str()));
         });
+        draw_bounds(vcx);
+        assert!(
+            vcx.debug_bounds("scoped-project-add-project").is_none(),
+            "Add project item must hide when searching in project filter"
+        );
 
         vcx.update(|window, cx| {
             let search = pane.read(cx).project_filter_search.clone();
@@ -3910,8 +4011,8 @@ mod sb_sections_pane_tests {
         let woke_op = vcx.debug_bounds("woke-env-op-shared-th").expect("env-op woke badge rendered");
         let woke_ro = vcx.debug_bounds("woke-env-ro-shared-th").expect("env-ro woke badge rendered");
         assert_ne!(woke_op.origin, woke_ro.origin);
-        let worktree_op = vcx.debug_bounds("thread-worktree-env-op-shared-th").expect("env-op worktree badge rendered");
-        let worktree_ro = vcx.debug_bounds("thread-worktree-env-ro-shared-th").expect("env-ro worktree badge rendered");
+        let worktree_op = vcx.debug_bounds("thread-env-env-op-shared-th").expect("env-op environment badge rendered");
+        let worktree_ro = vcx.debug_bounds("thread-env-env-ro-shared-th").expect("env-ro environment badge rendered");
         assert_ne!(worktree_op.origin, worktree_ro.origin);
         assert!(vcx.debug_bounds("unpin-env-op-shared-th").is_some(), "operable pinned row must have scoped unpin id");
 
@@ -4548,11 +4649,12 @@ mod sb_380_tests {
             "rendering a row with branch/worktree must subscribe to subscribeVcsBranch"
         );
         assert!(
-            vcx.debug_bounds("thread-worktree-menu-thread").is_some(),
-            "worktree badge renders while checkout is not reported removed"
+            vcx.debug_bounds("thread-env-menu-thread").is_some(),
+            "environment badge renders"
         );
 
-        // Once checkout status reports `isRepo: false`, row drops worktree/branch badges cleanly.
+        // Under `#40736`, the row keeps showing the environment badge even when checkout `isRepo: false`
+        // strips branch/worktree state from the row model and hover card.
         pane.update(vcx, |pane, cx| {
             for entry in pane.checkout_repos.values_mut() {
                 entry.is_repo = Some(false);
@@ -4562,8 +4664,12 @@ mod sb_380_tests {
         vcx.run_until_parked();
         vcx.update(|window, cx| window.draw(cx).clear());
         assert!(
+            vcx.debug_bounds("thread-env-menu-thread").is_some(),
+            "environment badge remains visible when checkout is removed"
+        );
+        assert!(
             vcx.debug_bounds("thread-worktree-menu-thread").is_none(),
-            "removed checkout must strip worktree badge from rendered sidebar row"
+            "worktree badge is not rendered on sidebar rows"
         );
 
         // Filter out project `checkout-b` from `sidebar.model`, then open header menu for `menu-thread`:

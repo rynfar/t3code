@@ -585,8 +585,31 @@ fn provider_pill_sorts_by_recency_and_ties_favor_failure_over_warning_and_succes
     // Newer timestamp: succeeded beats older failed until dismissed, then failed remains visible.
     let pill = provider_pill(&[failed.clone(), newer_success.clone()], None, &empty).unwrap();
     assert_eq!(pill.tone, Tone::Success);
-    let after_dismiss = provider_pill(&[failed, newer_success], None, &HashSet::from([pill.key])).unwrap();
+    let dismissed: HashSet<String> = pill.dismiss_keys.iter().cloned().collect();
+    let after_dismiss = provider_pill(&[failed, newer_success], None, &dismissed).unwrap();
     assert_eq!(after_dismiss.tone, Tone::Error);
+}
+
+#[test]
+fn provider_pill_does_not_recount_dismissed_providers_when_another_finishes() {
+    let mut a = provider("codex", "failed", "2026-01-02T00:00:00Z");
+    a.driver = "codex".into();
+    let mut b = provider("claude", "failed", "2026-01-02T00:01:00Z");
+    b.driver = "claudeAgent".into();
+    let mut c = provider("gemini", "failed", "2026-01-02T00:02:00Z");
+    c.driver = "gemini".into();
+
+    let first = provider_pill(&[a.clone(), b.clone()], None, &HashSet::new()).unwrap();
+    assert_eq!(first.title, "2 provider updates failed");
+    assert_eq!(first.dismiss_keys.len(), 2);
+
+    let dismissed: HashSet<String> = first.dismiss_keys.into_iter().collect();
+    assert!(provider_pill(&[a.clone(), b.clone()], None, &dismissed).is_none());
+
+    // When a third provider fails later, only that new failure is shown (`pingdotgg/t3code#39636`).
+    let second = provider_pill(&[a, b, c], None, &dismissed).unwrap();
+    assert_eq!(second.title, "Gemini v2.0 update failed");
+    assert_eq!(second.dismiss_keys.len(), 1);
 }
 
 #[test]

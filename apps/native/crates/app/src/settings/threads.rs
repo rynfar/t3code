@@ -161,8 +161,8 @@ pub(super) fn selection_label(config: &ServerConfig, selection: &ModelSelection)
         .unwrap_or_else(|| selection.model.clone())
 }
 
-/// `formatShortTimestamp` for a wake time, honoring the host locale when `Locale` is selected.
-fn format_time(time: &DateTime<Local>, format: TimestampFormat) -> String {
+/// `formatShortTimestamp` for a wake time, honoring the active app locale.
+fn format_time(time: &DateTime<Local>, format: TimestampFormat, locale: &str) -> String {
     let local = LocalTime {
         year: i64::from(time.year()),
         month: i64::from(time.month()),
@@ -173,7 +173,7 @@ fn format_time(time: &DateTime<Local>, format: TimestampFormat) -> String {
         millis: 0,
         weekday: i64::from(time.weekday().num_days_from_sunday()),
     };
-    SystemTimestampLocale.time(local, format)
+    crate::timestamp::format_time_for_locale(locale, local, format).unwrap_or_else(|| SystemTimestampLocale.time(local, format))
 }
 
 /// Renders effort/trait controls for a selected model (`TraitsPicker` in `SettingsPanels.tsx`).
@@ -243,7 +243,7 @@ pub(super) fn model_trait_controls(
 }
 
 /// `resolveSnoozePreset` against the local clock: (id, label, when, wake minute).
-fn resolve(preset: &SnoozePreset, now: DateTime<Local>, format: TimestampFormat) -> Option<(String, String, String, i64)> {
+fn resolve(preset: &SnoozePreset, now: DateTime<Local>, format: TimestampFormat, locale: &str) -> Option<(String, String, String, i64)> {
     let days_ahead = preset.days_ahead(now.weekday().num_days_from_sunday());
     let wake = match preset {
         SnoozePreset::After { minutes } => now + ChronoDuration::minutes(i64::from(*minutes)),
@@ -259,8 +259,14 @@ fn resolve(preset: &SnoozePreset, now: DateTime<Local>, format: TimestampFormat)
     };
     let label = preset.label(days_ahead);
     let names_day = matches!(preset, SnoozePreset::At { .. }) && label != "Next week";
-    let time = format_time(&wake, format);
-    let when = if names_day || wake.date_naive() == now.date_naive() { time } else { format!("{} {time}", wake.format("%a")) };
+    let time = format_time(&wake, format, locale);
+    let when = if names_day || wake.date_naive() == now.date_naive() {
+        time
+    } else {
+        let weekday = t3_core::timeline::format_short_weekday(locale, i64::from(wake.year()), i64::from(wake.month()), i64::from(wake.day()))
+            .unwrap_or_else(|| wake.format("%a").to_string());
+        format!("{weekday} {time}")
+    };
     Some((preset.id(), label, when, wake.timestamp() / 60))
 }
 
@@ -1115,6 +1121,7 @@ impl SettingsView {
     fn snooze_row(&mut self, saved: &[SnoozePreset], disabled: bool, locked: bool, window: &mut Window, cx: &mut Context<Self>) -> Row {
         let p = palette(cx);
         let format = store::client(cx).timestamp_format();
+        let locale = crate::i18n::active_formatting_locale(cx);
         let now = Local::now();
         let draft = self.threads.snooze.get_or_insert_with(|| SnoozeDraft::new(saved));
         draft.observe(saved);
@@ -1131,7 +1138,7 @@ impl SettingsView {
         let mut seen_wakes: Vec<i64> = Vec::new();
         let mut list = v_flex().gap(r(6.)).pt(r(12.)).pb(r(8.));
         for (index, preset) in presets.iter().enumerate() {
-            let preview: (bool, SharedString, Option<SharedString>) = match resolve(preset, now, format) {
+            let preview: (bool, SharedString, Option<SharedString>) = match resolve(preset, now, format, &locale) {
                 None => (false, "Passed for today".into(), None),
                 Some((id, ..)) if seen_ids.contains(&id) => (false, "Duplicate of an option above".into(), None),
                 Some((_, _, _, wake)) if seen_wakes.contains(&wake) => (false, "Same time as an option above".into(), None),
@@ -1203,7 +1210,7 @@ impl SettingsView {
             );
         }
         let mut menu: Vec<(String, String, i64)> =
-            presets.iter().filter_map(|preset| resolve(preset, now, format)).map(|(_, label, when, wake)| (label, when, wake)).collect();
+            presets.iter().filter_map(|preset| resolve(preset, now, format, &locale)).map(|(_, label, when, wake)| (label, when, wake)).collect();
         menu.sort_by_key(|(_, _, wake)| *wake);
         menu.dedup_by_key(|(_, _, wake)| *wake);
         let labels: Vec<&str> = menu.iter().map(|(label, ..)| label.as_str()).collect();

@@ -413,7 +413,11 @@ impl Composer {
             self.record_draft(target, cx);
         }
         let storage_key = key(target);
-        let draft = cx.global::<SharedDraftStore>().store.get(&storage_key)?.clone();
+        let draft = match cx.global::<SharedDraftStore>().store.get(&storage_key) {
+            Some(draft) => draft.clone(),
+            None if !keep_choices && matches!(target, Target::Draft(_)) => Draft::default(),
+            None => return None,
+        };
         let preferred_keys = match target {
             Target::Draft(draft) => self.mutate_drafts(cx, |store| store.forget_session(draft)),
             _ => Vec::new(),

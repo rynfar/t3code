@@ -382,6 +382,8 @@ pub struct Supports {
 pub struct ThreadActionMenuState<'a> {
     pub can_operate: bool,
     pub can_find: bool,
+    /// False where no inline title editor is rendered, such as sidebar search results (`pingdotgg/t3code#31545`).
+    pub can_rename: bool,
     pub can_share_with_guest: bool,
     pub can_turn_into_project: bool,
     pub branch: Option<&'a str>,
@@ -474,7 +476,11 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
             items.push(snooze);
         }
     }
-    items.push(MenuItem::new(A::Rename, "Rename thread", Some("pencil")).separated());
+    items.push(
+        MenuItem::new(A::Rename, "Rename thread", Some("pencil"))
+            .disabled(!state.can_rename)
+            .separated(),
+    );
     if state.supports.title_regeneration {
         let label = if state.is_regenerating_title { "Regenerating…" } else { "Regenerate title" };
         items.push(MenuItem::new(A::RegenerateTitle, label, Some("refresh-cw")).disabled(state.is_regenerating_title));
@@ -789,6 +795,7 @@ mod tests {
         ThreadActionMenuState {
             can_operate: true,
             can_find: false,
+            can_rename: true,
             can_share_with_guest: false,
             can_turn_into_project: false,
             branch: Some("feature/x"),
@@ -905,6 +912,9 @@ mod tests {
         let items = build_menu(&ThreadActionMenuState { can_find:true, can_share_with_guest:true, can_turn_into_project:true, project_filter:Some(("Repo", false)), supports:Supports { auto_settle_opt_out:true, ..supports() }, ..state(&[]) });
         let actions: Vec<_> = items.iter().map(|item| item.action.clone()).collect();
         assert_eq!(actions, [ThreadAction::Find, ThreadAction::NewThreadOnBranch, ThreadAction::Pin, ThreadAction::Settle, ThreadAction::Snooze, ThreadAction::Rename, ThreadAction::RegenerateTitle, ThreadAction::MarkUnread, ThreadAction::ShareGuest, ThreadAction::FilterByProject, ThreadAction::TurnIntoProject, ThreadAction::AutoSettle, ThreadAction::Copy, ThreadAction::ProjectSettings, ThreadAction::Archive, ThreadAction::Delete]);
+        assert!(!items.iter().find(|item| item.action == ThreadAction::Rename).unwrap().disabled);
+        let search_items = build_menu(&ThreadActionMenuState { can_rename: false, ..state(&[]) });
+        assert!(search_items.iter().find(|item| item.action == ThreadAction::Rename).unwrap().disabled);
         let read_only = build_menu(&ThreadActionMenuState { can_operate:false, can_share_with_guest:true, can_turn_into_project:true, supports:Supports {auto_settle_opt_out:true, ..supports()}, ..state(&[]) });
         assert!(!read_only.iter().find(|item| item.action == ThreadAction::ShareGuest).unwrap().disabled);
         assert!(read_only.iter().find(|item| item.action == ThreadAction::TurnIntoProject).unwrap().disabled);

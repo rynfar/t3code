@@ -10,11 +10,23 @@ pub enum Tone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pill {
     pub key: String,
+    pub dismiss_keys: Vec<String>,
     pub tone: Tone,
     pub title: String,
     pub description: String,
     pub dismissible: bool,
     pub dismiss_after_ms: Option<u64>,
+}
+
+fn terminal_update_key(provider: &ServerProvider) -> String {
+    let state = provider.update_state.as_ref().unwrap();
+    format!(
+        "{}:{}:{}:{}",
+        state.status,
+        provider.driver,
+        state.finished_at.as_deref().unwrap_or("pending"),
+        state.message.as_deref().unwrap_or_default()
+    )
 }
 pub fn active(provider: &ServerProvider) -> bool {
     provider
@@ -121,6 +133,7 @@ pub fn provider_pill(
         keys.sort();
         return Some(Pill {
             key: format!("loading:{}", keys.join("|")),
+            dismiss_keys: Vec::new(),
             tone: Tone::Loading,
             title: if active.len() == 1 {
                 format!("Updating {}", driver_label(&active[0].driver))
@@ -197,7 +210,8 @@ pub fn provider_pill(
                     )
                 });
             return Some(Pill {
-                key,
+                key: key.clone(),
+                dismiss_keys: vec![key],
                 tone: Tone::Warning,
                 title: if available.len() == 1 {
                     format!("{}: Update available", driver_label(&first.driver))
@@ -210,6 +224,7 @@ pub fn provider_pill(
             });
         }
     }
+    terminal.retain(|provider| !dismissed.contains(&terminal_update_key(provider)));
     let mut views = Vec::new();
     for (status, tone) in [
         ("failed", Tone::Error),
@@ -276,23 +291,9 @@ pub fn provider_pill(
                 if n == 1 { "provider" } else { "providers" }
             ),
         };
-        let mut keys: Vec<_> = selected
-            .iter()
-            .map(|p| {
-                let s = p.update_state.as_ref().unwrap();
-                format!(
-                    "{}:{}:{}",
-                    p.driver,
-                    s.finished_at.as_deref().unwrap_or("pending"),
-                    s.message.as_deref().unwrap_or_default()
-                )
-            })
-            .collect();
-        keys.sort();
-        let key = format!("{status}:{}", keys.join("|"));
-        if dismissed.contains(&key) {
-            continue;
-        }
+        let mut dismiss_keys: Vec<_> = selected.iter().map(|p| terminal_update_key(p)).collect();
+        dismiss_keys.sort();
+        let key = dismiss_keys.join("|");
         let latest = selected
             .iter()
             .filter_map(|p| p.update_state.as_ref().unwrap().finished_at.as_deref())
@@ -302,6 +303,7 @@ pub fn provider_pill(
             latest,
             Pill {
                 key,
+                dismiss_keys,
                 tone,
                 title,
                 description,

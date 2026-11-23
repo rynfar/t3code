@@ -225,18 +225,35 @@ pub fn resolve_listed_ancestor_thread_key(
 
 impl ScopedSidebarModel {
     pub fn build(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
-        Self::build_with_overrides(input, state, false, None)
+        Self::build_with_overrides(input, state, false, None, None)
     }
 
     pub fn build_presented(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
-        Self::build_with_overrides(input, state, true, None)
+        Self::build_with_overrides(input, state, true, None, None)
     }
 
     pub fn build_presented_with_launching(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, launching: &HashSet<String>) -> Self {
-        Self::build_with_overrides(input, state, true, Some(launching))
+        Self::build_with_overrides(input, state, true, Some(launching), None)
     }
 
-    fn build_with_overrides(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, presented: bool, launching: Option<&HashSet<String>>) -> Self {
+    /// Builds a fleet sidebar model while excluding an actively settling/snoozing `departing`
+    /// thread from collapsed shelves (`pingdotgg/t3code#26661`).
+    pub fn build_presented_with_options(
+        input: &ScopedSidebarInput<'_>,
+        state: &mut ScopedSidebarState,
+        launching: &HashSet<String>,
+        departing: Option<&ThreadKey>,
+    ) -> Self {
+        Self::build_with_overrides(input, state, true, Some(launching), departing)
+    }
+
+    fn build_with_overrides(
+        input: &ScopedSidebarInput<'_>,
+        state: &mut ScopedSidebarState,
+        presented: bool,
+        launching: Option<&HashSet<String>>,
+        departing: Option<&ThreadKey>,
+    ) -> Self {
         state.trackers.retain(|(saved_id,canonical_id,generation), _| input.environments.iter().any(|environment| {
             environment.owner.saved_id == *saved_id && environment.owner.canonical_id == *canonical_id && environment.owner.generation == *generation
         }));
@@ -373,6 +390,11 @@ impl ScopedSidebarModel {
         }
         model.next_change_at = model.next_change_at.into_iter().chain(model.threads.iter().filter_map(|thread| thread.thread.snoozed_until.filter(|wake| *wake > input.now))).min();
         let selected = input.selected.and_then(|key| model.index_by_key.get(key)).copied();
+        let shelf_selected = input
+            .selected
+            .filter(|key| Some(*key) != departing)
+            .and_then(|key| model.index_by_key.get(key))
+            .copied();
         let push = |model: &mut Self, indexes: &[usize], section, in_folder| {
             for &index in indexes { model.rows.push(ScopedSidebarRow::Thread { index, section, in_folder }); model.ordered.push(index); }
         };
@@ -409,7 +431,7 @@ impl ScopedSidebarModel {
         ] {
             if indexes.is_empty() { continue; }
             model.rows.push(ScopedSidebarRow::Shelf { shelf, count: indexes.len(), expanded });
-            push(&mut model, &indexes.into_iter().filter(|index| expanded || Some(*index) == selected).collect::<Vec<_>>(), section, false);
+            push(&mut model, &indexes.into_iter().filter(|index| expanded || Some(*index) == shelf_selected).collect::<Vec<_>>(), section, false);
         }
         model.settled_count = model.partition.settled.len() + unloaded;
         if !model.threads.is_empty() || unloaded > 0 {
@@ -421,9 +443,9 @@ impl ScopedSidebarModel {
             }).collect::<Vec<_>>();
             model.listed_settled_count = listed.len();
             let mut visible = listed.into_iter().take(input.shelves.settled_visible).collect::<Vec<_>>();
-            if let Some(selected) = selected && model.partition.settled.contains(&selected) && !visible.contains(&selected) { visible.push(selected); }
+            if let Some(shelf_selected) = shelf_selected && model.partition.settled.contains(&shelf_selected) && !visible.contains(&shelf_selected) { visible.push(shelf_selected); }
             model.hidden_settled_count = model.settled_count.saturating_sub(visible.len());
-            visible.retain(|index| expanded || Some(*index) == selected);
+            visible.retain(|index| expanded || Some(*index) == shelf_selected);
             if visible.is_empty() { marker(&mut model, Marker::SettledPlaceholder); }
             push(&mut model, &visible, Section::Settled, false);
             if expanded && model.hidden_settled_count > 0 { model.rows.push(ScopedSidebarRow::ShowMore { count: model.hidden_settled_count.min(super::SETTLED_TAIL_PAGE_COUNT) }); }

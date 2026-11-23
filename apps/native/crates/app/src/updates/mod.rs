@@ -1456,13 +1456,19 @@ impl UpdateControl {
             if let Some(pill) = &self.pill
                 && let Some(ms) = pill.dismiss_after_ms
             {
-                let key = pill.key.clone();
+                let keys = if pill.dismiss_keys.is_empty() {
+                    vec![pill.key.clone()]
+                } else {
+                    pill.dismiss_keys.clone()
+                };
                 self.success_timer = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(ms))
                         .await;
                     let _ = this.update(cx, |this, cx| {
-                        this.dismissed.insert(key);
+                        for key in keys {
+                            this.dismissed.insert(key);
+                        }
                         this.sync(cx);
                     });
                 }));
@@ -1865,7 +1871,13 @@ impl UpdateControl {
                         }
                         let _ = this.update(cx, |this, cx| {
                             if let Some(pill) = &this.pill {
-                                this.dismissed.insert(pill.key.clone());
+                                if pill.dismiss_keys.is_empty() {
+                                    this.dismissed.insert(pill.key.clone());
+                                } else {
+                                    for key in &pill.dismiss_keys {
+                                        this.dismissed.insert(key.clone());
+                                    }
+                                }
                             }
                             if this.fixture {
                                 this.pill = None;

@@ -829,6 +829,8 @@ impl SidebarPane {
         let press_row_id = row_id.clone();
         let press_id = thread.id.clone();
         let press_key = hover_key.clone();
+        let menu_id = thread.id.clone();
+        let menu_key = hover_key.clone();
         let drag_payload = super::DraggedThread::new(thread.id.clone(), hover_key.clone());
         let drag_title = thread.title.clone();
         let drag_project = project.clone();
@@ -1006,6 +1008,18 @@ impl SidebarPane {
                                     .children(prefix.map(|(label, color)| div().flex_none().font_weight(FontWeight::MEDIUM).text_color(color).child(label)))
                                     .child(div().flex_1().min_w_0().truncate().child(text))
                             })),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            this.hover.dismiss(cx);
+                            if let Some(key) = &menu_key {
+                                this.menu.update(cx, |menu, cx| menu.open_for_scoped_search_thread(key, event.position, window, cx));
+                            } else {
+                                this.menu.update(cx, |menu, cx| menu.open_for_search_thread(&menu_id, event.position, window, cx));
+                            }
+                            cx.stop_propagation();
+                        }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.pending_thread_press = None;

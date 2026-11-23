@@ -76,7 +76,23 @@ pub fn default_project(state: &AppState) -> Option<String> {
     let thread_project = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)).map(|t| t.project_id.clone());
     thread_project.or_else(|| state.draft_project.clone()).or_else(|| {
         let snapshot = state.shell.snapshot.as_ref()?;
-        snapshot.projects.iter().find(|project| project.archived_at.is_none()).map(|project| project.id.clone())
+        let live: Vec<_> = snapshot
+            .projects
+            .iter()
+            .filter(|project| project.archived_at.is_none())
+            .cloned()
+            .collect();
+        let first = live.first()?;
+        Some(
+            t3_core::sidebar::grouping::resolve_group_default_project(
+                t3_core::sidebar::ENVIRONMENT_ID,
+                first,
+                &live,
+                &state.sidebar.settings.grouping,
+            )
+            .id
+            .clone(),
+        )
     })
 }
 

@@ -140,13 +140,16 @@ impl SnoozeRequest {
             return;
         };
         let settings = self.scoped.first().and_then(|owner| owner.destination.as_ref()).and_then(|owner| state.scoped_environment(&owner.saved_id)).and_then(|entry| entry.config.config.as_ref()).map(|config| t3_core::settings::snooze::menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_else(|| state.snooze_settings());
-        let Some(preset) = t3_core::sidebar::settled::pick_snooze_preset(
+        let locale = crate::i18n::active_formatting_locale(cx);
+        let time_label = |time| crate::sidebar::controller::snooze_time_label(time, cx);
+        let Some(preset) = t3_core::sidebar::settled::pick_snooze_preset_in_locale(
             shown,
             id,
             now,
             &settings,
             &SystemZone,
-            &crate::sidebar::controller::time_label,
+            &time_label,
+            Some(&locale),
         ) else {
             state.show_toast(
                 crate::toast::Toast::new(
@@ -1686,7 +1689,7 @@ mod lifecycle {
             let request = SnoozeRequest::capture(s, vec!["menu-thread".into()], true, None);
             let shown = [t3_core::sidebar::settled::SnoozePreset { id:"after:90".into(), label:"In 90 minutes".into(), when_label:"Expired shown time".into(), snoozed_until:0 }];
             s.sidebar.selection.toggle("menu-thread");
-            let fixed = t3_core::sidebar::settled::pick_snooze_preset(&shown, "after:90", 1_000, &s.snooze_settings(), &SystemZone, &crate::sidebar::controller::time_label).unwrap();
+            let fixed = t3_core::sidebar::settled::pick_snooze_preset(&shown, "after:90", 1_000, &s.snooze_settings(), &SystemZone, &t3_core::sidebar::settled::default_time_label).unwrap();
             assert_eq!(fixed.snoozed_until, 1_000 + 90 * MINUTE_MS);
             request.pick_preset("after:90", &shown, s, cx);
             assert!(s.sidebar.selection.is_empty());

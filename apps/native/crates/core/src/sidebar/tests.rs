@@ -2126,3 +2126,42 @@ fn resolve_listed_ancestor_follows_subagents_side_chats_and_delegated_tasks() {
         ThreadKey::new("saved-b", "delegated-archived")
     );
 }
+
+#[test]
+fn departing_active_thread_is_omitted_from_collapsed_shelves_and_snooze_localizes_weekday() {
+    let snap = snapshot(vec![wire_thread("settled-active", json!({
+        "settledOverride": "settled",
+        "settledAt": NOW,
+        "updatedAt": NOW,
+    }))]);
+    let mut tracker = InboxReturnTracker::default();
+    let input = ModelInput {
+        snapshot: &snap,
+        config_loaded: true,
+        extra_threads: &[],
+        older_settled: None,
+        settings: &SidebarSettings::default(),
+        shelves: &ShelfState::default(),
+        selected_thread_id: Some("settled-active"),
+        project_scope: None,
+        hidden_thread_ids: None,
+        now: iso(NOW),
+        dragging: None,
+    };
+    let pinned_in_collapsed = SidebarModel::build_with_options(&input, &mut tracker, None, None);
+    assert!(
+        pinned_in_collapsed.rows.iter().any(|r| matches!(r, SidebarRow::Thread { section: Section::Settled, .. })),
+        "without departing guard, active settled thread pins inside collapsed Settled shelf"
+    );
+    let departing_omitted = SidebarModel::build_with_options(&input, &mut tracker, None, Some("settled-active"));
+    assert!(
+        !departing_omitted.rows.iter().any(|r| matches!(r, SidebarRow::Thread { section: Section::Settled, .. })),
+        "departing active thread must not flash in collapsed Settled shelf (pingdotgg/t3code#26661)"
+    );
+
+    // 2026-06-15 is a Monday; "In 2 days" / Duration crossing midnight into next day uses localized weekday.
+    let now_monday = parse_iso("2026-06-15T10:00:00Z").unwrap();
+    let duration = settled::SnoozePresetSetting::After { minutes: 48 * 60 };
+    let fr = settled::resolve_snooze_preset_in_locale(&duration, now_monday, &FixedZone(0), &settled::default_time_label, Some("fr")).unwrap();
+    assert!(fr.when_label.starts_with("mer"), "expected French Wednesday abbreviation in when_label, got {:?}", fr.when_label);
+}

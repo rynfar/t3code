@@ -14,7 +14,16 @@ pub struct DraftRow {
     pub created_at: i64,
 }
 
-fn row(session: DraftRef, draft: &Draft) -> DraftRow {
+fn row_with_terminal(session: DraftRef, draft: Option<&Draft>, terminal_label: Option<&str>) -> DraftRow {
+    let key = session.key();
+    let Some(draft) = draft else {
+        return DraftRow {
+            key,
+            draft: session,
+            preview: terminal_label.unwrap_or_default().to_owned(),
+            created_at: 0,
+        };
+    };
     let mut preview = String::new();
     let mut cursor = 0;
     for reference in context_references(&draft.prompt) {
@@ -27,11 +36,17 @@ fn row(session: DraftRef, draft: &Draft) -> DraftRow {
     let preview = preview.trim().split('\n').next().unwrap_or_default().to_owned();
     let preview = if preview.is_empty() {
         let count = draft.attachments.len() + draft.terminals.len() + draft.pending_attachment_count;
-        format!("{count} attachment{}", if count == 1 { "" } else { "s" })
+        if count == 0
+            && let Some(label) = terminal_label
+        {
+            label.to_owned()
+        } else {
+            format!("{count} attachment{}", if count == 1 { "" } else { "s" })
+        }
     } else {
         preview
     };
-    DraftRow { key: session.key(), draft: session, preview, created_at: draft.created_at.unwrap_or(draft.updated_at) }
+    DraftRow { key, draft: session, preview, created_at: draft.created_at.unwrap_or(draft.updated_at) }
 }
 
 #[derive(Default)]
@@ -44,22 +59,46 @@ pub struct DraftRows {
 
 impl DraftRows {
     pub fn update_draft(&mut self, store: &DraftStore, key: &str, scope: Option<&HashSet<String>>) -> bool {
+        self.update_draft_with_terminals(store, key, scope, &HashMap::new())
+    }
+
+    pub fn update_draft_with_terminals(
+        &mut self,
+        store: &DraftStore,
+        key: &str,
+        scope: Option<&HashSet<String>>,
+        terminal_labels: &HashMap<String, String>,
+    ) -> bool {
         let position = self.positions.get(key).copied();
         let held = position.map(|index| &self.rows[index]);
         let draft = store.get(key);
+        let terminal_label = terminal_labels.get(key).map(String::as_str);
         let next = if self.active.as_deref() == Some(key) {
-            let next = draft.and(self.frozen.as_ref());
-            if held.is_some() == next.is_some() {
+            let next = draft
+                .and(self.frozen.as_ref())
+                .cloned()
+                .or_else(|| {
+                    let label = terminal_label?;
+                    let session = DraftRef::from_key(key)?;
+                    if scope.is_some_and(|scope| !scope.contains(&session.project_id)) {
+                        return None;
+                    }
+                    Some(row_with_terminal(session, draft, Some(label)))
+                });
+            if held == next.as_ref() {
                 return false;
             }
-            next.cloned()
+            next
         } else {
-            let next = draft.filter(|draft| draft.has_user_content()).and_then(|draft| {
-                let session = DraftRef::from_key(key)?;
+            let next = DraftRef::from_key(key).and_then(|session| {
                 if scope.is_some_and(|scope| !scope.contains(&session.project_id)) {
                     return None;
                 }
-                Some(row(session, draft))
+                if let Some(draft) = draft.filter(|draft| draft.has_user_content() || terminal_label.is_some()) {
+                    Some(row_with_terminal(session, Some(draft), terminal_label))
+                } else {
+                    terminal_label.map(|label| row_with_terminal(session, None, Some(label)))
+                }
             });
             if held == next.as_ref() {
                 return false;
@@ -79,30 +118,69 @@ impl DraftRows {
     }
 
     fn index_rows(&mut self) {
-        self.rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
+        self.rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.key.cmp(&b.key)));
         self.positions = self.rows.iter().enumerate().map(|(index, row)| (row.key.clone(), index)).collect();
     }
 
     pub fn update(&mut self, store: &DraftStore, active: Option<&str>, scope: Option<&HashSet<String>>) {
+        self.update_with_terminals(store, active, scope, &HashMap::new());
+    }
+
+    /// Rebuilds listed draft rows, keeping script-only drafts with running/open terminals
+    /// reachable in the sidebar (`pingdotgg/t3code#25272`).
+    pub fn update_with_terminals(
+        &mut self,
+        store: &DraftStore,
+        active: Option<&str>,
+        scope: Option<&HashSet<String>>,
+        terminal_labels: &HashMap<String, String>,
+    ) {
         if self.active.as_deref() != active {
             self.active = active.map(str::to_owned);
             self.frozen = active.and_then(|key| {
                 let session = DraftRef::from_key(key)?;
-                store.get(key).filter(|draft| draft.has_user_content()).map(|draft| row(session, draft))
+                store
+                    .get(key)
+                    .filter(|draft| draft.has_user_content())
+                    .map(|draft| row_with_terminal(session, Some(draft), terminal_labels.get(key).map(String::as_str)))
             });
         }
-        self.rows = store
+        let mut seen = HashSet::new();
+        let mut rows: Vec<DraftRow> = store
             .session_drafts()
             .filter_map(|(session, draft)| {
+                let key = session.key();
                 if scope.is_some_and(|scope| !scope.contains(&session.project_id)) {
                     return None;
                 }
-                if Some(session.key().as_str()) == active {
-                    return self.frozen.clone();
+                seen.insert(key.clone());
+                let terminal_label = terminal_labels.get(&key).map(String::as_str);
+                if Some(key.as_str()) == active {
+                    return self.frozen.clone().or_else(|| {
+                        terminal_label.map(|label| row_with_terminal(session, Some(draft), Some(label)))
+                    });
                 }
-                draft.has_user_content().then(|| row(session, draft))
+                (draft.has_user_content() || terminal_label.is_some())
+                    .then(|| row_with_terminal(session, Some(draft), terminal_label))
             })
             .collect();
+        for (key, label) in terminal_labels {
+            if seen.contains(key) {
+                continue;
+            }
+            let Some(session) = DraftRef::from_key(key) else {
+                continue;
+            };
+            if scope.is_some_and(|scope| !scope.contains(&session.project_id)) {
+                continue;
+            }
+            if Some(key.as_str()) == active && let Some(frozen) = &self.frozen {
+                rows.push(frozen.clone());
+            } else {
+                rows.push(row_with_terminal(session, None, Some(label)));
+            }
+        }
+        self.rows = rows;
         self.index_rows();
     }
 }
@@ -128,8 +206,8 @@ mod tests {
             ),
         );
         let pending = Draft { pending_attachment_count: 1, updated_at: 1, ..Default::default() };
-        assert_eq!(row(session("upload"), &pending).preview, "1 attachment");
-        assert_eq!(row(session("upload"), &Draft { pending_attachment_count: 2, ..pending }).preview, "2 attachments");
+        assert_eq!(row_with_terminal(session("upload"), Some(&pending), None).preview, "1 attachment");
+        assert_eq!(row_with_terminal(session("upload"), Some(&Draft { pending_attachment_count: 2, ..pending }), None).preview, "2 attachments");
         let mut rows = DraftRows::default();
         rows.update(&store, Some(&new_thread_key("empty")), None);
         assert_eq!(rows.rows.iter().map(|r| r.draft.project_id.as_str()).collect::<Vec<_>>(), ["p3", "p2", "p1"]);
@@ -183,4 +261,31 @@ mod tests {
         assert_eq!(rows.rows.len(), 1);
     }
 
+    #[test]
+    fn script_only_drafts_with_running_terminals_stay_listed_with_terminal_preview() {
+        let mut store = DraftStore::default();
+        let script = DraftRef::new(crate::composer::drafts::DraftId::new("script".into()), "env", "p1");
+        let empty = DraftRef::new(crate::composer::drafts::DraftId::new("empty".into()), "env", "p1");
+        store.set(&script.key(), Draft { runtime_mode: Some(crate::server_config::RuntimeMode::Auto), updated_at: 5, ..Default::default() });
+        store.set(&empty.key(), Draft { runtime_mode: Some(crate::server_config::RuntimeMode::Auto), updated_at: 4, ..Default::default() });
+
+        let orphan = DraftRef::new(crate::composer::drafts::DraftId::new("orphan".into()), "env", "p2");
+        let terminals = HashMap::from([
+            (script.key(), "Dev server".to_owned()),
+            (orphan.key(), "Test runner".to_owned()),
+        ]);
+
+        let mut rows = DraftRows::default();
+        rows.update_with_terminals(&store, Some(&script.key()), None, &terminals);
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0].draft, script);
+        assert_eq!(rows.rows[0].preview, "Dev server");
+        assert_eq!(rows.rows[1].draft, orphan);
+        assert_eq!(rows.rows[1].preview, "Test runner");
+
+        // Scoped filter keeps only matching project drafts.
+        rows.update_with_terminals(&store, None, Some(&HashSet::from(["p1".into()])), &terminals);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].draft, script);
+    }
 }

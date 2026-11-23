@@ -80,8 +80,15 @@ impl Zone for SystemZone {
     }
 }
 
-pub fn time_label(time: LocalTime) -> String {
-    settled::default_time_label(time)
+/// Formats `time` using the app's formatting locale and user `TimestampFormat` preference
+/// (`pingdotgg/t3code#39494`).
+pub fn snooze_time_label(time: LocalTime, cx: &gpui::App) -> String {
+    let locale = crate::i18n::active_formatting_locale(cx);
+    let format = crate::settings::store::try_client(cx)
+        .map(|doc| doc.timestamp_format())
+        .unwrap_or_default();
+    crate::timestamp::format_time_for_locale(&locale, time, format)
+        .unwrap_or_else(|| settled::default_time_label(time))
 }
 
 #[derive(Clone, PartialEq)]
@@ -149,6 +156,9 @@ pub struct SidebarController {
     pub fleet_anchor: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     pub(crate) route_observed: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     pub(crate) route_pending: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    /// Active thread currently settling/snoozing away with forward navigation (`pingdotgg/t3code#26661`).
+    pub(crate) departing_thread_id: Option<String>,
+    pub(crate) departing_thread_key: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     pub(crate) search_input: Option<gpui::WeakEntity<gpui_component::input::InputState>>,
     pub grouping_projects: Vec<t3_core::sidebar::grouping::ScopedProject>,
     pub grouping_threads: Vec<t3_core::sidebar::fleet::ScopedThread>,
@@ -492,8 +502,12 @@ impl AppState {
             });
         }
         let selected_row_id = self.active_sidebar_row_id();
+        if selected_row_id.as_deref() != self.sidebar.departing_thread_id.as_deref() {
+            self.sidebar.departing_thread_id = None;
+        }
+        let departing_id = self.sidebar.departing_thread_id.as_deref();
         let build_model = |snapshot, tracker: &mut _, dragging| {
-            SidebarModel::build_with_launching(
+            SidebarModel::build_with_options(
                 &ModelInput {
                     snapshot,
                     config_loaded: self.server_config.config.is_some(),
@@ -509,6 +523,7 @@ impl AppState {
                 },
                 tracker,
                 Some(self.sidebar.history.launching_threads()),
+                departing_id,
             )
         };
         let mut model = match snapshot_ref {
@@ -609,6 +624,10 @@ impl AppState {
             .as_deref()
             .and_then(|id| self.active_thread_key(id))
             .map(|key| t3_core::sidebar::fleet::resolve_listed_ancestor_thread_key(&key, &environments, &extras));
+        if selected.as_ref() != self.sidebar.departing_thread_key.as_ref() {
+            self.sidebar.departing_thread_key = None;
+        }
+        let departing_key = self.sidebar.departing_thread_key.clone();
         if !self.sidebar.history.launching_threads().is_empty() {
             self.sidebar.history.retain_launching(|id| {
                 environments
@@ -625,12 +644,12 @@ impl AppState {
             });
         }
         let build_fleet = |fleet_state: &mut _, dragging| {
-            t3_core::sidebar::fleet::ScopedSidebarModel::build_presented_with_launching(&t3_core::sidebar::fleet::ScopedSidebarInput {
+            t3_core::sidebar::fleet::ScopedSidebarModel::build_presented_with_options(&t3_core::sidebar::fleet::ScopedSidebarInput {
                 environments: &environments, groups: &groups, preferences: &self.project_preferences,
                 settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
                 older: &older, extra_threads: &extras, now, folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
                 dragging,
-            }, fleet_state, self.sidebar.history.launching_threads())
+            }, fleet_state, self.sidebar.history.launching_threads(), departing_key.as_ref())
         };
         let mut model = build_fleet(&mut self.sidebar.fleet_state, self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section));
         let mut cancelled_fleet_drag = false;
@@ -710,7 +729,8 @@ impl AppState {
             ThreadAction::SnoozePreset(preset) => {
                 let Some(environment) = self.scoped_environment(&key.environment_id) else { return; };
                 let settings = environment.config.config.as_ref().map(|config| menu_settings(&config.settings.threads.snooze_presets)).unwrap_or_default();
-                let Some(preset) = settled::pick_snooze_preset(shown, &preset, now_ms(), &settings, &SystemZone, &time_label) else { return; };
+                let locale = crate::i18n::active_formatting_locale(cx);
+                let Some(preset) = settled::pick_snooze_preset_in_locale(shown, &preset, now_ms(), &settings, &SystemZone, &|time| snooze_time_label(time, cx), Some(&locale)) else { return; };
                 actions::snooze(&uuid(), id, preset.snoozed_until)
             }
             ThreadAction::NewThreadOnBranch => {
@@ -1007,6 +1027,18 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 if !(if removes { owner.response_after_placement(state) } else { owner.response_current(state) }) || !state.scoped_ready(&destination, scope) { return; }
                 if let Err(error) = result {
+                    let mut stay_changed = false;
+                    if state.sidebar.departing_thread_id.as_deref() == Some(owner.thread.as_str()) {
+                        state.sidebar.departing_thread_id = None;
+                        stay_changed = true;
+                    }
+                    if owner.key().is_some_and(|k| state.sidebar.departing_thread_key.as_ref() == Some(&k)) {
+                        state.sidebar.departing_thread_key = None;
+                        stay_changed = true;
+                    }
+                    if stay_changed {
+                        state.rebuild_sidebar(cx);
+                    }
                     if let Some((claim, _, _)) = &undo { state.sidebar.undo.finish(claim); }
                     state.show_toast(Toast::new(ToastKind::Error, failure).description(error.to_string()), cx);
                 } else {
@@ -1418,6 +1450,10 @@ impl AppState {
         let id = thread_id.to_owned();
         self.dispatch_then(actions::settle(&uuid(), thread_id), Some("Failed to settle thread"), cx, move |state, ok, cx| {
             if !ok {
+                if state.sidebar.departing_thread_id.as_deref() == Some(id.as_str()) {
+                    state.sidebar.departing_thread_id = None;
+                    state.rebuild_sidebar(cx);
+                }
                 state.sidebar.undo.finish(&claim);
                 return;
             }
@@ -1478,8 +1514,13 @@ impl AppState {
             return;
         }
         let claim = self.sidebar.undo.begin(UndoKind::Snooze, thread_id);
+        let id = thread_id.to_owned();
         self.dispatch_then(actions::snooze(&uuid(), thread_id, snoozed_until), Some("Failed to snooze thread"), cx, move |state, ok, cx| {
             if !ok {
+                if state.sidebar.departing_thread_id.as_deref() == Some(id.as_str()) {
+                    state.sidebar.departing_thread_id = None;
+                    state.rebuild_sidebar(cx);
+                }
                 state.sidebar.undo.finish(&claim);
                 return;
             }
@@ -2278,8 +2319,15 @@ impl AppState {
         }
     }
 
-    pub fn snooze_presets(&self) -> Vec<SnoozePreset> {
-        settled::resolve_snooze_presets(&self.snooze_settings(), now_ms(), &SystemZone, &time_label)
+    pub fn snooze_presets_for(&self, cx: &gpui::App) -> Vec<SnoozePreset> {
+        let locale = crate::i18n::active_formatting_locale(cx);
+        settled::resolve_snooze_presets_in_locale(
+            &self.snooze_settings(),
+            now_ms(),
+            &SystemZone,
+            &|time| snooze_time_label(time, cx),
+            Some(&locale),
+        )
     }
 
     /// The environment's saved snooze options, or the defaults before its settings load (`Sidebar.snooze.ts`).
@@ -2327,7 +2375,8 @@ impl AppState {
             ThreadAction::Unpin => self.request_unpin_thread(thread_id, cx),
             ThreadAction::Unsnooze => self.unsnooze_thread(thread_id, cx),
             ThreadAction::SnoozePreset(id) => {
-                if let Some(preset) = settled::pick_snooze_preset(shown_presets, &id, now_ms(), &self.snooze_settings(), &SystemZone, &time_label) {
+                let locale = crate::i18n::active_formatting_locale(cx);
+                if let Some(preset) = settled::pick_snooze_preset_in_locale(shown_presets, &id, now_ms(), &self.snooze_settings(), &SystemZone, &|time| snooze_time_label(time, cx), Some(&locale)) {
                     self.snooze_thread(thread_id, preset.snoozed_until, cx);
                 }
             }

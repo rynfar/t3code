@@ -124,6 +124,75 @@ fn repository_scoped_key(project: &ProjectShell, mode: GroupingMode) -> Option<S
     })
 }
 
+/// The project's workspace root is its repository's git top-level, not a sub-folder
+/// (`pingdotgg/t3code#37191`).
+pub fn is_repository_root_project(project: &ProjectShell) -> bool {
+    repository_relative_path(project).as_deref() == Some("")
+}
+
+/// A group's default checkout for new threads: its repository root, else its first member
+/// (`pingdotgg/t3code#37191`).
+pub fn select_group_default_project<'a>(projects: &[&'a ProjectShell]) -> Option<&'a ProjectShell> {
+    projects
+        .iter()
+        .copied()
+        .find(|project| is_repository_root_project(project))
+        .or_else(|| projects.first().copied())
+}
+
+fn select_group_default_scoped_project<'a>(projects: &[&'a ScopedProject]) -> Option<&'a ScopedProject> {
+    projects
+        .iter()
+        .copied()
+        .find(|project| is_repository_root_project(&project.project))
+        .or_else(|| projects.first().copied())
+}
+
+/// The checkout a new thread in `project`'s group starts in on its environment: the group's root
+/// (`pingdotgg/t3code#37191`).
+pub fn resolve_group_default_project<'a>(
+    environment_id: &str,
+    project: &'a ProjectShell,
+    projects: &'a [ProjectShell],
+    settings: &GroupingSettings,
+) -> &'a ProjectShell {
+    let environment_id = settings.environment_id.as_deref().unwrap_or(environment_id);
+    let key = logical_key(environment_id, project, resolve_mode(environment_id, project, settings));
+    projects
+        .iter()
+        .find(|candidate| {
+            is_repository_root_project(candidate)
+                && logical_key(environment_id, candidate, resolve_mode(environment_id, candidate, settings)) == key
+        })
+        .unwrap_or(project)
+}
+
+/// A sidebar filtered to one project already says where the next thread belongs, so New skips the
+/// picker there (`pingdotgg/t3code#35185`).
+pub fn resolve_scoped_new_thread_project_ref(
+    shift_key: bool,
+    scoped_groups: &[&ScopedProjectGroup],
+    viewed: Option<&ProjectRef>,
+) -> Option<ProjectRef> {
+    if shift_key {
+        return None;
+    }
+    let [group] = scoped_groups else {
+        return None;
+    };
+    if let Some(viewed) = viewed
+        && group.member_refs.contains(viewed)
+    {
+        return Some(viewed.clone());
+    }
+    group
+        .member_refs
+        .iter()
+        .find(|candidate| *candidate == &group.representative)
+        .cloned()
+        .or_else(|| Some(group.representative.clone()))
+}
+
 fn resolve_mode(environment_id: &str, project: &ProjectShell, settings: &GroupingSettings) -> GroupingMode {
     settings.overrides.get(&physical_project_key(environment_id, &project.workspace_root)).copied().unwrap_or(settings.mode)
 }
@@ -276,7 +345,7 @@ pub fn build_project_groups(environment_id: &str, projects: &[ProjectShell], set
     groups
         .into_iter()
         .filter_map(|(key, members)| {
-            let representative = *members.first()?;
+            let representative = select_group_default_project(&members)?;
             Some(ProjectGroup {
                 label: if members.len() > 1 { group_label(&key, representative, &members) } else { representative.title.clone() },
                 representative_id: representative.id.clone(),
@@ -489,10 +558,36 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
         }
     }
     for group in &mut groups {
-        let preferred = input.preferred_environment.and_then(|id| group.registrations.iter().find(|project| project.owner.saved_id == id))
-            .map(|project| group.registrations.iter().filter(|candidate| candidate.owner.saved_id == project.owner.saved_id && candidate.physical_key() == project.physical_key())
-                .reduce(|a, b| if replaces_winner(&a.project, &b.project) { b } else { a }).unwrap());
-        let representative = preferred.unwrap_or(&group.members[0].project);
+        let preferred = input.preferred_environment.and_then(|id| {
+            let mut env_winners: Vec<&ScopedProject> = Vec::new();
+            for candidate in group.registrations.iter().filter(|project| project.owner.saved_id == id) {
+                let pkey = candidate.physical_key();
+                if let Some(existing) = env_winners.iter_mut().find(|winner| winner.physical_key() == pkey) {
+                    if replaces_winner(&existing.project, &candidate.project) {
+                        *existing = candidate;
+                    }
+                } else {
+                    env_winners.push(candidate);
+                }
+            }
+            env_winners
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    let pkey = candidate.physical_key();
+                    is_repository_root_project(&candidate.project)
+                        || group
+                            .members
+                            .iter()
+                            .find(|member| member.physical_key == pkey)
+                            .is_some_and(|member| is_repository_root_project(&member.project.project))
+                })
+                .or_else(|| env_winners.first().copied())
+        });
+        let all_members: Vec<_> = group.members.iter().map(|member| &member.project).collect();
+        let representative = preferred
+            .or_else(|| select_group_default_scoped_project(&all_members))
+            .unwrap_or(&group.members[0].project);
         group.representative = representative.reference();
         let display = group.members.iter().find(|member| member.physical_key == representative.physical_key()).unwrap();
         group.label = if group.is_scratch { "No project".into() } else if group.members.len() > 1 {
@@ -771,7 +866,10 @@ pub fn filter_project_scope_items<T>(
     }
     items
         .into_iter()
-        .filter(|item| value_of(item) != "all" && label_of(item).to_lowercase().contains(&trimmed))
+        .filter(|item| {
+            let value = value_of(item);
+            value != "all" && value != "add-project" && label_of(item).to_lowercase().contains(&trimmed)
+        })
         .collect()
 }
 
@@ -1127,5 +1225,60 @@ mod tests {
 
         // Subfolder group keeps representative title when displayNames/repo names disagree.
         assert_eq!(group_label("github.com/acme/repo::apps/web", &folder_a, &[&folder_a, &folder_b]), "MyRepo-wt");
+    }
+
+    #[test]
+    fn grouped_repo_defaults_to_root_checkout_and_scoped_new_thread_target() {
+        let sub = project("sub", "/repo/apps/web");
+        let root = project("root", "/repo");
+        assert!(!is_repository_root_project(&sub));
+        assert!(is_repository_root_project(&root));
+
+        let groups = build_project_groups("env-a", &[sub.clone(), root.clone()], &GroupingSettings::default());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].representative_id, "root");
+        assert_eq!(
+            resolve_group_default_project("env-a", &sub, &[sub.clone(), root.clone()], &GroupingSettings::default()).id,
+            "root"
+        );
+
+        let owner = |saved: &str| EnvironmentOwner {
+            saved_id: saved.into(),
+            canonical_id: Some(format!("canon-{saved}")),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 1,
+        };
+        let scoped = vec![
+            ScopedProject { owner: owner("env-a"), project: sub, is_scratch: false, environment_label: "A".into() },
+            ScopedProject { owner: owner("env-a"), project: root, is_scratch: false, environment_label: "A".into() },
+        ];
+        let scoped_groups = build_scoped_project_groups(&GroupInput {
+            projects: &scoped,
+            threads: &[],
+            settings: &GroupingSettings::default(),
+            preferences: &ProjectPreferences::default(),
+            preferred_environment: Some("env-a"),
+            consumer: GroupConsumer::Sidebar,
+            sort: ProjectSortOrder::Manual,
+        });
+        assert_eq!(scoped_groups.len(), 1);
+        assert_eq!(scoped_groups[0].representative.project_id, "root");
+        assert_eq!(
+            resolve_scoped_new_thread_project_ref(false, &[&scoped_groups[0]], None),
+            Some(ProjectRef { environment_id: "env-a".into(), project_id: "root".into() })
+        );
+        let viewed_sub = ProjectRef { environment_id: "env-a".into(), project_id: "sub".into() };
+        assert_eq!(
+            resolve_scoped_new_thread_project_ref(false, &[&scoped_groups[0]], Some(&viewed_sub)),
+            Some(viewed_sub)
+        );
+        assert_eq!(
+            resolve_scoped_new_thread_project_ref(true, &[&scoped_groups[0]], None),
+            None
+        );
+
+        let filter_items = vec![("add-project", "Add project"), ("all", "All projects"), ("p1", "Add feature")];
+        assert_eq!(filter_project_scope_items(filter_items, "add", |i| i.0, |i| i.1), vec![("p1", "Add feature")]);
     }
 }

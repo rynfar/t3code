@@ -4,7 +4,7 @@ use std::fmt;
 use icu_calendar::{Date, Gregorian};
 use icu_datetime::{
     DateTimeFormatter, DateTimeFormatterPreferences, NoCalendarFormatter,
-    fieldsets::{MD, T, YMD},
+    fieldsets::{E, MD, T, YMD},
     input::Time,
     options::YearStyle,
     pattern::{DateTimePattern, DayPeriodNameLength, FixedCalendarDateTimeNames},
@@ -171,6 +171,16 @@ impl IntlTimestampClock {
     }
 }
 
+/// Formats a calendar date's short localized weekday (`Intl.DateTimeFormat(locale, { weekday: "short" })`,
+/// `pingdotgg/t3code#39494`).
+pub fn format_short_weekday(locale_tag: &str, year: i64, month: i64, day: i64) -> Option<String> {
+    let locale = locale_tag.parse::<Locale>().ok()?;
+    let prefs = DateTimeFormatterPreferences::from(&locale);
+    let formatter = DateTimeFormatter::try_new(prefs, E::short()).ok()?;
+    let date = Date::try_new_iso(year as i32, month as u8, day as u8).ok()?;
+    Some(formatter.format(&date).to_string())
+}
+
 struct ClockParts<'a> {
     text: String,
     hour: &'a str,
@@ -278,5 +288,15 @@ mod tests {
         let bg_bg = IntlTimestampClock::new("bg-BG").unwrap();
         assert_eq!(bg_bg.numeric_date(local, false), "3.07");
         assert_eq!(bg_bg.numeric_date(local, true), "3.07.2026 г.");
+    }
+
+    #[test]
+    fn short_weekday_follows_app_locale() {
+        // 2026-07-03 is a Friday.
+        assert_eq!(format_short_weekday("en-US", 2026, 7, 3).as_deref(), Some("Fri"));
+        let de = format_short_weekday("de", 2026, 7, 3).unwrap();
+        assert!(de.starts_with("Fr"), "expected German Friday abbreviation, got {de:?}");
+        let fr = format_short_weekday("fr", 2026, 7, 3).unwrap();
+        assert!(fr.starts_with("ven"), "expected French Friday abbreviation, got {fr:?}");
     }
 }

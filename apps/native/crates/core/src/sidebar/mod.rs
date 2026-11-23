@@ -241,10 +241,22 @@ pub struct SidebarModel {
 
 impl SidebarModel {
     pub fn build(input: &ModelInput, tracker: &mut InboxReturnTracker) -> SidebarModel {
-        Self::build_with_launching(input, tracker, None)
+        Self::build_with_options(input, tracker, None, None)
     }
 
     pub fn build_with_launching(input: &ModelInput, tracker: &mut InboxReturnTracker, launching_thread_ids: Option<&HashSet<String>>) -> SidebarModel {
+        Self::build_with_options(input, tracker, launching_thread_ids, None)
+    }
+
+    /// Builds the sidebar model, omitting `departing_thread_id` from collapsed shelf pinning so
+    /// settling/snoozing an active thread does not flash inside a collapsed shelf before navigation
+    /// completes (`pingdotgg/t3code#26661`).
+    pub fn build_with_options(
+        input: &ModelInput,
+        tracker: &mut InboxReturnTracker,
+        launching_thread_ids: Option<&HashSet<String>>,
+        departing_thread_id: Option<&str>,
+    ) -> SidebarModel {
         let snapshot = input.snapshot;
         let subagent_requests = pending_subagent_requests(&snapshot.threads);
         let rows: Vec<&ThreadShell> = snapshot
@@ -292,7 +304,8 @@ impl SidebarModel {
             .min();
         let mut model = SidebarModel { threads, index_by_id, project_names, partition, next_change_at, ..Default::default() };
         let frontier = input.older_settled.and_then(|shelf| shelf.frontier);
-        model.build_rows(input.shelves, input.selected_thread_id, frontier, unloaded_settled, input.dragging);
+        let shelf_selected = input.selected_thread_id.filter(|id| Some(*id) != departing_thread_id);
+        model.build_rows(input.shelves, shelf_selected, frontier, unloaded_settled, input.dragging);
         model
     }
 

@@ -33,10 +33,12 @@ const STATE_NAME: &str = "terminal-state";
 const AUTHORIZATION_ERROR: &str = "EnvironmentAuthorizationError";
 
 /// Each thread's terminals with a running process on the current connection, in metadata order
-/// (`useThreadRunningTerminalIds`), for the sidebar's terminal indicator.
+/// (`useThreadRunningTerminalIds`), plus the first terminal label per thread for sidebar draft rows
+/// (`useTerminalLabelsByThreadKey`, `pingdotgg/t3code#25272`).
 #[derive(Default)]
 pub struct RunningTerminals {
     pub by_thread: std::collections::BTreeMap<String, Vec<String>>,
+    pub first_label_by_thread: std::collections::HashMap<String, String>,
 }
 
 impl gpui::Global for RunningTerminals {}
@@ -582,8 +584,31 @@ impl TerminalDrawer {
     /// Publishes the current connection's running terminals; observers wake only on a change.
     fn publish_running(&self, cx: &mut App) {
         let by_thread = self.summaries.as_deref().map(terminal::running_by_thread).unwrap_or_default();
-        if cx.try_global::<RunningTerminals>().is_none_or(|current| current.by_thread != by_thread) {
-            cx.set_global(RunningTerminals { by_thread });
+        let mut first_label_by_thread = std::collections::HashMap::new();
+        if let Some(summaries) = self.summaries.as_deref() {
+            for summary in summaries {
+                let entry = first_label_by_thread.entry(summary.thread_id.clone());
+                let label = terminal::session_label(&summary.terminal_id, Some(summary.label.as_str()));
+                match entry {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((summary.terminal_id.clone(), label));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if terminal::natural_cmp(&summary.terminal_id, &slot.get().0) == std::cmp::Ordering::Less {
+                            slot.insert((summary.terminal_id.clone(), label));
+                        }
+                    }
+                }
+            }
+        }
+        let first_label_by_thread: std::collections::HashMap<String, String> = first_label_by_thread
+            .into_iter()
+            .map(|(thread_id, (_, label))| (thread_id, label))
+            .collect();
+        if cx.try_global::<RunningTerminals>().is_none_or(|current| {
+            current.by_thread != by_thread || current.first_label_by_thread != first_label_by_thread
+        }) {
+            cx.set_global(RunningTerminals { by_thread, first_label_by_thread });
         }
     }
 

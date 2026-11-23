@@ -84,6 +84,7 @@ pub struct ThreadHoverCard {
     favicon: ProjectVisual,
     environment: Option<(SharedString, Icon)>,
     branch: Option<SharedString>,
+    worktree_path: Option<SharedString>,
     branch_mismatch: bool,
     model: Option<ModelLine>,
     handed_off: Option<SharedString>,
@@ -163,6 +164,12 @@ impl ThreadHoverCard {
                 (!label.is_empty()).then(|| (SharedString::from(label.to_owned()), Icon::machine(config)))
             }),
             branch: thread.branch.clone().filter(|branch| !branch.is_empty()).map(Into::into),
+            worktree_path: thread
+                .worktree_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(|path| t3_core::sidebar::thread::worktree_display_name(path).to_owned().into()),
             branch_mismatch: false,
             model,
             handed_off: model::handed_off_from(thread, &entries).map(Into::into),
@@ -180,6 +187,7 @@ impl ThreadHoverCard {
                     let _ = this.update(cx, |card, cx| {
                         if status.as_ref().is_some_and(|status| !status.is_repo) {
                             card.branch = None;
+                            card.worktree_path = None;
                             card.branch_mismatch = false;
                         } else {
                             let current = status.and_then(|status| status.ref_name);
@@ -201,6 +209,7 @@ impl ThreadHoverCard {
             favicon: target.favicon.clone(),
             environment: None,
             branch: None,
+            worktree_path: None,
             branch_mismatch: false,
             model: None,
             handed_off: None,
@@ -282,6 +291,7 @@ impl Render for ThreadHoverCard {
         });
         let environment = self.environment.clone().map(|(label, icon)| line(icon.render(px(12.), muted).into_any_element(), label, p).debug_selector(|| "thread-hover-environment".into()));
         let branch = self.branch.clone().map(|branch| line(Icon::GitBranch.render(px(12.), muted).into_any_element(), branch, p).debug_selector(|| "thread-hover-branch".into()));
+        let worktree = self.worktree_path.clone().map(|worktree| line(Icon::FolderGit2.render(px(12.), muted).into_any_element(), worktree, p).debug_selector(|| "thread-hover-worktree".into()));
         let mismatch = self.branch_mismatch.then(|| {
             let warning = hsla(p.warning);
             div()
@@ -372,6 +382,7 @@ impl Render for ThreadHoverCard {
                             .children(project)
                             .children(environment)
                             .children(branch)
+                            .children(worktree)
                             .children(mismatch)
                             .children(model)
                             .children(handed_off)
@@ -842,6 +853,9 @@ mod tests {
             is_repo: None,
         };
         let (card, vcx) = cx.add_window_view(|_, cx| ThreadHoverCard::new(&target, cx));
+        card.read_with(vcx, |card, _| {
+            assert_eq!(card.worktree_path.as_deref(), Some("removed-worktree"));
+        });
         let checkout = card.update(vcx, |card, _| card._checkout.take()).expect("worktree thread must verify checkout existence");
         let (method, params, reply) = fixture.next_request().await;
         assert_eq!(method, t3_core::vcs::method::VCS_REFRESH_STATUS);
@@ -851,6 +865,7 @@ mod tests {
         vcx.update(|window, cx| window.draw(cx).clear());
         card.read_with(vcx, |card, _| {
             assert_eq!(card.branch, None, "removed worktree checkout must clear branch on hover card");
+            assert_eq!(card.worktree_path, None, "removed worktree checkout must clear worktree path on hover card");
             assert!(!card.branch_mismatch);
         });
         state.update(vcx, |state, _| state.stop_pump());

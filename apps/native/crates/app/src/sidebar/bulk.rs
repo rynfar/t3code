@@ -11,7 +11,7 @@ use t3_core::sidebar::selection::{BulkAction, BulkSelection, SelectionClear};
 use t3_core::sidebar::settled::{self, SnoozePreset};
 use t3_core::thread_actions::{self as actions, UndoKind};
 
-use super::controller::{Deletion, SystemZone, now_ms, time_label, uuid};
+use super::controller::{Deletion, SystemZone, now_ms, snooze_time_label, uuid};
 use crate::app_state::{AppEvent, AppState};
 
 struct ScopedBulkAttempt {
@@ -134,7 +134,8 @@ impl AppState {
                 self.clear_thread_selection(cx);
             }
             BulkAction::SnoozePreset(preset) => {
-                let Some(preset) = settled::pick_snooze_preset(shown_presets, &preset, now_ms(), &self.snooze_settings(), &SystemZone, &time_label) else { return };
+                let locale = crate::i18n::active_formatting_locale(cx);
+                let Some(preset) = settled::pick_snooze_preset_in_locale(shown_presets, &preset, now_ms(), &self.snooze_settings(), &SystemZone, &|time| snooze_time_label(time, cx), Some(&locale)) else { return };
                 self.clear_thread_selection(cx);
                 for thread in &threads {
                     self.snooze_thread(&thread.id, preset.snoozed_until, cx);

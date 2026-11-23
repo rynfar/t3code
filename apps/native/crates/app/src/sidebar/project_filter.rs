@@ -27,6 +27,7 @@ use crate::theme::{ThemeSlot, ThemeSlotExt as _, theme_slot_clipped_background_l
 
 #[derive(Clone)]
 enum ScopeEntry<G> {
+    AddProject,
     All,
     Group(G),
 }
@@ -34,6 +35,7 @@ enum ScopeEntry<G> {
 impl<G> ScopeEntry<G> {
     fn value<'a>(&'a self, key: impl Fn(&'a G) -> &'a str) -> &'a str {
         match self {
+            ScopeEntry::AddProject => "add-project",
             ScopeEntry::All => "all",
             ScopeEntry::Group(group) => key(group),
         }
@@ -41,6 +43,7 @@ impl<G> ScopeEntry<G> {
 
     fn label<'a>(&'a self, label: impl Fn(&'a G) -> &'a str) -> &'a str {
         match self {
+            ScopeEntry::AddProject => "Add project",
             ScopeEntry::All => "All projects",
             ScopeEntry::Group(group) => label(group),
         }
@@ -195,7 +198,13 @@ impl SidebarPane {
             self.project_filter_highlighted = None;
             return;
         }
-        self.project_filter_highlighted = self.visible_filter_values(cx).into_iter().next();
+        let query_empty = self.project_filter_search.read(cx).value().trim().is_empty();
+        let values = self.visible_filter_values(cx);
+        self.project_filter_highlighted = if query_empty {
+            values.iter().find(|value| value.as_str() == "all").cloned().or_else(|| values.into_iter().next())
+        } else {
+            values.into_iter().next()
+        };
         self.project_filter_scroll.scroll_to_item(0);
     }
 
@@ -269,14 +278,14 @@ impl SidebarPane {
         if !state.fleet.environments.is_empty() {
             let raw = pickable_scoped_project_groups(&state.project_groups_for(GroupConsumer::Sidebar, cx));
             let ordered = order_while_open(&mut self.project_filter_order.borrow_mut(), raw, |g| g.key.as_str());
-            let items: Vec<_> = std::iter::once(ScopeEntry::All).chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
+            let items: Vec<_> = [ScopeEntry::AddProject, ScopeEntry::All].into_iter().chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
             filter_project_scope_items(items, &query, |e| e.value(|g| g.key.as_str()), |e| e.label(|g| g.label.as_str()))
                 .into_iter()
                 .map(|e| e.value(|g| g.key.as_str()).to_owned())
                 .collect()
         } else {
             let ordered = order_while_open(&mut self.project_filter_order.borrow_mut(), self.project_groups(cx), |g| g.key.as_str());
-            let items: Vec<_> = std::iter::once(ScopeEntry::All).chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
+            let items: Vec<_> = [ScopeEntry::AddProject, ScopeEntry::All].into_iter().chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
             filter_project_scope_items(items, &query, |e| e.value(|g| g.key.as_str()), |e| e.label(|g| g.label.as_str()))
                 .into_iter()
                 .map(|e| e.value(|g| g.key.as_str()).to_owned())
@@ -312,6 +321,11 @@ impl SidebarPane {
             return;
         };
         let fleet = !self.state.read(cx).fleet.environments.is_empty();
+        if target == "add-project" {
+            self.close_project_filter(Some(window), cx);
+            window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+            return;
+        }
         if target == "all" {
             if fleet {
                 self.state.update(cx, |state, cx| state.set_scoped_project_scope(Vec::new(), cx));
@@ -337,7 +351,7 @@ impl SidebarPane {
     }
 
     fn toggle_highlighted_project_pin(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(target) = self.project_filter_highlighted.clone().filter(|cur| cur != "all") else {
+        let Some(target) = self.project_filter_highlighted.clone().filter(|cur| cur != "all" && cur != "add-project") else {
             return false;
         };
         let fleet = !self.state.read(cx).fleet.environments.is_empty();
@@ -370,7 +384,7 @@ impl SidebarPane {
     }
 
     fn open_highlighted_project_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(target) = self.project_filter_highlighted.clone().filter(|cur| cur != "all") else {
+        let Some(target) = self.project_filter_highlighted.clone().filter(|cur| cur != "all" && cur != "add-project") else {
             return false;
         };
         let fleet = !self.state.read(cx).fleet.environments.is_empty();
@@ -406,16 +420,16 @@ impl SidebarPane {
             let fleet_keys = state.scoped_project_scope(&fleet_groups);
             let selected: Vec<_> = fleet_groups.iter().filter(|group| fleet_keys.contains(&group.key)).collect();
             let label = if selected.is_empty() {
-                crate::i18n::t(cx, "Filter threads by project").to_owned()
+                crate::i18n::t(cx, "Projects").to_owned()
             } else {
                 format!(
                     "{}: {}",
-                    crate::i18n::t(cx, "Filter threads by project"),
+                    crate::i18n::t(cx, "Projects"),
                     selected.iter().map(|group| if group.is_scratch { crate::i18n::t(cx, "No project") } else { group.label.as_str() }).collect::<Vec<_>>().join(", ")
                 )
             };
             let content = if selected.is_empty() {
-                Self::button_icon(Icon::ListFilter, "project-filter", cx).into_any_element()
+                Self::button_icon(Icon::Folder, "project-filter", cx).into_any_element()
             } else {
                 let size = crate::project_icon::size(if selected.len() > 1 { 14. } else { 16. }, cx);
                 let icons = selected
@@ -438,16 +452,16 @@ impl SidebarPane {
             .filter(|group| state.sidebar.project_filter_scope.is_selected(group))
             .collect();
         let label = if scoped.is_empty() {
-            crate::i18n::t(cx, "Filter threads by project").to_owned()
+            crate::i18n::t(cx, "Projects").to_owned()
         } else {
             format!(
                 "{}: {}",
-                crate::i18n::t(cx, "Filter threads by project"),
+                crate::i18n::t(cx, "Projects"),
                 scoped.iter().map(|group| if state.is_scratch_project(&group.representative_id) { crate::i18n::t(cx, "No project") } else { group.label.as_str() }).collect::<Vec<_>>().join(", ")
             )
         };
         let content = if scoped.is_empty() {
-            Self::button_icon(Icon::ListFilter, "project-filter", cx).into_any_element()
+            Self::button_icon(Icon::Folder, "project-filter", cx).into_any_element()
         } else {
             let size = crate::project_icon::size(if scoped.len() > 1 { 14. } else { 16. }, cx);
             let icons = scoped
@@ -659,7 +673,7 @@ impl SidebarPane {
         let p = palette(cx);
         let query = self.project_filter_search.read(cx).value().to_string();
         let ordered = order_while_open(&mut self.project_filter_order.borrow_mut(), self.project_groups(cx), |g| g.key.as_str());
-        let entries: Vec<_> = std::iter::once(ScopeEntry::All).chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
+        let entries: Vec<_> = [ScopeEntry::AddProject, ScopeEntry::All].into_iter().chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
         let filtered = filter_project_scope_items(
             entries,
             &query,
@@ -673,6 +687,33 @@ impl SidebarPane {
 
         for entry in filtered {
             match entry {
+                ScopeEntry::AddProject => {
+                    let highlighted = self.project_filter_highlighted.as_deref() == Some("add-project");
+                    let icon = Icon::FolderPlus.render(crate::project_icon::size(16., cx), hsla(p.icon_muted)).into_any_element();
+                    rows.push(
+                        div()
+                            .id("project-filter-add-project")
+                            .debug_selector(|| "project-filter-add-project".to_owned())
+                            .min_h(px(30.))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .when(highlighted, |s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                            .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                            .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(icon))
+                            .child(div().min_w_0().truncate().child(crate::i18n::t(cx, "Add project")))
+                            .child(div().ml_auto().size(px(24.)).flex_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_project_filter(Some(window), cx);
+                                window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 ScopeEntry::All => {
                     let highlighted = self.project_filter_highlighted.as_deref() == Some("all");
                     let folder = Icon::Folder.render(crate::project_icon::size(16., cx), hsla(p.icon_muted)).into_any_element();
@@ -853,7 +894,7 @@ impl SidebarPane {
             (pickable, selected, span)
         };
         let ordered = order_while_open(&mut self.project_filter_order.borrow_mut(), all_groups, |g| g.key.as_str());
-        let entries: Vec<_> = std::iter::once(ScopeEntry::All).chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
+        let entries: Vec<_> = [ScopeEntry::AddProject, ScopeEntry::All].into_iter().chain(ordered.into_iter().map(ScopeEntry::Group)).collect();
         let filtered = filter_project_scope_items(
             entries,
             &query,
@@ -867,6 +908,33 @@ impl SidebarPane {
 
         for entry in filtered {
             match entry {
+                ScopeEntry::AddProject => {
+                    let highlighted = self.project_filter_highlighted.as_deref() == Some("add-project");
+                    let icon = Icon::FolderPlus.render(crate::project_icon::size(16., cx), hsla(p.icon_muted)).into_any_element();
+                    rows.push(
+                        div()
+                            .id("scoped-project-add-project")
+                            .debug_selector(|| "scoped-project-add-project".to_owned())
+                            .min_h(px(30.))
+                            .px(px(8.))
+                            .py(px(3.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .when(highlighted, |s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                            .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                            .child(div().size(px(16.)).flex_none().flex().items_center().justify_center().child(icon))
+                            .child(div().min_w_0().truncate().child(crate::i18n::t(cx, "Add project")))
+                            .child(div().ml_auto().size(px(24.)).flex_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_project_filter(Some(window), cx);
+                                window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 ScopeEntry::All => {
                     let highlighted = self.project_filter_highlighted.as_deref() == Some("all");
                     let folder = Icon::Folder.render(crate::project_icon::size(16., cx), hsla(p.icon_muted)).into_any_element();
