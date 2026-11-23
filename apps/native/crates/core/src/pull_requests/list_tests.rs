@@ -29,6 +29,7 @@ fn entry(number: u64, title: &str) -> ListEntry {
         labels: Vec::new(),
         review_decision: None,
         checks_state: None,
+        visibility: None,
     }
 }
 

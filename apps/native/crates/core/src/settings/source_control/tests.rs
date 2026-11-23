@@ -317,3 +317,72 @@ fn issue_tracker_summary_describes_disconnected_rejected_and_linked_states() {
         "Connected as alex@example.com · 2 projects linked"
     );
 }
+
+#[test]
+fn issue_tracker_multi_team_helpers_preserve_primary_scope_and_cap_additional() {
+    use crate::issues::wire::{
+        IssueTrackerConnection, IssueTrackerKind, IssueTrackerProjectBinding, IssueTrackerScope,
+        MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES, StandaloneIssueTrackerCredential,
+    };
+    use std::collections::HashMap;
+
+    let tracker = IssueTrackerConnection {
+        tracker: IssueTrackerKind::Linear,
+        display_name: "Linear".into(),
+        host: "linear.app".into(),
+        scope_noun: "team".into(),
+        credential: StandaloneIssueTrackerCredential {
+            label: "Personal API key".into(),
+            help_url: None,
+        },
+        connected: true,
+        account: Some("alex".into()),
+        detail: None,
+        workspace: Some("acme".into()),
+        scopes: vec![
+            IssueTrackerScope { key: "ENG".into(), name: "Engineering".into() },
+            IssueTrackerScope { key: "DES".into(), name: "Design".into() },
+        ],
+    };
+
+    let binding = IssueTrackerProjectBinding {
+        tracker: IssueTrackerKind::Linear,
+        scope: "ENG".into(),
+        additional_scopes: vec!["DES".into(), "ENG".into()],
+    };
+    assert_eq!(binding.scopes(), vec!["ENG", "DES"]);
+    assert_eq!(
+        bound_issue_tracker_scopes(&IssueTrackerKind::Linear, Some(&binding)),
+        vec!["ENG", "DES"]
+    );
+    assert!(bound_issue_tracker_scopes(&IssueTrackerKind::Jira, Some(&binding)).is_empty());
+
+    // Preserves order of kept `current` scopes even if `scopes` arrives sorted differently.
+    let updated = issue_tracker_binding_for(
+        IssueTrackerKind::Linear,
+        &["ENG".into(), "DES".into()],
+        &["OPS".into(), "DES".into(), "ENG".into()],
+    )
+    .unwrap();
+    assert_eq!(updated.scope, "ENG");
+    assert_eq!(updated.additional_scopes, vec!["DES", "OPS"]);
+    assert!(issue_tracker_binding_for(IssueTrackerKind::Linear, &["ENG".into()], &[]).is_none());
+
+    // Missing bound scope is synthesized and `addable` flips false once max additional reached.
+    let mut full_bound = vec!["CUSTOM".into()];
+    full_bound.extend((0..MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES).map(|i| format!("T{i}")));
+    let opts = issue_tracker_scope_options(&tracker, &full_bound);
+    assert_eq!(opts.len(), 3 + MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES);
+    assert!(!opts[0].addable); // ENG not in full_bound
+    assert!(!opts[1].addable); // DES not in full_bound
+    assert!(opts[2].addable && opts[2].key == "CUSTOM");
+    assert!(opts.last().is_some_and(|opt| {
+        opt.addable && opt.key == format!("T{}", MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES - 1)
+    }));
+
+    let empty_tracker = IssueTrackerConnection { scopes: Vec::new(), ..tracker.clone() };
+    assert!(!has_issue_tracker_teams(&empty_tracker, &HashMap::new()));
+    let mut bindings = HashMap::new();
+    bindings.insert("p1".into(), binding);
+    assert!(has_issue_tracker_teams(&empty_tracker, &bindings));
+}

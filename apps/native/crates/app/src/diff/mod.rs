@@ -205,6 +205,33 @@ pub struct External {
     pub error: Option<String>,
 }
 
+pub(crate) fn next_key_scroll_offset(key: &str, top: f32, max_top: f32, viewport: f32) -> Option<f32> {
+    const LINE_STEP: f32 = 48.0;
+    let page = (viewport * 0.85).max(LINE_STEP);
+    let target = match key {
+        "up" => top - LINE_STEP,
+        "down" => top + LINE_STEP,
+        "pageup" => top - page,
+        "pagedown" => top + page,
+        "home" => 0.0,
+        "end" => max_top,
+        _ => return None,
+    };
+    Some(target.clamp(0.0, max_top.max(0.0)))
+}
+
+pub(crate) fn scroll_handle_by_key(scroll: &gpui::ScrollHandle, key: &str) -> bool {
+    let max_top = f32::from(scroll.max_offset().y).max(0.0);
+    let offset = scroll.offset();
+    let top = f32::from(-offset.y).clamp(0.0, max_top);
+    let viewport = f32::from(scroll.bounds().size.height).max(48.0);
+    let Some(next) = next_key_scroll_offset(key, top, max_top, viewport) else {
+        return false;
+    };
+    scroll.set_offset(point(offset.x, px(-next)));
+    true
+}
+
 impl DiffPanel {
     pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::construct(state, cx);
@@ -2081,6 +2108,21 @@ impl DiffPanel {
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         cx.stop_propagation();
+    }
+
+    pub(crate) fn scroll_by_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(max_top) = self.max_scroll_top_px() else {
+            return false;
+        };
+        let top = f32::from(-self.list.scroll_px_offset_for_scrollbar().y).clamp(0.0, max_top);
+        let viewport = f32::from(self.list.viewport_bounds().size.height).max(48.0);
+        let Some(next) = next_key_scroll_offset(key, top, max_top, viewport) else {
+            return false;
+        };
+        self.list.set_offset_from_scrollbar(point(px(0.), px(-next)));
+        self.on_list_scrolled();
+        cx.notify();
+        true
     }
 }
 

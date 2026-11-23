@@ -302,6 +302,10 @@ impl CodeTab {
         }
     }
 
+    pub(super) fn scroll_by_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        self.panel.update(cx, |panel, cx| panel.scroll_by_key(key, cx))
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.slices.clear();
@@ -631,9 +635,6 @@ fn join_with_withheld(
     loaded: &HashMap<String, FileDiff>,
     truncated: bool,
 ) -> Arc<Parsed> {
-    if slices.len() == 1 && omitted.is_empty() && loaded.is_empty() && slices[0].truncated == truncated {
-        return slices[0].clone();
-    }
     let mut files: Vec<FileDiff> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for slice in slices {
@@ -665,7 +666,7 @@ fn join_with_withheld(
             })
             .unwrap_or(ParsedPatch::Empty)
     } else {
-        ParsedPatch::Files(files)
+        ParsedPatch::Files(t3_core::diff::order_file_diffs_for_review(files))
     };
     Parsed::from_patch(patch, truncated, None, None, None)
 }

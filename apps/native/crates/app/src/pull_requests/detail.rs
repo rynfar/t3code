@@ -282,6 +282,8 @@ pub struct DetailView {
     pub(super) markdown: MarkdownStore,
     pub(super) timeline: Vec<t3_core::pull_requests::detail::TimelineEvent>,
     pub(super) timeline_list: gpui::ListState,
+    focus: gpui::FocusHandle,
+    pending_focus: bool,
     guide: Option<Entity<GuideTab>>,
     code: Option<Entity<CodeTab>>,
     /// First diff slice prefetched on hovering the Code tab (`pingdotgg/t3code#32911`).
@@ -447,6 +449,8 @@ impl DetailView {
             markdown: MarkdownStore::new(cx.entity_id()),
             timeline: Vec::new(),
             timeline_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
+            focus: cx.focus_handle(),
+            pending_focus: true,
             guide: None,
             code: None,
             prefetched_diff: None,
@@ -669,6 +673,56 @@ impl DetailView {
             source_control_media: true,
             source_control_media_repository: Some(detail.repository.clone()),
             viewer: self.viewer.downgrade(),
+        }
+    }
+
+    pub(super) fn link_thread_id(&self, cx: &App) -> Option<String> {
+        let app = self.state.read(cx);
+        (!app.pull_requests_open && !app.issues_open)
+            .then(|| app.selected_thread.clone())
+            .flatten()
+    }
+
+    fn project_cwd(&self, cx: &App) -> Option<String> {
+        if let Some(root) = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.workspace_root.clone())
+            .filter(|root| !root.trim().is_empty())
+        {
+            return Some(root);
+        }
+        let app = self.state.read(cx);
+        if let Some(target_env) = self.environment.as_deref()
+            && let Some(env) = app.fleet.environments.iter().find(|env| {
+                env.summary.owner.saved_id == target_env
+                    || env.summary.owner.canonical_id.as_deref() == Some(target_env)
+            })
+        {
+            return env
+                .summary
+                .projects
+                .iter()
+                .find(|p| p.project.id == self.reference.project_id)
+                .map(|p| p.project.workspace_root.clone())
+                .filter(|root| !root.is_empty());
+        }
+        app.shell
+            .project(&self.reference.project_id)
+            .map(|p| p.workspace_root.clone())
+            .filter(|root| !root.is_empty())
+    }
+
+    pub(super) fn markdown_action_ctx(
+        &self,
+        cx: &Context<Self>,
+    ) -> crate::transcript::markdown::links::MarkdownActionContext {
+        crate::transcript::markdown::links::MarkdownActionContext {
+            state: self.state.clone(),
+            owner: cx.entity_id(),
+            cwd: self.project_cwd(cx),
+            thread_id: self.link_thread_id(cx),
+            thread_view: None,
         }
     }
 
@@ -1328,6 +1382,7 @@ impl DetailView {
     pub(crate) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.disarm(cx);
         self.tab = tab;
+        self.pending_focus = tab != Tab::Guide;
         if tab == Tab::Code && self.code.is_none() {
             let state = self.state.clone();
             let detail_view = cx.entity().downgrade();
@@ -2329,6 +2384,38 @@ impl DetailView {
             SharedString::from("pr-detail-stack-popover"),
             cx,
         );
+        let visibility = self
+            .detail
+            .as_ref()
+            .and_then(|d| d.visibility)
+            .or_else(|| self.entry.as_ref().and_then(|e| e.visibility));
+        let dark = cx.theme().is_dark();
+        let private_badge =
+            (visibility == Some(t3_core::pull_requests::wire::PullRequestVisibility::Private))
+                .then(|| {
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(4.))
+                        .h(px(22.))
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(hsla(p.input))
+                        .bg(if dark {
+                            hsla(p.input).opacity(0.32)
+                        } else {
+                            hsla(p.background)
+                        })
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(Icon::Lock.sized(px(12.)))
+                        .child(crate::i18n::t(cx, "Private").to_owned())
+                });
+        let ref_state = self.state.clone();
+        let ref_thread_id = self.link_thread_id(cx);
+        let host_state = self.state.clone();
+        let host_thread_id = self.link_thread_id(cx);
         v_flex()
             .flex_none()
             .gap(px(8.))
@@ -2344,11 +2431,37 @@ impl DetailView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(hsla(p.muted_foreground))
-                            .child(format!("{} #{}", self.reference.repository, self.reference.number)),
+                            .child(
+                                h_flex().min_w_0().max_w_full().child(
+                                    div()
+                                        .id("pr-detail-ref-link")
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(hsla(p.muted_foreground))
+                                        .when_some(url.clone(), |el, link| {
+                                            let state = ref_state.clone();
+                                            let thread_id = ref_thread_id.clone();
+                                            el.cursor_pointer()
+                                                .hover(|s| s.text_color(hsla(p.foreground)).underline())
+                                                .on_click(move |ev, _, cx| {
+                                                    crate::transcript::markdown::open_browser_link(
+                                                        &link,
+                                                        ev.modifiers(),
+                                                        Some(&state),
+                                                        thread_id.clone(),
+                                                        cx,
+                                                    );
+                                                })
+                                        })
+                                        .child(format!(
+                                            "{} #{}",
+                                            self.reference.repository, self.reference.number
+                                        )),
+                                ),
+                            ),
                     )
+                    .children(private_badge)
                     .children(stack_pill)
                     .child(self.render_actions(window, cx))
                     .child(
@@ -2385,7 +2498,20 @@ impl DetailView {
                     }))
                     .children(self.render_linked_threads(cx))
                     .children(url.map(|url| {
-                        Button::new("pr-open-host", Variant::GhostMuted, Size::IconSm).icon(Icon::ExternalLink).tooltip("Open on the host").on_click(move |_, _, cx| cx.open_url(&url))
+                        let state = host_state.clone();
+                        let thread_id = host_thread_id.clone();
+                        Button::new("pr-open-host", Variant::GhostMuted, Size::IconSm)
+                            .icon(Icon::ExternalLink)
+                            .tooltip("Open on the host")
+                            .on_click(move |ev, _, cx| {
+                                crate::transcript::markdown::open_browser_link(
+                                    &url,
+                                    ev.modifiers(),
+                                    Some(&state),
+                                    thread_id.clone(),
+                                    cx,
+                                );
+                            })
                     })),
             )
             .child(self.render_tabs(window, cx))
@@ -2734,9 +2860,25 @@ impl DetailView {
             let url = detail.url.clone();
             let link = detail.url.clone();
             let number = format!("#{}", detail.number);
+            let open_host_entity = entity.clone();
             menu = menu
                 .separator()
-                .item(PopupMenuItem::new("Open on the host").on_click(move |_, _, cx| cx.open_url(&url)))
+                .item(PopupMenuItem::new("Open on the host").on_click(move |_, _, cx| {
+                    let (state, thread_id) = open_host_entity
+                        .upgrade()
+                        .map(|view| {
+                            let v = view.read(cx);
+                            (Some(v.state.clone()), v.link_thread_id(cx))
+                        })
+                        .unwrap_or((None, None));
+                    crate::transcript::markdown::open_browser_link(
+                        &url,
+                        gpui::Modifiers::default(),
+                        state.as_ref(),
+                        thread_id,
+                        cx,
+                    );
+                }))
                 .item(PopupMenuItem::new(format!("Copy {term} link")).on_click(act(&entity, Box::new(move |view, cx| view.copy(link.clone(), "Link", cx)))))
                 .item(PopupMenuItem::new(format!("Copy {term} number")).on_click(act(&entity, Box::new(move |view, cx| view.copy(number.clone(), "Number", cx)))));
             if detail.state == PrState::Open && detail.can(Action::Close) {
@@ -2761,6 +2903,65 @@ impl DetailView {
         }
     }
 
+    fn has_focused_text_input(&self, window: &Window, cx: &App) -> bool {
+        let input_focused = |input: Option<&Entity<InputState>>| {
+            input.is_some_and(|e| gpui::Focusable::focus_handle(e.read(cx), cx).is_focused(window))
+        };
+        let textarea_focused = |input: Option<&Entity<TextareaState>>| {
+            input.is_some_and(|e| gpui::Focusable::focus_handle(e.read(cx), cx).is_focused(window))
+        };
+        input_focused(self.title_input.as_ref())
+            || textarea_focused(self.description_input.as_ref())
+            || input_focused(self.reviewer_search_input.as_ref())
+            || textarea_focused(self.review_summary_input.as_ref())
+            || textarea_focused(self.comment_input.as_ref())
+            || textarea_focused(self.editing_comment.as_ref().map(|edit| &edit.input))
+            || textarea_focused(self.reply_input.as_ref())
+            || input_focused(self.thread_picker_input.as_ref())
+    }
+
+    fn scroll_by_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        match self.tab {
+            Tab::Summary => {
+                if crate::diff::scroll_handle_by_key(&self.summary_scroll, key) {
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
+            }
+            Tab::Timeline => {
+                let viewport = f32::from(self.timeline_list.viewport_bounds().size.height);
+                if viewport <= 0.0 {
+                    return false;
+                }
+                let max_top = f32::from(self.timeline_list.max_offset_for_scrollbar().y).max(0.0);
+                let top = f32::from(-self.timeline_list.scroll_px_offset_for_scrollbar().y)
+                    .clamp(0.0, max_top);
+                let Some(next) = crate::diff::next_key_scroll_offset(
+                    key,
+                    top,
+                    max_top,
+                    viewport.max(48.0),
+                ) else {
+                    return false;
+                };
+                self.timeline_list
+                    .set_offset_from_scrollbar(gpui::point(px(0.), px(-next)));
+                cx.notify();
+                true
+            }
+            Tab::Guide => self
+                .guide
+                .as_ref()
+                .is_some_and(|guide| guide.update(cx, |guide, cx| guide.scroll_by_key(key, cx))),
+            Tab::Code => self
+                .code
+                .as_ref()
+                .is_some_and(|code| code.update(cx, |code, cx| code.scroll_by_key(key, cx))),
+        }
+    }
+
     fn render_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.tab {
             Tab::Summary => super::summary::render(self, window, cx),
@@ -2775,10 +2976,22 @@ fn tab_label(label: &'static str) -> impl IntoElement {
     div().ml(px(6.)).text_xs().font_weight(FontWeight::MEDIUM).child(SharedString::from(label))
 }
 
+impl gpui::Focusable for DetailView {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         self.markdown.begin_frame();
+        if self.pending_focus {
+            self.pending_focus = false;
+            if !self.has_focused_text_input(window, cx) {
+                window.focus(&self.focus, cx);
+            }
+        }
         let review_panel = self.detail.clone().and_then(|detail| interactions::review_form_panel(self, &detail, window, cx));
         let thread_picker = interactions::thread_link_picker_modal(self, window, cx);
         let body = match (&self.detail, &self.error) {
@@ -2805,17 +3018,30 @@ impl Render for DetailView {
         }
         v_flex()
             .id("pr-detail")
+            .track_focus(&self.focus)
             .relative()
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
             .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key != "escape" { return; }
-                if view.label_picker_open {
-                    view.toggle_label_picker(cx);
-                    cx.stop_propagation();
-                } else if view.reviewer_picker_open {
-                    view.toggle_reviewer_picker(window, cx);
+                if event.keystroke.key == "escape" {
+                    if view.label_picker_open {
+                        view.toggle_label_picker(cx);
+                        cx.stop_propagation();
+                    } else if view.reviewer_picker_open {
+                        view.toggle_reviewer_picker(window, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                let modifiers = &event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control || modifiers.alt || modifiers.shift {
+                    return;
+                }
+                if view.has_focused_text_input(window, cx) {
+                    return;
+                }
+                if view.scroll_by_key(event.keystroke.key.as_str(), cx) {
                     cx.stop_propagation();
                 }
             }))

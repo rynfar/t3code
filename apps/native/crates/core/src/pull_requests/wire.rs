@@ -77,6 +77,15 @@ literals!(ReviewerKind { User = "user", Team = "team" });
 literals!(ViewedFilesStore { Host = "host", Environment = "environment" });
 literals!(FileViewedState { Unviewed = "unviewed", Viewed = "viewed", Dismissed = "dismissed" });
 
+/// Who can read a pull request on a host that can hide one in a public repository
+/// (`PullRequestVisibility`, `pingdotgg/t3code#40741`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PullRequestVisibility {
+    Public,
+    Private,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reaction {
@@ -254,6 +263,15 @@ where
     Ok(values.into_iter().filter_map(|value| serde_json::from_value(value).ok()).collect())
 }
 
+/// Decodes an optional field leniently, dropping unknown future variants to `None`.
+pub fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
@@ -326,6 +344,8 @@ pub struct ListEntry {
     pub review_decision: Option<ReviewDecision>,
     #[serde(default)]
     pub checks_state: Option<ChecksState>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub visibility: Option<PullRequestVisibility>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +699,8 @@ pub struct Detail {
     pub merge_queue_removal: Option<MergeQueueRemoval>,
     #[serde(default)]
     pub maintainer_can_modify: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub visibility: Option<PullRequestVisibility>,
 }
 
 impl Detail {
@@ -893,5 +915,56 @@ mod tests {
                 .unwrap();
         assert!(capabilities.allows(MergeMethod::FastForward));
         assert!(!capabilities.allows(MergeMethod::Merge));
+    }
+
+    #[test]
+    fn visibility_decodes_known_values_and_drops_unknown_to_none() {
+        let priv_entry: ListEntry = decode(json!({
+            "provider": "github",
+            "host": "github.com",
+            "projectId": "p1",
+            "projectTitle": "Repo",
+            "repository": "acme/repo",
+            "number": 7,
+            "title": "Secret",
+            "url": "https://github.com/acme/repo/pull/7",
+            "headBranch": "feat",
+            "baseBranch": "main",
+            "state": "open",
+            "isDraft": false,
+            "mergeability": "mergeable",
+            "additions": 1,
+            "deletions": 0,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "viewerReviewRequested": false,
+            "visibility": "private"
+        }))
+        .unwrap();
+        assert_eq!(priv_entry.visibility, Some(PullRequestVisibility::Private));
+
+        let unknown_entry: ListEntry = decode(json!({
+            "provider": "github",
+            "host": "github.com",
+            "projectId": "p1",
+            "projectTitle": "Repo",
+            "repository": "acme/repo",
+            "number": 8,
+            "title": "Internal",
+            "url": "https://github.com/acme/repo/pull/8",
+            "headBranch": "feat",
+            "baseBranch": "main",
+            "state": "open",
+            "isDraft": false,
+            "mergeability": "mergeable",
+            "additions": 1,
+            "deletions": 0,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "viewerReviewRequested": false,
+            "visibility": "enterprise-only"
+        }))
+        .unwrap();
+        assert_eq!(unknown_entry.visibility, None);
     }
 }

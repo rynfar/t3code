@@ -57,6 +57,7 @@ use crate::transcript::markdown::{MarkdownStore, prose};
 
 pub(crate) type CloseHandler = Rc<dyn Fn(&mut App)>;
 pub(crate) type SelectPrHandler = Rc<dyn Fn(PrRef, &mut App)>;
+pub(crate) type SelectIssueHandler = Rc<dyn Fn(IssueRef, Option<String>, &mut App)>;
 pub(crate) type MutatedHandler = Rc<dyn Fn(&mut App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub struct IssueDetailPanel {
     markdown: MarkdownStore,
     on_close: Option<CloseHandler>,
     on_select_pr: Option<SelectPrHandler>,
+    on_select_issue: Option<SelectIssueHandler>,
     on_mutated: Option<MutatedHandler>,
     _fetch: Option<Task<()>>,
     _older: Option<Task<()>>,
@@ -127,6 +129,7 @@ impl IssueDetailPanel {
         seed: Option<IssueListEntry>,
         on_close: Option<CloseHandler>,
         on_select_pr: Option<SelectPrHandler>,
+        on_select_issue: Option<SelectIssueHandler>,
         on_mutated: Option<MutatedHandler>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -179,6 +182,7 @@ impl IssueDetailPanel {
             markdown: MarkdownStore::new(cx.entity_id()),
             on_close,
             on_select_pr,
+            on_select_issue,
             on_mutated,
             _fetch: None,
             _older: None,
@@ -1805,6 +1809,87 @@ impl Render for IssueDetailPanel {
                     let when = parse_iso(&event.created_at)
                         .map(|at| compact_relative_label(at, now_ms()))
                         .unwrap_or_default();
+                    let ref_link = event.reference.as_ref().and_then(|source| {
+                        let detail_str = event.detail.as_deref()?;
+                        let at = sentence.find(detail_str)?;
+                        Some((
+                            sentence[..at].to_owned(),
+                            detail_str.to_owned(),
+                            sentence[at + detail_str.len()..].to_owned(),
+                            source.clone(),
+                        ))
+                    });
+                    let sentence_el = if let Some((before, label, after, source)) = ref_link {
+                        let on_select_pr = self.on_select_pr.clone();
+                        let on_select_issue = self.on_select_issue.clone();
+                        let project_id = self.reference.project_id.clone();
+                        let tracker = self.reference.tracker.clone();
+                        let ref_host = self.reference.host.clone();
+                        let detail_host = Some(detail.host.clone());
+                        let state = self.state.clone();
+                        let thread_id = self.thread_id.clone();
+                        h_flex()
+                            .items_baseline()
+                            .flex_wrap()
+                            .when(!before.is_empty(), |row| row.child(before))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("issue-event-ref-{idx}")))
+                                    .cursor_pointer()
+                                    .text_color(hsla(p.muted_foreground))
+                                    .hover(|s| s.text_color(hsla(p.foreground)).underline())
+                                    .on_click(move |ev, _, cx| {
+                                        if !ev.modifiers().platform && !ev.modifiers().control {
+                                            if source.kind == "pull-request"
+                                                && let Some(cb) = &on_select_pr
+                                            {
+                                                let host = t3_core::pull_requests::link::parse_change_request_url(&source.url)
+                                                    .map(|link| link.host)
+                                                    .or_else(|| detail_host.clone())
+                                                    .or_else(|| ref_host.clone());
+                                                cb(
+                                                    PrRef {
+                                                        project_id: project_id.clone(),
+                                                        host,
+                                                        repository: source.repository.clone(),
+                                                        number: source.number,
+                                                    },
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                            if source.kind != "pull-request"
+                                                && let Some(cb) = &on_select_issue
+                                            {
+                                                cb(
+                                                    IssueRef {
+                                                        project_id: project_id.clone(),
+                                                        tracker: tracker.clone(),
+                                                        host: detail_host.clone().or_else(|| ref_host.clone()),
+                                                        scope: source.repository.clone(),
+                                                        key: source.number.to_string(),
+                                                    },
+                                                    Some(source.url.clone()),
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                        }
+                                        crate::transcript::markdown::open_browser_link(
+                                            &source.url,
+                                            ev.modifiers(),
+                                            Some(&state),
+                                            thread_id.clone(),
+                                            cx,
+                                        );
+                                    })
+                                    .child(label),
+                            )
+                            .when(!after.is_empty(), |row| row.child(after))
+                            .into_any_element()
+                    } else {
+                        div().child(sentence).into_any_element()
+                    };
                     h_flex()
                         .id(SharedString::from(format!("issue-event-{idx}")))
                         .px(px(4.))
@@ -1819,7 +1904,7 @@ impl Render for IssueDetailPanel {
                                 .text_color(hsla(p.foreground))
                                 .child(e_actor),
                         )
-                        .child(sentence)
+                        .child(sentence_el)
                         .child(when)
                         .into_any_element()
                 }
@@ -2352,6 +2437,7 @@ mod tests {
                 sample_ref(),
                 None,
                 Some(seed),
+                None,
                 None,
                 None,
                 None,

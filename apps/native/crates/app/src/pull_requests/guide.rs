@@ -309,6 +309,14 @@ impl GuideTab {
     }
 
     /// Handles `j` / `k` keyboard tour stepping (`GuideTour.tsx:86-94`).
+    pub(super) fn scroll_by_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        if crate::diff::scroll_handle_by_key(&self.scroll, key) {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.comment_target.is_some() {
             return;
@@ -317,9 +325,13 @@ impl GuideTab {
         if m.platform || m.control || m.alt || m.shift {
             return;
         }
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str();
+        match key {
             "j" => self.step(1, cx),
             "k" => self.step(-1, cx),
+            _ if self.scroll_by_key(key, cx) => {
+                cx.stop_propagation();
+            }
             _ => {}
         }
     }

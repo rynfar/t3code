@@ -18,10 +18,11 @@ use t3_client::store;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::issues::list::{
     EnvironmentIssueEntry, FilterProject, HeldIssuePage, HostOption, IssueCandidatesTracker,
-    IssueListPreferences, IssueListReadTracker, IssueListRefreshMode, IssueTrackerGroup, PAGE_SIZE,
-    PREFERENCES_KEY, ProjectDescriptor, SEARCH_DEBOUNCE_MS, continue_issue_page,
-    filter_held_by_host, group_issues, hold_issue_pages, host_options_for, issue_cursors_for_host,
-    issue_filter_projects, issue_filter_scopes,
+    IssueListPreferences, IssueListReadTracker, IssueListRefreshMode, IssueListTarget,
+    IssueTrackerGroup, PAGE_SIZE, PREFERENCES_KEY, ProjectDescriptor, SEARCH_DEBOUNCE_MS,
+    continue_issue_page, every_project_hidden, filter_held_by_host, group_issues, hold_issue_pages,
+    host_options_for, is_project_hidden, issue_cursors_for_host, issue_filter_projects,
+    issue_filter_scopes, issue_list_targets,
 };
 use t3_core::issues::saved_views::{
     ISSUE_SAVED_VIEW_PLACEHOLDER, ISSUE_SAVED_VIEWS_KEY, SavedView, create_saved_view,
@@ -388,27 +389,99 @@ impl IssuesPage {
         self.read_tracker.is_pending()
     }
 
-    fn active_targets(&self, cx: &App) -> Vec<EnvironmentTarget> {
-        let targets = self.all_environment_targets(cx);
-        if let Some(scoped) = self.prefs.scoped_project() {
-            targets
-                .into_iter()
-                .filter(|target| target.matches_id(&scoped.environment_id))
-                .collect()
-        } else {
-            targets
+    pub(super) fn canonical_hidden_projects(&self, cx: &App) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (env_id, project_id) in &self.prefs.hide_projects {
+            let resolved_env = self
+                .environment_target_for(env_id, cx)
+                .map(|target| target.env_id)
+                .unwrap_or_else(|| env_id.clone());
+            let pair = (resolved_env, project_id.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
         }
+        out
     }
 
-    pub(super) fn canonical_scoped_project(
+    pub(super) fn every_project_hidden(&self, cx: &App) -> bool {
+        let projects = self.filter_projects(cx);
+        let hidden = self.canonical_hidden_projects(cx);
+        every_project_hidden(&projects, &hidden)
+    }
+
+    pub(super) fn planned_targets(
         &self,
+        mode: IssueListRefreshMode,
         cx: &App,
-    ) -> Option<t3_core::issues::list::ScopedProject> {
-        let mut scoped = self.prefs.scoped_project()?;
-        if let Some(target) = self.environment_target_for(&scoped.environment_id, cx) {
-            scoped.environment_id = target.env_id;
-        }
-        Some(scoped)
+    ) -> Vec<IssueListTarget> {
+        let targets = self.all_environment_targets(cx);
+        let env_ids: Vec<String> = targets.iter().map(|target| target.env_id.clone()).collect();
+        let projects = self.filter_projects(cx);
+        let hidden = self.canonical_hidden_projects(cx);
+        let base_input = self.prefs.to_list_input(
+            PAGE_SIZE,
+            &self.sent,
+            None,
+            mode == IssueListRefreshMode::Manual,
+        );
+        issue_list_targets(&env_ids, &projects, &hidden, &base_input)
+    }
+
+    fn exclude_project_ids_for(&self, env_id: &str, cx: &App) -> Vec<String> {
+        self.planned_targets(IssueListRefreshMode::Background, cx)
+            .into_iter()
+            .find(|target| target.environment_id == env_id)
+            .map(|target| target.input.exclude_project_ids)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn toggle_project_hidden(
+        &mut self,
+        env_id: &str,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.all_environment_targets(cx);
+        let canonical_for = |id: &str| -> String {
+            targets
+                .iter()
+                .find(|target| target.matches_id(id))
+                .map(|target| target.env_id.clone())
+                .unwrap_or_else(|| id.to_owned())
+        };
+        let target_canon = canonical_for(env_id);
+        self.update_prefs(
+            |prefs| {
+                let was_hidden = prefs
+                    .hide_projects
+                    .iter()
+                    .any(|(e, p)| p == project_id && canonical_for(e) == target_canon);
+                if was_hidden {
+                    prefs
+                        .hide_projects
+                        .retain(|(e, p)| !(p == project_id && canonical_for(e) == target_canon));
+                } else {
+                    prefs
+                        .hide_projects
+                        .push((target_canon, project_id.to_owned()));
+                }
+            },
+            cx,
+        );
+    }
+
+    fn active_targets(&self, cx: &App) -> Vec<EnvironmentTarget> {
+        let planned = self.planned_targets(IssueListRefreshMode::Background, cx);
+        let targets = self.all_environment_targets(cx);
+        targets
+            .into_iter()
+            .filter(|target| {
+                planned
+                    .iter()
+                    .any(|item| item.environment_id == target.env_id)
+            })
+            .collect()
     }
 
     fn search_scope_key(&self) -> String {
@@ -568,6 +641,8 @@ impl IssuesPage {
         self.loading_more_gen += 1;
         self.read_tracker
             .set_search_key(search_key.clone(), &target_ids);
+        self.held_pages
+            .retain(|env_id, _| target_ids.contains(env_id));
         self.unsupported = false;
         if targets.is_empty() {
             self.held_pages.clear();
@@ -588,9 +663,10 @@ impl IssuesPage {
     ) {
         let env_id = target.env_id;
         let (generation, send_refresh) = self.read_tracker.begin_read(&env_id, mode);
-        let input = self
+        let mut input = self
             .prefs
             .to_list_input(PAGE_SIZE, &self.sent, None, send_refresh);
+        input.exclude_project_ids = self.exclude_project_ids_for(&env_id, cx);
         let payload =
             serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
         let task = read_for_owner(
@@ -668,9 +744,10 @@ impl IssuesPage {
         let owner = self
             .environment_target_for(&env_id, cx)
             .and_then(|target| target.owner);
-        let input = self
+        let mut input = self
             .prefs
             .to_list_input(PAGE_SIZE, &self.sent, Some(cursors.clone()), false);
+        input.exclude_project_ids = self.exclude_project_ids_for(&env_id, cx);
         let payload =
             serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
         let task = read_for_owner(
@@ -710,8 +787,8 @@ impl IssuesPage {
     pub(super) fn ensure_candidates(&mut self, cx: &mut Context<Self>) {
         let projects = self.project_descriptors(cx);
         let shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
-        let scoped = self.canonical_scoped_project(cx);
-        let scopes = issue_filter_scopes(&shown, &projects, scoped.as_ref());
+        let hidden = self.canonical_hidden_projects(cx);
+        let scopes = issue_filter_scopes(&shown, &projects, &hidden);
         let to_fetch = self.candidates_tracker.sync_targets(scopes);
         for target in to_fetch {
             self.fetch_candidate_target(target, cx);
@@ -762,7 +839,16 @@ impl IssuesPage {
 
     pub(super) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let projects = self.project_descriptors(cx);
-        let shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
+        let mut shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
+        let hidden = self.canonical_hidden_projects(cx);
+        if !hidden.is_empty() {
+            for (env_id, page) in &mut shown {
+                page.entries
+                    .retain(|entry| !is_project_hidden(&hidden, env_id, &entry.project_id));
+                page.errors
+                    .retain(|error| !is_project_hidden(&hidden, env_id, &error.project_id));
+            }
+        }
         self.groups = group_issues(&shown, &self.sent, &projects, self.prefs.effective_sort());
 
         let mut rows = Vec::new();
@@ -827,6 +913,25 @@ impl IssuesPage {
             let on_select_pr = std::rc::Rc::new(move |reference, cx: &mut App| {
                 let _ = pr_weak.update(cx, |page, cx| page.open_linked_pr(reference, cx));
             });
+            let issue_weak = page_weak.clone();
+            let on_select_issue = std::rc::Rc::new(move |reference: IssueRef, url: Option<String>, cx: &mut App| {
+                let _ = issue_weak.update(cx, |page, cx| {
+                    let env_id = page.detail_environment.clone();
+                    if page.state.read(cx).uses_shared_utility_panel() {
+                        let target = IssueTarget::from_ref(
+                            env_id,
+                            &reference,
+                            Some(format!("#{}", reference.key)),
+                            url,
+                        );
+                        page.state.update(cx, |state, cx| {
+                            state.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, target, cx);
+                        });
+                    } else {
+                        page.open_detail_pane(env_id, reference, None, cx);
+                    }
+                });
+            });
             let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
                 let _ = page_weak.update(cx, |page, cx| {
                     page.fetch_all(IssueListRefreshMode::Background, cx);
@@ -843,6 +948,7 @@ impl IssuesPage {
                     seed,
                     Some(on_close),
                     Some(on_select_pr),
+                    Some(on_select_issue),
                     Some(on_mutated),
                     cx,
                 )
@@ -1116,6 +1222,12 @@ impl IssuesPage {
     fn render_body(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.unsupported {
             return super::row::unsupported_state(cx).into_any_element();
+        }
+        if self.every_project_hidden(cx) {
+            let show_all = cx.listener(|this, _, _, cx| {
+                this.update_prefs(|p| p.hide_projects.clear(), cx);
+            });
+            return super::row::empty_every_project_hidden(show_all, cx).into_any_element();
         }
         let none_answered = self.held_pages.is_empty();
         let pending = self.is_pending();
@@ -1508,16 +1620,44 @@ mod tests {
             assert_eq!(remote_desc.host.as_deref(), Some("dev.azure.com"));
             assert_eq!(remote_desc.issue_scope.as_deref(), Some("acme/Core"));
 
-            // Selecting a secondary-env project by canonical ID still matches saved-remote!
-            page.prefs.issue_server = Some("canon-remote".into());
-            page.prefs.issue_project = Some("p-remote".into());
-            let scoped_targets = page.active_targets(cx);
-            assert_eq!(scoped_targets.len(), 1);
-            assert_eq!(scoped_targets[0].env_id, "saved-remote");
+            // Hiding a secondary-env project by canonical ID resolves to `saved-remote` and skips
+            // that environment when its only project is hidden!
+            page.prefs.hide_projects = vec![("canon-remote".into(), "p-remote".into())];
             assert_eq!(
-                page.canonical_scoped_project(cx).map(|s| s.environment_id),
-                Some("saved-remote".into())
+                page.canonical_hidden_projects(cx),
+                vec![("saved-remote".into(), "p-remote".into())]
             );
+            assert!(!page.every_project_hidden(cx));
+            let active = page.active_targets(cx);
+            assert_eq!(active.len(), 1);
+            assert_ne!(active[0].env_id, "saved-remote");
+            let planned = page.planned_targets(IssueListRefreshMode::Background, cx);
+            assert_eq!(planned.len(), 1);
+            assert!(planned[0].input.exclude_project_ids.is_empty());
+
+            // Hiding the remaining project hits `every_project_hidden` and yields zero planned targets.
+            let remaining = projects
+                .iter()
+                .find(|p| p.project_id != "p-remote")
+                .expect("local project exists")
+                .clone();
+            page.toggle_project_hidden(&remaining.environment_id, &remaining.project_id, cx);
+            assert!(page.every_project_hidden(cx));
+            assert!(
+                page.planned_targets(IssueListRefreshMode::Background, cx)
+                    .is_empty()
+            );
+
+            // Unhiding clears canonical alias match as well.
+            page.toggle_project_hidden("saved-remote", "p-remote", cx);
+            assert!(!page.every_project_hidden(cx));
+            assert!(
+                !page
+                    .canonical_hidden_projects(cx)
+                    .iter()
+                    .any(|(env, proj)| env == "saved-remote" && proj == "p-remote")
+            );
+            page.prefs.hide_projects.clear();
 
             // 2. Active labels/assignee lead before 30-item truncation.
             let many_labels: Vec<String> = (0..35).map(|i| format!("a-label-{i:02}")).collect();

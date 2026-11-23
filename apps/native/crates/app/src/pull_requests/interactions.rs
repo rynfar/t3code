@@ -403,7 +403,12 @@ pub(super) fn comment_form(view: &mut DetailView, detail: &Detail, window: &mut 
 
     let preview = view.comment_preview;
     let editor = if preview {
-        markdown_preview(&body, &mut view.markdown, "pr-comment-preview", cx)
+        let preview_body = if detail.provider == "github" {
+            t3_core::pull_requests::emoji::replace_github_emojis(&body)
+        } else {
+            body.clone()
+        };
+        markdown_preview(&preview_body, &mut view.markdown, "pr-comment-preview", cx)
     } else {
         Textarea::new(&input).disabled(locked).theme_slot(ThemeSlot::Input, cx).into_any_element()
     };

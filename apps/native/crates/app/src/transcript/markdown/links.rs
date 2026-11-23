@@ -975,16 +975,53 @@ fn open_resolved_issue_link(
     });
 }
 
+fn is_http_or_https(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || trimmed
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+pub(crate) fn open_browser_link(
+    url: &str,
+    modifiers: gpui::Modifiers,
+    state: Option<&Entity<AppState>>,
+    thread_id: Option<String>,
+    cx: &mut App,
+) {
+    let browser_link_target = crate::settings::client_settings(cx).browser_link_target();
+    let active_thread_id = thread_id.or_else(|| {
+        state.and_then(|s| {
+            let app = s.read(cx);
+            (!app.pull_requests_open && !app.issues_open)
+                .then(|| app.selected_thread.clone())
+                .flatten()
+        })
+    });
+    if !modifiers.platform
+        && !modifiers.control
+        && is_http_or_https(url)
+        && browser_link_target == BrowserLinkTarget::App
+        && let Some(previews) = crate::preview::previews(cx)
+        && let Some(thread_id) = active_thread_id
+    {
+        previews.update(cx, |p, cx| p.open_link(thread_id, url.to_owned(), cx));
+        return;
+    }
+
+    cx.open_url(url);
+}
+
 fn open_external_link(
     url: &str,
     modifiers: gpui::Modifiers,
     action_ctx: Option<&MarkdownActionContext>,
     cx: &mut App,
 ) {
-    let (pr_links_in_app, browser_link_target) = {
-        let settings = crate::settings::client_settings(cx);
-        (settings.pull_request_links_open_in_app(), settings.browser_link_target())
-    };
+    let pr_links_in_app = crate::settings::client_settings(cx).pull_request_links_open_in_app();
     if !modifiers.platform
         && !modifiers.control
         && pr_links_in_app
@@ -1009,15 +1046,13 @@ fn open_external_link(
         return;
     }
 
-    if browser_link_target == BrowserLinkTarget::App
-        && let Some(previews) = crate::preview::previews(cx)
-        && let Some(thread_id) = action_ctx.and_then(|c| c.thread_id.clone().or_else(|| c.state.read(cx).selected_thread.clone()))
-    {
-        previews.update(cx, |p, cx| p.open_link(thread_id, url.to_owned(), cx));
-        return;
-    }
-
-    cx.open_url(url);
+    open_browser_link(
+        url,
+        modifiers,
+        action_ctx.map(|c| &c.state),
+        action_ctx.and_then(|c| c.thread_id.clone()),
+        cx,
+    );
 }
 
 /// Routes to a saved citation's source message (either on the active environment or cross-env).

@@ -167,6 +167,15 @@ fn lines(entry: &ListEntry, elsewhere: bool, stack_popover: Option<AnyElement>, 
                 .child(div().flex_none().font_family(mono).text_xs().text_color(hsla(p.muted_foreground)).child(format!("#{}", entry.number)))
                 .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(entry.title.clone()))
                 .children(stack_popover)
+                .children((entry.visibility == Some(t3_core::pull_requests::wire::PullRequestVisibility::Private)).then(|| {
+                    glyph(
+                        SharedString::from(format!("pr-private-{key}")),
+                        Icon::Lock,
+                        hsla(p.muted_foreground),
+                        12.,
+                        crate::i18n::t(cx, "Private"),
+                    )
+                }))
                 .children(entry.checks_state.map(|state| {
                     let (icon, color) = checks_glyph(state, cx);
                     glyph(SharedString::from(format!("pr-checks-{key}")), icon, color, 14., t3_core::pull_requests::detail::checks_state_label(state))

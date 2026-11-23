@@ -120,6 +120,36 @@ fn repository_before<'a>(kind: &str, path: &'a str, route: &str) -> Option<(&'a 
 
 /// GitCafe has no self-hosted installs (`GITCAFE_HOSTS`).
 const GITCAFE_HOSTS: &[&str] = &["git.cafe", "staging.git.cafe"];
+const TANSTACK_SOURCE_HOST: &str = "source.tanstack.com";
+
+fn without_owner_mark(repo: &str) -> &str {
+    repo.strip_prefix('@')
+        .or_else(|| repo.get(..3).filter(|p| p.eq_ignore_ascii_case("%40")).map(|_| &repo[3..]))
+        .unwrap_or(repo)
+}
+
+fn parse_tanstack_source(url: &url::Url, host: &str) -> Option<(String, u64)> {
+    if host != TANSTACK_SOURCE_HOST {
+        return None;
+    }
+    let mut segments = url.path().strip_prefix('/')?.splitn(5, '/');
+    let (owner_raw, name, route, digits) =
+        (segments.next()?, segments.next()?, segments.next()?, segments.next()?);
+    let owner = without_owner_mark(owner_raw);
+    if owner.is_empty()
+        || owner.contains('@')
+        || owner.contains('%')
+        || name.is_empty()
+        || route != "pull"
+    {
+        return None;
+    }
+    let number: u64 = digits
+        .parse()
+        .ok()
+        .filter(|number| *number > 0 && digits.chars().all(|c| c.is_ascii_digit()))?;
+    Some((format!("{owner}/{name}").to_lowercase(), number))
+}
 
 /// GitCafe's `CHANGE_REQUEST_PATH`, `/<owner>/<repo>/pull(s)/<n>`, on its own hosts only: the
 /// route is GitHub's and Forgejo's shape too, so GitCafe claims it first.
@@ -163,6 +193,9 @@ fn parse_claimed(value: &str) -> Option<(&'static str, ChangeRequestLink)> {
     if let Some((repository, number)) = parse_gitcafe(&url, &host) {
         return Some(("gitcafe", ChangeRequestLink { host, repository, number, url: value.trim().to_owned() }));
     }
+    if let Some((repository, number)) = parse_tanstack_source(&url, &host) {
+        return Some(("tanstack-source", ChangeRequestLink { host, repository, number, url: value.trim().to_owned() }));
+    }
     ROUTES.iter().find_map(|(kind, route)| {
         let (repository, rest) = repository_before(kind, url.path(), route)?;
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -182,7 +215,11 @@ pub fn parse_reference(input: &str) -> Option<String> {
     }
     let mut words = trimmed.split_whitespace();
     let normalized = match (words.next(), words.next(), words.next()) {
-        (Some(gh), Some(pr), Some(checkout)) if gh.eq_ignore_ascii_case("gh") && pr.eq_ignore_ascii_case("pr") && checkout.eq_ignore_ascii_case("checkout") => {
+        (Some(cli), Some(pr), Some(checkout))
+            if (cli.eq_ignore_ascii_case("gh") || cli.eq_ignore_ascii_case("src"))
+                && pr.eq_ignore_ascii_case("pr")
+                && checkout.eq_ignore_ascii_case("checkout") =>
+        {
             words.collect::<Vec<_>>().join(" ")
         }
         _ => trimmed.to_owned(),
@@ -210,14 +247,20 @@ impl LinkProject {
     /// From a project's `repositoryIdentity`.
     pub fn from_identity(identity: &Value) -> Option<LinkProject> {
         let text = |key: &str| identity.get(key).and_then(Value::as_str).map(str::to_owned).filter(|s| !s.trim().is_empty());
-        let repository = text("displayName").or_else(|| Some(format!("{}/{}", text("owner")?, text("name")?)))?;
+        let provider = text("provider").unwrap_or_else(|| "github".into());
+        let raw_repository = text("displayName").or_else(|| Some(format!("{}/{}", text("owner")?, text("name")?)))?;
+        let repository = if provider == "tanstack-source" {
+            without_owner_mark(&raw_repository).to_owned()
+        } else {
+            raw_repository
+        };
         let web_url = text("webUrl");
         let host = web_url
             .as_deref()
             .and_then(|web| url::Url::parse(web).ok())
             .and_then(|url| url.host_str().map(str::to_lowercase))
             .or_else(|| text("canonicalKey").and_then(|key| key.split('/').next().map(str::to_lowercase)))?;
-        Some(LinkProject { provider: text("provider").unwrap_or_else(|| "github".into()), host, repository, web_url })
+        Some(LinkProject { provider, host, repository, web_url })
     }
 
     /// `changeRequestUrl` for the hosts whose routes are known from a repository path.
@@ -231,6 +274,10 @@ impl LinkProject {
             "gitlab" => Some(below("-/merge_requests")),
             "bitbucket" => Some(below("pull-requests")),
             "forgejo" | "gitcafe" => Some(below("pulls")),
+            "tanstack-source" => Some(match &self.web_url {
+                Some(web) => format!("{}/pull/{number}", web.trim_end_matches('/')),
+                None => format!("https://{}/@{}/pull/{number}", self.host, without_owner_mark(&self.repository)),
+            }),
             _ => None,
         }
     }
@@ -562,6 +609,29 @@ mod tests {
         ];
         let matched: Vec<&str> = filter_linkable_threads(&candidates, "fix").iter().map(|t| t.id.as_str()).collect();
         assert_eq!(matched, vec!["t2", "t1"]);
+    }
+
+    #[test]
+    fn tanstack_source_claims_owner_prefixed_pr_urls_and_strips_owner_mark() {
+        let parsed = parse_change_request_url("https://source.tanstack.com/@TanStack/router/pull/8882/files").unwrap();
+        assert_eq!(parsed.host, "source.tanstack.com");
+        assert_eq!(parsed.repository, "tanstack/router");
+        assert_eq!(parsed.number, 8882);
+        assert_eq!(
+            change_request_provider("https://source.tanstack.com/%40TanStack/router/pull/8882"),
+            Some("tanstack-source")
+        );
+
+        let project = LinkProject::from_identity(&serde_json::json!({
+            "canonicalKey": "source.tanstack.com/tanstack/router",
+            "provider": "tanstack-source",
+            "displayName": "@TanStack/router"
+        }))
+        .unwrap();
+        assert_eq!(project.repository, "TanStack/router");
+        let resolved = resolve_link_input("src pr checkout #8882", Some(&project)).unwrap().unwrap();
+        assert_eq!(resolved.url, "https://source.tanstack.com/@TanStack/router/pull/8882");
+        assert_eq!(resolved.repository, "tanstack/router");
     }
 
     #[test]

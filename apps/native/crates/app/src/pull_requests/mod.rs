@@ -205,6 +205,27 @@ pub fn open_link_dialog(dialog: &Entity<LinkPullRequestDialog>, window: &mut Win
 }
 
 pub(crate) fn link_projects(state: &AppState) -> Vec<t3_core::pull_requests::target::Project<'_>> {
+    if !state.fleet.environments.is_empty() {
+        return state
+            .fleet
+            .environments
+            .iter()
+            .flat_map(|env| {
+                let environment = env.summary.owner.saved_id.as_str();
+                let config_loaded = env.config.config.is_some();
+                env.summary
+                    .projects
+                    .iter()
+                    .filter(|scoped| scoped.project.archived_at.is_none())
+                    .map(move |scoped| t3_core::pull_requests::target::Project {
+                        id: &scoped.project.id,
+                        environment,
+                        identity: scoped.project.repository_identity.as_ref(),
+                        config_loaded,
+                    })
+            })
+            .collect();
+    }
     let Some(environment) = state.environment() else { return Vec::new() };
     state.shell.snapshot.as_ref().into_iter().flat_map(|s| &s.projects).map(|project| t3_core::pull_requests::target::Project {
         id: &project.id, environment, identity: project.repository_identity.as_ref(), config_loaded: state.server_config.config.is_some(),
@@ -212,26 +233,47 @@ pub(crate) fn link_projects(state: &AppState) -> Vec<t3_core::pull_requests::tar
 }
 
 pub(crate) fn open_resolved_link(state: &Entity<AppState>, target: t3_core::pull_requests::target::Target, cx: &mut App) {
-    if state.read(cx).environment() != Some(target.environment.as_str()) { return; }
-    let open_in_right_panel = {
+    let env_known = {
         let app = state.read(cx);
-        !app.pull_requests_open && app.selected_thread.is_some()
+        app.environment() == Some(target.environment.as_str())
+            || app.fleet.environments.iter().any(|env| {
+                env.summary.owner.saved_id == target.environment
+                    || env.summary.owner.canonical_id.as_deref() == Some(target.environment.as_str())
+            })
     };
-    if open_in_right_panel {
+    if !env_known {
+        return;
+    }
+    let (open_in_issues, open_in_thread_panel) = {
+        let app = state.read(cx);
+        (
+            app.issues_open && !app.pull_requests_open,
+            !app.pull_requests_open && app.selected_thread.is_some(),
+        )
+    };
+    let pr_target = t3_core::right_panel::PullRequestTarget {
+        environment_id: Some(target.environment),
+        project_id: target.reference.project_id.clone(),
+        host: target.reference.host.clone(),
+        repository: target.reference.repository.clone(),
+        number: target.reference.number,
+        url: Some(target.url.clone()),
+        reveal_url: Some(target.url.clone()),
+        detail_tab: None,
+    };
+    if open_in_issues {
         state.update(cx, |state, cx| {
-            state.open_pull_request_surface(
-                t3_core::right_panel::PullRequestTarget {
-                    environment_id: Some(target.environment),
-                    project_id: target.reference.project_id,
-                    host: target.reference.host,
-                    repository: target.reference.repository,
-                    number: target.reference.number,
-                    url: Some(target.url.clone()),
-                    reveal_url: Some(target.url),
-                    detail_tab: None,
-                },
+            state.open_pull_request_surface_for_key(
+                t3_core::right_panel::ISSUES_PANEL_THREAD_KEY,
+                pr_target,
                 cx,
             );
+        });
+        return;
+    }
+    if open_in_thread_panel {
+        state.update(cx, |state, cx| {
+            state.open_pull_request_surface(pr_target, cx);
         });
         return;
     }
@@ -250,6 +292,12 @@ pub(crate) fn open_context_link(state: &Entity<AppState>, url: &str, cx: &mut Ap
     let target = t3_core::pull_requests::target::resolve(url, &link_projects(app), environment, project, environment, true);
     match target {
         Some(target) => open_resolved_link(state, target, cx),
-        None => cx.open_url(url),
+        None => crate::transcript::markdown::open_browser_link(
+            url,
+            gpui::Modifiers::default(),
+            Some(state),
+            None,
+            cx,
+        ),
     }
 }

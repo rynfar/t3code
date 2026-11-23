@@ -490,7 +490,8 @@ pub(crate) fn tracker_icon(tracker: &IssueTrackerKind) -> Icon {
         IssueTrackerKind::GitHub
         | IssueTrackerKind::GitLab
         | IssueTrackerKind::AzureDevOps
-        | IssueTrackerKind::Forgejo => Icon::GitBranch,
+        | IssueTrackerKind::Forgejo
+        | IssueTrackerKind::TanStackSource => Icon::GitBranch,
         IssueTrackerKind::Linear | IssueTrackerKind::Jira | IssueTrackerKind::Unknown(_) => {
             Icon::Ticket
         }

@@ -140,6 +140,11 @@ fn thread_setting_commands_use_wire_literals() {
     assert_eq!(set_interaction_mode("c", "t", InteractionMode::Plan)["interactionMode"], "plan");
     assert_eq!(set_model_selection("c", "t", &selection())["type"], "thread.model-selection.set");
     assert_eq!(ApprovalDecision::parse("acceptAlways"), Some(ApprovalDecision::AcceptAlways));
+    let renamed = with_title_renamed(
+        create_thread("c", "t", "p", "PR title", &selection(), RuntimeMode::FullAccess, InteractionMode::Default, None, None),
+        true,
+    );
+    assert_eq!(renamed["titleRenamed"], json!(true));
 }
 
 #[test]

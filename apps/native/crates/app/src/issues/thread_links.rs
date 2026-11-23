@@ -626,7 +626,7 @@ pub(crate) fn render_picker_overlay<V: 'static>(
         .collect();
     let (mut threads, project_names) =
         environment_threads_and_projects(state.read(cx), environment_id.as_deref(), &key, &linked_ids);
-    let needle = links.picker_query.trim().to_lowercase();
+    let needle = links.picker_query.trim();
     threads.retain(|thread| {
         if needle.is_empty() {
             return true;
@@ -635,9 +635,7 @@ pub(crate) fn render_picker_overlay<V: 'static>(
             .get(&thread.project_id)
             .map(String::as_str)
             .unwrap_or("");
-        format!("{} {}", thread.title, proj)
-            .to_lowercase()
-            .contains(&needle)
+        t3_core::issues::links::thread_link_matches(needle, &format!("{} {}", thread.title, proj))
     });
     threads.sort_by_key(|b| std::cmp::Reverse(b.updated_at_ms));
     let pending = links.pending;

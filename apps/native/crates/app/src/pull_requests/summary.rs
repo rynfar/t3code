@@ -104,7 +104,7 @@ pub fn render(view: &mut DetailView, window: &mut Window, cx: &mut Context<Detai
             this.checks_open = !this.checks_open;
             cx.notify();
         })))
-        .when(open, |this| this.child(checks(&detail, cx)))
+        .children(open.then(|| checks(view, &detail, cx)))
         .when(!open, |this| this.child(div().px(px(16.)).pb(px(16.)).text_xs().text_color(hsla(p.muted_foreground)).child(describe_checks(&detail.checks))))
         .child(comments)
         .into_any_element()
@@ -117,7 +117,12 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
         let saving = view.description_saves > 0;
         let preview = view.description_preview;
         let editor = if preview {
-            let text = input.read(cx).value().to_string();
+            let raw = input.read(cx).value().to_string();
+            let text = if detail.provider == "github" {
+                t3_core::pull_requests::emoji::replace_github_emojis(&raw)
+            } else {
+                raw
+            };
             markdown_preview(&text, &mut view.markdown, "pr-description-preview", cx)
         } else {
             Textarea::new(&input).disabled(saving).theme_slot(ThemeSlot::Input, cx).into_any_element()
@@ -155,9 +160,17 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
     let body = view.description().unwrap_or_default();
     let segments = if view.can_edit_description(cx) { task_segments(&body) } else { None };
     let scope = view.media_scope(detail, cx);
+    let action_ctx = view.markdown_action_ctx(cx);
+    let is_github = detail.provider == "github";
     let Some(segments) = segments else {
-        let text: Arc<str> = if body.trim().is_empty() { Arc::from("_No description provided._") } else { Arc::from(body.as_str()) };
-        let state = view.markdown.state_with_media_scope(&format!("body:{}", detail.url), &text, None, Some(scope), cx);
+        let text: Arc<str> = if body.trim().is_empty() {
+            Arc::from("_No description provided._")
+        } else if is_github {
+            Arc::from(t3_core::pull_requests::emoji::replace_github_emojis(&body).as_str())
+        } else {
+            Arc::from(body.as_str())
+        };
+        let state = view.markdown.state_with_media_scope(&format!("body:{}", detail.url), &text, Some(action_ctx), Some(scope), cx);
         return prose(&state, cx).into_any_element();
     };
     let p = palette(cx);
@@ -168,8 +181,13 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
             Segment::Task { marker, checked, text, depth } => (Some(checkbox(index, marker, checked, cx)), text, depth),
             Segment::Item { bullet, text, depth } => (Some(div().flex_none().min_w(px(16.)).text_color(hsla(p.muted_foreground)).child(bullet).into_any_element()), text, depth),
         };
-        let text: Arc<str> = Arc::from(text.as_str());
-        let state = view.markdown.state_with_media_scope(&format!("body:{}:{index}", detail.url), &text, None, Some(scope.clone()), cx);
+        let rendered = if is_github {
+            t3_core::pull_requests::emoji::replace_github_emojis(&text)
+        } else {
+            text
+        };
+        let text: Arc<str> = Arc::from(rendered.as_str());
+        let state = view.markdown.state_with_media_scope(&format!("body:{}:{index}", detail.url), &text, Some(action_ctx.clone()), Some(scope.clone()), cx);
         let content = div().flex_1().min_w_0().child(prose(&state, cx));
         rows.push(h_flex().items_start().gap(px(6.)).pl(px(NEST * depth as f32)).children(lead).child(content).into_any_element());
     }
@@ -356,7 +374,7 @@ fn label_picker(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>
     }, cx)
 }
 
-fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
+fn checks(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
     let p = palette(cx);
     if detail.checks.is_empty() {
         return v_flex()
@@ -368,9 +386,13 @@ fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
                 div().child(Button::new("pr-checks-refresh", Variant::Ghost, Size::Xs).label("Refresh").on_click(cx.listener(|this, _, _, cx| this.refresh_checks(cx)))),
             );
     }
-    v_flex().px(px(12.)).pb(px(16.)).children(ordered_checks(&detail.checks).into_iter().enumerate().map(|(index, check)| {
+    let state = view.state.clone();
+    let thread_id = view.link_thread_id(cx);
+    v_flex().px(px(12.)).pb(px(16.)).children(ordered_checks(&detail.checks).into_iter().enumerate().map(move |(index, check)| {
         let (icon, color) = check_glyph(check.status, cx);
         let url = check.url.clone();
+        let state = state.clone();
+        let thread_id = thread_id.clone();
         h_flex()
             .id(SharedString::from(format!("pr-check-{index}")))
             .items_start()
@@ -389,9 +411,15 @@ fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
             }))
             .child(div().flex_1().min_w_0().text_color(hsla(p.foreground)).child(check.name.clone()))
             .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(check_status_label(check)))
-            .on_click(move |_, _, cx| {
+            .on_click(move |ev, _, cx| {
                 if let Some(url) = &url {
-                    cx.open_url(url);
+                    crate::transcript::markdown::open_browser_link(
+                        url,
+                        ev.modifiers(),
+                        Some(&state),
+                        thread_id.clone(),
+                        cx,
+                    );
                 }
             })
     }))

@@ -11,7 +11,7 @@ use gpui::{
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_core::issues::list::{IssueListPreferences, MAX_LABELS};
+use t3_core::issues::list::{IssueListPreferences, MAX_LABELS, is_project_hidden};
 use t3_core::issues::saved_views::{
     is_view_modified, issue_view_matches, issue_view_suggested_name, resolve_selected_view,
     saved_view_name_error,
@@ -221,7 +221,7 @@ fn filters_menu(
 ) -> AnyElement {
     let prefs = page.prefs.clone();
     let filter_projects = page.filter_projects(cx);
-    let scoped_project = page.canonical_scoped_project(cx);
+    let hidden_projects = page.canonical_hidden_projects(cx);
     let candidates = page.candidates_tracker.merged();
     let failed_candidates = !page.candidates_tracker.failed_targets().is_empty();
 
@@ -300,68 +300,48 @@ fn filters_menu(
                 cx,
             );
 
-            if filter_projects.len() > 1 || scoped_project.is_some() {
-                let shown_project = scoped_project
-                    .as_ref()
-                    .map(|scoped| {
-                        filter_projects
-                            .iter()
-                            .find(|p| {
-                                p.environment_id == scoped.environment_id
-                                    && p.project_id == scoped.project_id
-                            })
-                            .map(|p| p.title.clone())
-                            .unwrap_or_else(|| t(cx, "Unavailable project").to_owned())
-                    })
-                    .unwrap_or_else(|| t(cx, "All projects").to_owned());
+            if !filter_projects.is_empty() || !hidden_projects.is_empty() {
+                let hidden_count = hidden_projects.len();
+                let shown_project = if hidden_count == 0 {
+                    t(cx, "All projects").to_owned()
+                } else {
+                    t(cx, "{hidden} hidden").replace("{hidden}", &hidden_count.to_string())
+                };
                 let project_entity = entity.clone();
                 let projects = filter_projects.clone();
-                let current_project = scoped_project.clone();
+                let current_hidden = hidden_projects.clone();
                 menu = menu.submenu(
-                    format!("{} · {shown_project}", t(cx, "Project")),
+                    format!("{} · {shown_project}", t(cx, "Projects")),
                     window,
                     cx,
                     move |menu, _, cx| {
                         let clear_entity = project_entity.clone();
-                        let mut menu = menu.item(
-                            PopupMenuItem::new(t(cx, "All projects").to_owned())
-                                .checked(current_project.is_none())
-                                .on_click(move |_, _, cx| {
-                                    update(&clear_entity, cx, |prefs| {
-                                        prefs.issue_server = None;
-                                        prefs.issue_project = None;
-                                    });
-                                }),
-                        );
-                        if let Some(scoped) = &current_project
-                            && !projects.iter().any(|p| {
-                                p.environment_id == scoped.environment_id
-                                    && p.project_id == scoped.project_id
-                            })
-                        {
-                            menu = menu.item(
-                                PopupMenuItem::new(t(cx, "Unavailable project").to_owned())
-                                    .checked(true)
-                                    .disabled(true),
-                            );
-                        }
+                        let menu = menu
+                            .item(
+                                PopupMenuItem::new(t(cx, "Show all").to_owned())
+                                    .checked(current_hidden.is_empty())
+                                    .on_click(move |_, _, cx| {
+                                        update(&clear_entity, cx, |prefs| {
+                                            prefs.hide_projects.clear();
+                                        });
+                                    }),
+                            )
+                            .separator();
                         projects.iter().fold(menu, |menu, project| {
-                            let is_selected = current_project.as_ref().is_some_and(|s| {
-                                s.environment_id == project.environment_id
-                                    && s.project_id == project.project_id
-                            });
+                            let visible = !is_project_hidden(
+                                &current_hidden,
+                                &project.environment_id,
+                                &project.project_id,
+                            );
                             let env_id = project.environment_id.clone();
                             let project_id = project.project_id.clone();
                             let entity = project_entity.clone();
                             menu.item(
                                 PopupMenuItem::new(project.title.clone())
-                                    .checked(is_selected)
+                                    .checked(visible)
                                     .on_click(move |_, _, cx| {
-                                        let env_id = env_id.clone();
-                                        let project_id = project_id.clone();
-                                        update(&entity, cx, move |prefs| {
-                                            prefs.issue_server = Some(env_id);
-                                            prefs.issue_project = Some(project_id);
+                                        let _ = entity.update(cx, |this, cx| {
+                                            this.toggle_project_hidden(&env_id, &project_id, cx);
                                         });
                                     }),
                             )

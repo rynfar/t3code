@@ -150,6 +150,7 @@ pub(super) fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bo
             .on_click(cx.listener(move |this, _, _, cx| this.add_comment_to_chat(thread_id.as_deref(), &comment_id, cx)))
     });
     let scope = detail_clone.as_ref().map(|detail| view.media_scope(detail, cx));
+    let action_ctx = view.markdown_action_ctx(cx);
     let body: Option<AnyElement> = if is_editing_this {
         let edit_input = view.editing_comment.as_ref().map(|e| e.input.clone());
         let saving = view.editing_comment.as_ref().is_some_and(|e| e.saving);
@@ -178,8 +179,13 @@ pub(super) fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bo
     } else {
         event.body.clone().map(|body| {
             if event.markdown {
-                let text: Arc<str> = Arc::from(body.as_str());
-                let state = view.markdown.state_with_media_scope(&format!("event:{}", event.id), &text, None, scope.clone(), cx);
+                let rendered = if detail_clone.as_ref().is_some_and(|d| d.provider == "github") {
+                    t3_core::pull_requests::emoji::replace_github_emojis(&body)
+                } else {
+                    body
+                };
+                let text: Arc<str> = Arc::from(rendered.as_str());
+                let state = view.markdown.state_with_media_scope(&format!("event:{}", event.id), &text, Some(action_ctx.clone()), scope.clone(), cx);
                 prose(&state, cx).into_any_element()
             } else {
                 div().text_sm().text_color(hsla(p.foreground)).child(body).into_any_element()

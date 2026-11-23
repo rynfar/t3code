@@ -194,6 +194,18 @@ impl AppState {
         }
     }
 
+    /// Opens a single pull request tab in a named panel key (e.g. `ISSUES_PANEL_THREAD_KEY`).
+    pub fn open_pull_request_surface_for_key(
+        &mut self,
+        panel_key: &str,
+        target: PullRequestTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panels.panels.open_pull_request(panel_key, target) {
+            self.save_panels(cx);
+        }
+    }
+
     pub fn set_pull_request_surface_detail_tab(&mut self, thread_id: &str, surface_id: &str, tab: PullRequestDetailTab, cx: &mut Context<Self>) {
         if self.panels.panels.set_pull_request_detail_tab(thread_id, surface_id, tab) {
             self.save_panels(cx);

@@ -242,7 +242,7 @@ impl RenderOnce for Button {
             .when(enabled, |this| this.cursor_pointer().hover(move |style| style.bg(hover_fill).text_color(hover_text)))
             .when(self.busy, |this| this.child(Spinner::new("pr-button-progress", px(icon_size), look.icon)))
             .when_some(self.icon.filter(|_| !self.busy), |this, icon| this.child(icon.sized(px(icon_size)).text_color(look.icon)))
-            .when_some(self.label, |this, label| this.child(label))
+            .when_some(self.label, |this, label| this.child(div().min_w_0().truncate().child(label)))
             .when_some(self.trailing, |this, count| this.child(div().px(px(6.)).rounded_full().bg(pill).text_xs().text_color(pill_text).child(count)))
             .when_some(self.tooltip, |this, text| this.tooltip(move |window, cx| tooltip_view(text.clone(), window, cx)))
             .when_some(self.on_click.filter(|_| enabled), |this, handler| {

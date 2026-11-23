@@ -555,16 +555,19 @@ impl PromptLinks {
                     &checkout.pull_request,
                     Some(prepared.pull_request.title.as_str()),
                 );
-                let create_cmd = t3_core::commands::create_thread(
-                    &crate::sidebar::controller::uuid(),
-                    &thread_id,
-                    &checkout.project_id,
-                    &title,
-                    &model_selection,
-                    t3_core::server_config::RuntimeMode::FullAccess,
-                    t3_core::server_config::InteractionMode::Default,
-                    Some(&prepared.branch),
-                    prepared.worktree_path.as_deref(),
+                let create_cmd = t3_core::commands::with_title_renamed(
+                    t3_core::commands::create_thread(
+                        &crate::sidebar::controller::uuid(),
+                        &thread_id,
+                        &checkout.project_id,
+                        &title,
+                        &model_selection,
+                        t3_core::server_config::RuntimeMode::FullAccess,
+                        t3_core::server_config::InteractionMode::Default,
+                        Some(&prepared.branch),
+                        prepared.worktree_path.as_deref(),
+                    ),
+                    true,
                 );
                 let pr_link = rules::pull_request_checkout_link(&checkout.pull_request, &prepared.pull_request.url);
                 let link_cmd = t3_core::pull_requests::link::link_command(
@@ -1097,6 +1100,7 @@ mod tests {
                 assert_eq!(payload["projectId"], "proj-t3");
                 assert_eq!(payload["branch"], "feat/pr-111");
                 assert_eq!(payload["worktreePath"], "/repo/.worktrees/pr-111");
+                assert_eq!(payload["titleRenamed"], json!(true));
             } else {
                 assert_eq!(payload["number"], 111);
                 assert_eq!(payload["repository"], "pingdotgg/t3code");

@@ -10,6 +10,7 @@ pub mod cache;
 pub mod chat_context;
 pub mod detail;
 pub mod editing;
+pub mod emoji;
 pub mod guide;
 pub mod link;
 pub mod list;

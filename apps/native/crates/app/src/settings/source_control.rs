@@ -11,6 +11,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Map, Value, json};
 use t3_core::auth::ORCHESTRATION_READ_SCOPE;
@@ -24,9 +25,9 @@ use t3_core::server_config::ServerConfig;
 use t3_core::settings::search::Section;
 use t3_core::settings::source_control::{
     self, AppSignInDef, DISCOVER, Discovery, DiscoveryItem, Dot, HostCredentialsDef, HostDefinition, HostFieldDef, MERGE_METHODS, SIGN_IN_CANCEL,
-    SIGN_IN_START, SIGN_IN_WAIT, SignInPrompt, SourceControlChange, WritingMode, decode_discovery, decode_sign_in_prompt, group_host_accounts,
-    has_secret_value, host_definition, issue_tracker_summary, merge_method_value, next_host_account_choices, parse_merge_method,
-    read_host_credential_settings, read_host_fields,
+    SIGN_IN_START, SIGN_IN_WAIT, SignInPrompt, SourceControlChange, WritingMode, bound_issue_tracker_scopes, decode_discovery, decode_sign_in_prompt,
+    group_host_accounts, has_issue_tracker_teams, has_secret_value, host_definition, issue_tracker_binding_for, issue_tracker_scope_options,
+    issue_tracker_summary, merge_method_value, next_host_account_choices, parse_merge_method, read_host_credential_settings, read_host_fields,
 };
 
 use super::controls::{
@@ -39,11 +40,11 @@ use super::{Block, SettingsView, store};
 use crate::components::secret_source::SecretSourceInput;
 use crate::i18n::t;
 use crate::icons::{Icon, source_control_logo};
+use crate::pull_requests::controls::{Button as MenuButton, Size as MenuButtonSize, Variant as MenuButtonVariant};
 use crate::theme::{hsla, palette};
 
 const STORED_SECRET: &str = "__stored__";
 const ACTIVE_ACCOUNT: &str = "__active__";
-const UNBOUND_SCOPE: &str = "__unbound__";
 
 /// `badge.tsx` tints the settings pages use.
 #[derive(Clone, Copy)]
@@ -464,8 +465,7 @@ impl SettingsView {
     fn bind_issue_tracker_project(
         &mut self,
         project_id: String,
-        tracker: IssueTrackerKind,
-        scope: String,
+        binding: Option<IssueTrackerProjectBinding>,
         cx: &mut Context<Self>,
     ) {
         if !self.can_edit_issue_trackers(cx) {
@@ -476,20 +476,6 @@ impl SettingsView {
         }
         let scope_key = self.issue_tracker_scope_key(cx);
         self.source_control.binding_pending.insert(project_id.clone());
-        let additional_scopes = self
-            .source_control
-            .trackers
-            .as_ref()
-            .and_then(|res| res.as_ref().ok())
-            .and_then(|list| list.bindings.get(&project_id))
-            .filter(|existing| existing.tracker == tracker)
-            .map(|existing| existing.additional_scopes.clone())
-            .unwrap_or_default();
-        let binding = (scope != UNBOUND_SCOPE).then_some(IssueTrackerProjectBinding {
-            tracker,
-            scope,
-            additional_scopes,
-        });
         let payload = serde_json::to_value(IssueTrackerBindProjectInput {
             project_id: project_id.clone(),
             binding,
@@ -787,56 +773,93 @@ impl SettingsView {
                         .control(credential_control),
                     );
 
-                if usable && !projects.is_empty() && !tracker.scopes.is_empty() {
+                if usable && !projects.is_empty() && has_issue_tracker_teams(&tracker, &list.bindings) {
                     details = details.child(
                         Row::new(
                             SharedString::from(format!("issue-tracker-projects-{key}")),
                             "Projects",
                         )
                         .description(format!(
-                            "Pick the {} {} whose issues each project lists beside its repository's own.",
+                            "Pick one or more {} {}s for each project. Their issues list beside the repository's own, and agents file new issues in the first one unless asked for another.",
                             tracker.display_name, tracker.scope_noun
                         )),
                     );
                     for (project_id, project_title) in &projects {
                         let bound = list.bindings.get(project_id);
-                        let current_scope = bound
-                            .filter(|b| b.tracker == tracker.tracker)
-                            .map(|b| b.scope.as_str())
-                            .unwrap_or(UNBOUND_SCOPE);
-                        let mut options = vec![SelectOption::new(UNBOUND_SCOPE, "Not bound")];
-                        for scope in &tracker.scopes {
-                            options.push(SelectOption::new(
-                                scope.key.clone(),
-                                format!("{} ({})", scope.name, scope.key),
-                            ));
-                        }
+                        let current_scopes = bound_issue_tracker_scopes(&tracker.tracker, bound);
+                        let options = issue_tracker_scope_options(&tracker, &current_scopes);
+                        let trigger_label = if current_scopes.is_empty() {
+                            t(cx, "Not bound").to_owned()
+                        } else {
+                            current_scopes
+                                .iter()
+                                .map(|scope_key| {
+                                    tracker
+                                        .scopes
+                                        .iter()
+                                        .find(|s| s.key == *scope_key)
+                                        .map_or(scope_key.as_str(), |s| s.name.as_str())
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
                         let is_pending = self.source_control.binding_pending.contains(project_id);
                         let view = cx.entity().downgrade();
                         let bind_project_id = project_id.clone();
                         let bind_tracker = tracker.tracker.clone();
+                        let tooltip_text = format!(
+                            "{} {} for {}",
+                            tracker.display_name, tracker.scope_noun, project_title
+                        );
                         details = details.child(
                             Row::new(
                                 SharedString::from(format!("issue-tracker-bind-{key}-{project_id}")),
                                 project_title.clone(),
                             )
                             .control(
-                                Select::new(
+                                MenuButton::new(
                                     SharedString::from(format!("issue-tracker-scope-{key}-{project_id}")),
-                                    options,
+                                    MenuButtonVariant::Outline,
+                                    MenuButtonSize::Sm,
                                 )
-                                .selected(current_scope)
-                                .width(220.)
+                                .w(r(220.))
+                                .label(trigger_label)
+                                .tooltip(tooltip_text)
                                 .disabled(disabled || is_pending)
-                                .on_change(move |next, _, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        this.bind_issue_tracker_project(
-                                            bind_project_id.clone(),
-                                            bind_tracker.clone(),
-                                            next.to_string(),
-                                            cx,
-                                        );
-                                    });
+                                .dropdown_menu(move |menu, _, _| {
+                                    options.iter().fold(menu, |menu, option| {
+                                        let checked = current_scopes.iter().any(|s| s == &option.key);
+                                        let option_key = option.key.clone();
+                                        let current = current_scopes.clone();
+                                        let view = view.clone();
+                                        let project_id = bind_project_id.clone();
+                                        let tracker_kind = bind_tracker.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(format!("{} ({})", option.name, option.key))
+                                                .checked(checked)
+                                                .disabled(!option.addable)
+                                                .on_click(move |_, _, cx| {
+                                                    let mut next_scopes = current.clone();
+                                                    if let Some(pos) = next_scopes.iter().position(|s| s == &option_key) {
+                                                        next_scopes.remove(pos);
+                                                    } else {
+                                                        next_scopes.push(option_key.clone());
+                                                    }
+                                                    let binding = issue_tracker_binding_for(
+                                                        tracker_kind.clone(),
+                                                        &current,
+                                                        &next_scopes,
+                                                    );
+                                                    let _ = view.update(cx, |this, cx| {
+                                                        this.bind_issue_tracker_project(
+                                                            project_id.clone(),
+                                                            binding.clone(),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        )
+                                    })
                                 }),
                             ),
                         );

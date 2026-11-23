@@ -19,12 +19,13 @@ mod tests {
     use serde_json::json;
 
     use super::list::{
-        HeldIssuePage, IssueCandidatesTarget, IssueCandidatesTracker, IssueListPreferences,
-        IssueListReadTracker, IssueListRefreshMode, MAX_HELD_SEARCHES, PAGE_SIZE,
-        ProjectDescriptor, ScopedProject, continue_issue_page, filter_held_by_host, group_issues,
-        hold_issue_pages, host_options_for, issue_cursors_for_host, issue_entry_key,
-        issue_filter_projects, issue_filter_scopes, issues_search_from_url, merge_issue_list_page,
-        repository_change_request_host, repository_issue_scope,
+        HeldIssuePage, ISSUE_LIST_MAX_EXCLUDED_PROJECTS, IssueCandidatesTarget,
+        IssueCandidatesTracker, IssueListPreferences, IssueListReadTracker, IssueListRefreshMode,
+        MAX_HELD_SEARCHES, PAGE_SIZE, ProjectDescriptor, continue_issue_page,
+        every_project_hidden, filter_held_by_host, group_issues, hold_issue_pages,
+        host_options_for, issue_cursors_for_host, issue_entry_key, issue_filter_projects,
+        issue_filter_scopes, issue_list_targets, issues_search_from_url, merge_issue_list_page,
+        repository_change_request_host, repository_issue_bindings, repository_issue_scope,
     };
     use super::saved_views::{
         SAVED_VIEW_NAME_MAX_LENGTH, SavedView, SavedViewNameError, create_saved_view,
@@ -284,8 +285,8 @@ mod tests {
     }
 
     #[test]
-    fn project_filter_keeps_distinct_projects_and_excludes_scratch() {
-        // Mirrors `pingdotgg/t3code#38256`.
+    fn project_filter_keeps_distinct_projects_and_hides_excluded_targets() {
+        // Mirrors `pingdotgg/t3code#38256` and `#38799`.
         let projects = vec![
             ProjectDescriptor {
                 environment_id: "env-a".into(),
@@ -295,6 +296,7 @@ mod tests {
                 provider: Some("github".into()),
                 host: Some("github.com".into()),
                 issue_scope: Some("acme/app".into()),
+                issue_bindings: Vec::new(),
             },
             ProjectDescriptor {
                 environment_id: "env-b".into(),
@@ -304,6 +306,7 @@ mod tests {
                 provider: Some("github".into()),
                 host: Some("github.com".into()),
                 issue_scope: Some("acme/app".into()),
+                issue_bindings: Vec::new(),
             },
             ProjectDescriptor {
                 environment_id: "env-a".into(),
@@ -313,6 +316,7 @@ mod tests {
                 provider: None,
                 host: None,
                 issue_scope: None,
+                issue_bindings: Vec::new(),
             },
         ];
         let env_labels = HashMap::from([
@@ -320,9 +324,47 @@ mod tests {
             ("env-b".to_owned(), "Server".to_owned()),
         ]);
         let choices = issue_filter_projects(&projects, &env_labels);
-        assert_eq!(choices.len(), 2);
+        assert_eq!(choices.len(), 3);
         assert_eq!(choices[0].title, "App · Laptop");
         assert_eq!(choices[1].title, "App · Server");
+        assert_eq!(choices[2].title, "Scratch");
+
+        let base_input = IssueListPreferences::default().to_list_input(PAGE_SIZE, "", None, false);
+        let envs = vec!["env-a".to_owned(), "env-b".to_owned()];
+        // Hiding both env-a projects skips env-a completely while keeping env-b unfiltered.
+        let hidden_env_a = vec![
+            ("env-a".to_owned(), "p1".to_owned()),
+            ("env-a".to_owned(), "scratch".to_owned()),
+        ];
+        assert!(!every_project_hidden(&choices, &hidden_env_a));
+        let targets = issue_list_targets(&envs, &choices, &hidden_env_a, &base_input);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].environment_id, "env-b");
+        assert!(targets[0].input.exclude_project_ids.is_empty());
+
+        // Partial hide on env-a sets excludeProjectIds for env-a.
+        let partial_hide = vec![("env-a".to_owned(), "scratch".to_owned())];
+        let partial_targets = issue_list_targets(&envs, &choices, &partial_hide, &base_input);
+        assert_eq!(partial_targets.len(), 2);
+        assert_eq!(partial_targets[0].input.exclude_project_ids, vec!["scratch".to_owned()]);
+
+        // Every project hidden produces zero targets.
+        let all_hidden = vec![
+            ("env-a".to_owned(), "p1".to_owned()),
+            ("env-a".to_owned(), "scratch".to_owned()),
+            ("env-b".to_owned(), "p2".to_owned()),
+        ];
+        assert!(every_project_hidden(&choices, &all_hidden));
+        assert!(issue_list_targets(&envs, &choices, &all_hidden, &base_input).is_empty());
+
+        // Before projects load on env-c, saved hide pairs still exclude env-c project IDs.
+        let unloaded_targets = issue_list_targets(
+            &["env-c".to_owned()],
+            &[],
+            &[("env-c".to_owned(), "p9".to_owned())],
+            &base_input,
+        );
+        assert_eq!(unloaded_targets[0].input.exclude_project_ids, vec!["p9".to_owned()]);
 
         let mut held = BTreeMap::new();
         held.insert(
@@ -338,16 +380,11 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let scopes = issue_filter_scopes(
-            &held,
-            &projects,
-            Some(&ScopedProject {
-                environment_id: "env-a".into(),
-                project_id: "p1".into(),
-            }),
-        );
+        let scopes = issue_filter_scopes(&held, &projects, &partial_hide);
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].input.project_id, "p1");
+        let hidden_all_a = issue_filter_scopes(&held, &projects, &hidden_env_a);
+        assert!(hidden_all_a.is_empty());
     }
 
     #[test]
@@ -518,6 +555,7 @@ mod tests {
         let prefs = IssueListPreferences {
             who: IssueInvolvement::Assigned,
             status: IssueListState::Open,
+            hide_projects: vec![("env-a".into(), "p2".into()), ("env-a".into(), "p1".into())],
             label: vec!["bug".into(), "alpha".into()],
             ..Default::default()
         };
@@ -530,12 +568,18 @@ mod tests {
         );
         assert_eq!(saved_view_name_error("my bugs", &views, Some("v1")), None);
 
-        // Label order does not break matching.
+        // Label and hideProjects order do not break matching.
         let reordered = IssueListPreferences {
             label: vec!["alpha".into(), "bug".into()],
+            hide_projects: vec![("env-a".into(), "p1".into()), ("env-a".into(), "p2".into())],
             ..prefs.clone()
         };
         assert!(issue_view_matches(&views[0], &reordered));
+        let cleared_hidden = IssueListPreferences {
+            hide_projects: Vec::new(),
+            ..reordered.clone()
+        };
+        assert!(!issue_view_matches(&views[0], &cleared_hidden));
         let active = resolve_selected_view(&views, None, &reordered, issue_view_matches);
         assert_eq!(active.map(|v| v.id.as_str()), Some("v1"));
         assert!(!is_view_modified(active, &reordered, issue_view_matches));
@@ -559,6 +603,29 @@ mod tests {
 
         assert!(delete_saved_view(&mut views, "v1"));
         assert!(views.is_empty());
+
+        // `hideProjects` URL parsing & max-length cap.
+        let mut raw_many = Vec::new();
+        for i in 0..(ISSUE_LIST_MAX_EXCLUDED_PROJECTS + 25) {
+            raw_many.push(json!(["env-a", format!("p-{i}")]));
+        }
+        let raw_search: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "hideProjects": [["env", "web"], ["env"], "api", ["env", 3]]
+        }))
+        .unwrap();
+        let parsed = issues_search_from_url(&raw_search);
+        assert_eq!(
+            parsed.preferences.hide_projects,
+            vec![("env".into(), "web".into()), ("env".into(), "3".into())]
+        );
+        let cap_search: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "hideProjects": raw_many
+        }))
+        .unwrap();
+        assert_eq!(
+            issues_search_from_url(&cap_search).preferences.hide_projects.len(),
+            ISSUE_LIST_MAX_EXCLUDED_PROJECTS
+        );
     }
 
     #[test]
@@ -1080,6 +1147,28 @@ mod tests {
         assert_eq!(r_fj.project_id, "fj");
         assert_eq!(r_fj.reference.tracker, IssueTrackerKind::Forgejo);
 
+        // TanStack Source strips owner `@` and resolves against canonical project bindings (`#40741`).
+        let ts_projects = [IssueLinkProject {
+            id: "ts".into(),
+            environment_id: "env-1".into(),
+            repository_identity: Some(json!({
+                "canonicalKey": "source.tanstack.com/tanstack/router",
+                "provider": "tanstack-source",
+                "displayName": "@TanStack/router",
+            })),
+        }];
+        let r_ts = resolve_issue_link_target(
+            "https://source.tanstack.com/@TanStack/router/issues/91",
+            &ts_projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_ts.project_id, "ts");
+        assert_eq!(r_ts.reference.tracker, IssueTrackerKind::TanStackSource);
+        assert_eq!(r_ts.reference.scope, "tanstack/router");
+        assert_eq!(r_ts.reference.key, "91");
+
         // Linear standalone tracker (`#38854`).
         let trackers: IssueTrackerConnectionList = decode(json!({
             "trackers": [{
@@ -1094,7 +1183,7 @@ mod tests {
                 "scopes": []
             }],
             "bindings": {
-                "p1": { "tracker": "linear", "scope": "API" },
+                "p1": { "tracker": "linear", "scope": "API", "additionalScopes": ["OPS"] },
                 "p2": { "tracker": "linear", "scope": "WEB" }
             }
         }))
@@ -1111,6 +1200,16 @@ mod tests {
         assert_eq!(r_lin.project_id, "p2");
         assert_eq!(r_lin.reference.scope, "WEB");
         assert_eq!(r_lin.reference.key, "WEB-17");
+        let r_lin_additional = resolve_issue_link_target(
+            "https://linear.app/acme/issue/OPS-9/alert",
+            &projects,
+            Some("p1"),
+            Some(&trackers),
+        )
+        .unwrap();
+        assert_eq!(r_lin_additional.project_id, "p1");
+        assert_eq!(r_lin_additional.reference.scope, "OPS");
+        assert_eq!(r_lin_additional.reference.key, "OPS-9");
 
         // Foreign workspace, lookalike host, or PR URL stay ordinary links.
         assert!(resolve_issue_link_target(
@@ -1202,5 +1301,82 @@ mod tests {
         assert_eq!(vis[0].id, "t1");
         assert_eq!(linked_threads_label(1), "Linked from 1 thread");
         assert_eq!(linked_threads_label(3), "Linked from 3 threads");
+    }
+
+    #[test]
+    fn fork_upstream_issue_bindings_and_accent_folding_matcher() {
+        use super::links::{
+            IssueLinkProject, normalize_search_text, resolve_issue_link_target, thread_link_matches,
+        };
+
+        // `#39159`: fork resolves both its own and same-host upstream issues + filter scopes.
+        let fork_identity = json!({
+            "canonicalKey": "github.com/forkuser/repo",
+            "provider": "github",
+            "displayName": "forkuser/repo",
+            "locator": { "remoteUrl": "https://github.com/forkuser/repo.git" },
+            "origin": {
+                "canonicalKey": "github.com/upstream/repo",
+                "displayName": "upstream/repo",
+                "remoteUrl": "https://github.com/upstream/repo.git"
+            }
+        });
+        let bindings = repository_issue_bindings(&fork_identity);
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].scope, "forkuser/repo");
+        assert_eq!(bindings[1].scope, "upstream/repo");
+
+        let cross_host_fork = json!({
+            "canonicalKey": "github.com/forkuser/repo",
+            "provider": "github",
+            "displayName": "forkuser/repo",
+            "origin": {
+                "canonicalKey": "gitlab.com/upstream/repo",
+                "displayName": "upstream/repo"
+            }
+        });
+        assert_eq!(repository_issue_bindings(&cross_host_fork).len(), 1);
+
+        let desc = ProjectDescriptor::from_repository_identity(
+            "env-a".into(),
+            "fork-p".into(),
+            "Fork".into(),
+            false,
+            Some(&fork_identity),
+        );
+        let mut held = BTreeMap::new();
+        held.insert(
+            "env-a".to_owned(),
+            HeldIssuePage::from_answer(IssueListResult {
+                trackers: vec![github_tracker("github.com", true, true)],
+                ..Default::default()
+            }),
+        );
+        let scopes = issue_filter_scopes(&held, &[desc], &[]);
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[1].input.scope, "upstream/repo");
+
+        let link_projects = vec![IssueLinkProject {
+            id: "fork-p".into(),
+            environment_id: "env-a".into(),
+            repository_identity: Some(fork_identity),
+        }];
+        let resolved_upstream = resolve_issue_link_target(
+            "https://github.com/upstream/repo/issues/88",
+            &link_projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved_upstream.project_id, "fork-p");
+        assert_eq!(resolved_upstream.reference.scope, "upstream/repo");
+        assert_eq!(resolved_upstream.reference.key, "88");
+
+        // `#39557`: accent folding in ThreadLinkPicker.
+        assert_eq!(normalize_search_text("  Café  "), "cafe");
+        assert!(thread_link_matches("cafe", "Café layout bug"));
+        assert!(thread_link_matches("resume", "Fix Résumé parser"));
+        assert!(thread_link_matches("café", "Cafe notes"));
+        assert!(!thread_link_matches("xyz", "Café layout bug"));
     }
 }

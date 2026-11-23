@@ -87,6 +87,7 @@ pub enum IssueTrackerKind {
     GitLab,
     AzureDevOps,
     Forgejo,
+    TanStackSource,
     Linear,
     Jira,
     Unknown(String),
@@ -99,6 +100,7 @@ impl IssueTrackerKind {
             "gitlab" => Self::GitLab,
             "azure-devops" => Self::AzureDevOps,
             "forgejo" => Self::Forgejo,
+            "tanstack-source" => Self::TanStackSource,
             "linear" => Self::Linear,
             "jira" => Self::Jira,
             other => Self::Unknown(other.to_owned()),
@@ -111,6 +113,7 @@ impl IssueTrackerKind {
             Self::GitLab => "gitlab",
             Self::AzureDevOps => "azure-devops",
             Self::Forgejo => "forgejo",
+            Self::TanStackSource => "tanstack-source",
             Self::Linear => "linear",
             Self::Jira => "jira",
             Self::Unknown(other) => other.as_str(),
@@ -124,6 +127,7 @@ impl IssueTrackerKind {
             Self::GitLab => "GitLab",
             Self::AzureDevOps => "Azure DevOps",
             Self::Forgejo => "Forgejo",
+            Self::TanStackSource => "TanStack Source",
             Self::Linear => "Linear",
             Self::Jira => "Jira",
             Self::Unknown(other) => other.as_str(),
@@ -949,6 +953,9 @@ pub struct StandaloneIssueTrackerCredential {
     pub help_url: Option<String>,
 }
 
+/// `MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES` (`packages/contracts/src/issue.ts`).
+pub const MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES: usize = 250;
+
 /// `IssueTrackerProjectBinding`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -957,6 +964,25 @@ pub struct IssueTrackerProjectBinding {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_scopes: Vec<String>,
+}
+
+impl IssueTrackerProjectBinding {
+    /// Returns the primary `scope` followed by any deduplicated non-empty `additional_scopes`
+    /// (`issueTrackerBindingScopes` in `packages/contracts/src/issue.ts`).
+    pub fn scopes(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(1 + self.additional_scopes.len());
+        let primary = self.scope.trim();
+        if !primary.is_empty() {
+            out.push(self.scope.clone());
+        }
+        for scope in &self.additional_scopes {
+            let trimmed = scope.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == scope) {
+                out.push(scope.clone());
+            }
+        }
+        out
+    }
 }
 
 /// `IssueTrackerScope`.

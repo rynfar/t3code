@@ -165,6 +165,7 @@ pub fn issue_view_matches(
     let canonical = |prefs: &IssueListPreferences| {
         let mut normalized = prefs.normalized();
         normalized.label.sort();
+        normalized.hide_projects.sort();
         normalized
     };
     canonical(&view.preferences) == canonical(preferences)

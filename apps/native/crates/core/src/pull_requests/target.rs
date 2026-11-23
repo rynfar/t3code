@@ -21,6 +21,13 @@ fn text<'a>(identity: &'a Value, key: &str) -> Option<&'a str> {
     identity.get(key)?.as_str().filter(|v| !v.is_empty())
 }
 
+fn without_owner_mark(repository: &str) -> &str {
+    repository
+        .strip_prefix('@')
+        .or_else(|| repository.get(..3).filter(|p| p.eq_ignore_ascii_case("%40")).map(|_| &repository[3..]))
+        .unwrap_or(repository)
+}
+
 fn authority(url: &url::Url) -> String {
     url[url::Position::BeforeHost..url::Position::AfterPort].to_lowercase()
 }
@@ -71,8 +78,17 @@ fn matches(identity: &Value, link: &super::link::ChangeRequestLink, url: &url::U
     let remote_host = remote.as_ref().filter(|remote| provider == "forgejo" && matches!(remote.scheme(), "http" | "https")).map(authority);
     let host = remote_host.as_deref().unwrap_or_else(|| key.split('/').next().filter(|v| !v.trim().is_empty()).map(str::trim).unwrap_or(provider));
     let on_host = host == link.host || host == link_authority;
-    let repository = text(identity, "displayName").map(str::to_owned).or_else(|| Some(format!("{}/{}", text(identity, "owner")?, text(identity, "name")?)));
-    Some((on_host && repository.is_some_and(|r| r.eq_ignore_ascii_case(&link.repository)), on_host))
+    let repository = text(identity, "displayName")
+        .map(str::to_owned)
+        .or_else(|| Some(format!("{}/{}", text(identity, "owner")?, text(identity, "name")?)));
+    let repo_matches = repository.is_some_and(|r| {
+        if provider == "tanstack-source" {
+            without_owner_mark(&r).eq_ignore_ascii_case(without_owner_mark(&link.repository))
+        } else {
+            r.eq_ignore_ascii_case(&link.repository)
+        }
+    });
+    Some((on_host && repo_matches, on_host))
 }
 
 pub fn resolve(url: &str, projects: &[Project<'_>], environment: Option<&str>, project: Option<&str>, primary: Option<&str>, lend_host: bool) -> Option<Target> {
@@ -180,5 +196,14 @@ mod tests {
         let missing_provider = json!({"canonicalKey":"github.com/acme/app","displayName":"acme/app"});
         let p = [Project { id: "unknown", environment: "e", identity: Some(&missing_provider), config_loaded: true }];
         assert!(resolve("https://github.com/acme/app/pull/1", &p, Some("e"), None, None, true).is_none());
+
+        let mut tanstack = identity("tanstack-source", "source.tanstack.com", "tanstack/router");
+        tanstack["canonicalKey"] = json!("source.tanstack.com/tanstack/router");
+        tanstack["displayName"] = json!("@TanStack/router");
+        let p = [Project { id: "ts", environment: "e", identity: Some(&tanstack), config_loaded: true }];
+        let ts_target = resolve("https://source.tanstack.com/@TanStack/router/pull/8882/files", &p, Some("e"), None, None, false).unwrap();
+        assert_eq!(ts_target.reference.project_id, "ts");
+        assert_eq!(ts_target.reference.repository, "tanstack/router");
+        assert_eq!(ts_target.reference.host.as_deref(), Some("source.tanstack.com"));
     }
 }

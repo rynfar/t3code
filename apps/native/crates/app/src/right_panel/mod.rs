@@ -808,6 +808,22 @@ impl RightPanelView {
         let thread_owned = (!thread_id.starts_with("new-thread:")
             && !AppState::is_utility_panel_key(thread_id))
             .then(|| thread_id.to_owned());
+        let issue_env_id = env_id.clone();
+        let issue_thread_id = thread_id.to_owned();
+        let state_issue = state.clone();
+        let on_select_issue = std::rc::Rc::new(
+            move |issue_ref: t3_core::issues::wire::IssueRef, url: Option<String>, cx: &mut App| {
+                let target = t3_core::right_panel::IssueTarget::from_ref(
+                    issue_env_id.clone(),
+                    &issue_ref,
+                    Some(format!("#{}", issue_ref.key)),
+                    url,
+                );
+                state_issue.update(cx, |state, cx| {
+                    state.open_issue_surface_for_key(&issue_thread_id, target, cx);
+                });
+            },
+        );
         let state_mutated = state.clone();
         let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
             state_mutated.update(cx, |_, cx| cx.emit(crate::app_state::AppEvent::IssuesMutated));
@@ -821,6 +837,7 @@ impl RightPanelView {
                 None,
                 None,
                 Some(on_select_pr),
+                Some(on_select_issue),
                 Some(on_mutated),
                 cx,
             )

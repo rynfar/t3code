@@ -763,5 +763,93 @@ pub fn issue_tracker_summary(
     }
 }
 
+/// Option row rendered in the multi-select tracker scope picker (`issueTrackerScopeOptions` in
+/// `packages/client-runtime/src/state/issueTrackers.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueTrackerScopeOption {
+    pub key: String,
+    pub name: String,
+    pub addable: bool,
+}
+
+/// Returns all bound scopes for `tracker` (`boundIssueTrackerScopes`).
+pub fn bound_issue_tracker_scopes(
+    tracker: &crate::issues::wire::IssueTrackerKind,
+    binding: Option<&crate::issues::wire::IssueTrackerProjectBinding>,
+) -> Vec<String> {
+    match binding {
+        Some(binding) if &binding.tracker == tracker => binding.scopes(),
+        _ => Vec::new(),
+    }
+}
+
+/// Builds the updated `IssueTrackerProjectBinding` when `scopes` are selected, preserving the
+/// existing order of `current` scopes so the primary scope stays stable (`issueTrackerBindingFor`).
+pub fn issue_tracker_binding_for(
+    tracker: crate::issues::wire::IssueTrackerKind,
+    current: &[String],
+    scopes: &[String],
+) -> Option<crate::issues::wire::IssueTrackerProjectBinding> {
+    let mut ordered: Vec<String> = current
+        .iter()
+        .filter(|key| scopes.contains(*key))
+        .cloned()
+        .collect();
+    for key in scopes {
+        if !ordered.contains(key) {
+            ordered.push(key.clone());
+        }
+    }
+    let mut iter = ordered.into_iter();
+    let scope = iter.next()?;
+    let additional_scopes: Vec<String> = iter
+        .take(crate::issues::wire::MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES)
+        .collect();
+    Some(crate::issues::wire::IssueTrackerProjectBinding {
+        tracker,
+        scope,
+        additional_scopes,
+    })
+}
+
+/// Builds offered scope choices including any currently bound keys absent from `tracker.scopes`
+/// (`issueTrackerScopeOptions`).
+pub fn issue_tracker_scope_options(
+    tracker: &crate::issues::wire::IssueTrackerConnection,
+    bound: &[String],
+) -> Vec<IssueTrackerScopeOption> {
+    let full = bound.len() > crate::issues::wire::MAX_ISSUE_TRACKER_ADDITIONAL_SCOPES;
+    let mut out: Vec<IssueTrackerScopeOption> = tracker
+        .scopes
+        .iter()
+        .map(|scope| IssueTrackerScopeOption {
+            key: scope.key.clone(),
+            name: scope.name.clone(),
+            addable: !full || bound.contains(&scope.key),
+        })
+        .collect();
+    for key in bound {
+        if !tracker.scopes.iter().any(|scope| scope.key == *key) {
+            out.push(IssueTrackerScopeOption {
+                key: key.clone(),
+                name: key.clone(),
+                addable: true,
+            });
+        }
+    }
+    out
+}
+
+/// Whether the tracker offers any selectable scopes or has an existing binding (`hasIssueTrackerTeams`).
+pub fn has_issue_tracker_teams(
+    tracker: &crate::issues::wire::IssueTrackerConnection,
+    bindings: &std::collections::HashMap<String, crate::issues::wire::IssueTrackerProjectBinding>,
+) -> bool {
+    !tracker.scopes.is_empty()
+        || bindings
+            .values()
+            .any(|binding| binding.tracker == tracker.tracker)
+}
+
 #[cfg(test)]
 mod tests;

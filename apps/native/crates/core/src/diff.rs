@@ -11,6 +11,7 @@ mod completion;
 mod expand;
 mod file_actions;
 mod file_kind;
+pub mod file_order;
 mod fold;
 mod parse;
 mod hunks;
@@ -56,6 +57,7 @@ pub use file_actions::{
     resolve_diff_path_for_workspace, resolve_file_context_menu_absolute_path,
 };
 pub use file_kind::{ChangedFileKind, classify_changed_file, is_test_changed_file};
+pub use file_order::{diff_file_tree_positions, order_file_diffs_for_review};
 pub use fold::{
     DiffFoldGroup, DiffFoldOverride, FileDiffFoldChoices, PullRequestDiffFolds,
     are_all_diff_files_collapsed, cut_line_note, cut_line_note_start, has_cut_lines,

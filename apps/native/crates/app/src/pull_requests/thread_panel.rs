@@ -656,8 +656,19 @@ impl ThreadPullRequestsPanel {
                             state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Info, message), cx));
                         }));
                         let open_url = menu_link.url.clone();
+                        let state_open = panel_entity.clone();
                         menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Open on host").to_owned()).on_click(move |_, _, cx| {
-                            cx.open_url(&open_url);
+                            let (state, thread_id) = {
+                                let panel = state_open.read(cx);
+                                (panel.state.clone(), panel.selected_thread.clone())
+                            };
+                            crate::transcript::markdown::open_browser_link(
+                                &open_url,
+                                gpui::Modifiers::default(),
+                                Some(&state),
+                                thread_id,
+                                cx,
+                            );
                         }));
                         if can_watch {
                             let watch_link = menu_link.clone();

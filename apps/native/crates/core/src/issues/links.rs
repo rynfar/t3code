@@ -7,9 +7,11 @@
 use std::collections::HashSet;
 
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 use url::Url;
 
-use super::list::{repository_change_request_host, repository_issue_scope};
+use super::list::repository_issue_bindings;
 use super::wire::{
     IssueLinkedThread, IssueRef, IssueTrackerConnectionList, IssueTrackerKind, ThreadIssueKey,
     ThreadIssueLinkSource, thread_issue_keys_equal,
@@ -60,20 +62,18 @@ struct ProjectIssueBinding {
     scope: String,
 }
 
-fn project_issue_binding(project: &IssueLinkProject) -> Option<ProjectIssueBinding> {
-    let identity = project.repository_identity.as_ref()?;
-    let provider = identity
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|p| !p.is_empty() && *p != "unknown")?;
-    let scope = repository_issue_scope(identity)?;
-    let host = repository_change_request_host(identity, Some(provider))?;
-    Some(ProjectIssueBinding {
-        tracker: provider.to_lowercase(),
-        host: host.to_lowercase(),
-        scope: scope.to_lowercase(),
-    })
+fn project_issue_bindings(project: &IssueLinkProject) -> Vec<ProjectIssueBinding> {
+    let Some(identity) = project.repository_identity.as_ref() else {
+        return Vec::new();
+    };
+    repository_issue_bindings(identity)
+        .into_iter()
+        .map(|binding| ProjectIssueBinding {
+            tracker: binding.tracker.to_lowercase(),
+            host: binding.host.to_lowercase(),
+            scope: binding.scope.to_lowercase(),
+        })
+        .collect()
 }
 
 fn url_authority(url: &Url) -> Option<String> {
@@ -301,8 +301,43 @@ fn parse_forgejo_issue(url: &Url, known: bool) -> Option<ParsedIssueUrl> {
     })
 }
 
-/// Parses a git-host issue URL (`GitHub`, `GitLab`, `Azure DevOps`, `Forgejo`), honoring
-/// `known_provider` when a workspace project vouches for a custom hostname (`pingdotgg/t3code#38269`).
+fn parse_tanstack_source_issue(url: &Url, known: bool) -> Option<ParsedIssueUrl> {
+    let host = url.host_str()?.to_lowercase();
+    if !known && host != "source.tanstack.com" {
+        return None;
+    }
+    let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 4 || segments[2] != "issues" {
+        return None;
+    }
+    let owner = segments[0]
+        .strip_prefix('@')
+        .or_else(|| {
+            segments[0]
+                .get(..3)
+                .filter(|p| p.eq_ignore_ascii_case("%40"))
+                .map(|_| &segments[0][3..])
+        })
+        .unwrap_or(segments[0]);
+    if owner.is_empty() || owner.contains('@') || owner.contains('%') {
+        return None;
+    }
+    let number = parse_positive_u64(segments[3])?;
+    let scope = format!("{owner}/{}", segments[1]).to_lowercase();
+    Some(ParsedIssueUrl {
+        tracker: IssueTrackerKind::TanStackSource,
+        host,
+        authority: url_authority(url)?,
+        scope,
+        scope_alias: None,
+        key: number.to_string(),
+        workspace: None,
+    })
+}
+
+/// Parses a git-host issue URL (`GitHub`, `GitLab`, `Azure DevOps`, `Forgejo`, `TanStack Source`),
+/// honoring `known_provider` when a workspace project vouches for a custom hostname
+/// (`pingdotgg/t3code#38269`).
 pub fn parse_git_host_issue_url(raw: &str, known_provider: Option<&str>) -> Option<ParsedIssueUrl> {
     let url = Url::parse(raw.trim()).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -314,10 +349,12 @@ pub fn parse_git_host_issue_url(raw: &str, known_provider: Option<&str>) -> Opti
             "gitlab" => parse_gitlab_issue(&url),
             "azure-devops" => parse_azure_devops_issue(&url),
             "forgejo" => parse_forgejo_issue(&url, true),
+            "tanstack-source" => parse_tanstack_source_issue(&url, true),
             _ => None,
         };
     }
-    parse_github_issue(&url, false)
+    parse_tanstack_source_issue(&url, false)
+        .or_else(|| parse_github_issue(&url, false))
         .or_else(|| parse_gitlab_issue(&url))
         .or_else(|| parse_azure_devops_issue(&url))
         .or_else(|| parse_forgejo_issue(&url, false))
@@ -356,12 +393,13 @@ pub fn resolve_issue_link_target(
         let authority_str = authority.as_deref()?;
         let hostname_str = hostname.as_deref()?;
         for project in projects {
-            let binding = project_issue_binding(project)?;
-            if binding.host != hostname_str && binding.host != authority_str {
-                continue;
-            }
-            if let Some(known) = parse_git_host_issue_url(url, Some(&binding.tracker)) {
-                return Some(known);
+            for binding in project_issue_bindings(project) {
+                if binding.host != hostname_str && binding.host != authority_str {
+                    continue;
+                }
+                if let Some(known) = parse_git_host_issue_url(url, Some(&binding.tracker)) {
+                    return Some(known);
+                }
             }
         }
         None
@@ -370,12 +408,16 @@ pub fn resolve_issue_link_target(
     if let Some(link) = git_parsed {
         let on_host: Vec<(&IssueLinkProject, ProjectIssueBinding)> = projects
             .iter()
-            .filter_map(|project| {
-                let binding = project_issue_binding(project)?;
-                let matches_tracker = binding.tracker == link.tracker.as_str();
-                let matches_host = binding.host == link.host
-                    || authority.as_deref() == Some(binding.host.as_str());
-                (matches_tracker && matches_host).then_some((project, binding))
+            .flat_map(|project| {
+                project_issue_bindings(project)
+                    .into_iter()
+                    .filter(|binding| {
+                        let matches_tracker = binding.tracker == link.tracker.as_str();
+                        let matches_host = binding.host == link.host
+                            || authority.as_deref() == Some(binding.host.as_str());
+                        matches_tracker && matches_host
+                    })
+                    .map(move |binding| (project, binding))
             })
             .collect();
         let on_authority: Vec<(&IssueLinkProject, ProjectIssueBinding)> = on_host
@@ -460,37 +502,51 @@ fn resolve_standalone_issue_link(
         })
         .collect();
     let scope_lower = link.scope.to_lowercase();
+    let matched_scope = |binding: &super::wire::IssueTrackerProjectBinding| {
+        binding
+            .scopes()
+            .into_iter()
+            .find(|key| key.to_lowercase() == scope_lower)
+    };
     let own = prefer_first_project(
         on_tracker
             .iter()
-            .filter(|(_, binding)| binding.scope.to_lowercase() == scope_lower)
-            .copied()
+            .filter_map(|candidate| {
+                matched_scope(candidate.1).map(|scope| (candidate.0, (candidate.1, scope)))
+            })
             .collect(),
         preferred_project_id,
     );
-    let (lender_project, lender_binding, used_own) = match own {
-        Some((project, binding)) => (project, binding, true),
-        None => {
-            let (project, binding) = prefer_first_project(on_tracker, preferred_project_id)?;
-            (project, binding, false)
-        }
-    };
-    Some(ResolvedIssueLink {
-        environment_id: lender_project.environment_id.clone(),
-        project_id: lender_project.id.clone(),
-        reference: IssueRef {
+    match own {
+        Some((lender_project, (lender_binding, bound_scope))) => Some(ResolvedIssueLink {
+            environment_id: lender_project.environment_id.clone(),
             project_id: lender_project.id.clone(),
-            tracker: lender_binding.tracker.clone(),
-            host: Some(link.host),
-            scope: if used_own {
-                lender_binding.scope.clone()
-            } else {
-                link.scope
+            reference: IssueRef {
+                project_id: lender_project.id.clone(),
+                tracker: lender_binding.tracker.clone(),
+                host: Some(link.host),
+                scope: bound_scope,
+                key: link.key,
             },
-            key: link.key,
-        },
-        url: url.trim().to_owned(),
-    })
+            url: url.trim().to_owned(),
+        }),
+        None => {
+            let (lender_project, lender_binding) =
+                prefer_first_project(on_tracker, preferred_project_id)?;
+            Some(ResolvedIssueLink {
+                environment_id: lender_project.environment_id.clone(),
+                project_id: lender_project.id.clone(),
+                reference: IssueRef {
+                    project_id: lender_project.id.clone(),
+                    tracker: lender_binding.tracker.clone(),
+                    host: Some(link.host),
+                    scope: link.scope,
+                    key: link.key,
+                },
+                url: url.trim().to_owned(),
+            })
+        }
+    }
 }
 
 /// Builds a `thread.issue.link` command payload (`packages/contracts/src/orchestrationV2.ts`).
@@ -577,4 +633,26 @@ pub fn linked_threads_label(count: usize) -> String {
         1 => "Linked from 1 thread".to_owned(),
         n => format!("Linked from {n} threads"),
     }
+}
+
+/// Folds accents via Unicode NFD decomposition (`normalizeSearchText` in `apps/web/src/lib/utils.ts`).
+pub fn normalize_search_text(input: &str) -> String {
+    input
+        .nfd()
+        .filter(|ch| !is_combining_mark(*ch))
+        .collect::<String>()
+        .to_lowercase()
+        .trim()
+        .to_owned()
+}
+
+/// Accent-folding thread-link matcher (`threadLinkMatcher` in `ThreadLinkPicker.logic.ts`).
+pub fn thread_link_matches(query: &str, text: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let local = trimmed.to_lowercase();
+    let folded = normalize_search_text(query);
+    text.to_lowercase().contains(&local) || normalize_search_text(text).contains(&folded)
 }

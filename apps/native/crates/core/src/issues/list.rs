@@ -31,6 +31,8 @@ pub const PREFERENCES_KEY: &str = "t3.issues.preferences";
 pub const MAX_BOUNDED_PREFERENCE_LEN: usize = 200;
 /// Maximum number of label filters (`Schema.isMaxLength(20)`).
 pub const MAX_LABELS: usize = 20;
+/// Maximum number of excluded project pairs (`ISSUE_LIST_MAX_EXCLUDED_PROJECTS`).
+pub const ISSUE_LIST_MAX_EXCLUDED_PROJECTS: usize = 1000;
 /// Upper bound for tracked inactive search entries (`pingdotgg/t3code#38493`).
 pub const MAX_HELD_SEARCHES: usize = 16;
 
@@ -42,10 +44,9 @@ pub const MAX_HELD_SEARCHES: usize = 16;
 pub struct IssueListPreferences {
     pub who: IssueInvolvement,
     pub status: IssueListState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issue_server: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issue_project: Option<String>,
+    /// `(environmentId, projectId)` pairs hidden from the list (`hideProjects`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide_projects: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,18 +68,29 @@ fn bound_opt(value: Option<&str>) -> Option<String> {
     Some(trimmed.chars().take(MAX_BOUNDED_PREFERENCE_LEN).collect())
 }
 
+fn normalize_hidden_projects(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (env_id, project_id) in pairs {
+        if out.len() >= ISSUE_LIST_MAX_EXCLUDED_PROJECTS {
+            break;
+        }
+        let (Some(env), Some(proj)) = (bound_opt(Some(env_id)), bound_opt(Some(project_id))) else {
+            continue;
+        };
+        if seen.insert((env.clone(), proj.clone())) {
+            out.push((env, proj));
+        }
+    }
+    out
+}
+
 impl IssueListPreferences {
     /// Normalizes preferences in the exact shape `issueListPreferences()` writes:
-    /// drops unpaired `issueServer`/`issueProject`, bounds strings, normalizes `order` (`updated`
+    /// deduplicates and caps `hideProjects`, bounds strings, normalizes `order` (`updated`
     /// stored as `None`), and caps labels at `MAX_LABELS`.
     pub fn normalized(&self) -> Self {
-        let (issue_server, issue_project) = match (
-            bound_opt(self.issue_server.as_deref()),
-            bound_opt(self.issue_project.as_deref()),
-        ) {
-            (Some(server), Some(project)) => (Some(server), Some(project)),
-            _ => (None, None),
-        };
+        let hide_projects = normalize_hidden_projects(&self.hide_projects);
         let label: Vec<String> = self
             .label
             .iter()
@@ -100,8 +112,7 @@ impl IssueListPreferences {
         Self {
             who,
             status,
-            issue_server,
-            issue_project,
+            hide_projects,
             host: bound_opt(self.host.as_deref()),
             q: bound_opt(self.q.as_deref()),
             label,
@@ -117,23 +128,11 @@ impl IssueListPreferences {
         }
     }
 
-    pub fn scoped_project(&self) -> Option<ScopedProject> {
-        let server = self.issue_server.as_deref()?.trim();
-        let project = self.issue_project.as_deref()?.trim();
-        if server.is_empty() || project.is_empty() {
-            return None;
-        }
-        Some(ScopedProject {
-            environment_id: server.to_owned(),
-            project_id: project.to_owned(),
-        })
-    }
-
     /// Number of active filters shown in the `Filters` button pill (`IssueListFilterPickers.tsx`).
     pub fn filter_count(&self) -> usize {
         usize::from(self.status != IssueListState::Open)
             + usize::from(self.who != IssueInvolvement::All)
-            + usize::from(self.scoped_project().is_some())
+            + usize::from(!self.hide_projects.is_empty())
             + usize::from(self.assignee.as_deref().is_some_and(|a| !a.trim().is_empty()))
             + self.label.len()
     }
@@ -157,7 +156,7 @@ impl IssueListPreferences {
         IssueListInput {
             state: normalized.status,
             involvement: Some(normalized.who),
-            project_id: normalized.issue_project,
+            project_id: None,
             exclude_project_ids: Vec::new(),
             host: normalized.host,
             limit: Some(limit.clamp(1, 200)),
@@ -171,12 +170,20 @@ impl IssueListPreferences {
     }
 }
 
-/// Scoped environment + project identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScopedProject {
-    pub environment_id: String,
-    pub project_id: String,
+fn project_pairs_from_json(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    let raw_pairs: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|pair| {
+            let arr = pair.as_array()?;
+            let env = bounded_json_value(arr.first())?;
+            let proj = bounded_json_value(arr.get(1))?;
+            Some((env, proj))
+        })
+        .collect();
+    normalize_hidden_projects(&raw_pairs)
 }
 
 /// Full route search parameters (`IssuesSearch` in `IssuesPage.tsx` / `issuesSearch.logic.ts`).
@@ -241,8 +248,7 @@ pub fn issues_search_from_url(raw: &Map<String, Value>) -> IssuesSearch {
         preferences: IssueListPreferences {
             who,
             status,
-            issue_server: bounded_json_value(raw.get("issueServer")),
-            issue_project: bounded_json_value(raw.get("issueProject")),
+            hide_projects: project_pairs_from_json(raw.get("hideProjects")),
             host: bounded_json_value(raw.get("host")),
             q: bounded_json_value(raw.get("q")),
             label: labels_from_json(raw.get("label")),
@@ -457,6 +463,14 @@ pub struct EnvironmentProjectError {
     pub message: String,
 }
 
+/// One repository binding (primary repo or its fork upstream) (`sourceControlClients.issueBindings`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryIssueBinding {
+    pub tracker: String,
+    pub host: String,
+    pub scope: String,
+}
+
 /// Minimal project info used for error attribution, project filtering, and candidate scopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDescriptor {
@@ -467,6 +481,7 @@ pub struct ProjectDescriptor {
     pub provider: Option<String>,
     pub host: Option<String>,
     pub issue_scope: Option<String>,
+    pub issue_bindings: Vec<RepositoryIssueBinding>,
 }
 
 fn non_empty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -487,6 +502,15 @@ fn http_url_host_with_port(raw: &str) -> Option<String> {
         Some(port) => Some(format!("{host}:{port}")),
         None => Some(host),
     }
+}
+
+fn http_url_origin_and_host(raw: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = http_url_host_with_port(raw)?;
+    Some((format!("{}://{host}", url.scheme()), host))
 }
 
 /// Decodes percent-encoded UTF-8 URL path segments (`decodeUrlPathSegment`), returning the
@@ -603,14 +627,31 @@ pub fn repository_issue_scope(identity: &Value) -> Option<String> {
         };
     }
 
+    let strip_owner_mark = |value: String| {
+        if provider == Some("tanstack-source") {
+            value
+                .strip_prefix('@')
+                .or_else(|| {
+                    value
+                        .get(..3)
+                        .filter(|p| p.eq_ignore_ascii_case("%40"))
+                        .map(|_| &value[3..])
+                })
+                .unwrap_or(&value)
+                .to_owned()
+        } else {
+            value
+        }
+    };
+
     if let Some(display_name) = non_empty_str(identity, "displayName") {
-        return Some(display_name.to_owned());
+        return Some(strip_owner_mark(display_name.to_owned()));
     }
     if let (Some(owner), Some(name)) = (
         non_empty_str(identity, "owner"),
         non_empty_str(identity, "name"),
     ) {
-        return Some(format!("{owner}/{name}"));
+        return Some(strip_owner_mark(format!("{owner}/{name}")));
     }
     if let Some(web_url) = non_empty_str(identity, "webUrl")
         && let Ok(url) = url::Url::parse(web_url)
@@ -623,10 +664,81 @@ pub fn repository_issue_scope(identity: &Value) -> Option<String> {
             .filter(|s| !s.is_empty())
             .collect();
         if segments.len() >= 2 {
-            return Some(segments.join("/"));
+            return Some(strip_owner_mark(segments.join("/")));
         }
     }
     None
+}
+
+/// Returns primary plus same-host fork upstream bindings (`sourceControlClients.issueBindings`,
+/// `pingdotgg/t3code#39159`).
+pub fn repository_issue_bindings(identity: &Value) -> Vec<RepositoryIssueBinding> {
+    let Some(tracker) = non_empty_str(identity, "provider").filter(|p| *p != "unknown") else {
+        return Vec::new();
+    };
+    let Some(scope) = repository_issue_scope(identity) else {
+        return Vec::new();
+    };
+    let Some(host) = repository_change_request_host(identity, Some(tracker)) else {
+        return Vec::new();
+    };
+    let primary = RepositoryIssueBinding {
+        tracker: tracker.to_owned(),
+        host: host.clone(),
+        scope: scope.clone(),
+    };
+
+    let Some(origin) = identity.get("origin").filter(|v| v.is_object()) else {
+        return vec![primary];
+    };
+    if repository_change_request_host(origin, None) != repository_change_request_host(identity, None) {
+        return vec![primary];
+    }
+    let origin_url = non_empty_str(origin, "remoteUrl").and_then(http_url_origin_and_host);
+    let primary_url = identity
+        .get("locator")
+        .and_then(|locator| non_empty_str(locator, "remoteUrl"))
+        .and_then(http_url_origin_and_host)
+        .or_else(|| non_empty_str(identity, "webUrl").and_then(http_url_origin_and_host));
+    if let Some((ref o_origin, ref o_host)) = origin_url {
+        let matches_host = match primary_url {
+            Some((ref p_origin, _)) => o_origin == p_origin,
+            None => o_host == &host,
+        };
+        if !matches_host {
+            return vec![primary];
+        }
+    }
+
+    let origin_key = non_empty_str(origin, "canonicalKey").unwrap_or("");
+    let origin_display = non_empty_str(origin, "displayName")
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            origin_key
+                .split('/')
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+    let synthetic = serde_json::json!({
+        "provider": tracker,
+        "canonicalKey": origin_key,
+        "displayName": origin_display,
+    });
+    let Some(origin_scope) = repository_issue_scope(&synthetic) else {
+        return vec![primary];
+    };
+    if origin_scope.eq_ignore_ascii_case(&scope) {
+        return vec![primary];
+    }
+    vec![
+        primary,
+        RepositoryIssueBinding {
+            tracker: tracker.to_owned(),
+            host,
+            scope: origin_scope,
+        },
+    ]
 }
 
 impl ProjectDescriptor {
@@ -644,6 +756,7 @@ impl ProjectDescriptor {
         let host = identity
             .and_then(|id| repository_change_request_host(id, provider.as_deref()));
         let issue_scope = identity.and_then(repository_issue_scope);
+        let issue_bindings = identity.map(repository_issue_bindings).unwrap_or_default();
         Self {
             environment_id,
             project_id,
@@ -652,6 +765,7 @@ impl ProjectDescriptor {
             provider,
             host,
             issue_scope,
+            issue_bindings,
         }
     }
 }
@@ -877,17 +991,14 @@ pub struct FilterProject {
     pub title: String,
 }
 
-/// Builds project filter choices (`pingdotgg/t3code#38256`): excludes scratch projects, keeps one
-/// entry per project even when two projects share a repository (because they may bind different
-/// Linear teams), and disambiguates duplicate titles across environments.
+/// Builds project filter choices (`pingdotgg/t3code#38256`, `#38799`): keeps scratch projects so
+/// Linear bindings on them can still be filtered, keeps one entry per project even when two
+/// projects share a repository, and disambiguates duplicate titles across environments.
 pub fn issue_filter_projects(
     projects: &[ProjectDescriptor],
     environment_labels: &HashMap<String, String>,
 ) -> Vec<FilterProject> {
-    let eligible: Vec<&ProjectDescriptor> = projects
-        .iter()
-        .filter(|project| !project.is_scratch)
-        .collect();
+    let eligible: Vec<&ProjectDescriptor> = projects.iter().collect();
     let mut title_counts: HashMap<String, usize> = HashMap::new();
     for project in &eligible {
         *title_counts.entry(project.title.to_lowercase()).or_default() += 1;
@@ -924,6 +1035,81 @@ pub fn issue_filter_projects(
     out
 }
 
+/// Planned per-environment `issues.list` RPC target (`IssueListTarget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueListTarget {
+    pub environment_id: String,
+    pub input: IssueListInput,
+}
+
+pub fn is_project_hidden(
+    hidden: &[(String, String)],
+    environment_id: &str,
+    project_id: &str,
+) -> bool {
+    hidden
+        .iter()
+        .any(|(env, proj)| env == environment_id && proj == project_id)
+}
+
+/// Returns `true` when at least one project exists and every project is hidden
+/// (`everyProjectHidden` in `IssuesPage.tsx`).
+pub fn every_project_hidden(projects: &[FilterProject], hidden: &[(String, String)]) -> bool {
+    !projects.is_empty()
+        && projects
+            .iter()
+            .all(|project| is_project_hidden(hidden, &project.environment_id, &project.project_id))
+}
+
+/// Computes per-environment `issues.list` requests leaving out hidden projects and skipping any
+/// environment whose own projects are all hidden (`issueListTargets` in `issuesSearch.logic.ts`).
+pub fn issue_list_targets(
+    environment_ids: &[String],
+    projects: &[FilterProject],
+    hidden: &[(String, String)],
+    base_input: &IssueListInput,
+) -> Vec<IssueListTarget> {
+    if every_project_hidden(projects, hidden) {
+        return Vec::new();
+    }
+    let mut targets = Vec::new();
+    for environment_id in environment_ids {
+        let own: Vec<&FilterProject> = projects
+            .iter()
+            .filter(|project| project.environment_id == *environment_id)
+            .collect();
+        if !own.is_empty()
+            && own
+                .iter()
+                .all(|project| is_project_hidden(hidden, &project.environment_id, &project.project_id))
+        {
+            continue;
+        }
+        let mut exclude_project_ids: Vec<String> = if !own.is_empty() {
+            own.into_iter()
+                .filter(|project| {
+                    is_project_hidden(hidden, &project.environment_id, &project.project_id)
+                })
+                .map(|project| project.project_id.clone())
+                .collect()
+        } else {
+            hidden
+                .iter()
+                .filter(|(env, _)| env == environment_id)
+                .map(|(_, project_id)| project_id.clone())
+                .collect()
+        };
+        exclude_project_ids.truncate(ISSUE_LIST_MAX_EXCLUDED_PROJECTS);
+        let mut input = base_input.clone();
+        input.exclude_project_ids = exclude_project_ids;
+        targets.push(IssueListTarget {
+            environment_id: environment_id.clone(),
+            input,
+        });
+    }
+    targets
+}
+
 /// Target for an `issues.candidates` RPC call (`IssueCandidatesTarget`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IssueCandidatesTarget {
@@ -947,7 +1133,7 @@ impl IssueCandidatesTarget {
 pub fn issue_filter_scopes(
     held: &BTreeMap<String, HeldIssuePage>,
     projects: &[ProjectDescriptor],
-    selected_project: Option<&ScopedProject>,
+    hidden: &[(String, String)],
 ) -> Vec<IssueCandidatesTarget> {
     let mut scopes: Vec<IssueCandidatesTarget> = Vec::new();
     let already_has = |scopes: &[IssueCandidatesTarget], scope: &str, host: Option<&str>| {
@@ -960,46 +1146,49 @@ pub fn issue_filter_scopes(
     };
 
     for (env_id, page) in held {
-        if let Some(selected) = selected_project
-            && selected.environment_id != *env_id
-        {
-            continue;
-        }
         for project in projects {
             if project.environment_id != *env_id {
                 continue;
             }
-            if let Some(selected) = selected_project
-                && selected.project_id != project.project_id
-            {
+            if is_project_hidden(hidden, env_id, &project.project_id) {
                 continue;
             }
-            let (Some(kind), Some(host), Some(scope)) = (
+            let bindings: Vec<(String, String, String)> = if !project.issue_bindings.is_empty() {
+                project
+                    .issue_bindings
+                    .iter()
+                    .map(|b| (b.tracker.clone(), b.host.clone(), b.scope.clone()))
+                    .collect()
+            } else if let (Some(kind), Some(host), Some(scope)) = (
                 project.provider.as_deref(),
                 project.host.as_deref(),
                 project.issue_scope.as_deref(),
-            ) else {
-                continue;
+            ) {
+                vec![(kind.to_owned(), host.to_owned(), scope.to_owned())]
+            } else {
+                Vec::new()
             };
-            let tracker = page.answer.trackers.iter().find(|t| {
-                t.tracker.as_str() == kind && t.host.eq_ignore_ascii_case(host)
-            });
-            let Some(tracker) = tracker else { continue };
-            if !tracker.configured || tracker.capabilities.is_none() {
-                continue;
+            for (kind, host, scope) in bindings {
+                let tracker = page.answer.trackers.iter().find(|t| {
+                    t.tracker.as_str() == kind && t.host.eq_ignore_ascii_case(&host)
+                });
+                let Some(tracker) = tracker else { continue };
+                if !tracker.configured || tracker.capabilities.is_none() {
+                    continue;
+                }
+                if already_has(&scopes, &scope, Some(&host)) {
+                    continue;
+                }
+                scopes.push(IssueCandidatesTarget {
+                    environment_id: env_id.clone(),
+                    input: IssueScopeRef {
+                        project_id: project.project_id.clone(),
+                        tracker: tracker.tracker.clone(),
+                        host: Some(host),
+                        scope,
+                    },
+                });
             }
-            if already_has(&scopes, scope, Some(host)) {
-                continue;
-            }
-            scopes.push(IssueCandidatesTarget {
-                environment_id: env_id.clone(),
-                input: IssueScopeRef {
-                    project_id: project.project_id.clone(),
-                    tracker: tracker.tracker.clone(),
-                    host: Some(host.to_owned()),
-                    scope: scope.to_owned(),
-                },
-            });
         }
 
         // Standalone trackers (e.g. Linear team bound in settings) appear in `answer.scopes`;
@@ -1018,9 +1207,7 @@ pub fn issue_filter_scopes(
                 .collect(),
         };
         for input in covered {
-            if let Some(selected) = selected_project
-                && selected.project_id != input.project_id
-            {
+            if is_project_hidden(hidden, env_id, &input.project_id) {
                 continue;
             }
             let host_lower = input.host.as_deref().map(str::to_lowercase);

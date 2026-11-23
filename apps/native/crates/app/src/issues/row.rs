@@ -476,6 +476,7 @@ fn empty_box(
     cx: &App,
 ) -> gpui::Div {
     let p = palette(cx);
+    let desc: SharedString = description.into();
     v_flex()
         .flex_1()
         .items_center()
@@ -500,13 +501,15 @@ fn empty_box(
                 .text_color(hsla(p.foreground))
                 .child(title.into()),
         )
-        .child(
-            div()
-                .max_w(px(360.))
-                .text_sm()
-                .text_color(hsla(p.muted_foreground))
-                .child(description.into()),
-        )
+        .when(!desc.is_empty(), |box_div| {
+            box_div.child(
+                div()
+                    .max_w(px(360.))
+                    .text_sm()
+                    .text_color(hsla(p.muted_foreground))
+                    .child(desc),
+            )
+        })
 }
 
 pub fn unsupported_state(cx: &App) -> impl IntoElement {
@@ -545,5 +548,22 @@ pub fn empty_no_trackers(cx: &App) -> impl IntoElement {
         t(cx, "No trackers to read").to_owned(),
         t(cx, "Add a project whose remote is on a supported tracker.").to_owned(),
         cx,
+    )
+}
+
+pub fn empty_every_project_hidden(
+    show_all: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    empty_box(
+        Icon::CircleDot,
+        t(cx, "Every project is hidden").to_owned(),
+        "",
+        cx,
+    )
+    .child(
+        Button::new("issues-show-all-projects", Variant::Outline, Size::Sm)
+            .label(t(cx, "Show all projects").to_owned())
+            .on_click(show_all),
     )
 }

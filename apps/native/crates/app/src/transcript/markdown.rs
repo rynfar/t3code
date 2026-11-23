@@ -5,6 +5,7 @@
 
 pub mod blocks;
 pub mod links;
+pub(crate) use self::links::open_browser_link;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;

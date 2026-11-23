@@ -7,7 +7,7 @@
 //! `pullRequests.subscribeRefreshes`, re-reading the list and the open detail on each new epoch
 //! (`refreshTrigger` in `client-runtime/src/state/pullRequests.ts`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{
@@ -229,6 +229,14 @@ pub struct PullRequestsPage {
     host_availability: HostAvailability,
     /// Connected fleet environments whose latest PR list read failed, mapped to retry deadline ms (`pingdotgg/t3code#34088`).
     unreachable_environments: HashMap<String, i64>,
+    /// Scope key matching the held per-environment fleet answers/failures (`pingdotgg/t3code#39536`).
+    fleet_scope_key: Option<String>,
+    /// Latest successful `pullRequests.list` result per fleet environment for selective retries.
+    fleet_answers: BTreeMap<String, ListResult>,
+    /// Latest error per fleet environment that failed on the current scope key.
+    fleet_failed: BTreeMap<String, String>,
+    /// Fleet environments with a list request currently in flight.
+    fleet_pending: HashSet<String>,
     /// Owning fleet environment id for each merged list entry, keyed by `PrRef::key()`.
     entry_environments: HashMap<String, String>,
     /// Per-environment pagination cursors from the latest fleet list read (`PullRequestsPage.tsx:342`).
@@ -268,6 +276,13 @@ impl Focusable for PullRequestsPage {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
+}
+
+type PlannedFleetRequest = (String, Option<EnvironmentOwner>, serde_json::Value);
+
+struct SelectiveRetryPlan {
+    key: String,
+    planned: Vec<PlannedFleetRequest>,
 }
 
 impl PullRequestsPage {
@@ -318,6 +333,10 @@ impl PullRequestsPage {
             restat: false,
             host_availability: HashMap::new(),
             unreachable_environments: HashMap::new(),
+            fleet_scope_key: None,
+            fleet_answers: BTreeMap::new(),
+            fleet_failed: BTreeMap::new(),
+            fleet_pending: HashSet::new(),
             entry_environments: HashMap::new(),
             next_cursors_by_env: HashMap::new(),
             truncated_envs: HashSet::new(),
@@ -768,8 +787,73 @@ impl PullRequestsPage {
         self.fetch(None, false, cx);
     }
 
+    fn clear_fleet_state(&mut self) {
+        self.fleet_scope_key = None;
+        self.fleet_answers.clear();
+        self.fleet_failed.clear();
+        self.fleet_pending.clear();
+    }
+
+    fn selective_retry_plan(&self, cx: &App) -> Option<SelectiveRetryPlan> {
+        let key = self.scope_key();
+        let fleet_mode = !self.state.read(cx).fleet.environments.is_empty();
+        if !fleet_mode
+            || self.fleet_scope_key.as_deref() != Some(key.as_str())
+            || self.fleet_failed.is_empty()
+            || self.fleet_answers.is_empty()
+        {
+            return None;
+        }
+        let mut inventory = self.fleet_inventory(cx);
+        for env_id in self.fleet_failed.keys() {
+            inventory.unreachable.remove(env_id);
+        }
+        let planned: Vec<PlannedFleetRequest> = self
+            .plan_fleet_requests(&inventory, None)
+            .into_iter()
+            .filter(|(env_id, _, _)| self.fleet_failed.contains_key(env_id))
+            .collect();
+        (!planned.is_empty()).then_some(SelectiveRetryPlan { key, planned })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planned_retry_envs(&self, cx: &App) -> Vec<String> {
+        self.selective_retry_plan(cx)
+            .map(|plan| plan.planned.into_iter().map(|(env_id, _, _)| env_id).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn retry_fetch(&mut self, cx: &mut Context<Self>) {
+        if let Some(SelectiveRetryPlan { key, planned }) = self.selective_retry_plan(cx) {
+            for (env_id, _, _) in &planned {
+                self.unreachable_environments.remove(env_id);
+                self.fleet_failed.remove(env_id);
+                self.fleet_pending.insert(env_id.clone());
+            }
+            let state = self.state.read(cx);
+            let dispatched: Vec<_> = planned
+                .into_iter()
+                .map(|(env_id, owner, input)| {
+                    let task = read_for_owner(state, owner.as_ref(), method::LIST, input, decode::<ListResult>);
+                    (env_id, task)
+                })
+                .collect();
+            self.data.pending = true;
+            self.data.loading_more = false;
+            self._list = Some(cx.spawn(async move |this, cx| {
+                let mut settled = Vec::with_capacity(dispatched.len());
+                for (env_id, task) in dispatched {
+                    settled.push((env_id, settle(task).await));
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_fleet_lists(key, false, false, settled, cx);
+                });
+            }));
+            cx.notify();
+            return;
+        }
         self.unreachable_environments.clear();
+        self.clear_fleet_state();
         self.refetch(cx);
     }
 
@@ -858,6 +942,10 @@ impl PullRequestsPage {
         let key = self.scope_key();
         let fleet_mode = !self.state.read(cx).fleet.environments.is_empty();
         if fleet_mode {
+            if !appending {
+                self.clear_fleet_state();
+                self.fleet_scope_key = Some(key.clone());
+            }
             let inventory = self.fleet_inventory(cx);
             let planned = self.plan_fleet_requests(&inventory, cursors.as_ref());
             if planned.is_empty() {
@@ -876,6 +964,9 @@ impl PullRequestsPage {
                     self.apply_list(key, appending, refreshing, Err(message), cx);
                 }
                 return;
+            }
+            for (env_id, _, _) in &planned {
+                self.fleet_pending.insert(env_id.clone());
             }
             let state = self.state.read(cx);
             let dispatched: Vec<_> = planned
@@ -929,29 +1020,77 @@ impl PullRequestsPage {
         if key != self.scope_key() {
             return;
         }
+        if self.fleet_scope_key.as_deref() != Some(key.as_str()) {
+            self.clear_fleet_state();
+            self.fleet_scope_key = Some(key.clone());
+        }
         let now = now_ms();
         let mut ok_answers: Vec<(String, ListResult)> = Vec::new();
         let mut first_error: Option<String> = None;
         for (env_id, outcome) in answers {
+            self.fleet_pending.remove(&env_id);
             match outcome {
                 Ok(result) => {
                     self.unreachable_environments.remove(&env_id);
+                    self.fleet_failed.remove(&env_id);
                     self.host_availability = remember_hosts(&self.host_availability, &[(env_id.as_str(), &result.providers, now)]);
+                    if appending {
+                        if let Some(prev) = self.fleet_answers.get_mut(&env_id) {
+                            let seen: HashSet<String> = prev.entries.iter().map(entry_key).collect();
+                            prev.entries.extend(
+                                result
+                                    .entries
+                                    .iter()
+                                    .filter(|entry| !seen.contains(&entry_key(entry)))
+                                    .cloned(),
+                            );
+                            prev.providers = result.providers.clone();
+                            prev.errors = result.errors.clone();
+                            prev.next_cursors = result.next_cursors.clone();
+                            prev.truncated = result.truncated;
+                        } else {
+                            self.fleet_answers.insert(env_id.clone(), result.clone());
+                        }
+                    } else {
+                        self.fleet_answers.insert(env_id.clone(), result.clone());
+                    }
                     ok_answers.push((env_id, result));
                 }
                 Err(error) => {
-                    self.unreachable_environments.insert(env_id, now + UNREACHABLE_TTL_MS);
+                    self.unreachable_environments.insert(env_id.clone(), now + UNREACHABLE_TTL_MS);
+                    self.fleet_failed.insert(env_id, error.clone());
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
             }
         }
-        if ok_answers.is_empty() {
+        if self.fleet_answers.is_empty() && ok_answers.is_empty() {
             self.apply_list(key, appending, refreshing, Err(first_error.unwrap_or_else(|| super::NOT_CONNECTED.to_owned())), cx);
             return;
         }
-        let mut merged = merge_fleet_list_results(&ok_answers);
+        let all_ok: Vec<(String, ListResult)> = if appending {
+            ok_answers.clone()
+        } else {
+            let order = self.fleet_inventory(cx).env_ids;
+            let mut ordered = Vec::with_capacity(self.fleet_answers.len());
+            for env_id in &order {
+                if let Some(result) = self.fleet_answers.get(env_id) {
+                    ordered.push((env_id.clone(), result.clone()));
+                }
+            }
+            for (env_id, result) in &self.fleet_answers {
+                if !order.contains(env_id) {
+                    ordered.push((env_id.clone(), result.clone()));
+                }
+            }
+            ordered
+        };
+        if all_ok.is_empty() {
+            self.apply_list(key, appending, refreshing, Err(first_error.unwrap_or_else(|| super::NOT_CONNECTED.to_owned())), cx);
+            return;
+        }
+        let mut merged = merge_fleet_list_results(&all_ok);
         let keeping_later_pages = refreshing
             && self
                 .data
@@ -1246,6 +1385,7 @@ impl PullRequestsPage {
         self.requested.clear();
         self.row_stacks.clear();
         self.unreachable_environments.clear();
+        self.clear_fleet_state();
         self.next_cursors_by_env.clear();
         self.truncated_envs.clear();
         self.host_availability = reset_hosts(&self.host_availability);
@@ -1890,7 +2030,12 @@ impl PullRequestsPage {
 impl Render for PullRequestsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let error_with_rows = self.data.error.clone().filter(|_| self.shown_count() > 0);
+        let error_with_rows = self
+            .data
+            .error
+            .clone()
+            .or_else(|| self.fleet_failed.values().next().cloned())
+            .filter(|_| self.shown_count() > 0);
         let detail = self.detail.clone();
         let detail_width = (f32::from(window.viewport_size().width) / 2.).max(DETAIL_MIN_WIDTH);
         let projects_col = self.render_project_assignment_column(cx);
@@ -2303,7 +2448,7 @@ mod tests {
                 key.clone(),
                 false,
                 false,
-                vec![("saved-local".into(), Ok(local_list)), ("saved-remote".into(), Ok(remote_list.clone()))],
+                vec![("saved-local".into(), Ok(local_list.clone())), ("saved-remote".into(), Ok(remote_list.clone()))],
                 cx,
             );
             let entries = &page.data.result.as_ref().unwrap().entries;
@@ -2338,10 +2483,10 @@ mod tests {
             assert_eq!(planned_next[0].0, "saved-remote");
             assert_eq!(planned_next[0].1["cursors"]["github"], json!("cursor-remote-9"));
 
-            // 3. Partial fleet failure marks the failing env unreachable while still painting the
-            // healthy env's rows (`#34088`), and `retry_fetch` clears transient unreachable marks.
+            // 3. Partial fleet failure marks ONLY the failing env unreachable while keeping the
+            // healthy env's rows (`#34088`), and `retry_fetch` retries ONLY failed envs (`#39536`).
             page.apply_fleet_lists(
-                key,
+                key.clone(),
                 false,
                 false,
                 vec![
@@ -2352,11 +2497,50 @@ mod tests {
             );
             assert!(page.unreachable_environments.contains_key("saved-local"));
             assert!(!page.unreachable_environments.contains_key("saved-remote"));
+            assert_eq!(page.fleet_failed.keys().map(String::as_str).collect::<Vec<_>>(), vec!["saved-local"]);
             assert_eq!(page.data.result.as_ref().unwrap().entries.len(), 2);
             assert!(page.data.error.is_none());
+            // While `saved-local` is offline (`Reconnecting`), selective retry skips it.
+            assert!(page.planned_retry_envs(cx).is_empty());
+
+            // Once `saved-local` is connected, `retry_fetch` retries ONLY `saved-local` while keeping
+            // `saved-remote`'s held rows, and merges both environments when `saved-local` answers.
+            page.state.update(cx, |state, _| {
+                Arc::make_mut(&mut Arc::make_mut(&mut state.fleet).environments[0]).status =
+                    ConnectionStatus::Connected;
+            });
+            assert_eq!(page.planned_retry_envs(cx), vec!["saved-local"]);
+            page.retry_fetch(cx);
+            assert_eq!(page.fleet_pending.iter().map(String::as_str).collect::<Vec<_>>(), vec!["saved-local"]);
+            assert!(page.fleet_answers.contains_key("saved-remote"));
+            assert!(!page.unreachable_environments.contains_key("saved-local"));
+            page.apply_fleet_lists(
+                key,
+                false,
+                false,
+                vec![("saved-local".into(), Ok(local_list))],
+                cx,
+            );
+            assert!(page.fleet_failed.is_empty());
+            assert!(page.fleet_pending.is_empty());
+            let merged_entries = &page.data.result.as_ref().unwrap().entries;
+            assert_eq!(merged_entries.len(), 2);
+            assert_eq!(
+                merged_entries.iter().find(|e| e.number == 42).unwrap().title,
+                "From MacBook"
+            );
+            assert_eq!(
+                merged_entries.iter().find(|e| e.number == 43).unwrap().title,
+                "Remote Only"
+            );
 
             // 4. Zero-slice fallback: scoping to `p-only-local` (owned only by disconnected `saved-local`)
             // dispatches zero fleet slices and surfaces an offline error instead of querying another server.
+            page.state.update(cx, |state, _| {
+                Arc::make_mut(&mut Arc::make_mut(&mut state.fleet).environments[0]).status =
+                    ConnectionStatus::Reconnecting { reason: "offline".into(), attempt: 1 };
+            });
+            page.unreachable_environments.insert("saved-local".into(), i64::MAX);
             page.prefs.project_id = Some("p-only-local".into());
             assert!(page.planned_fleet_requests(None, cx).is_empty());
             page.retry_fetch(cx);

@@ -403,6 +403,14 @@ pub fn with_source_plan_ref(mut command: Value, thread_id: &str, plan_id: &str) 
     command
 }
 
+/// Attach `titleRenamed` to a `thread.create` command payload (`pingdotgg/t3code#40567`).
+pub fn with_title_renamed(mut command: Value, renamed: bool) -> Value {
+    if let Some(obj) = command.as_object_mut() {
+        obj.insert("titleRenamed".into(), Value::Bool(renamed));
+    }
+    command
+}
+
 /// `projects.writeFile` payload for saving a proposed plan markdown file to the workspace.
 pub fn project_write_file(workspace_cwd: &str, relative_path: &str, contents: &str) -> Value {
     json!({
