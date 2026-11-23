@@ -73,7 +73,7 @@ pub struct RevertCheckpoint {
 }
 
 pub fn is_rewindable_checkpoint_status(status: &str) -> bool {
-    matches!(status, "ready" | "missing")
+    status != "stale"
 }
 
 /// `findRevertCheckpoint`: the last ready or missing checkpoint for `turn_count`; zero is the thread start.

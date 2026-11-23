@@ -8,9 +8,12 @@ use serde_json::{Map, Value, json};
 use crate::model::ModelSelection;
 use crate::server_config::{BooleanDescriptor, OptionChoice, OptionDescriptor, ProviderModel, SelectDescriptor};
 
+/// The variant choice that sends no variant; distinct from any variant name a provider defines.
+pub const DEFAULT_VARIANT_CHOICE_ID: &str = "t3:default";
+
 /// `REASONING_EFFORT_OPTION_IDS` plus `thinking`.
-const REASONING_IDS: [&str; 7] =
-    ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thinking"];
+const REASONING_IDS: [&str; 8] =
+    ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thinking", "thought_level"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OptionValue {

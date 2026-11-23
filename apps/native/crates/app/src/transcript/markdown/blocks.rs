@@ -1350,6 +1350,7 @@ fn render_table_block(
 
     let md_copy = data.data.to_markdown();
     let csv_copy = data.data.to_csv();
+    let html_copy = data.data.to_html();
     const TABLE_GROUP: &str = "markdown-table";
 
     v_flex()
@@ -1376,6 +1377,13 @@ fn render_table_block(
                     "Copy CSV",
                     move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(csv_copy.clone()));
+                    },
+                ))
+                .child(parts::CopyButton::new(
+                    SharedString::from(format!("table-copy-html:{}", data.key)),
+                    "Copy HTML",
+                    move |_, cx| {
+                        crate::composer::clipboard::write_raw_html(html_copy.clone(), html_copy.clone(), cx);
                     },
                 )),
         )

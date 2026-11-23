@@ -387,18 +387,27 @@ impl Render for DetailsView {
         any_above |= version_control.is_some();
         let show_issues = self.details.read(cx).shows("branch") && item_visible_at_density("branch", density);
         let close_view = cx.entity().downgrade();
+        let toggle_view = cx.entity().downgrade();
         let linked_issues = show_issues
             .then(|| {
                 self.issues_feed.render(
                     &self.state,
                     &thread_issues,
-                    any_above && density.is_full(),
-                    !density.is_full(),
+                    super::issues::IssueSectionOptions {
+                        separated: any_above && density.is_full(),
+                        compact: !density.is_full(),
+                    },
                     move |cx| {
                         let _ = close_view.update(cx, |this, cx| {
                             if popover {
                                 this.close_popover(cx);
                             }
+                        });
+                    },
+                    move |cx| {
+                        let _ = toggle_view.update(cx, |this, cx| {
+                            this.issues_feed.expanded = !this.issues_feed.expanded;
+                            cx.notify();
                         });
                     },
                     cx,

@@ -134,21 +134,22 @@ impl ProjectBrowse {
         if is_clone_query(&self.query) {
             return Some(BrowsePick::Add(self.query.trim().to_owned()));
         }
-        browse_path(&self.query, self.windows)?;
+        let bp = browse_path(&self.query, self.windows)?;
         if self.highlighted == 0 {
             return Some(BrowsePick::Add(add_target(&self.query)));
         }
         let entry = self.visible_entry(self.highlighted - 1)?;
-        Some(if add { BrowsePick::Add(entry.full_path.clone()) } else { BrowsePick::Enter(append_browse_segment(&self.query, &entry.name)) })
+        Some(if add { BrowsePick::Add(entry.full_path.clone()) } else { BrowsePick::Enter(append_browse_segment(&bp.directory, &entry.name)) })
     }
 
     /// Tab: the new query, when completion applies.
     pub fn complete(&self) -> Option<String> {
+        let bp = browse_path(&self.query, self.windows)?;
         let result = self.result.as_ref()?;
         let filter = self.filter();
         let visible = filter_browse_entries(&result.entries, &filter);
         let (name, complete) = browse_tab_completion(&visible, &filter)?;
-        Some(if complete { append_browse_segment(&self.query, &name) } else { format!("{}{name}", t3_core::projects::browse_directory_path(&self.query)) })
+        Some(if complete { append_browse_segment(&bp.directory, &name) } else { format!("{}{name}", bp.directory) })
     }
 
     fn render_footer_actions(&self, cx: &mut Context<CommandPalette>) -> AnyElement {
@@ -688,5 +689,34 @@ impl CommandPalette {
                     .on_click(cx.listener(|this, _, window, cx| this.submit_new_project(window, cx))),
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_bare_drive_browse_enters_and_completes_under_drive_root() {
+        let mut browse = ProjectBrowse {
+            query: "D:".into(),
+            windows: true,
+            loaded_directory: Some("D:\\".into()),
+            result: Some(BrowseResult {
+                entries: vec![t3_core::projects::BrowseEntry {
+                    name: "code".into(),
+                    full_path: "D:\\code".into(),
+                }],
+                ..Default::default()
+            }),
+            visible: vec![0],
+            highlighted: 1,
+            ..Default::default()
+        };
+        assert!(matches!(browse.pick(false), Some(BrowsePick::Enter(ref p)) if p == "D:\\code\\"));
+        assert_eq!(browse.complete().as_deref(), Some("D:\\code\\"));
+
+        browse.highlighted = 0;
+        assert!(matches!(browse.pick(false), Some(BrowsePick::Add(ref p)) if p == "D:"));
     }
 }

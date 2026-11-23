@@ -61,7 +61,20 @@ pub struct PendingThreadFind {
 }
 
 pub fn search_request(thread_id: &str, query: &str, start: Option<&FindStart>, offset: i64) -> Value {
+    search_request_with_theme(thread_id, query, start, offset, None)
+}
+
+pub fn search_request_with_theme(
+    thread_id: &str,
+    query: &str,
+    start: Option<&FindStart>,
+    offset: i64,
+    theme: Option<&str>,
+) -> Value {
     let mut input = json!({ "threadId": thread_id, "query": query.trim(), "skills": [] });
+    if let Some(theme) = theme.map(str::trim).filter(|t| !t.is_empty()) {
+        input["theme"] = json!(theme);
+    }
     if let Some(start) = start {
         input["start"] = json!({ "entryId": start.entry_id, "occurrence": start.occurrence });
     }

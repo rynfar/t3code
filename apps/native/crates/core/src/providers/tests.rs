@@ -378,3 +378,18 @@ fn fx_sub_providers_retained_models_catalog_gaps_and_dedup() {
     assert_eq!(deduped.len(), 1);
     assert_eq!(deduped[0].name, "First");
 }
+
+#[test]
+fn initials_split_punctuation_camel_humps_and_preserve_apostrophes_and_emoji() {
+    assert_eq!(initials("Codex (hub)"), "CH");
+    assert_eq!(initials("work_codex"), "WC");
+    assert_eq!(initials("Theo's Codex"), "TC");
+    assert_eq!(initials("Codex 'hub'"), "CH");
+    assert_eq!(initials("‘hub’"), "HU");
+    assert_eq!(initials("ClaudeProx"), "CP");
+    assert_eq!(initials("ClaudeAPI"), "CA");
+    assert_eq!(initials("API"), "AP");
+    assert_eq!(initials("ClaudeProx Work"), "CW");
+    assert_eq!(initials("😀 Work"), "😀W");
+    assert_eq!(initials("😀"), "😀");
+}

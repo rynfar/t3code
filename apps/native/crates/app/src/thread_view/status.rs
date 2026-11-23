@@ -95,6 +95,7 @@ pub struct ThreadFooter {
 struct BannerLines {
     provider: Option<ProviderBanner>,
     error: Option<ThreadError>,
+    error_dismiss_key: Option<String>,
 }
 
 /// The banner lane and what was dismissed. Dismissed errors and provider statuses last the
@@ -208,10 +209,21 @@ impl ThreadView {
         }
         let mut next = BannerLines::default();
         if let (Some(projection), Some(thread_id)) = (self.thread_state(state).projection.as_ref(), self.thread_id.as_deref()) {
-            let local = self.local_error.clone().map(|message| ThreadError { message, class: None, code: None, reset_at: None, runtime_failed: false });
-            next.error = local
-                .or_else(|| timeline_thread_error(thread_error(projection), state.thread_shell(thread_id)))
-                .filter(|error| !self.banners.dismissed_errors.contains(&error.banner_key(thread_id)));
+            if let Some(message) = self.local_error.clone() {
+                next.error = Some(ThreadError {
+                    message,
+                    class: None,
+                    code: None,
+                    reset_at: None,
+                    runtime_failed: false,
+                    source: None,
+                });
+                next.error_dismiss_key = None;
+            } else {
+                next.error = timeline_thread_error(thread_error(projection), state.thread_shell(thread_id))
+                    .filter(|error| !self.banners.dismissed_errors.contains(&error.banner_key(thread_id)));
+                next.error_dismiss_key = next.error.as_ref().map(|error| error.banner_key(thread_id));
+            }
         }
         if let Some(target) = &self.banners.target
             && target.thread.is_some()
@@ -746,13 +758,15 @@ impl ThreadView {
         self.sync_banners(cx);
     }
 
-    fn dismiss_error(&mut self, key: String, cx: &mut Context<Self>) {
+    fn dismiss_error(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         self.local_error = None;
-        self.banners.dismissed_errors.insert(key);
+        if let Some(key) = key {
+            self.banners.dismissed_errors.insert(key);
+        }
         self.sync_banners(cx);
     }
 
-    fn render_error_actions(&self, error: &ThreadError, key: String, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_error_actions(&self, error: &ThreadError, key: Option<String>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut actions = Vec::new();
         if error.workspace_limit() {
             let copy = Button::new("copy-admin-request", ButtonVariant::Default, ButtonSize::Sm).label("Copy request for admin").on_click(cx.listener(
@@ -812,8 +826,8 @@ impl ThreadView {
             let body = v_flex().gap(rem(8.)).child(body).child(h_flex().flex_wrap().justify_end().gap(rem(12.)).children(setup).child(refresh)).into_any_element();
             banners.push(alert(banner.warning, AlertIcon::Lucide(Icon::Info), Some(banner.title.clone()), vec![body], vec![dismiss], f32::INFINITY, cx));
         }
-        if let (Some(error), Some(thread_id)) = (&lines.error, self.thread_id.as_deref()) {
-            let key = error.banner_key(thread_id);
+        if let Some(error) = &lines.error {
+            let key = lines.error_dismiss_key.clone();
             let body: Vec<AnyElement> = if error.chatgpt_limit() {
                 vec![
                     v_flex()
@@ -1562,5 +1576,21 @@ mod selected_provider_tests {
         stage.read_with(&cx, |stage, cx| {
             assert!(stage.thread_view.read(cx).footer.lines.run_is_live);
         });
+
+        // Dismissing a local error clears it without adding a key to `dismissed_errors`, so a repeated local error shows again.
+        cx.update_window(window.into(), |_, _, cx| {
+            stage.update(cx, |stage, cx| {
+                stage.thread_view.update(cx, |view, cx| {
+                    view.show_local_error("Retry failed".into(), cx);
+                    assert_eq!(view.banners.lines.error.as_ref().map(|e| e.message.as_str()), Some("Retry failed"));
+                    assert_eq!(view.banners.lines.error_dismiss_key, None);
+                    let dismiss_key = view.banners.lines.error_dismiss_key.clone();
+                    view.dismiss_error(dismiss_key, cx);
+                    assert!(!view.banners.dismissed_errors.iter().any(|k| k.contains("Retry failed")));
+                    view.show_local_error("Retry failed".into(), cx);
+                    assert_eq!(view.banners.lines.error.as_ref().map(|e| e.message.as_str()), Some("Retry failed"));
+                });
+            });
+        }).unwrap();
     }
 }

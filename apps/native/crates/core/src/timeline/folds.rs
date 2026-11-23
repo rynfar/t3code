@@ -427,7 +427,23 @@ pub(super) fn turn_folds(entries: &[Arc<TimelineEntry>], input: &FoldInput) -> H
         let (Some(first), Some(last)) = (group.entries.first(), group.entries.last()) else { continue };
         let latest = activity.latest_run.as_ref().filter(|run| run.run_id == run_id);
         let latest_interrupted = latest.is_some_and(|run| run.status == "interrupted");
-        let last_end = entry_end(last);
+        // Subagents still finish asynchronously after the turn's terminal assistant reply; do not
+        // pull the worked/continued fold's end timestamp past the reply.
+        let late_subagent_ids: HashSet<&str> = group
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| *index > terminal_index && entry.event().is_some_and(|item| is_subagent(item)))
+            .map(|(_, entry)| entry.id.as_str())
+            .collect();
+        let last_turn_entry = group
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| !late_subagent_ids.contains(entry.id.as_str()))
+            .copied()
+            .unwrap_or(last);
+        let last_end = entry_end(last_turn_entry);
         let elapsed = match latest.and_then(|run| run.started_at.as_deref().zip(run.completed_at.as_deref())) {
             Some((start, end)) => elapsed_ms(start, end),
             None => elapsed_ms(
@@ -461,7 +477,11 @@ pub(super) fn turn_folds(entries: &[Arc<TimelineEntry>], input: &FoldInput) -> H
             if !hides_work(segment) {
                 continue;
             }
-            let segment_end = segment.iter().fold(None, |acc, e| max_iso(acc, Some(entry_end(e)))).unwrap_or(&steer.created_at);
+            let segment_end = segment
+                .iter()
+                .filter(|entry| !late_subagent_ids.contains(entry.id.as_str()))
+                .fold(None, |acc, e| max_iso(acc, Some(entry_end(e))))
+                .unwrap_or(&steer.created_at);
             let label = match elapsed_ms(&steer.created_at, segment_end) {
                 Some(ms) => format!("Continued for {}", format_duration(ms)),
                 None => "Continued".into(),

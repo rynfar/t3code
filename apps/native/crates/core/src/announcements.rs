@@ -335,6 +335,20 @@ pub fn next_thread(
     memory.settled = next.run_id;
     (memory, text)
 }
+/// Suppresses `"Done"` announcements for stopped runs, awaited background work, and monitor wakes
+/// (`resolveBackgroundThreadRunStatus`).
+fn resolve_background_thread_run_status(thread: &crate::sidebar::thread::SidebarThread) -> &str {
+    let status = thread.latest_run.as_ref().map_or("", |r| r.status.as_str());
+    if status == "completed"
+        && (thread.latest_run_stop_requested
+            || thread.background_holds_completion
+            || thread.monitor_holds_wake_completion)
+    {
+        return "";
+    }
+    status
+}
+
 #[derive(Default)]
 pub struct Background {
     previous: HashMap<String, BackgroundMemory>,
@@ -398,7 +412,7 @@ impl Background {
             let thread = present_thread(raw, sub);
             let run = thread.latest_run.as_ref();
             let run_id = run.map(|r| r.run_id.as_str());
-            let run_status = run.map_or("", |r| r.status.as_str());
+            let run_status = resolve_background_thread_run_status(&thread);
             let result = outcome(run_status);
             if let Some(before) =
                 before.filter(|_| open != Some(raw.id.as_str()) && !effective_snoozed(&thread, now))
@@ -473,7 +487,7 @@ impl Background {
                 };
                 let run = row.thread.latest_run.as_ref();
                 let run_id = run.map(|r| r.run_id.as_str());
-                let run_status = run.map_or("", |r| r.status.as_str());
+                let run_status = resolve_background_thread_run_status(&row.thread);
                 let result = outcome(run_status);
                 let is_open = open == Some((env_id, row.thread.id.as_str()));
                 let before = self.previous.get(&key);
@@ -1511,5 +1525,19 @@ mod screen_reader_detail_tests {
             Some("Done: t1")
         );
         assert_eq!(watcher.observe_secondary_fleet(&[&done], None, 1_000), None);
+
+        // Stopped runs, awaited background tasks, and monitor wakes suppress "Done" on secondary fleets too.
+        let mut monitor_watcher = Background::default();
+        let baseline_m = build_summary(vec![super::background_tests::row("t-mon", "running", json!({}))]);
+        assert_eq!(monitor_watcher.observe_secondary_fleet(&[&baseline_m], None, 1_000), None);
+        let suppressed_m = build_summary(vec![super::background_tests::row(
+            "t-mon",
+            "completed",
+            json!({
+                "latestRunBackgroundWake": true,
+                "pendingBackgroundTasks": [{ "taskId": "mon-1", "kind": "monitor", "title": "Watch" }]
+            }),
+        )]);
+        assert_eq!(monitor_watcher.observe_secondary_fleet(&[&suppressed_m], None, 1_000), None);
     }
 }

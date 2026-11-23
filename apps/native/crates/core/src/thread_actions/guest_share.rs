@@ -25,7 +25,7 @@ impl GuestShare {
     }
 
     pub fn status(&self, now: Ms) -> String {
-        if parse_iso(&self.expires_at).is_some_and(|expiry| expiry / 60_000 <= now / 60_000) {
+        if parse_iso(&self.expires_at).is_some_and(|expiry| expiry <= now) {
             "Guest link expired".into()
         } else {
             self.guest_name.as_ref().map_or_else(
@@ -165,6 +165,10 @@ mod tests {
         assert_eq!(
             share.status(parse_iso(&share.expires_at).unwrap()),
             "Guest link expired"
+        );
+        assert_eq!(
+            share.status(parse_iso(&share.expires_at).unwrap() - 10_000),
+            "Ada is a guest"
         );
         assert_eq!(create("t"), json!({"threadId":"t"}));
         assert_eq!(

@@ -790,8 +790,7 @@ impl GuestIndicator {
             .selected_thread
             .as_deref()
             .and_then(|id| state.guest_share(id))
-            .and_then(|share| t3_core::sidebar::time::parse_iso(&share.expires_at))
-            .map(|at| at / 60_000 * 60_000);
+            .and_then(|share| t3_core::sidebar::time::parse_iso(&share.expires_at));
         if let Some(at) = at.filter(|at| *at > now_ms()) {
             let wait = (at - now_ms()).max(0) as u64;
             self.expiry = Some(cx.spawn(async move |this, cx| {

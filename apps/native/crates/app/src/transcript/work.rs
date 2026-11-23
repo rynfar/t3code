@@ -462,6 +462,9 @@ fn entry_row(
     let thread_read = (!reasoning).then(|| thread_read_target(entry, &preview, env, cx)).flatten();
     let can_expand = viewed_image.is_some() || entry_can_expand(entry, env.workspace_root);
     let mut trailing = Vec::new();
+    if entry.item_type != Some("system_notice") {
+        trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
+    }
     if let Some(TurnItemKind::ThreadCreated { target_thread_id, .. }) = entry.item.as_ref().map(|item| &item.kind) {
         let target_thread_id = target_thread_id.clone();
         trailing.push(inline_button(
@@ -495,7 +498,6 @@ fn entry_row(
         trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
     }
     trailing.push(chevron(expanded, can_expand, cx));
-    trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     let heading = if let Some((prefix, target_id, title)) = thread_read {
         h_flex()
             .min_w_0()

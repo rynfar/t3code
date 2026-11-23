@@ -85,6 +85,7 @@ fn running(run: &str) -> ThreadActivity {
         active_turn_started_at: Some("2026-01-01T00:00:00Z".into()),
         pending_approval_ids: HashSet::new(),
         usage_limit_notice: None,
+        usage_limit_run_id: None,
     }
 }
 
@@ -1276,7 +1277,14 @@ fn turn_starting_messages_rewind_to_the_previous_runs_checkpoint() {
         checkpoint("c2", Some("r2"), Some(2), 2, "error"),
     ];
     let settled_err = revert_turn_counts(&RevertInput { checkpoints: &errored, unsettled_run_id: None, ..input });
-    assert_eq!(settled_err.get("u3"), None, "errored checkpoints are not rewindable");
+    assert_eq!(settled_err.get("u3"), Some(&2), "errored checkpoints still allow conversation-only rewind");
+    let stale = vec![
+        checkpoint("c0", None, None, 0, "ready"),
+        checkpoint("c1", Some("r1"), Some(1), 1, "ready"),
+        checkpoint("c2", Some("r2"), Some(2), 2, "stale"),
+    ];
+    let settled_stale = revert_turn_counts(&RevertInput { checkpoints: &stale, unsettled_run_id: None, ..input });
+    assert_eq!(settled_stale.get("u3"), None, "stale checkpoints are not rewindable");
     let paged = revert_turn_counts(&RevertInput { thread_start_ready: false, unsettled_run_id: None, ..input });
     assert_eq!(paged.get("u1"), None);
     let only_start: HashSet<u64> = [0].into();
@@ -1299,7 +1307,12 @@ fn finds_the_ready_checkpoint_for_a_turn_count() {
         find_revert_checkpoint(&checkpoints, 1),
         Some(RevertCheckpoint { id: "one".into(), scope_id: "scope".into(), status: "ready".into() })
     );
-    assert_eq!(find_revert_checkpoint(&checkpoints, 2), None);
+    assert_eq!(
+        find_revert_checkpoint(&checkpoints, 2),
+        Some(RevertCheckpoint { id: "two".into(), scope_id: "scope".into(), status: "error".into() })
+    );
+    let stale_checkpoints = [checkpoint("two-stale", Some("r2"), Some(2), 4, "stale")];
+    assert_eq!(find_revert_checkpoint(&stale_checkpoints, 2), None);
     assert_eq!(
         find_revert_checkpoint(&checkpoints, 3),
         Some(RevertCheckpoint { id: "three".into(), scope_id: "scope".into(), status: "missing".into() })
@@ -1573,7 +1586,7 @@ fn keeps_the_working_header_in_place_across_worktree_setup_handoff() {
     assert_eq!(rows[1].id, "worktree-setup-row");
 
     input.setup = Some(setup("failed", serde_json::json!([])));
-    assert_eq!(kinds(&input.rows(&[user.clone(), assistant])), ["message", "worktree-setup", "working", "message", "thinking"]);
+    assert_eq!(kinds(&input.rows(&[user.clone(), assistant])), ["message", "worktree-setup", "working", "message"]);
 
     let handed_off = serde_json::json!([stage("setup-script", "running"), stage("agent", "done")]);
     input.setup = Some(setup("running", handed_off.clone()));
@@ -2815,4 +2828,111 @@ fn explicit_script_and_language_only_locale_timestamps_match_node_intl() {
         assert_eq!(clock.numeric_date(midnight, false), md, "{tag} MD");
         assert_eq!(clock.numeric_date(midnight, true), ymd, "{tag} YMD");
     }
+}
+
+#[test]
+fn commandless_command_label_and_find_theme_and_late_subagent_fold_match_upstream() {
+    use crate::client_settings::TimestampFormat::TwentyFourHour;
+    use crate::sidebar::time::FixedZone;
+
+    // 1. Generic command titles localize by status, while custom titles are preserved.
+    let generic = WorkLogEntry {
+        id: "cmd-1".into(),
+        item_type: Some("command_execution"),
+        label: "Ran command".into(),
+        status: Some(ToolStatus::InProgress),
+        ..WorkLogEntry::default()
+    };
+    assert_eq!(live_work_entry_label(&generic, None, true), "Running command");
+    assert_eq!(work_entry_display_label(&WorkLogEntry { status: Some(ToolStatus::Failed), ..generic.clone() }, None), "Failed command");
+    let custom = WorkLogEntry {
+        id: "cmd-2".into(),
+        item_type: Some("command_execution"),
+        tool_title: Some("Building native bundle".into()),
+        label: "Building native bundle".into(),
+        status: Some(ToolStatus::Completed),
+        ..WorkLogEntry::default()
+    };
+    assert_eq!(work_entry_display_label(&custom, None), "Building native bundle");
+
+    // 2. Late subagent card after terminal reply does not inflate "Worked for ..." duration.
+    let sub_item: Arc<TurnItem> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "id": "sub-late",
+            "threadId": "t1",
+            "runId": "r1",
+            "ordinal": 3,
+            "status": "completed",
+            "updatedAt": "2026-01-01T00:05:00Z",
+            "type": "subagent",
+            "subagentId": "s1",
+            "label": "Worker"
+        }))
+        .unwrap(),
+    );
+    let fold_entries = vec![
+        message("u1", Role::User, "Go", Some("r1"), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        work("w1-entry", "r1", "2026-01-01T00:00:01Z", |w| w.status = Some(ToolStatus::Completed)),
+        message("a1", Role::Assistant, "Done", Some("r1"), "2026-01-01T00:00:10Z", "2026-01-01T00:00:10Z"),
+        Arc::new(TimelineEntry {
+            id: "sub-late".into(),
+            created_at: "2026-01-01T00:05:00Z".into(),
+            attempt: None,
+            kind: EntryKind::Event { item: sub_item, visibility: Visibility::Local },
+        }),
+    ];
+    let rows = derive_rows(
+        &RowsInput {
+            entries: &fold_entries,
+            activity: &ThreadActivity::default(),
+            expanded_run_ids: &HashSet::new(),
+            expanded_attempt_ids: &HashSet::new(),
+            expanded_work_group_ids: &HashSet::new(),
+            worktree_setup: None,
+            tool_call_visibility: crate::client_settings::ToolCallVisibility::default(),
+            revealed_message_id: None,
+        },
+        &mut RowsCache::default(),
+    );
+    let fold_label = rows.iter().find_map(|row| match &row.kind {
+        RowKind::TurnFold { label, .. } => Some(label.as_str()),
+        _ => None,
+    });
+    assert_eq!(fold_label, Some("Worked for 10s"));
+
+    // 3. ThreadError::banner_key separates distinct sources with identical messages; LimitRecovery past vs upcoming reset.
+    let e1 = ThreadError { message: "Failed".into(), class: None, code: None, reset_at: None, runtime_failed: true, source: Some("item-1@t1".into()) };
+    let e2 = ThreadError { message: "Failed".into(), class: None, code: None, reset_at: None, runtime_failed: true, source: Some("item-2@t2".into()) };
+    assert_ne!(e1.banner_key("t1"), e2.banner_key("t1"));
+
+    let clock = TimestampEnglish { british: false };
+    let rec = LimitRecovery {
+        run_id: "r1".into(),
+        error_code: None,
+        reset_at: Some("2026-07-03T13:05:00Z".into()),
+        snoozed_until: None,
+        can_schedule: true,
+        scheduled: false,
+        resumes: false,
+        snoozed: false,
+        reset_passed: true,
+        display_passed: true,
+    };
+    let reset_ms = parse_iso_ms("2026-07-03T13:05:00Z").unwrap();
+    assert!(rec.description(reset_ms + 60_000, &FixedZone(0), TwentyFourHour, &clock).starts_with("Reset "));
+    assert_eq!(rec.deadline(), None);
+
+    let snoozed_resuming = LimitRecovery {
+        snoozed_until: Some("2026-07-03T13:10:00Z".into()),
+        resumes: true,
+        reset_passed: true,
+        display_passed: false,
+        ..rec
+    };
+    assert_eq!(snoozed_resuming.deadline(), parse_iso_ms("2026-07-03T13:10:00Z"));
+    assert!(snoozed_resuming.description(reset_ms + 60_000, &FixedZone(0), TwentyFourHour, &clock).starts_with("Resumes "));
+
+    // 4. search_request_with_theme sets optional theme.
+    let req = search_request_with_theme("t1", "needle", None, 0, Some("dark"));
+    assert_eq!(req["theme"], "dark");
 }

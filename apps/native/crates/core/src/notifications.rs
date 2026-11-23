@@ -426,7 +426,7 @@ fn status_key(status: ThreadStatus) -> &'static str {
     }
 }
 
-fn monitor_holds_wake_completion(raw: &ThreadShell) -> bool {
+pub(crate) fn monitor_holds_wake_completion(raw: &ThreadShell) -> bool {
     raw.latest_run_background_wake == Some(true)
         && raw
             .pending_background_tasks

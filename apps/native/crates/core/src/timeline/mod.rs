@@ -95,7 +95,7 @@ pub use changed_files::{
 pub use fork::{FORK_FAILED, FORK_LABEL, can_fork, fork_from_run, fork_support};
 pub use find::{
     FindMatch, FindNavigation, FindResult, FindStart, MAX_QUERY_CHARS, PendingThreadFind, SEARCH_THREAD, bar_label, decode_result, format_count,
-    search_request, step_index, step_locally,
+    search_request, search_request_with_theme, step_index, step_locally,
 };
 pub use rewind::{
     CONFIRM_DESCRIPTION, CONFIRM_TITLE, EDIT_FROM_HERE, FAILED as REWIND_FAILED, INTERRUPT_FIRST, KEEP_CHANGES, NO_ROLLBACK, REVERT_FILES, RevertCheckpoint, RevertInput,

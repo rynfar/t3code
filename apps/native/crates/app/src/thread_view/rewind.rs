@@ -947,12 +947,25 @@ mod tests {
         composer.read_with(cx, |composer, cx| assert!(composer.is_rewinding(cx)));
 
         // Simulate the rolled-back projection arriving and verify Composer receives prompt + attachment.
+        let (rewind_tx, mut rewind_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rewind_sub = cx.update(|cx| {
+            cx.subscribe(&state, move |state, event, cx| {
+                if matches!(event, AppEvent::Rewind) && !state.read(cx).is_thread_rewinding("menu-thread") {
+                    let _ = rewind_tx.send(());
+                }
+            })
+        });
         state.update(cx, |state, cx| {
             let projection = state.thread.projection.as_mut().unwrap();
             projection.runs[0].status = "rolled_back".to_owned();
             cx.emit(crate::app_state::AppEvent::Thread);
         });
         cx.run_until_parked();
+        if state.read_with(cx, |state, _| state.is_thread_rewinding("menu-thread")) {
+            let _ = rewind_rx.recv().await;
+            cx.run_until_parked();
+        }
+        drop(rewind_sub);
         view.read_with(cx, |view, cx| assert!(!view.is_rewind_busy(cx)));
         composer.read_with(cx, |composer, cx| {
             assert!(!composer.is_rewinding(cx));

@@ -6,11 +6,12 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Styled, Subscription, Task, Window, div, prelude::*, px};
+use gpui_component::ActiveTheme as _;
 use gpui_component::h_flex;
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use t3_core::timeline::{
     FindMatch, FindResult, FindStart, MAX_QUERY_CHARS, PendingThreadFind, RowKind, SEARCH_THREAD, TimelineRow, bar_label, decode_result, fold_membership,
-    search_request, step_locally,
+    search_request_with_theme, step_locally,
 };
 
 use super::ThreadView;
@@ -243,7 +244,11 @@ impl ThreadView {
         }
         find.loading = true;
         let query = find.query.clone();
-        let request = self.state.read(cx).rpc(SEARCH_THREAD, search_request(&thread_id, &query, find.start.as_ref(), find.offset));
+        let theme = if cx.theme().is_dark() { "dark" } else { "light" };
+        let request = self.state.read(cx).rpc(
+            SEARCH_THREAD,
+            search_request_with_theme(&thread_id, &query, find.start.as_ref(), find.offset, Some(theme)),
+        );
         find.request = Some(cx.spawn(async move |this, cx| {
             let response = request.await;
             let _ = this.update(cx, |view, cx| {

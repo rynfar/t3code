@@ -55,7 +55,8 @@ fn quick_action_for_a_dirty_tree() {
 #[test]
 fn quick_action_for_a_clean_tree() {
     assert_eq!(quick(&status(false, true, 2, 0), false), ("Push & create PR".into(), QuickActionKind::Run(StackedAction::CreatePr)));
-    assert_eq!(quick(&status(false, true, 2, 0), true), ("Push".into(), QuickActionKind::Run(StackedAction::CommitPush)));
+    assert_eq!(quick(&status(false, true, 2, 0), true), ("Push".into(), QuickActionKind::Run(StackedAction::Push)));
+    assert_eq!(quick(&status(false, false, 2, 0), true), ("Push".into(), QuickActionKind::Run(StackedAction::Push)));
     assert_eq!(quick(&open_pr(status(false, true, 2, 0)), false), ("Push".into(), QuickActionKind::Run(StackedAction::Push)));
     assert_eq!(quick(&status(false, true, 0, 3), false), ("Pull".into(), QuickActionKind::Pull));
     assert_eq!(quick(&status(false, true, 1, 3), false), ("Sync ref".into(), QuickActionKind::Hint));

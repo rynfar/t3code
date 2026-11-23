@@ -230,7 +230,7 @@ pub fn resolve_quick_action(status: Option<&VcsStatus>, busy: bool, is_default_r
         }
         return QuickAction::run(format!("Commit, push & {}", terms.short_label), StackedAction::CommitPushPr);
     }
-    let push = if is_default_ref { StackedAction::CommitPush } else { StackedAction::Push };
+    let push = StackedAction::Push;
     if !status.remote.has_upstream {
         if !has_primary_remote {
             return QuickAction { label: "Publish repository".into(), disabled: false, kind: QuickActionKind::Publish, hint: None };

@@ -139,6 +139,61 @@ impl TableData {
         }
         out
     }
+
+    /// Serializes the table as standalone inline-styled HTML matching `serializeTableElementToHtml`.
+    pub fn to_html(&self) -> String {
+        if self.rows.is_empty() || self.rows.iter().all(|row| row.is_empty()) {
+            return String::new();
+        }
+        const TABLE_STYLE: &str = "border-collapse:collapse";
+        const CELL_STYLE: &str = "border:1px solid #d0d7de;padding:6px 12px;vertical-align:top";
+        const HEADER_STYLE: &str = "border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;background-color:#f6f8fa;color:#1f2328;font-weight:600";
+
+        let col_count = self
+            .rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(self.align.len());
+        let align_suffix = |col: usize| match self.align.get(col).copied().unwrap_or(ColumnAlignment::None) {
+            ColumnAlignment::Left => ";text-align:left",
+            ColumnAlignment::Center => ";text-align:center",
+            ColumnAlignment::Right => ";text-align:right",
+            ColumnAlignment::None => "",
+        };
+        let render_row = |row: &[String], header: bool| -> String {
+            let tag = if header { "th" } else { "td" };
+            let base_style = if header { HEADER_STYLE } else { CELL_STYLE };
+            let mut cells = String::new();
+            for col in 0..col_count {
+                let raw = row.get(col).map(String::as_str).unwrap_or("");
+                let escaped = raw
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;");
+                cells.push_str(&format!("<{tag} style=\"{base_style}{}\">{escaped}</{tag}>", align_suffix(col)));
+            }
+            format!("    <tr>{cells}</tr>")
+        };
+
+        let mut lines = vec![format!("<table dir=\"ltr\" style=\"{TABLE_STYLE}\">")];
+        if let Some(head) = self.rows.first() {
+            lines.push("  <thead>".into());
+            lines.push(render_row(head, true));
+            lines.push("  </thead>".into());
+        }
+        if self.rows.len() > 1 {
+            lines.push("  <tbody>".into());
+            for row in &self.rows[1..] {
+                lines.push(render_row(row, false));
+            }
+            lines.push("  </tbody>".into());
+        }
+        lines.push("</table>".into());
+        lines.join("\n")
+    }
 }
 
 fn escape_markdown_cell(cell: &str) -> String {
@@ -198,6 +253,10 @@ mod tests {
         assert_eq!(
             table.to_csv(),
             "Name,Value\nalpha | beta,\"42,000\"\n\"quote \"\"x\"\"\",10"
+        );
+        assert_eq!(
+            table.to_html(),
+            "<table dir=\"ltr\" style=\"border-collapse:collapse\">\n  <thead>\n    <tr><th style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;background-color:#f6f8fa;color:#1f2328;font-weight:600;text-align:left\">Name</th><th style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;background-color:#f6f8fa;color:#1f2328;font-weight:600;text-align:right\">Value</th></tr>\n  </thead>\n  <tbody>\n    <tr><td style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;text-align:left\">alpha | beta</td><td style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;text-align:right\">42,000</td></tr>\n    <tr><td style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;text-align:left\">quote &quot;x&quot;</td><td style=\"border:1px solid #d0d7de;padding:6px 12px;vertical-align:top;text-align:right\">10</td></tr>\n  </tbody>\n</table>"
         );
     }
 

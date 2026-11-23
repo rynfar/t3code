@@ -157,7 +157,7 @@ impl Render for LimitRecoveryBanner {
                     let resume = match (pending, recovery.scheduled) {
                         (true, _) => "Saving...",
                         (false, true) => "Cancel auto-resume",
-                        (false, false) => "Resume at reset",
+                        (false, false) => if recovery.reset_passed { "Resume now" } else { "Resume at reset" },
                     };
                     let snooze = match (pending, recovery.snoozed) {
                         (true, _) => "Saving...",

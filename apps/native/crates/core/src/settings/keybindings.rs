@@ -563,7 +563,21 @@ pub fn unassign_payload(row: &BindingRow) -> Option<Value> {
 /// The `keybindings.json` key pill (`KeybindingPill`): one cap per part, platform glyphs for
 /// modifiers, single characters upper-cased.
 pub fn key_pill_parts(key: &str, mac: bool) -> Vec<String> {
-    key.split('+')
+    let raw_parts: Vec<&str> = if key == "+" {
+        vec!["+"]
+    } else if let Some(prefix) = key.strip_suffix("++") {
+        let mut parts: Vec<&str> = if prefix.is_empty() {
+            Vec::new()
+        } else {
+            prefix.split('+').filter(|p| !p.is_empty()).collect()
+        };
+        parts.push("+");
+        parts
+    } else {
+        key.split('+').filter(|p| !p.is_empty()).collect()
+    };
+    raw_parts
+        .into_iter()
         .map(|part| match part {
             "mod" => (if mac { "⌘" } else { "Ctrl" }).to_owned(),
             "shift" => "⇧".to_owned(),
@@ -916,5 +930,8 @@ mod toast_controller_tests {
         assert_eq!(key_pill_parts("mod+pageup", false), vec!["Ctrl", "PageUp"]);
         assert_eq!(key_pill_parts("ctrl+pageup", true), vec!["⌃", "PageUp"]);
         assert_eq!(key_pill_parts("shift+pagedown", true), vec!["⇧", "PageDown"]);
+        assert_eq!(key_pill_parts("+", true), vec!["+"]);
+        assert_eq!(key_pill_parts("mod++", true), vec!["⌘", "+"]);
+        assert_eq!(key_pill_parts("mod+shift++", false), vec!["Ctrl", "⇧", "+"]);
     }
 }

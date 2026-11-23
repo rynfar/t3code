@@ -259,15 +259,38 @@ pub fn display_name(provider: &ServerProvider) -> String {
 }
 
 /// `providerInstanceInitials`: the monogram drawn when a provider has no logo. Punctuation splits
-/// words; apostrophes inside a word stay.
+/// words; apostrophes inside a word stay; a single camel-case word splits at its humps.
 pub fn initials(label: &str) -> String {
-    let spaced: String = label.chars().map(|ch| if ch.is_ascii_punctuation() && ch != '\'' { ' ' } else { ch }).collect();
-    let words: Vec<&str> =
-        spaced.split_whitespace().map(|word| word.trim_matches('\'')).filter(|word| !word.is_empty()).collect();
+    static PUNCT_SEPARATORS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[^\P{P}'’]+").expect("provider initials punctuation regex")
+    });
+    let to_words = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| word.trim_matches(['\'', '’']).to_owned())
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let replaced = PUNCT_SEPARATORS.replace_all(label, " ");
+    let mut words = to_words(&replaced);
+    if words.len() == 1 {
+        let mut split = String::new();
+        let mut chars = words[0].chars().peekable();
+        while let Some(ch) = chars.next() {
+            split.push(ch);
+            if ch.is_lowercase() && chars.peek().is_some_and(|next| next.is_uppercase()) {
+                split.push(' ');
+            }
+        }
+        words = to_words(&split);
+    }
     match words.as_slice() {
         [] => String::new(),
         [word] => word.chars().take(2).collect::<String>().to_uppercase(),
-        [first, second, ..] => [first, second].iter().filter_map(|word| word.chars().next()).collect::<String>().to_uppercase(),
+        [first, second, ..] => [first, second]
+            .iter()
+            .filter_map(|word| word.chars().next())
+            .collect::<String>()
+            .to_uppercase(),
     }
 }
 

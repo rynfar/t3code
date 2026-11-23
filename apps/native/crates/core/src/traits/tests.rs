@@ -193,3 +193,20 @@ fn ultracode_boolean_normalizes_legacy_effort_and_layouts_in_footer() {
     assert_eq!(parts.ultracode.map(|u| (u.id.as_str(), u.current_value)), Some(("ultracode", Some(true))));
     assert_eq!(effort_suffix("claudeAgent", &both), EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: true, context_window: None });
 }
+
+#[test]
+fn thought_level_and_reasoning_role_count_as_reasoning_control() {
+    let custom: Vec<OptionDescriptor> = serde_json::from_value(json!([
+        {"id": "custom_thinking", "label": "Thinking", "type": "select", "role": "reasoning", "options": [
+            {"id": "low", "label": "Low"},
+            {"id": "high", "label": "High", "isDefault": true}
+        ]},
+        {"id": "thought_level", "label": "Thought level", "type": "select", "options": [
+            {"id": "medium", "label": "Medium"}
+        ]}
+    ]))
+    .unwrap();
+    assert!(is_reasoning_control(&custom[0]));
+    assert!(is_reasoning_control(&custom[1]));
+    assert_eq!(DEFAULT_VARIANT_CHOICE_ID, "t3:default");
+}

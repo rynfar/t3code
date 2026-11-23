@@ -34,6 +34,7 @@ pub struct ThreadActivity {
     pub active_turn_started_at: Option<String>,
     pub pending_approval_ids: HashSet<String>,
     pub usage_limit_notice: Option<UsageLimitNoticeRows>,
+    pub usage_limit_run_id: Option<String>,
 }
 
 const ACTIVITY: [&str; 4] = ["preparing", "starting", "running", "waiting"];
@@ -121,6 +122,11 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         })
         .map(|request| request.id.clone())
         .collect();
+    let usage_limit_run_id = if super::status::thread_error(projection).is_some_and(|e| e.limit_blocked()) {
+        super::status::presented_latest_run(projection).map(|r| r.id.clone())
+    } else {
+        None
+    };
     ThreadActivity {
         latest_run: activity_run.map(|run| summarize(run, projection)),
         running_run_id,
@@ -129,6 +135,7 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         active_turn_started_at,
         pending_approval_ids,
         usage_limit_notice: derive_usage_limit_notice_rows(projection),
+        usage_limit_run_id,
     }
 }
 
@@ -410,8 +417,8 @@ pub struct ModelSwitchDisplay {
     pub effort_changed: bool,
 }
 
-const FALLBACK_EFFORT_KEYS: [&str; 7] =
-    ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thinking"];
+const FALLBACK_EFFORT_KEYS: [&str; 8] =
+    ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thinking", "thought_level"];
 
 fn resolve_effort(
     selection: &serde_json::Value,
@@ -429,7 +436,7 @@ fn resolve_effort(
             opts.and_then(|o| o.get(*key))
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && *s != crate::traits::DEFAULT_VARIANT_CHOICE_ID)
         })?;
         return Some((value.to_owned(), value.to_owned()));
     };
@@ -443,13 +450,13 @@ fn resolve_effort(
         .and_then(|o| o.get(&select.id))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != crate::traits::DEFAULT_VARIANT_CHOICE_ID)
         .map(str::to_owned)
         .or_else(|| {
             crate::traits::current_value(&crate::server_config::OptionDescriptor::Select(select.clone()))
                 .and_then(|v| match v {
-                    crate::traits::OptionValue::Str(s) => Some(s),
-                    crate::traits::OptionValue::Bool(_) => None,
+                    crate::traits::OptionValue::Str(s) if s != crate::traits::DEFAULT_VARIANT_CHOICE_ID => Some(s),
+                    crate::traits::OptionValue::Str(_) | crate::traits::OptionValue::Bool(_) => None,
                 })
         })?;
     let label = select

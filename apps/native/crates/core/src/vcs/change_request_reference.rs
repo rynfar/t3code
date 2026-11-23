@@ -27,7 +27,7 @@ static GITHUB_REFERENCE: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?i)^https
 static GITLAB_REFERENCE: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?i)^https?://[^/?#\s]+/[^/?#\s]+(?:/[^/?#\s]+)+/-/merge_requests/([0-9]+)(?:[/?#].*)?$"));
 static FORGEJO_REFERENCE: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?i)^https?://[^/\s]+/(?:[^/\s]+/)+[^/\s]+/pulls/([0-9]+)(?:[/?#].*)?$"));
 static AZURE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-    pattern(r"(?i)^https://(?:dev\.azure\.com/[^/\s]+/[^/\s]+|[^/\s]+\.visualstudio\.com/(?:DefaultCollection/)?[^/\s]+)/_git/[^/\s]+/pullrequest/([0-9]+)(?:[/?#].*)?$")
+    pattern(r"(?i)^https://(?:dev\.azure\.com/[^/\s]+(?:/[^/\s]+)?/|[^/\s]+\.visualstudio\.com/(?:DefaultCollection/)?(?:[^/\s]+/)?)_git/[^/\s]+/pullrequest/([0-9]+)(?:[/?#].*)?$")
 });
 
 /// The `CHANGE_REQUEST_PATH`s of hosts that also check the hostname.
@@ -123,7 +123,10 @@ mod tests {
     fn legacy_azure_devops_urls_with_or_without_default_collection_check_out() {
         for url in [
             "https://acme.visualstudio.com/project/_git/t3code/pullrequest/42",
+            "https://acme.visualstudio.com/_git/t3code/pullrequest/42",
+            "https://acme.visualstudio.com/DefaultCollection/_git/t3code/pullrequest/42",
             "https://acme.visualstudio.com/DefaultCollection/project/_git/t3code/pullrequest/42",
+            "https://dev.azure.com/acme/_git/t3code/pullrequest/42",
             "https://dev.azure.com/acme/project/_git/t3code/pullrequest/42?_a=files",
         ] {
             assert_eq!(parse_pull_request_reference(url).as_deref(), Some(url));

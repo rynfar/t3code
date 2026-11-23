@@ -196,6 +196,7 @@ pub struct DeviceScreen {
     pub(super) fold_error: Option<String>,
     /// Tracks environment/connection switches so hub SSE/poll tasks restart with fresh credentials.
     connection_id: Option<u64>,
+    last_home_press: Option<std::time::Instant>,
     _state_sub: Subscription,
 }
 
@@ -262,7 +263,21 @@ impl DeviceScreen {
             fold_pending: false,
             fold_error: None,
             connection_id,
+            last_home_press: None,
             _state_sub: state_sub,
+        }
+    }
+
+    fn press_home(&mut self) {
+        if self
+            .last_home_press
+            .is_some_and(|at| at.elapsed() <= std::time::Duration::from_millis(400))
+        {
+            self.last_home_press = None;
+            self.send(DeviceInput::Button(HardwareButton::AppSwitcher));
+        } else {
+            self.last_home_press = Some(std::time::Instant::now());
+            self.send(DeviceInput::Button(HardwareButton::Home));
         }
     }
 
@@ -1124,7 +1139,7 @@ impl DeviceScreen {
                             .icon(Icon::House)
                             .tooltip("Home")
                             .disabled(disabled)
-                            .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Button(HardwareButton::Home)))),
+                            .on_click(cx.listener(|this, _, _, _| this.press_home())),
                     )
                     .when(platform == Platform::Android, |this| {
                         this.child(

@@ -390,6 +390,9 @@ fn fold_setup(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> Fold
             if failure.class == "usage_limit" { &mut usage_limited } else { &mut other_failures }.insert(run.clone());
         }
     }
+    if let Some(id) = activity.usage_limit_run_id.as_ref() {
+        usage_limited.insert(id.clone());
+    }
     let itemized: HashSet<String> =
         failed_runs.iter().filter(|run| !usage_limited.contains(*run) || other_failures.contains(*run)).cloned().collect();
     let live_subagents = live_subagent_entry_ids(entries);
@@ -790,9 +793,11 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
         rows.extend(working_row());
     }
     let turn_ended = activity.latest_run.as_ref().is_some_and(|run| run.turn_ended);
+    let reply_is_streaming = entries.last().and_then(|e| e.message()).is_some_and(|m| m.role == Role::Assistant && m.streaming);
     let provider_starting = activity.latest_run.as_ref().and_then(|run| run.provider_starting_label.clone());
     if is_working
         && !turn_ended
+        && !reply_is_streaming
         && !setup_owns_working_slot
         && !compaction.active
         && !compaction.only_run_finished
@@ -1113,6 +1118,7 @@ mod tests {
             runless_work_active: false,
             running_run_id: None,
             usage_limit_notice: None,
+            usage_limit_run_id: None,
         }
     }
 
@@ -1259,5 +1265,58 @@ mod tests {
         assert!(!work_ids.contains(&"del-ok"), "matching non-failed delegate_task should be hidden, got {work_ids:?}");
         assert!(work_ids.contains(&"del-err"), "failed isError delegate_task stays visible, got {work_ids:?}");
         assert!(work_ids.contains(&"del-other"), "unmatched delegate_task stays visible, got {work_ids:?}");
+    }
+
+    #[test]
+    fn usage_limit_run_id_groups_work_on_failed_run_without_error_turn_item() {
+        let mk_work = |id: &str, ts: &str| {
+            entry_work(&format!("{id}-entry"), ts, WorkLogEntry {
+                id: id.into(),
+                created_at: ts.into(),
+                run_id: Some("r1".into()),
+                label: "Ran command".into(),
+                command: Some("ls".into()),
+                status: Some(ToolStatus::Completed),
+                ..Default::default()
+            })
+        };
+        let entries = [
+            mk_work("w1", "2026-11-01T00:01:00.000Z"),
+            mk_work("w2", "2026-11-01T00:02:00.000Z"),
+        ];
+        let empty = HashSet::new();
+        let itemized_rows = derive_rows(
+            &RowsInput {
+                entries: &entries,
+                activity: &activity(false, Some(run("r1", "failed")), None),
+                expanded_run_ids: &empty,
+                expanded_attempt_ids: &empty,
+                expanded_work_group_ids: &empty,
+                worktree_setup: None,
+                tool_call_visibility: ToolCallVisibility::default(),
+                revealed_message_id: None,
+            },
+            &mut RowsCache::default(),
+        );
+        assert_eq!(itemized_rows.len(), 2);
+        assert!(itemized_rows.iter().all(|r| matches!(r.kind, RowKind::Work { .. })));
+
+        let mut act = activity(false, Some(run("r1", "failed")), None);
+        act.usage_limit_run_id = Some("r1".into());
+        let grouped_rows = derive_rows(
+            &RowsInput {
+                entries: &entries,
+                activity: &act,
+                expanded_run_ids: &empty,
+                expanded_attempt_ids: &empty,
+                expanded_work_group_ids: &empty,
+                worktree_setup: None,
+                tool_call_visibility: ToolCallVisibility::default(),
+                revealed_message_id: None,
+            },
+            &mut RowsCache::default(),
+        );
+        assert_eq!(grouped_rows.len(), 1);
+        assert!(matches!(grouped_rows[0].kind, RowKind::WorkToggle { .. }));
     }
 }

@@ -57,6 +57,9 @@ impl ToolFind {
 }
 
 fn fold_character(character: char) -> char {
+    if character == 'İ' {
+        return 'i';
+    }
     let mut lowered = character.to_lowercase();
     let first = lowered.next().unwrap_or(character);
     match first {
@@ -425,6 +428,13 @@ mod tests {
                 .map(|range| &text[range.clone()])
                 .collect::<Vec<_>>(),
             ["Σ", "ς", "σ"]
+        );
+        assert_eq!(
+            occurrences(text, "i")
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["İ"]
         );
         assert_eq!(
             occurrences(text, "don't")

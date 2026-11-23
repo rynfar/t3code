@@ -210,6 +210,21 @@ pub(crate) fn write(text: String, fragment: String, cx: &mut App) {
     let _ = html;
 }
 
+pub(crate) fn write_raw_html(plain_text: String, html: String, cx: &mut App) {
+    #[cfg(feature = "snapshot")]
+    if crate::webview::is_offscreen() {
+        cx.set_global(super::prompt_links::SnapshotClipboard(Some(
+            serde_json::json!({"text": plain_text, "html": html}).to_string(),
+        )));
+        return;
+    }
+    cx.write_to_clipboard(ClipboardItem::new_string(plain_text));
+    #[cfg(target_os = "macos")]
+    platform::write_html(&format!("<meta charset=\"utf-8\">{html}"));
+    #[cfg(not(target_os = "macos"))]
+    let _ = html;
+}
+
 pub(super) fn read_html_fragment() -> Option<String> {
     if crate::webview::is_offscreen() {
         return None;

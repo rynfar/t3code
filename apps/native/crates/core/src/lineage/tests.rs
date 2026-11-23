@@ -487,3 +487,54 @@ fn waiting_label_and_surrogate_safe_subagent_truncation_match_web() {
     let overflow = format!("{}😀", "x".repeat(279));
     assert_eq!(subagent_detail_preview("failed", Some(&overflow), None), Some(format!("{}…", "x".repeat(279))));
 }
+
+#[test]
+fn subagent_effort_label_supports_thought_level_reasoning_role_and_default_variant() {
+    let model_with_role: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "grok-acp",
+        "name": "Grok ACP",
+        "capabilities": {
+            "optionDescriptors": [
+                {
+                    "id": "custom_effort",
+                    "label": "Custom",
+                    "type": "select",
+                    "role": "reasoning",
+                    "options": [{ "id": "high", "label": "High" }]
+                }
+            ]
+        }
+    }))
+    .unwrap();
+    let sel_role = crate::model::ModelSelection {
+        instance_id: "grok".into(),
+        model: "grok-acp".into(),
+        options: Some(json!([{ "id": "custom_effort", "value": "high" }])),
+    };
+    assert_eq!(subagents::effort_label(&sel_role, Some(&model_with_role), None).as_deref(), Some("High"));
+
+    let model_with_variant: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "oc-model",
+        "name": "OC Model",
+        "capabilities": {
+            "optionDescriptors": [
+                {
+                    "id": "variant",
+                    "label": "Variant",
+                    "type": "select",
+                    "options": [
+                        { "id": crate::traits::DEFAULT_VARIANT_CHOICE_ID, "label": "Default" },
+                        { "id": "max", "label": "Max" }
+                    ]
+                }
+            ]
+        }
+    }))
+    .unwrap();
+    let sel_default = crate::model::ModelSelection {
+        instance_id: "oc".into(),
+        model: "oc-model".into(),
+        options: None,
+    };
+    assert_eq!(subagents::effort_label(&sel_default, Some(&model_with_variant), None).as_deref(), Some("Default"));
+}

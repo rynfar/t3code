@@ -556,12 +556,19 @@ fn open_resolved_file_now(
         }
         return;
     }
-    let (panel_open, action_cwd) = {
+    let (panel_open, panel_cwd) = {
         let app = state.read(cx);
-        (app.panel_thread().is_some(), resolved_root.map(str::to_owned).or_else(|| resolve_action_target(ctx, app).1))
+        (
+            app.panel_thread().is_some(),
+            app.file_workspace().map(|w| w.cwd).filter(|s| !s.is_empty()),
+        )
     };
-    if panel_open && let Some(cwd) = action_cwd {
-        let target = t3_core::files::file_surface_path(&file.full_path, Some(&cwd));
+    if panel_open
+        && (panel_cwd.is_some()
+            || file.full_path.starts_with('/')
+            || t3_core::markdown::links::is_windows_drive_path(&file.full_path))
+    {
+        let target = t3_core::files::file_surface_path(&file.full_path, panel_cwd.as_deref());
         state.update(cx, |app, cx| {
             app.mutate_panels(cx, |panels, thread| panels.panels.open_file(thread, target.as_deref(), file.line));
         });
@@ -727,15 +734,22 @@ fn resolve_and_open_workspace_file_link(
                             let candidates = search_workspace_candidates(&client, root, &query).await;
                             project_searches.push((root.as_str(), candidates));
                         }
-                        let borrowed: Vec<(&str, &[WorkspaceEntryCandidate])> = project_searches
-                            .iter()
-                            .map(|(root, entries)| (*root, entries.as_slice()))
-                            .collect();
-                        if let Some(matched_full) = pick_project_link_match(&lookup_rel, borrowed) {
-                            let matched_root = other_roots
+                        let mut borrowed: Vec<(&str, &[WorkspaceEntryCandidate])> = Vec::with_capacity(project_searches.len() + 1);
+                        borrowed.push((cwd.as_str(), active_entries.as_slice()));
+                        borrowed.extend(
+                            project_searches
                                 .iter()
-                                .find(|root| root_contains_path(root, &matched_full))
-                                .cloned();
+                                .map(|(root, entries)| (*root, entries.as_slice())),
+                        );
+                        if let Some(matched_full) = pick_project_link_match(&lookup_rel, borrowed) {
+                            let matched_root = root_contains_path(&cwd, &matched_full)
+                                .then(|| cwd.clone())
+                                .or_else(|| {
+                                    other_roots
+                                        .iter()
+                                        .find(|root| root_contains_path(root, &matched_full))
+                                        .cloned()
+                                });
                             return Some((matched_full, matched_root));
                         }
                     }

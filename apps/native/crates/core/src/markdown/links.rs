@@ -361,7 +361,7 @@ fn has_non_file_url_scheme(value: &str) -> bool {
         && !scheme.eq_ignore_ascii_case("file")
 }
 
-fn is_windows_drive_path(value: &str) -> bool {
+pub fn is_windows_drive_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -619,6 +619,29 @@ fn pick_stripped_workspace_match(
         .map(|e| e.path.clone())
 }
 
+fn workspace_qualified_path_matches(
+    relative_path: &str,
+    cwd: &str,
+    entries: &[WorkspaceEntryCandidate],
+) -> Vec<String> {
+    if let Some(stripped) = strip_repeated_workspace_prefix(relative_path, cwd)
+        && let Some(found) = pick_stripped_workspace_match(&stripped, cwd, entries)
+    {
+        return vec![found];
+    }
+    let suffix = relative_path.replace('\\', "/");
+    let suffix_slash = format!("/{suffix}");
+    entries
+        .iter()
+        .filter(|e| e.kind == WorkspaceEntryKind::File)
+        .filter(|e| {
+            let norm = e.path.replace('\\', "/");
+            norm == suffix || norm.ends_with(&suffix_slash)
+        })
+        .map(|e| e.path.clone())
+        .collect()
+}
+
 /// Picks the single matching workspace-relative file from `entries` (`#33943`).
 pub fn pick_workspace_link_match(
     relative_path: &str,
@@ -629,22 +652,9 @@ pub fn pick_workspace_link_match(
     if needs_workspace_basename_lookup(trimmed) {
         return pick_workspace_basename_match(trimmed, entries);
     }
-    if let Some(stripped) = strip_repeated_workspace_prefix(trimmed, cwd)
-        && let Some(found) = pick_stripped_workspace_match(&stripped, cwd, entries)
-    {
-        return Some(found);
-    }
-    let suffix = trimmed.replace('\\', "/");
-    let suffix_slash = format!("/{suffix}");
-    let mut matches = entries
-        .iter()
-        .filter(|e| e.kind == WorkspaceEntryKind::File)
-        .filter(|e| {
-            let norm = e.path.replace('\\', "/");
-            norm == suffix || norm.ends_with(&suffix_slash)
-        });
+    let mut matches = workspace_qualified_path_matches(trimmed, cwd, entries).into_iter();
     let first = matches.next()?;
-    matches.next().is_none().then(|| first.path.clone())
+    matches.next().is_none().then_some(first)
 }
 
 /// Resolves a unique absolute path across candidate project roots (`#35036`).
@@ -652,12 +662,55 @@ pub fn pick_project_link_match<'a, I>(relative_path: &str, searches: I) -> Optio
 where
     I: IntoIterator<Item = (&'a str, &'a [WorkspaceEntryCandidate])>,
 {
-    let mut matches = searches.into_iter().filter_map(|(root, entries)| {
-        let matched = pick_workspace_link_match(relative_path, root, entries)?;
-        Some(resolve_full_and_relative(&matched, Some(root)).0)
-    });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
+    let target = relative_path.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let searches: Vec<(&'a str, &'a [WorkspaceEntryCandidate])> = searches.into_iter().collect();
+    let is_basename = needs_workspace_basename_lookup(target);
+    let folded = target.to_lowercase();
+    let is_folded_match = |entry: &WorkspaceEntryCandidate| {
+        entry.kind == WorkspaceEntryKind::File && basename_of(&entry.path).to_lowercase() == folded
+    };
+    let mut matches = std::collections::BTreeMap::<String, String>::new();
+    let mut root_hits = 0usize;
+    let mut add_match = |path: String| {
+        // Windows paths that differ only by case stay distinct: a directory can be case-sensitive.
+        let key = if is_windows_drive_path(&path) || path.starts_with("\\\\") {
+            path.replace('/', "\\")
+        } else {
+            path.clone()
+        };
+        matches.entry(key).or_insert(path);
+    };
+    for &(root, entries) in &searches {
+        if is_basename {
+            if !entries.iter().any(is_folded_match) {
+                continue;
+            }
+            root_hits += 1;
+            if let Some(matched) = pick_workspace_basename_match(target, entries) {
+                add_match(resolve_full_and_relative(&matched, Some(root)).0);
+            }
+        } else {
+            for matched in workspace_qualified_path_matches(target, root, entries) {
+                add_match(resolve_full_and_relative(&matched, Some(root)).0);
+            }
+        }
+    }
+    if is_basename && root_hits > 1 {
+        // A root's pick, or a root left ambiguous by case, can hide another file elsewhere.
+        for &(root, entries) in &searches {
+            for entry in entries {
+                if is_folded_match(entry) {
+                    add_match(resolve_full_and_relative(&entry.path, Some(root)).0);
+                }
+            }
+        }
+    }
+    (matches.len() == 1)
+        .then(|| matches.into_values().next())
+        .flatten()
 }
 
 fn is_shell_name(name: &str) -> bool {
@@ -1021,6 +1074,22 @@ mod tests {
         assert_eq!(
             pick_project_link_match("lib.rs", [("/Volumes/repo", &entries[..])]).as_deref(),
             Some("/Volumes/repo/crates/core/src/lib.rs")
+        );
+        let root_a = [
+            WorkspaceEntryCandidate { path: "apps/a/README.md".into(), kind: WorkspaceEntryKind::File },
+            WorkspaceEntryCandidate { path: "apps/b/readme.md".into(), kind: WorkspaceEntryKind::File },
+        ];
+        let root_b = [
+            WorkspaceEntryCandidate { path: "docs/README.md".into(), kind: WorkspaceEntryKind::File },
+        ];
+        // Cross-root basename hits uncover internally case-ambiguous candidates too.
+        assert_eq!(pick_project_link_match("README.md", [("/repo-a", &root_a[..]), ("/repo-b", &root_b[..])]), None);
+        // Nested project roots naming the same physical file deduplicate to one match.
+        let parent_entries = [WorkspaceEntryCandidate { path: "packages/sub/only.rs".into(), kind: WorkspaceEntryKind::File }];
+        let child_entries = [WorkspaceEntryCandidate { path: "only.rs".into(), kind: WorkspaceEntryKind::File }];
+        assert_eq!(
+            pick_project_link_match("only.rs", [("/repo", &parent_entries[..]), ("/repo/packages/sub", &child_entries[..])]).as_deref(),
+            Some("/repo/packages/sub/only.rs")
         );
 
         let dirs = agent_working_directories_from_commands([

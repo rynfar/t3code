@@ -87,11 +87,10 @@ pub fn resolve_label_collisions(
     for (theme, _) in &entries {
         *counts.entry(theme.id.clone()).or_insert(0) += 1;
     }
-    let mut seen = std::collections::BTreeSet::new();
-    entries
+    let relabelled: Vec<ThemeDefinition> = entries
         .into_iter()
         .map(|(theme, source)| {
-            let theme = if counts[&theme.id] > 1 {
+            if counts[&theme.id] > 1 {
                 source
                     .as_deref()
                     .map(|s| humanize(s.rsplit_once('.').map_or(s, |(stem, _)| stem)))
@@ -102,12 +101,37 @@ pub fn resolve_label_collisions(
                     .unwrap_or(theme)
             } else {
                 theme
-            };
+            }
+        })
+        .collect();
+    let input_ids: std::collections::BTreeSet<String> =
+        relabelled.iter().map(|theme| theme.id.clone()).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    relabelled
+        .into_iter()
+        .map(|theme| {
             if seen.insert(theme.id.clone()) {
                 return theme;
             }
             for suffix in 2..100 {
-                if let Ok(candidate) = rename(&theme, &format!("{} {suffix}", theme.label))
+                let suffix_text = suffix.to_string();
+                let mut base: Vec<char> = theme.label.chars().collect();
+                let mut stem = base.iter().collect::<String>().trim_end().to_owned();
+                let mut name = format!("{stem} {suffix_text}");
+                let mut id = id_from_name(&name);
+                while name.chars().count() > 48
+                    || id.rsplit('-').next() != Some(suffix_text.as_str())
+                    || id == id_from_name(&stem)
+                {
+                    if base.pop().is_none() {
+                        break;
+                    }
+                    stem = base.iter().collect::<String>().trim_end().to_owned();
+                    name = format!("{stem} {suffix_text}");
+                    id = id_from_name(&name);
+                }
+                if let Ok(candidate) = rename(&theme, &name)
+                    && !input_ids.contains(&candidate.id)
                     && seen.insert(candidate.id.clone())
                 {
                     return candidate;
@@ -728,5 +752,19 @@ mod session_tests {
         assert_eq!(renamed.len(), 2);
         assert_eq!(renamed[0].css.as_deref(), Some(":root { --a: #111; }"));
         assert_eq!(renamed[1].css.as_deref(), Some(":root { --a: #222; }"));
+
+        // Long names truncate to <= 48 chars without re-colliding against incoming ids.
+        let long_name = "A Very Long Theme Name That Is Forty Seven Char";
+        assert_eq!(long_name.chars().count(), 47);
+        let collided_two = format!("{} 2", long_name.chars().take(46).collect::<String>().trim_end());
+        let long_collided = resolve_label_collisions(vec![
+            (with_css(long_name, true, None), None),
+            (with_css(long_name, true, None), None),
+            (with_css(&collided_two, true, None), None),
+        ]);
+        assert_eq!(long_collided.len(), 3);
+        let ids: std::collections::BTreeSet<_> = long_collided.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(long_collided.iter().all(|t| t.label.chars().count() <= 48));
     }
 }

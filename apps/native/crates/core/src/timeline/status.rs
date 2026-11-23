@@ -98,7 +98,36 @@ fn error_summary(failure: Option<&ProviderFailure>, session_error: Option<&str>)
         code: current.and_then(|failure| failure.code.clone()),
         reset_at: current.filter(|failure| failure.class == "usage_limit").and_then(|failure| failure.reset_at.clone()),
         runtime_failed: false,
+        source: None,
     })
+}
+
+/// `threadErrorSource`: a session error belongs to the latest ended run, as that run's failure when
+/// the text matches. Session timestamps are not used: providers rewrite them on unrelated updates.
+fn thread_error_source(
+    failure_item: Option<(&TurnItem, &ProviderFailure)>,
+    session_error: Option<&str>,
+    projection: &ThreadProjection,
+) -> Option<String> {
+    let item_source = |item: &TurnItem| format!("{}@{}", item.id, item.completed_at.as_deref().unwrap_or(""));
+    if let Some((item, failure)) = failure_item
+        && (session_error.is_none() || session_error == Some(failure.message.as_str()))
+    {
+        return Some(item_source(item));
+    }
+    let session_error = session_error?;
+    let ended = projection
+        .runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "failed" | "completed"))
+        .max_by_key(|run| run.ordinal)?;
+    let ended_failure = failure_item
+        .filter(|(item, _)| item.run_id.as_deref() == Some(ended.id.as_str()))
+        .or_else(|| latest_root_provider_failure_item(Some(ended), projection));
+    match ended_failure {
+        Some((item, failure)) if failure.message == session_error => Some(item_source(item)),
+        _ => Some(format!("{}@{}", ended.id, ended.completed_at.as_deref().unwrap_or(""))),
+    }
 }
 
 /// `usageLimitRunPresentedAsLatest`: a limited run stays the latest while later runs never started.
@@ -123,6 +152,8 @@ pub struct ThreadError {
     pub reset_at: Option<String>,
     /// The runtime's status is `failed`.
     pub runtime_failed: bool,
+    /// `lastErrorSource`: item/run identity key separating distinct errors with identical messages.
+    pub source: Option<String>,
 }
 
 impl ThreadError {
@@ -145,15 +176,19 @@ impl ThreadError {
 
     /// `getThreadErrorBannerKey`; also the session dismissal key.
     pub fn banner_key(&self, thread_id: &str) -> String {
-        format!("{thread_id}\u{0}{}", self.message)
+        let source = self.source.as_deref().unwrap_or("");
+        format!("{thread_id}\u{0}{source}\u{0}{}", self.message)
     }
 }
 
 pub fn thread_error(projection: &ThreadProjection) -> Option<ThreadError> {
     let latest = presented_latest_run(projection);
-    let mut error = error_summary(latest_root_provider_failure(latest, projection), session_error(projection))?;
+    let session = session_error(projection);
+    let failure_item = latest_root_provider_failure_item(latest, projection);
+    let mut error = error_summary(failure_item.map(|(_, failure)| failure), session)?;
     let activity = latest_matching_run(projection, &ACTIVITY_RUN_STATUSES).or(latest);
     error.runtime_failed = usage_limit_presented_run(projection).is_some() || activity.is_some_and(|run| run.status == "failed");
+    error.source = thread_error_source(failure_item, session, projection);
     Some(error)
 }
 
@@ -330,6 +365,7 @@ pub struct LimitRecovery {
     pub resumes: bool,
     pub snoozed: bool,
     pub reset_passed: bool,
+    pub display_passed: bool,
 }
 
 impl LimitRecovery {
@@ -351,20 +387,41 @@ impl LimitRecovery {
         if self.chatgpt_limit() { "ChatGPT usage limit reached" } else { Self::TITLE }
     }
 
-    pub fn description(&self, now_ms: i64, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
-        if self.workspace_limit() {
-            return "You've reached your workspace's limit for using your ChatGPT plan in other apps.".to_owned();
-        }
-        let display_at = if self.resumes {
+    fn display_at(&self) -> Option<&str> {
+        if self.resumes {
             match (self.reset_at.as_deref().and_then(parse_iso_ms), self.snoozed_until.as_deref().and_then(parse_iso_ms)) {
                 (Some(reset), Some(snoozed)) if snoozed > reset => self.snoozed_until.as_deref(),
                 _ => self.reset_at.as_deref(),
             }
         } else {
             self.reset_at.as_deref()
-        };
-        match display_at.filter(|reset| !reset.is_empty()).map(|reset| format_upcoming(reset, now_ms, zone, format, locale)) {
-            Some(reset) => format!("{} {reset}", if self.resumes { "Resumes" } else { "Resets" }),
+        }
+    }
+
+    pub fn description(&self, now_ms: i64, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+        if self.workspace_limit() {
+            return "You've reached your workspace's limit for using your ChatGPT plan in other apps.".to_owned();
+        }
+        let display_at = self.display_at();
+        let reset_passed = self.reset_passed
+            || self
+                .reset_at
+                .as_deref()
+                .and_then(parse_iso_ms)
+                .is_some_and(|reset| reset <= now_ms);
+        let display_passed = self.display_passed
+            || display_at
+                .and_then(parse_iso_ms)
+                .is_some_and(|at| at <= now_ms);
+        let resumes_upcoming = self.resumes && !display_passed;
+        let shown_at = if resumes_upcoming { display_at } else { self.reset_at.as_deref() };
+        match shown_at
+            .filter(|reset| !reset.is_empty())
+            .map(|reset| format_upcoming(reset, now_ms, zone, format, locale))
+        {
+            Some(reset) if resumes_upcoming => format!("Resumes {reset}"),
+            Some(reset) if reset_passed => format!("Reset {reset}"),
+            Some(reset) => format!("Resets {reset}"),
             None => "Reset time unavailable; retry manually".to_owned(),
         }
     }
@@ -384,9 +441,22 @@ impl LimitRecovery {
         Ok(meta_update(command_id, thread_id, json!({ "runId": self.run_id, "resetAt": reset_at, "snooze": !self.snoozed })))
     }
 
-    /// When the snooze button next changes on its own.
+    /// When the snooze button or "Resumes ..." countdown next changes on its own.
     pub fn deadline(&self) -> Option<i64> {
-        self.reset_at.as_deref().and_then(parse_iso_ms).filter(|_| !self.reset_passed)
+        let reset_ms = self.reset_at.as_deref().and_then(parse_iso_ms);
+        if !self.reset_passed
+            && let Some(reset_ms) = reset_ms
+        {
+            return Some(reset_ms);
+        }
+        if self.resumes
+            && !self.display_passed
+            && let Some(display_ms) = self.display_at().and_then(parse_iso_ms)
+            && reset_ms.is_none_or(|reset| display_ms > reset)
+        {
+            return Some(display_ms);
+        }
+        None
     }
 }
 
@@ -430,6 +500,15 @@ pub fn limit_recovery_with(error: Option<&ThreadError>, shell: &ThreadShell, req
     let scheduled = recovery.is_some_and(|recovery| recovery.auto_resume);
     let resumes = can_schedule && scheduled;
     let reset_passed = reset_ms.is_some_and(|reset| reset <= now_ms);
+    let display_ms = if resumes {
+        match (reset_ms, shell.snoozed_until.as_deref().and_then(parse_iso_ms)) {
+            (Some(reset), Some(snoozed)) if snoozed > reset => Some(snoozed),
+            _ => reset_ms,
+        }
+    } else {
+        reset_ms
+    };
+    let display_passed = display_ms.is_some_and(|at| at <= now_ms);
     let snoozed = limit_recovery_owns_snooze(Some(&run_id), reset_at.as_deref(), shell.limit_recovery.as_ref(), shell.snoozed_until.as_deref()) && !reset_passed;
     Some(LimitRecovery {
         scheduled,
@@ -441,6 +520,7 @@ pub fn limit_recovery_with(error: Option<&ThreadError>, shell: &ThreadShell, req
         snoozed_until: shell.snoozed_until.clone(),
         can_schedule,
         reset_passed,
+        display_passed,
     })
 }
 

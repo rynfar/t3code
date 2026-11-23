@@ -882,6 +882,11 @@ pub fn start_project_clone(
     })
 }
 
+fn is_bare_windows_drive(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 fn is_windows_drive(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
@@ -932,6 +937,9 @@ pub fn browse_leaf(value: &str) -> &str {
 
 /// `appendBrowsePathSegment`: enter a folder.
 pub fn append_browse_segment(current: &str, segment: &str) -> String {
+    if is_bare_windows_drive(current) {
+        return format!("{current}\\{segment}\\");
+    }
     format!("{}{segment}{}", browse_directory_path(current), preferred_separator(current))
 }
 
@@ -958,9 +966,14 @@ pub struct BrowsePath {
 
 /// `getFilesystemBrowsePath`: the folder to list and the leaf to filter its entries by.
 pub fn browse_path(query: &str, windows: bool) -> Option<BrowsePath> {
-    is_browse_query(query, windows).then(|| BrowsePath {
-        directory: browse_directory_path(query).to_owned(),
-        filter: if has_trailing_separator(query) { String::new() } else { browse_leaf(query).to_owned() },
+    is_browse_query(query, windows).then(|| {
+        if windows && is_bare_windows_drive(query) {
+            return BrowsePath { directory: format!("{query}\\"), filter: String::new() };
+        }
+        BrowsePath {
+            directory: browse_directory_path(query).to_owned(),
+            filter: if has_trailing_separator(query) { String::new() } else { browse_leaf(query).to_owned() },
+        }
     })
 }
 
@@ -1163,6 +1176,8 @@ mod tests {
         assert_eq!(browse_parent_path("/Users/"), Some("/".into()));
         assert_eq!(browse_parent_path("/"), None);
         assert_eq!(browse_leaf("C:\\code\\t3"), "t3");
+        assert_eq!(browse_path("D:", true), Some(BrowsePath { directory: "D:\\".into(), filter: String::new() }));
+        assert_eq!(append_browse_segment("D:", "code"), "D:\\code\\");
     }
 
     #[test]

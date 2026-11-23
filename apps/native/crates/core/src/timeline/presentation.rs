@@ -629,6 +629,40 @@ pub fn cap_thought_preview(text: &str) -> String {
     crate::assistant_citations::take_units(&collapsed, THOUGHT_PREVIEW_MAX_LENGTH, false)
 }
 
+const GENERIC_COMMAND_TITLES: [&str; 3] = ["Ran command", "Run command", "Command"];
+
+fn generic_command_status_label(status: ToolStatus) -> String {
+    match status {
+        ToolStatus::InProgress => "Running command",
+        ToolStatus::Failed => "Failed command",
+        ToolStatus::Declined => "Declined command",
+        ToolStatus::Stopped => "Stopped command",
+        ToolStatus::Completed | ToolStatus::Idle => "Ran command",
+    }
+    .to_owned()
+}
+
+fn commandless_command_label(entry: &WorkLogEntry, status: ToolStatus) -> Option<String> {
+    if entry.item_type != Some("command_execution")
+        || entry.command.as_deref().is_some_and(|c| !c.trim().is_empty())
+    {
+        return None;
+    }
+    // The provider's own title, before a client substitutes its fallback label.
+    let raw_title = match entry.item.as_ref() {
+        Some(item) => item.title.as_deref(),
+        None => entry.tool_title.as_deref().filter(|t| !t.is_empty()).or(Some(entry.label.as_str())),
+    };
+    let title = raw_title.map(str::trim).filter(|t| !t.is_empty());
+    match title {
+        None => Some(generic_command_status_label(status)),
+        Some(title) if GENERIC_COMMAND_TITLES.contains(&normalize_compact_tool_label(title).as_str()) => {
+            Some(generic_command_status_label(status))
+        }
+        Some(_) => None,
+    }
+}
+
 /// `workEntryDisplayLabel`.
 pub fn work_entry_display_label(entry: &WorkLogEntry, workspace_root: Option<&str>) -> String {
     if entry.item_type == Some("system_notice") {
@@ -643,6 +677,9 @@ pub fn work_entry_display_label(entry: &WorkLogEntry, workspace_root: Option<&st
     }
     if let Some(command) = entry.command.as_deref().filter(|c| !c.trim().is_empty()) {
         return command_display_text(command);
+    }
+    if let Some(label) = commandless_command_label(entry, live_status(entry.status, false)) {
+        return label;
     }
     let action = tool_group_action(entry);
     if matches!(action, ToolGroupAction::CodeSearch | ToolGroupAction::Search) {
@@ -734,6 +771,9 @@ pub fn live_work_entry_label(entry: &WorkLogEntry, workspace_root: Option<&str>,
             _ => "Ran",
         };
         return format!("{verb} {}", command_program_name(command).unwrap_or_else(|| "command".into()));
+    }
+    if let Some(label) = commandless_command_label(entry, status) {
+        return label;
     }
     work_entry_display_label(entry, workspace_root)
 }

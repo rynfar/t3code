@@ -8,14 +8,15 @@ use gpui::{
     SharedString, Styled, Task, div, prelude::*, px,
 };
 use gpui_component::{h_flex, v_flex};
+use t3_core::i18n::IcuArg;
 use t3_core::issues::wire::{
     IssueDetail, IssueRef, ThreadIssueLink, decode, method, thread_issue_key_of,
 };
 use t3_core::right_panel::IssueTarget;
 
-use super::controls::{hover_fill, section_with_options};
+use super::controls::{Row, hover_fill, section_with_options};
 use crate::app_state::AppState;
-use crate::i18n::t;
+use crate::i18n::{t, t_fmt};
 use crate::icons::Icon;
 use crate::issues::{
     HeldIssueKey, environment_owner_for, held_issue_detail, hold_issue_detail,
@@ -24,6 +25,11 @@ use crate::issues::{
 use crate::right_panel::tooltip_view;
 use crate::theme::{hsla, palette};
 
+pub(super) struct IssueSectionOptions {
+    pub separated: bool,
+    pub compact: bool,
+}
+
 /// Lazily loads and caches live `IssueDetail` for each issue linked to the active thread so
 /// `ThreadDetailsIssueRows` can show live state, title, and comment count.
 #[derive(Default)]
@@ -31,6 +37,7 @@ pub(super) struct LinkedIssuesFeed {
     details: HashMap<String, IssueDetail>,
     in_flight: HashSet<String>,
     failed: HashSet<String>,
+    pub(super) expanded: bool,
     _tasks: Vec<Task<()>>,
 }
 
@@ -42,6 +49,7 @@ impl LinkedIssuesFeed {
     pub(super) fn reset(&mut self) {
         self.in_flight.clear();
         self.failed.clear();
+        self.expanded = false;
         self._tasks.clear();
     }
 
@@ -145,11 +153,12 @@ impl LinkedIssuesFeed {
         &self,
         state: &Entity<AppState>,
         links: &[ThreadIssueLink],
-        separated: bool,
-        compact: bool,
+        options: IssueSectionOptions,
         on_open: impl Fn(&mut App) + Clone + 'static,
+        on_toggle: impl Fn(&mut App) + Clone + 'static,
         cx: &App,
     ) -> Option<AnyElement> {
+        let IssueSectionOptions { separated, compact } = options;
         if links.is_empty() {
             return None;
         }
@@ -164,7 +173,9 @@ impl LinkedIssuesFeed {
         let p = palette(cx);
         let fill = hover_fill(cx);
 
-        let rows: Vec<AnyElement> = links
+        let collapsed = compact && !self.expanded && links.len() > 1;
+        let visible_links = if collapsed { &links[..1] } else { links };
+        let mut rows: Vec<AnyElement> = visible_links
             .iter()
             .enumerate()
             .map(|(idx, link)| {
@@ -255,6 +266,24 @@ impl LinkedIssuesFeed {
             })
             .collect();
 
+        if compact && links.len() > 1 {
+            let hidden = links.len() - 1;
+            let label = if self.expanded {
+                t(cx, "Show less").to_owned()
+            } else {
+                t_fmt(cx, "Show {count} more", &[("count", IcuArg::Int(hidden as i64))])
+            };
+            rows.push(
+                Row::new("details-issues-more", label)
+                    .icon(if self.expanded { Icon::ChevronUp } else { Icon::ChevronDown })
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        on_toggle(cx);
+                    })
+                    .into_any_element(),
+            );
+        }
+
         let heading = Some(SharedString::from(t(cx, "Linked issues").to_owned()));
         Some(
             section_with_options(separated, heading, compact, cx)
@@ -325,12 +354,18 @@ mod tests {
         }
         impl gpui::Render for Host {
             fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let this = cx.entity().downgrade();
                 div().size_full().children(self.feed.render(
                     &self.state,
                     &self.links,
-                    true,
-                    false,
+                    IssueSectionOptions { separated: true, compact: true },
                     |_| {},
+                    move |cx| {
+                        let _ = this.update(cx, |host, cx| {
+                            host.feed.expanded = !host.feed.expanded;
+                            cx.notify();
+                        });
+                    },
                     cx,
                 ))
             }
@@ -346,20 +381,36 @@ mod tests {
             app.environments.active = Some("env-a".into());
         });
 
+        let mut second_link = link.clone();
+        second_link.key = "20".into();
+        second_link.display_key = "#20".into();
+        second_link.title = "Second linked issue".into();
         let link_for_host = link.clone();
         let state_for_host = state.clone();
         let window = cx.add_window(|_, _| Host {
             state: state_for_host,
             feed: LinkedIssuesFeed::new(),
-            links: vec![link_for_host],
+            links: vec![link_for_host, second_link],
         });
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.update(|window, cx| window.draw(cx).clear());
         assert!(vcx.debug_bounds("thread-details-issue-0").is_some());
+        assert!(vcx.debug_bounds("thread-details-issue-1").is_none());
+        assert!(vcx.debug_bounds("details-issues-more").is_some());
 
         vcx.update(|_, cx| {
             let mut feed = LinkedIssuesFeed::new();
-            assert!(feed.render(&state, &[], false, false, |_| {}, cx).is_none());
+            assert!(
+                feed.render(
+                    &state,
+                    &[],
+                    IssueSectionOptions { separated: false, compact: false },
+                    |_| {},
+                    |_| {},
+                    cx,
+                )
+                .is_none()
+            );
 
             // Seed local cache with an older detail first, then update HeldIssues and verify
             // detail_for prefers fresher HeldIssues updates over the stale local snapshot.

@@ -617,7 +617,7 @@ impl NativeChildStep {
     }
 }
 
-const EFFORT_OPTION_IDS: [&str; 6] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level"];
+const EFFORT_OPTION_IDS: [&str; 7] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level", "thought_level"];
 
 /// Ultracode was a Claude effort level before it became its own toggle; that level ran at `xhigh`.
 fn with_legacy_ultracode_effort(
@@ -761,8 +761,20 @@ pub fn effort_label(
             reported.instance_id == selection.instance_id && (reported.model == selection.model || reported.model == resolved_model.slug)
         })
         .map(|reported| with_legacy_ultracode_effort(descriptors, selections(reported.options.as_ref())));
-    for id in EFFORT_OPTION_IDS {
-        let Some(OptionDescriptor::Select(descriptor)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
+    let reasoning_descriptors = descriptors
+        .iter()
+        .filter_map(|descriptor| match descriptor {
+            OptionDescriptor::Select(select) if select.role.as_deref() == Some("reasoning") => Some(select),
+            _ => None,
+        })
+        .chain(EFFORT_OPTION_IDS.iter().filter_map(|id| {
+            descriptors.iter().find_map(|descriptor| match descriptor {
+                OptionDescriptor::Select(select) if select.id == *id && select.role.as_deref() != Some("reasoning") => Some(select),
+                _ => None,
+            })
+        }));
+    for descriptor in reasoning_descriptors {
+        let id = descriptor.id.as_str();
         let chosen = explicit.iter().find(|option| option.id == id).map(|option| &option.value);
         // `getReportedOptionValue`: only for options the selection leaves unstated.
         let reported = reported.as_ref().filter(|_| chosen.is_none()).and_then(|options| options.iter().find(|option| option.id == id)).map(|option| &option.value);
@@ -774,7 +786,11 @@ pub fn effort_label(
         };
         let current = match reported {
             Some(OptionValue::Str(value)) => Some(value.as_str()),
-            _ if id == "variant" && chosen.is_none() => None,
+            _ if id == "variant" && chosen.is_none() => descriptor
+                .options
+                .iter()
+                .find(|option| option.id == crate::traits::DEFAULT_VARIANT_CHOICE_ID)
+                .map(|option| option.id.as_str()),
             _ => value.filter(|value| !value.is_empty()).or_else(|| descriptor.options.iter().find(|option| option.is_default).map(|option| option.id.as_str())),
         };
         let label = descriptor.options.iter().find(|option| Some(option.id.as_str()) == current).map(|option| option.label.clone()).or_else(|| {

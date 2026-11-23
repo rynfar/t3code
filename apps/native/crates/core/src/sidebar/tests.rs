@@ -44,6 +44,8 @@ fn base(id: &str) -> SidebarThread {
         pending_guest_message_count: 0,
         has_actionable_proposed_plan: false,
         background_holds_completion: false,
+        latest_run_stop_requested: false,
+        monitor_holds_wake_completion: false,
         goal_active: false,
         created_at: Some(iso("2026-06-01T00:00:00.000Z")),
         updated_at: Some(iso("2026-06-01T00:00:00.000Z")),
