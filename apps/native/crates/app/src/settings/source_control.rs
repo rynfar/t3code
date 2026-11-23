@@ -476,7 +476,20 @@ impl SettingsView {
         }
         let scope_key = self.issue_tracker_scope_key(cx);
         self.source_control.binding_pending.insert(project_id.clone());
-        let binding = (scope != UNBOUND_SCOPE).then_some(IssueTrackerProjectBinding { tracker, scope });
+        let additional_scopes = self
+            .source_control
+            .trackers
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .and_then(|list| list.bindings.get(&project_id))
+            .filter(|existing| existing.tracker == tracker)
+            .map(|existing| existing.additional_scopes.clone())
+            .unwrap_or_default();
+        let binding = (scope != UNBOUND_SCOPE).then_some(IssueTrackerProjectBinding {
+            tracker,
+            scope,
+            additional_scopes,
+        });
         let payload = serde_json::to_value(IssueTrackerBindProjectInput {
             project_id: project_id.clone(),
             binding,
@@ -1668,9 +1681,14 @@ impl SettingsView {
 
         let kind_for_source = def.kind.to_owned();
         let view_for_source = cx.entity().downgrade();
+        let secret_providers = if config.has_secret_providers_feature() && config.secret_references {
+            config.settings.secret_providers.0.as_slice()
+        } else {
+            &[]
+        };
         let token_input = SecretSourceInput::new(
             SharedString::from(format!("sc-token-source-{}", def.kind)), t(cx, "Token"), &value_input,
-            &config.settings.secret_providers.0, (source != STORED_SECRET).then_some(source.as_str()),
+            secret_providers, (source != STORED_SECRET).then_some(source.as_str()),
         ).disabled(!can_write || saving).on_source_change(move |next, window, cx| {
             let next = next.map_or_else(|| STORED_SECRET.to_owned(), |source| source.to_string());
             let _ = view_for_source.update(cx, |this, cx| {
@@ -2027,10 +2045,15 @@ impl SettingsView {
             let kind_for_source = def.kind.to_owned();
             let key_for_source = field.key.to_owned();
             let view_for_source = cx.entity().downgrade();
+            let secret_providers = if config.has_secret_providers_feature() && config.secret_references {
+                config.settings.secret_providers.0.as_slice()
+            } else {
+                &[]
+            };
             let field_control = if field.secret {
                 SecretSourceInput::new(
                     SharedString::from(format!("sc-field-source-{}-{}", def.kind, field.key)), t(cx, field.label),
-                    input, &config.settings.secret_providers.0, (source != STORED_SECRET).then_some(source.as_str()),
+                    input, secret_providers, (source != STORED_SECRET).then_some(source.as_str()),
                 ).disabled(!can_write || saving).on_source_change(move |next, window, cx| {
                     let source = next.map_or_else(|| STORED_SECRET.to_owned(), |source| source.to_string());
                     let _ = view_for_source.update(cx, |this, cx| {

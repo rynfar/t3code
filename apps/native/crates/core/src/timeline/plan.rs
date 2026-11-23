@@ -100,6 +100,7 @@ fn has_unsent_manual_continuation_source(run_id: &str, projection: &ThreadProjec
     let accepted_attempts: std::collections::HashSet<&str> = projection
         .provider_turns
         .iter()
+        .filter(|turn| turn.value.get("promptDropped") != Some(&serde_json::Value::Bool(true)))
         .filter_map(|turn| turn.value.get("runAttemptId").and_then(serde_json::Value::as_str))
         .collect();
     let latest_attempt = |id: &str, matches: &dyn Fn(&crate::thread::RunAttempt) -> bool| -> u64 {
@@ -364,6 +365,14 @@ mod tests {
             status: "interrupted".into(),
             completed_at: Some("2026-01-01T00:01:30Z".into()),
         });
+        assert_eq!(resumable_run_id(&projection).as_deref(), Some("run-1"));
+
+        // A turn whose prompt was dropped before delivery keeps manual continuation available (`#40670`).
+        projection.attempts.pop();
+        projection.provider_turns = vec![crate::thread::Entity {
+            id: "turn-dropped".into(),
+            value: serde_json::json!({ "id": "turn-dropped", "runAttemptId": "att-1", "promptDropped": true }),
+        }];
         assert_eq!(resumable_run_id(&projection).as_deref(), Some("run-1"));
     }
 }

@@ -477,6 +477,16 @@ pub struct IssueComment {
     pub reactions: Option<Vec<IssueReaction>>,
 }
 
+/// `IssueEventReference`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueEventReference {
+    pub repository: String,
+    pub number: u64,
+    pub kind: String,
+    pub url: String,
+}
+
 /// `IssueEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -488,6 +498,8 @@ pub struct IssueEvent {
     pub created_at: String,
     #[serde(default)]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<IssueEventReference>,
 }
 
 /// `IssueLinkedPullRequest`.
@@ -644,6 +656,8 @@ pub struct IssueListInput {
     pub involvement: Option<IssueInvolvement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_project_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -941,6 +955,8 @@ pub struct StandaloneIssueTrackerCredential {
 pub struct IssueTrackerProjectBinding {
     pub tracker: IssueTrackerKind,
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_scopes: Vec<String>,
 }
 
 /// `IssueTrackerScope`.

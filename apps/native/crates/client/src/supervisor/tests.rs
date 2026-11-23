@@ -26,8 +26,18 @@ fn projection(thread_id: &str) -> Value {
 async fn next_thread_sequence(events: &mut mpsc::Receiver<ClientEvent>) -> Option<u64> {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("an event").expect("open");
-        if let ClientEvent::Thread { item, .. } = event {
-            return thread_sequence(&item);
+        match event {
+            ClientEvent::Thread { item, .. } => {
+                if let Some(seq) = thread_sequence(&item) {
+                    return Some(seq);
+                }
+            }
+            ClientEvent::ThreadBatch { items, .. } => {
+                if let Some(seq) = items.iter().rev().find_map(thread_sequence) {
+                    return Some(seq);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -531,19 +541,25 @@ async fn thread_stream_keeps_syncing_after_stream_defect_and_protocol_defect() {
     first
         .chunk(
             &sub2,
-            json!([{"kind": "event", "sequence": 7, "event": {"id": "e7", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+            json!([
+                {"kind": "event", "sequence": 7, "event": {"id": "e7", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}},
+                {"kind": "synchronized"}
+            ]),
         )
         .await;
     assert_eq!(next_thread_sequence(&mut events).await, Some(7));
 
-    // 2. Malformed/undecodable frame must back off and resubscribe at afterSequence: 7 without advancing sequence.
+    // 2. Malformed/undecodable frame clears cursor and reloads a full snapshot (`#24583`).
     first.chunk(&sub2, json!([{"kind": "event", "sequence": 99, "event": "not-an-object"}])).await;
     let sub_after_decode = first.request(method::SUBSCRIBE_THREAD).await;
-    assert_eq!(sub_after_decode["payload"]["afterSequence"], 7);
+    assert_eq!(sub_after_decode["payload"].get("afterSequence"), None);
     first
         .chunk(
             &sub_after_decode,
-            json!([{"kind": "event", "sequence": 8, "event": {"id": "e8", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+            json!([
+                {"kind": "snapshot", "snapshotSequence": 8, "projection": projection("t1"), "hasMoreHistory": false},
+                {"kind": "synchronized"}
+            ]),
         )
         .await;
     assert_eq!(next_thread_sequence(&mut events).await, Some(8));
@@ -558,7 +574,10 @@ async fn thread_stream_keeps_syncing_after_stream_defect_and_protocol_defect() {
     second
         .chunk(
             &sub3,
-            json!([{"kind": "event", "sequence": 9, "event": {"id": "e9", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+            json!([
+                {"kind": "event", "sequence": 9, "event": {"id": "e9", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}},
+                {"kind": "synchronized"}
+            ]),
         )
         .await;
     assert_eq!(next_thread_sequence(&mut events).await, Some(9));
@@ -601,4 +620,169 @@ async fn thread_stream_stops_retrying_on_authorization_error_and_caps_backoff() 
         tokio::time::timeout(Duration::from_millis(80), conn.request(method::SUBSCRIBE_THREAD)).await.is_err(),
         "EnvironmentAuthorizationError must stop thread stream retries"
     );
+}
+
+#[tokio::test]
+async fn wake_probe_server_probe_updates_server_clock_offset() {
+    let mut server = FakeServer::start().await;
+    server.set_descriptor(Some(json!({
+        "environmentId": "env-probe-clock",
+        "label": "Studio",
+        "serverVersion": "0.1.9",
+        "orchestrationProtocolVersion": 2
+    })));
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut conn = server.connection().await;
+    answer_config(&mut conn, Some(json!({
+        "environment": { "environmentId": "env-probe-clock", "label": "Studio" },
+        "serverTime": "1970-01-01T00:00:01.000Z"
+    }))).await;
+    let _shell = conn.request(method::SUBSCRIBE_SHELL).await;
+    loop {
+        if matches!(tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap(), Some(ClientEvent::ServerConfig(_))) {
+            break;
+        }
+    }
+    let before = t3_core::clock::to_server_clock("env-probe-clock", wall_now_ms());
+    assert!(before < 1_000_000_000_000, "initial stale snapshot should produce negative offset: {before}");
+
+    client.notify_wakeup(ConnectionWakeup::ApplicationActiveProbe);
+    let probe_req = tokio::time::timeout(Duration::from_secs(2), conn.request(method::SERVER_PROBE))
+        .await
+        .expect("server.probe requested on wakeup");
+    let now_iso = t3_core::sidebar::time::format_iso(wall_now_ms());
+    conn.send(json!({
+        "_tag": "Exit",
+        "requestId": probe_req["id"],
+        "exit": { "_tag": "Success", "value": { "serverTime": now_iso } }
+    }))
+    .await;
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("clock event") {
+            Some(ClientEvent::ServerClock { .. }) => break,
+            Some(_) => {}
+            None => panic!("events closed"),
+        }
+    }
+    let after = t3_core::clock::to_server_clock("env-probe-clock", wall_now_ms());
+    assert!((wall_now_ms() - after).abs() < 10_000, "probe should restore live clock offset: {after}");
+}
+
+#[tokio::test]
+async fn incompatible_initial_server_config_stops_session_as_unsupported() {
+    let mut server = FakeServer::start().await;
+    server.set_descriptor(Some(json!({
+        "environmentId": "env-bad-cfg",
+        "label": "Studio",
+        "serverVersion": "0.1.9",
+        "orchestrationProtocolVersion": 2
+    })));
+    let (_client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut conn = server.connection().await;
+    let config_req = conn.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+    conn.chunk(&config_req, json!([{"type": "snapshot", "config": "invalid"}])).await;
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("unsupported status") {
+            Some(ClientEvent::Status(ConnectionStatus::Unsupported { reason, .. })) => {
+                assert!(reason.contains("incompatible server configuration"), "{reason}");
+                break;
+            }
+            Some(_) => {}
+            None => panic!("events closed"),
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), server.connection()).await.is_err(),
+        "incompatible initial config must park instead of reconnecting in a loop"
+    );
+}
+
+#[tokio::test]
+async fn resumed_thread_catch_up_batches_until_synchronized_and_recovers_failed_resume() {
+    let mut server = FakeServer::start().await;
+    let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+    client.open_thread_from("t1", Some(5));
+
+    let mut conn = server.connection().await;
+    answer_config(&mut conn, None).await;
+    let _shell = conn.request(method::SUBSCRIBE_SHELL).await;
+    let sub1 = conn.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub1["payload"]["afterSequence"], 5);
+
+    // Partial catch-up emits Synchronizing and holds items until Synchronized.
+    conn.chunk(
+        &sub1,
+        json!([
+            {"kind": "event", "sequence": 6, "event": {"id": "e6", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}},
+            {"kind": "event", "sequence": 7, "event": {"id": "e7", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}
+        ]),
+    )
+    .await;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("syncing") {
+            Some(ClientEvent::ThreadSynchronizing { thread_id }) if thread_id == "t1" => break,
+            Some(ClientEvent::Thread { .. } | ClientEvent::ThreadBatch { .. }) => {
+                panic!("resumed catch-up events must not flush before Synchronized");
+            }
+            Some(_) => {}
+            None => panic!("events closed"),
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), async {
+            while let Some(ev) = events.recv().await {
+                if matches!(ev, ClientEvent::Thread { .. } | ClientEvent::ThreadBatch { .. }) {
+                    return ev;
+                }
+            }
+            panic!("closed");
+        })
+        .await
+        .is_err(),
+        "no thread items may land before Synchronized"
+    );
+
+    conn.chunk(
+        &sub1,
+        json!([
+            {"kind": "event", "sequence": 8, "event": {"id": "e8", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}},
+            {"kind": "synchronized"}
+        ]),
+    )
+    .await;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("batch") {
+            Some(ClientEvent::ThreadBatch { thread_id, items }) => {
+                assert_eq!(thread_id, "t1");
+                let seqs: Vec<Option<u64>> = items.iter().map(thread_sequence).collect();
+                assert_eq!(seqs, vec![Some(6), Some(7), Some(8), None]);
+                break;
+            }
+            Some(_) => {}
+            None => panic!("events closed"),
+        }
+    }
+
+    // A decode failure mid-resume immediately clears afterSequence without sleep backoff and reloads snapshot.
+    client.open_thread_from("t2", Some(10));
+    let sub2 = conn.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub2["payload"]["threadId"], "t2");
+    assert_eq!(sub2["payload"]["afterSequence"], 10);
+    conn.chunk(&sub2, json!([{"kind": "event", "sequence": 11, "event": "bad"}])).await;
+    let sub2_retry = tokio::time::timeout(Duration::from_millis(180), conn.request(method::SUBSCRIBE_THREAD))
+        .await
+        .expect("failed resume must resubscribe immediately without 250ms sleep");
+    assert_eq!(sub2_retry["payload"]["threadId"], "t2");
+    assert_eq!(sub2_retry["payload"].get("afterSequence"), None);
+    conn.chunk(
+        &sub2_retry,
+        json!([
+            {"kind": "snapshot", "snapshotSequence": 12, "projection": projection("t2"), "hasMoreHistory": false},
+            {"kind": "synchronized"}
+        ]),
+    )
+    .await;
+    assert_eq!(next_thread_sequence(&mut events).await, Some(12));
 }

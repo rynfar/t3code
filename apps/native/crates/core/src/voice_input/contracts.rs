@@ -20,6 +20,7 @@ pub const VOICE_RECORDING_LIMIT_SECONDS: u64 = 5 * 60;
 pub const SPEECH_MAX_CUSTOM_WORDS: usize = 100;
 pub const SPEECH_MAX_CUSTOM_WORD_LEN_UTF16: usize = 50;
 pub const SPEECH_MAX_ALIASES_PER_WORD: usize = 8;
+pub const SPEECH_MAX_HINTS: usize = 8;
 
 pub const DEFAULT_SPEECH_POST_PROCESSING_PROMPT: &str = r#"Clean this speech-to-text transcript. Fix punctuation, capitalization, and obvious spelling errors. Convert spoken numbers and punctuation where appropriate. Remove hesitation sounds and filler words, except when they contribute to the speaker's meaning. For example, keep words such as "like" when they serve a purpose in the sentence, and keep repetition used for emphasis.
 
@@ -269,56 +270,67 @@ pub fn validate_speech_custom_words(entries: &[SpeechCustomWordEntry]) -> Result
     Ok(())
 }
 
+/// Result of `resolveSpeechVocabulary` (`packages/shared/src/speech.ts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedSpeechVocabulary {
+    pub speech_custom_words: Vec<SpeechCustomWordEntry>,
+    pub speech_hints: Vec<String>,
+}
+
 /// `resolveSpeechVocabulary` from `packages/shared/src/speech.ts`:
-/// Project spellings win over personal ones; hint terms come first so the 100-entry wire limit
-/// cannot drop them.
+/// Project spellings win over personal ones. Hint terms, such as the project name or correction
+/// cue, only steer recognition, so they travel apart from the dictionary (`speech_hints`).
 pub fn resolve_speech_vocabulary(
     personal: &[SpeechCustomWordEntry],
     project: &[SpeechCustomWordEntry],
     hints: &[&str],
-) -> Vec<SpeechCustomWordEntry> {
-    let mut known = HashSet::new();
-    for entry in project.iter().chain(personal.iter()) {
-        known.insert(vocabulary_key(&entry.term));
-        for alias in &entry.aliases {
-            known.insert(vocabulary_key(alias));
-        }
-    }
-
-    let mut combined: Vec<SpeechCustomWordEntry> = Vec::new();
-    for hint in hints {
-        let normalized: String = hint.split_whitespace().collect::<Vec<_>>().join(" ");
-        let utf16_len = normalized.encode_utf16().count();
-        if utf16_len > 0
-            && utf16_len <= SPEECH_MAX_CUSTOM_WORD_LEN_UTF16
-            && !known.contains(&vocabulary_key(&normalized))
-        {
-            combined.push(SpeechCustomWordEntry { term: normalized, aliases: Vec::new() });
-        }
-    }
-    combined.extend(project.iter().cloned());
-    combined.extend(personal.iter().cloned());
-
+) -> ResolvedSpeechVocabulary {
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for entry in combined {
+    let mut speech_custom_words = Vec::new();
+    for entry in project.iter().chain(personal.iter()) {
         let term_key = vocabulary_key(&entry.term);
         if !seen.insert(term_key) {
             continue;
         }
         let mut unique_aliases = Vec::new();
-        for alias in entry.aliases {
-            let alias_key = vocabulary_key(&alias);
+        for alias in &entry.aliases {
+            let alias_key = vocabulary_key(alias);
             if seen.insert(alias_key) {
-                unique_aliases.push(alias);
+                unique_aliases.push(alias.clone());
             }
         }
-        out.push(SpeechCustomWordEntry { term: entry.term, aliases: unique_aliases });
-        if out.len() == SPEECH_MAX_CUSTOM_WORDS {
+        speech_custom_words.push(SpeechCustomWordEntry {
+            term: entry.term.clone(),
+            aliases: unique_aliases,
+        });
+        if speech_custom_words.len() == SPEECH_MAX_CUSTOM_WORDS {
             break;
         }
     }
-    out
+
+    let mut known: HashSet<String> = HashSet::new();
+    for entry in &speech_custom_words {
+        known.insert(vocabulary_key(&entry.term));
+        for alias in &entry.aliases {
+            known.insert(vocabulary_key(alias));
+        }
+    }
+    let mut speech_hints = Vec::new();
+    for hint in hints {
+        if speech_hints.len() == SPEECH_MAX_HINTS {
+            break;
+        }
+        let normalized: String = hint.split_whitespace().collect::<Vec<_>>().join(" ");
+        let utf16_len = normalized.encode_utf16().count();
+        if utf16_len == 0 || utf16_len > SPEECH_MAX_CUSTOM_WORD_LEN_UTF16 {
+            continue;
+        }
+        if known.insert(vocabulary_key(&normalized)) {
+            speech_hints.push(normalized);
+        }
+    }
+
+    ResolvedSpeechVocabulary { speech_custom_words, speech_hints }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -989,6 +1001,8 @@ pub struct SpeechTranscriptionOptions {
     pub speech_language: String,
     pub speech_translate_to_english: bool,
     pub speech_custom_words: Vec<SpeechCustomWordEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speech_hints: Vec<String>,
     pub speech_remove_filler_words: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speech_correction_word: Option<String>,
@@ -1002,6 +1016,7 @@ impl Default for SpeechTranscriptionOptions {
             speech_language: "auto".to_owned(),
             speech_translate_to_english: false,
             speech_custom_words: Vec::new(),
+            speech_hints: Vec::new(),
             speech_remove_filler_words: true,
             speech_correction_word: None,
             speech_silence_filtering: true,

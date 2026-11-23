@@ -197,6 +197,7 @@ fn apply_voice_fixture(
                     favicon_path: None,
                     project_icon: None,
                     scripts: Vec::new(),
+                    tracked_folders: Vec::new(),
                     created_at: "2026-04-01T00:00:00.000Z".into(),
                     updated_at: "2026-04-01T00:00:00.000Z".into(),
                 }],
@@ -916,6 +917,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                 config.providers.extend(fixture.providers);
                 if fixture.secret_references {
                     config.secret_references=true;
+                    config.feature_flags.get_or_insert_with(Default::default).secret_providers = Some(true);
                     config.settings.secret_providers=fixture.settings.secret_providers;
                 }
                 config.settings.provider_instances = config.settings.provider_instances.iter()
@@ -1236,6 +1238,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                         favicon_path: None,
                         project_icon: None,
                         scripts: Vec::new(),
+                        tracked_folders: Vec::new(),
                         created_at: "2026-04-01T00:00:00.000Z".into(),
                         updated_at: "2026-04-01T00:00:00.000Z".into(),
                     });
@@ -2015,6 +2018,7 @@ mod tests {
                     favicon_path: None,
                     project_icon: None,
                     scripts: Vec::new(),
+                    tracked_folders: Vec::new(),
                     created_at: "2026-04-01T00:00:00.000Z".into(),
                     updated_at: "2026-04-01T00:00:00.000Z".into(),
                 }],

@@ -158,6 +158,7 @@ impl IssueListPreferences {
             state: normalized.status,
             involvement: Some(normalized.who),
             project_id: normalized.issue_project,
+            exclude_project_ids: Vec::new(),
             host: normalized.host,
             limit: Some(limit.clamp(1, 200)),
             cursors: cursors.filter(|c| !c.is_empty()),

@@ -355,6 +355,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Some(ClientEvent::StreamError { context, message }) => println!("decode error in {context}: {message}"),
+                Some(
+                    ClientEvent::ThreadBatch { .. }
+                    | ClientEvent::ThreadSynchronizing { .. }
+                    | ClientEvent::ServerClock { .. },
+                ) => {}
             }
         }
     }

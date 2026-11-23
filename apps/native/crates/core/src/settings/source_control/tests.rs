@@ -302,7 +302,7 @@ fn issue_tracker_summary_describes_disconnected_rejected_and_linked_states() {
     let mut bindings = HashMap::new();
     bindings.insert(
         "p1".into(),
-        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "ENG".into() },
+        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "ENG".into(), additional_scopes: Vec::new() },
     );
     assert_eq!(
         issue_tracker_summary(&tracker, &bindings),
@@ -310,7 +310,7 @@ fn issue_tracker_summary_describes_disconnected_rejected_and_linked_states() {
     );
     bindings.insert(
         "p2".into(),
-        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "OPS".into() },
+        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "OPS".into(), additional_scopes: Vec::new() },
     );
     assert_eq!(
         issue_tracker_summary(&tracker, &bindings),

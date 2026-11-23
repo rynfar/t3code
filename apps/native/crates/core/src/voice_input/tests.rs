@@ -641,12 +641,17 @@ fn custom_words_validation_and_resolution() {
     let project = vec![
         SpeechCustomWordEntry { term: "t3 code".into(), aliases: vec!["t3".into()] },
     ];
-    let resolved = resolve_speech_vocabulary(&personal, &project, &["  gpui  crate ", "t3 code"]);
-    assert_eq!(resolved[0].term, "gpui crate");
-    assert_eq!(resolved[1].term, "t3 code");
-    assert_eq!(resolved.len(), 2);
+    let resolved = resolve_speech_vocabulary(&personal, &project, &["  gpui  crate ", "t3 code", "t3", "gpui crate"]);
+    assert_eq!(resolved.speech_custom_words.len(), 1);
+    assert_eq!(resolved.speech_custom_words[0].term, "t3 code");
+    assert_eq!(resolved.speech_custom_words[0].aliases, vec!["t3"]);
+    assert_eq!(resolved.speech_hints, vec!["gpui crate"]);
 
-    assert!(validate_speech_custom_words(&resolved).is_ok());
+    assert!(validate_speech_custom_words(&resolved.speech_custom_words).is_ok());
+
+    let many_hints: Vec<&str> = (0..12).map(|i| Box::leak(format!("hint-{i}").into_boxed_str()) as &str).collect();
+    let capped = resolve_speech_vocabulary(&[], &[], &many_hints);
+    assert_eq!(capped.speech_hints.len(), SPEECH_MAX_HINTS);
     let duplicate = vec![
         SpeechCustomWordEntry { term: "foo".into(), aliases: vec!["FOO".into()] },
     ];

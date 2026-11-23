@@ -4869,6 +4869,7 @@ mod stream_error_tests {
                     favicon_path: None,
                     project_icon: None,
                     scripts: Vec::new(),
+                    tracked_folders: Vec::new(),
                     created_at: "2026-04-01T00:00:00.000Z".to_owned(),
                     updated_at: "2026-04-01T00:00:00.000Z".to_owned(),
                 }],

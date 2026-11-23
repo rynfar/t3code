@@ -714,7 +714,36 @@ async fn run(
                 for event in &batch {
                     match event {
                         ClientEvent::Shell(item) => {
+                            let was_synchronized = entry.shell.synchronized;
+                            if was_synchronized
+                                && let t3_core::shell::ShellStreamItem::ThreadUpdated { thread, .. } = item
+                                && let Some(server_time_ms) = t3_core::sidebar::time::parse_iso(&thread.updated_at)
+                            {
+                                let received_at_ms = wall_now_ms();
+                                t3_core::clock::observe_server_time(&id, server_time_ms, received_at_ms);
+                                if let Some(canonical_id) = entry
+                                    .config
+                                    .config
+                                    .as_ref()
+                                    .map(|c| c.environment.environment_id.as_str())
+                                    .filter(|cid| !cid.is_empty() && *cid != id)
+                                {
+                                    t3_core::clock::observe_server_time(canonical_id, server_time_ms, received_at_ms);
+                                }
+                            }
                             changed |= apply_shell(entry, item);
+                        }
+                        ClientEvent::ServerClock { server_time_ms, requested_at_ms, received_at_ms } => {
+                            t3_core::clock::record_server_clock(&id, Some(*server_time_ms), *requested_at_ms, *received_at_ms);
+                            if let Some(canonical_id) = entry
+                                .config
+                                .config
+                                .as_ref()
+                                .map(|c| c.environment.environment_id.as_str())
+                                .filter(|cid| !cid.is_empty() && *cid != id)
+                            {
+                                t3_core::clock::record_server_clock(canonical_id, Some(*server_time_ms), *requested_at_ms, *received_at_ms);
+                            }
                         }
                         ClientEvent::ServerConfig(event) => {
                             if let t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: snapshot } = &**event
@@ -780,7 +809,10 @@ async fn run(
                     }
                 }
                 if active.as_ref() == Some(&id) {
-                    let events = batch.into_iter().filter(|e| !matches!(e, ClientEvent::Status(_) | ClientEvent::Moved { .. })).collect::<Vec<_>>();
+                    let events = batch
+                        .into_iter()
+                        .filter(|e| !matches!(e, ClientEvent::Status(_) | ClientEvent::Moved { .. } | ClientEvent::ServerClock { .. }))
+                        .collect::<Vec<_>>();
                     if !events.is_empty() { let _ = output.send(EnvironmentEvent::Active { id, generation: epoch, events }).await; }
                 }
             }

@@ -78,6 +78,9 @@ pub struct AppThread {
     /// The last rewind that failed, by the command that asked for it.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
+    /// Repositories a completed rewind left untouched because none had a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_unrestored: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +122,10 @@ pub struct Run {
     pub fresh_context: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_continuation_of_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
 }
 
 impl Run {
@@ -299,6 +306,7 @@ pub enum EventBody {
     ThreadPullRequestLinkUpdated,
     RunUpserted(Box<Run>),
     RunBackgroundWorkCancelled { run_id: String, restart_cancelled_background_work: Option<Value> },
+    RunOutputSubmitted { run_id: String, output: Value },
     AttemptUpserted(RunAttempt),
     NodeUpserted(Entity),
     SubagentUpserted(Entity),
@@ -362,6 +370,10 @@ fn decode_body(kind: &str, payload: Value) -> Result<EventBody, serde_json::Erro
         "run.background-work-cancelled" => EventBody::RunBackgroundWorkCancelled {
             run_id: payload.get("runId").and_then(Value::as_str).unwrap_or_default().to_owned(),
             restart_cancelled_background_work: payload.get("restartCancelledBackgroundWork").cloned(),
+        },
+        "run.output-submitted" => EventBody::RunOutputSubmitted {
+            run_id: payload.get("runId").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            output: payload.get("output").cloned().unwrap_or(Value::Null),
         },
         "run-attempt.created" | "run-attempt.updated" => EventBody::AttemptUpserted(from(payload)?),
         "node.updated" => EventBody::NodeUpserted(from(payload)?),
@@ -453,6 +465,7 @@ pub struct ThreadState {
     pub projection: Option<ThreadProjection>,
     pub sequence: Option<u64>,
     pub synchronized: bool,
+    pub error: Option<String>,
     pub history: ThreadHistoryMeta,
     /// `thread.deleted` arrived: the projection and history are gone until a new snapshot.
     pub deleted: bool,
@@ -540,6 +553,7 @@ impl ThreadState {
     pub fn apply_classified(&mut self, item: ThreadStreamItem) -> ThreadApplyKind {
         match item {
             ThreadStreamItem::Synchronized => {
+                self.error = None;
                 if !std::mem::replace(&mut self.synchronized, true) {
                     ThreadApplyKind::Structure
                 } else {
@@ -562,6 +576,7 @@ impl ThreadState {
                 };
                 self.replace_projection(Some(*projection));
                 self.deleted = false;
+                self.error = None;
                 self.sequence = Some(snapshot_sequence);
                 ThreadApplyKind::Structure
             }
@@ -570,6 +585,7 @@ impl ThreadState {
                     return ThreadApplyKind::Unchanged;
                 }
                 self.sequence = Some(sequence);
+                self.error = None;
                 let delta_meta = (!self.deleted && self.merging.is_none())
                     .then(|| {
                         let projection = self.projection.as_ref()?;

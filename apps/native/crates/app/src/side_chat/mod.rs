@@ -113,6 +113,25 @@ impl AppState {
         changed
     }
 
+    pub(crate) fn mark_side_thread_synchronizing(&mut self, thread_id: &str) -> bool {
+        let Some(state) = self.side_threads.threads.get_mut(thread_id) else {
+            return false;
+        };
+        if !state.synchronized {
+            return false;
+        }
+        state.synchronized = false;
+        true
+    }
+
+    pub(crate) fn set_side_thread_error(&mut self, thread_id: &str, message: String) -> bool {
+        let Some(state) = self.side_threads.threads.get_mut(thread_id) else {
+            return false;
+        };
+        state.error = Some(message);
+        true
+    }
+
     /// The open thread's selection moved onto a side subscription: it keeps its live state.
     pub(crate) fn adopt_side_thread(&mut self, thread_id: &str) {
         if let Some(state) = self.side_threads.take(thread_id) {

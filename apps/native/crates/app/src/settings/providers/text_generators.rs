@@ -629,7 +629,9 @@ impl SettingsView {
     fn render_text_generator_wizard(&self, config: &ServerConfig, can_write: bool, cx: &mut Context<Self>) -> Option<DialogFrame> {
         let wizard = self.providers.text_generators.wizard.as_ref()?;
         let p = palette(cx);
-        let has_secret_providers = !config.settings.secret_providers.0.is_empty();
+        let has_secret_providers = config.has_secret_providers_feature()
+            && config.secret_references
+            && !config.settings.secret_providers.0.is_empty();
         let title = if wizard.is_new { "Add text generator" } else { "Edit text generator" };
 
         match wizard.step {

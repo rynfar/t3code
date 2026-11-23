@@ -755,7 +755,7 @@ impl SettingsView {
 
     fn usage_source_secret_select(&self, current: Option<&str>, disabled: bool, cx: &Context<Self>) -> Option<AnyElement> {
         let config = self.scoped_raw_representative_config(cx)?;
-        let mut sources = if config.secret_references {
+        let mut sources = if config.secret_references && config.has_secret_providers_feature() {
             config
                 .settings
                 .secret_providers

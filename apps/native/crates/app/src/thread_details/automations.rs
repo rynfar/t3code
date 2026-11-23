@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use chrono::{Local, TimeZone};
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Task, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
@@ -13,7 +12,7 @@ use t3_client::supervisor::ConnectionStatus;
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::managed_policy::{Capability, capability_denial};
 use t3_core::settings::scheduled_tasks::{RunStatus, ScheduledTask, decode_list, id_payload, method, set_enabled_payload};
-use t3_core::thread_details::{automation_schedule_line_in, tasks_for_thread};
+use t3_core::thread_details::{automation_schedule_line_with_format, tasks_for_thread};
 
 use super::controls::{hover_fill, section_with_action};
 use super::view::DetailsView;
@@ -34,9 +33,7 @@ impl Drop for Abort {
     }
 }
 
-fn once_label(ms: i64) -> String {
-    Local.timestamp_millis_opt(ms).single().map(|time| time.format("%b %-d, %Y, %-I:%M %p").to_string()).unwrap_or_default()
-}
+use crate::timestamp::once_label;
 
 pub(super) struct AutomationsFeed {
     connection: Option<u64>,
@@ -202,11 +199,19 @@ impl AutomationsFeed {
             .on_click(|_, _, cx| crate::settings::open(t3_core::settings::search::Section::ScheduledTasks, cx))
             .into_any_element();
 
+        let ts_format = crate::settings::store::client(cx).timestamp_format();
         let rows: Vec<AnyElement> = bound
             .into_iter()
             .map(|task| {
                 let title = if task.title.trim().is_empty() { task.prompt.as_str() } else { task.title.as_str() }.to_owned();
-                let subtitle = automation_schedule_line_in(task, once_label, self.time_zone.as_deref(), now);
+                let subtitle = automation_schedule_line_with_format(
+                    task,
+                    |ms| once_label(ms, ts_format),
+                    self.time_zone.as_deref(),
+                    now,
+                    ts_format,
+                    &crate::timestamp::SystemTimestampLocale,
+                );
                 let dot_color = match task.last_run_status {
                     RunStatus::Running => hsla(p.info),
                     RunStatus::Succeeded => hsla(p.success),

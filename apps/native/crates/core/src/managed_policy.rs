@@ -33,6 +33,7 @@ pub enum Capability {
     Connect,
     WebhookTasks,
     BrowserCookieImport,
+    PreviewTunnel,
 }
 
 pub fn capability_denial(policy: Option<&Value>, capability: Capability) -> Option<String> {
@@ -42,6 +43,10 @@ pub fn capability_denial(policy: Option<&Value>, capability: Capability) -> Opti
         Capability::Connect => ("connect", "T3 Connect"),
         Capability::WebhookTasks => ("webhookTasks", "webhook tasks"),
         Capability::BrowserCookieImport => ("browserCookieImport", "importing browser cookies"),
+        Capability::PreviewTunnel => (
+            "previewTunnel",
+            "opening this machine's local servers on other devices",
+        ),
     };
     let denied = match capability {
         Capability::RemoteClients => p["limits"][key]
@@ -50,6 +55,17 @@ pub fn capability_denial(policy: Option<&Value>, capability: Capability) -> Opti
         _ => p["limits"][key] == false,
     };
     denied.then(|| format!("{}'s policy does not allow {label}.", organization(p)))
+}
+
+/// Whether the preview tunnel serves: the setting is on and no policy switches it off (`allowsPreviewTunnel`).
+pub fn allows_preview_tunnel(config: &crate::server_config::ServerConfig) -> bool {
+    config.settings.enable_preview_tunnel.unwrap_or(true)
+        && config
+            .managed_policy
+            .as_ref()
+            .and_then(|p| p.pointer("/limits/previewTunnel"))
+            .and_then(Value::as_bool)
+            != Some(false)
 }
 
 pub fn driver_allowed(policy: Option<&Value>, driver: &str) -> bool {
@@ -379,5 +395,23 @@ mod tests {
             Some("Managed by Example Corp.")
         );
         assert!(setting_lock_reason_for_any([Some(&policy)], &["promptSuggestionsEnabled"]).is_none());
+    }
+
+    #[test]
+    fn preview_tunnel_policy_and_setting_match_contracts() {
+        let mut config = crate::server_config::ServerConfig::default();
+        assert!(allows_preview_tunnel(&config));
+        config.settings.enable_preview_tunnel = Some(false);
+        assert!(!allows_preview_tunnel(&config));
+        config.settings.enable_preview_tunnel = Some(true);
+        config.managed_policy = Some(json!({
+            "organization": "Acme",
+            "limits": { "previewTunnel": false }
+        }));
+        assert!(!allows_preview_tunnel(&config));
+        assert_eq!(
+            capability_denial(config.managed_policy.as_ref(), Capability::PreviewTunnel).as_deref(),
+            Some("Acme's policy does not allow opening this machine's local servers on other devices.")
+        );
     }
 }

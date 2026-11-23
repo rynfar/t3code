@@ -25,7 +25,7 @@ use t3_core::server_config::ServerConfig;
 use t3_core::settings::access::ACCESS_READ as ACCESS_READ_SCOPE;
 use t3_core::settings::{
     LoadPreference, PEER_LINKS_LINK_METHOD, PEER_LINKS_LIST_METHOD, PEER_LINKS_UNLINK_METHOD,
-    PeerLinkHealth, PeerLinkSummary, PullRequestRoutingPermission,
+    PeerLinkHealth, PeerLinkRemoveResult, PeerLinkSummary, PullRequestRoutingPermission,
     StoredPullRequestRoutingPermission, load_balancing_enabled_patch, load_balancing_weight_patch,
     load_preference_for_weight, peer_link_create_payload, peer_link_health, peer_link_status_text,
     peer_link_unlink_payload, pull_request_routing_connection_key,
@@ -846,6 +846,7 @@ impl SettingsView {
         confirm.error = None;
         let host_saved_id = confirm.host_saved_id.clone();
         let target_env_id = confirm.target_env_id.clone();
+        let target_label = confirm.target_label.clone();
         cx.notify();
 
         let app = self.state.read(cx);
@@ -867,11 +868,12 @@ impl SettingsView {
                     None => return Err("Environment is not connected.".to_owned()),
                 },
             };
-            client
+            let reply = client
                 .request(PEER_LINKS_UNLINK_METHOD, peer_link_unlink_payload(&target_env_id))
                 .await
                 .map_err(|err| err.to_string())?;
-            Ok(())
+            let result: PeerLinkRemoveResult = serde_json::from_value(reply).unwrap_or_default();
+            Ok(result)
         });
 
         let refresh_host = host_saved_id.clone();
@@ -880,8 +882,22 @@ impl SettingsView {
                 .await
                 .unwrap_or_else(|_| Err("Could not forget the link.".to_owned()));
             let _ = this.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(result) => {
                     this.environments.forget_confirm = None;
+                    if result.removed && result.ended_there != Some(true) {
+                        this.state.update(cx, |state, cx| {
+                            state.show_toast(
+                                crate::toast::Toast::new(
+                                    crate::toast::ToastKind::Warning,
+                                    format!("{target_label} did not answer"),
+                                )
+                                .description(format!(
+                                    "Revoke \"T3 Code \u{00b7} \u{2026}\" in {target_label}'s Sharing & access to end the session there too."
+                                )),
+                                cx,
+                            );
+                        });
+                    }
                     this.refresh_peer_links(&refresh_host, true, cx);
                     cx.notify();
                 }
@@ -2338,7 +2354,7 @@ impl SettingsView {
                 id: "peer-link-forget-dialog",
                 title: SharedString::from(format!("Forget {label}?")),
                 description: SharedString::from(format!(
-                    "Agents here stop working there. Revoke \"T3 Code \u{00b7} \u{2026}\" in {label}'s Sharing & access to end the session there too."
+                    "Agents here stop working there, and their session on {label} ends too if it answers."
                 )),
                 max_width: 448.,
                 body: div()

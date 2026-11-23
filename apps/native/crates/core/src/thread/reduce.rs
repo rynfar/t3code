@@ -34,12 +34,18 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
         EventBody::ThreadVisitRecorded => {}
         // Pull request links are not modeled natively yet; the activity bump above still applies.
         EventBody::ThreadPullRequestLinkUpdated | EventBody::CheckpointRollbackRequested => {}
-        EventBody::RunUpserted(run) => {
+        EventBody::RunUpserted(mut run) => {
             let run_id = run.id.clone();
-            let prev_status = projection.runs.iter().find(|r| r.id == run_id).map(|r| r.status.as_str());
+            let prev = projection.runs.iter().find(|r| r.id == run_id);
+            let prev_status = prev.map(|r| r.status.clone());
+            if run.output.is_none()
+                && let Some(existing_output) = prev.and_then(|r| r.output.clone())
+            {
+                run.output = Some(existing_output);
+            }
             let hides = matches!(run.status.as_str(), "rolled_back" | "queued" | "cancelled")
-                && prev_status != Some(run.status.as_str());
-            let left_queue = prev_status == Some("queued") && run.status != "queued";
+                && prev_status.as_deref() != Some(run.status.as_str());
+            let left_queue = prev_status.as_deref() == Some("queued") && run.status != "queued";
             upsert_by(&mut projection.runs, *run, |r| &r.id);
             if hides {
                 refresh_visible_items(projection);
@@ -51,6 +57,11 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
         EventBody::RunBackgroundWorkCancelled { run_id, restart_cancelled_background_work } => {
             if let Some(run) = projection.runs.iter_mut().find(|run| run.id == run_id) {
                 run.restart_cancelled_background_work = restart_cancelled_background_work;
+            }
+        }
+        EventBody::RunOutputSubmitted { run_id, output } => {
+            if let Some(run) = projection.runs.iter_mut().find(|run| run.id == run_id) {
+                run.output = Some(output);
             }
         }
         EventBody::AttemptUpserted(attempt) => {

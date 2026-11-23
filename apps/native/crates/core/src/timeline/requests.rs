@@ -183,11 +183,11 @@ pub enum SecretTone {
     TimedOut,
 }
 
-pub fn secret_request_privacy_note(delivery: Option<&str>) -> &'static str {
-    if delivery == Some("file") {
-        "Kept out of chat, in a private file this agent's commands can read for 24 hours"
-    } else {
-        "Stored securely, never shown to the agent"
+pub fn secret_request_privacy_note(delivery: Option<&str>, has_fields: bool) -> &'static str {
+    match (delivery, has_fields) {
+        (Some("file"), true) => "Kept out of chat, in private files this agent's commands can read for 24 hours",
+        (Some("file"), false) => "Kept out of chat, in a private file this agent's commands can read for 24 hours",
+        _ => "Stored securely, never shown to the agent",
     }
 }
 
@@ -838,11 +838,47 @@ mod tests {
         }))
         .expect("secret request turn item");
         match item {
-            crate::turn_item::TurnItemKind::SecretRequest { url, .. } => {
+            crate::turn_item::TurnItemKind::SecretRequest { url, fields, .. } => {
                 assert_eq!(url.as_deref(), Some("https://platform.openai.com/api-keys"));
+                assert!(fields.is_none());
             }
             other => panic!("unexpected kind: {other:?}"),
         }
+
+        let multi: crate::turn_item::TurnItemKind = serde_json::from_value(serde_json::json!({
+            "type": "secret_request",
+            "label": "Account login",
+            "reason": "Enter email and password",
+            "secretStatus": "pending",
+            "delivery": "file",
+            "fields": [
+                { "name": "email", "label": "Email", "placeholder": "you@example.com", "secret": false },
+                { "name": "password", "label": "Password" }
+            ]
+        }))
+        .expect("multi-field secret request turn item");
+        match multi {
+            crate::turn_item::TurnItemKind::SecretRequest { fields, .. } => {
+                let fields = fields.expect("fields");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].secret, Some(false));
+                assert_eq!(fields[1].secret, None);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        assert_eq!(
+            secret_request_privacy_note(None, false),
+            "Stored securely, never shown to the agent"
+        );
+        assert_eq!(
+            secret_request_privacy_note(Some("file"), false),
+            "Kept out of chat, in a private file this agent's commands can read for 24 hours"
+        );
+        assert_eq!(
+            secret_request_privacy_note(Some("file"), true),
+            "Kept out of chat, in private files this agent's commands can read for 24 hours"
+        );
 
         let cfg: crate::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
             "secretRequestReferences": true
@@ -858,6 +894,21 @@ mod tests {
                 "answer": {
                     "type": "reference",
                     "reference": { "provider": "op-work", "reference": "op://vault/item/field" }
+                }
+            })
+        );
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("email".to_owned(), "a@b.com".to_owned());
+        values.insert("password".to_owned(), "s3cr3t".to_owned());
+        assert_eq!(
+            crate::commands::secret_request_answer_save_values("t1", "i1", &values),
+            serde_json::json!({
+                "threadId": "t1",
+                "turnItemId": "i1",
+                "answer": {
+                    "type": "save",
+                    "values": { "email": "a@b.com", "password": "s3cr3t" }
                 }
             })
         );

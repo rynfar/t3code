@@ -237,13 +237,36 @@ pub fn is_checkpoint_diff_truncated(patch: &str) -> bool {
     patch.ends_with(CHECKPOINT_DIFF_TRUNCATED_MARKER)
 }
 
-/// `OrchestrationGetTurnDiffResult.diff`.
+/// `OrchestrationGetTurnDiffResult.diff` (falling back to tracked repository diffs when the
+/// thread root folder itself has no Git diff).
 pub fn decode_turn_diff(value: &Value) -> Result<String, String> {
-    value
-        .get("diff")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "The server sent a diff without a patch.".to_owned())
+    if let Some(diff) = value.get("diff").and_then(Value::as_str) {
+        if !diff.is_empty() {
+            return Ok(diff.to_owned());
+        }
+        if let Some(repos) = value.get("repositories").and_then(Value::as_array) {
+            let repo_diffs: Vec<&str> = repos
+                .iter()
+                .filter_map(|repo| repo.get("diff").and_then(Value::as_str))
+                .filter(|patch| !patch.is_empty())
+                .collect();
+            if !repo_diffs.is_empty() {
+                return Ok(repo_diffs.join("\n"));
+            }
+        }
+        return Ok(String::new());
+    }
+    if let Some(repos) = value.get("repositories").and_then(Value::as_array) {
+        let repo_diffs: Vec<&str> = repos
+            .iter()
+            .filter_map(|repo| repo.get("diff").and_then(Value::as_str))
+            .filter(|patch| !patch.is_empty())
+            .collect();
+        if !repo_diffs.is_empty() {
+            return Ok(repo_diffs.join("\n"));
+        }
+    }
+    Err("The server sent a diff without a patch.".to_owned())
 }
 
 pub fn diff_preview_request(cwd: &str, base_ref: Option<&str>, ignore_whitespace: bool) -> (&'static str, Value) {

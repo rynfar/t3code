@@ -100,7 +100,10 @@ pub enum ClientEvent {
     Status(ConnectionStatus),
     Shell(ShellStreamItem),
     Thread { thread_id: String, item: Box<ThreadStreamItem> },
+    ThreadBatch { thread_id: String, items: Vec<ThreadStreamItem> },
+    ThreadSynchronizing { thread_id: String },
     ServerConfig(Box<ServerConfigStreamEvent>),
+    ServerClock { server_time_ms: i64, requested_at_ms: i64, received_at_ms: i64 },
     StreamError { context: String, message: String },
     /// The prepared route now listens at another address (an SSH tunnel had to change ports).
     /// The client stopped; the app starts one there.
@@ -693,6 +696,24 @@ async fn supervise(
                         awaiting_approval = false;
                         continue;
                     }
+                    SessionEnd::Unsupported(reason) => {
+                        refused_routes_tx.send_replace(Vec::new());
+                        let _ = events
+                            .send(ClientEvent::Status(ConnectionStatus::Unsupported {
+                                reason: reason.clone(),
+                                server_outdated: false,
+                            }))
+                            .await;
+                        match wait_draining(None, &mut commands, &mut wakeup_rx, &mut resume).await {
+                            WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
+                                attempt = 0;
+                                last_failure = reason;
+                                awaiting_approval = false;
+                                continue;
+                            }
+                            WaitOutcome::Dropped => return,
+                        }
+                    }
                     SessionEnd::Dropped => return,
                 }
             }
@@ -1055,11 +1076,12 @@ enum SessionEnd {
     Closed(String),
     ReconnectImmediately,
     SwitchRoute(String),
+    Unsupported(String),
     Dropped,
 }
 
 enum WakeProbeResult {
-    Alive(ConnectionWakeup),
+    Alive { reason: ConnectionWakeup, clock_sample: Option<(i64, i64, i64)> },
     ReplaceImmediately,
     Failed(String),
 }
@@ -1081,6 +1103,7 @@ impl RunningWakeProbe {
 fn spawn_wake_probe(
     session: Session,
     http_base: String,
+    expected_environment_id: Option<String>,
     reason: ConnectionWakeup,
     nearby: bool,
 ) -> Option<RunningWakeProbe> {
@@ -1092,16 +1115,22 @@ fn spawn_wake_probe(
         let outcome = if tolerates_miss {
             // Foreground probe (`supervisor.ts:789-792, 857-863`): a busy host can miss one probe
             // while still healthy, so retry once before declaring the session dead.
-            if session.probe(timeout).await || session.probe(timeout).await {
-                WakeProbeResult::Alive(reason)
+            let first = session.probe_with_clock(timeout, expected_environment_id.clone()).await;
+            if first.alive {
+                WakeProbeResult::Alive { reason, clock_sample: first.clock_sample }
             } else {
-                WakeProbeResult::Failed("Connection did not respond to a connection health check.".into())
+                let second = session.probe_with_clock(timeout, expected_environment_id).await;
+                if second.alive {
+                    WakeProbeResult::Alive { reason, clock_sample: second.clock_sample }
+                } else {
+                    WakeProbeResult::Failed("Connection did not respond to a connection health check.".into())
+                }
             }
         } else {
             // Non-foreground wake (`ApplicationActive`, `ApplicationActiveLong`, `NetworkChanged`):
             // race the WebSocket probe against an HTTP host check (`awaitSilentSocket`). If HTTP
             // answers while the socket stays silent, replace the socket immediately.
-            let ws_probe = session.probe(timeout);
+            let ws_probe = session.probe_with_clock(timeout, expected_environment_id.clone());
             let http_check = async {
                 auth::fetch_descriptor_timeout(&http_base, timeout).await.is_ok()
             };
@@ -1110,9 +1139,9 @@ fn spawn_wake_probe(
             let mut http_done = false;
             loop {
                 tokio::select! {
-                    alive = &mut ws_probe => {
-                        break if alive {
-                            WakeProbeResult::Alive(reason)
+                    probe = &mut ws_probe => {
+                        break if probe.alive {
+                            WakeProbeResult::Alive { reason, clock_sample: probe.clock_sample }
                         } else if long_resume {
                             WakeProbeResult::ReplaceImmediately
                         } else {
@@ -1125,8 +1154,9 @@ fn spawn_wake_probe(
                             // Host answered HTTP; give the WebSocket a brief grace window to see a
                             // frame before treating it as a silent socket to replace immediately.
                             let grace = Duration::from_millis(250).min(timeout);
-                            if session.probe(grace).await {
-                                break WakeProbeResult::Alive(reason);
+                            let grace_probe = session.probe_with_clock(grace, expected_environment_id.clone()).await;
+                            if grace_probe.alive {
+                                break WakeProbeResult::Alive { reason, clock_sample: grace_probe.clock_sample };
                             }
                             break WakeProbeResult::ReplaceImmediately;
                         }
@@ -1301,6 +1331,8 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 
 enum ThreadDelivery {
     Item(Box<ThreadStreamItem>),
+    Batch(Vec<ThreadStreamItem>),
+    Synchronizing,
     DecodeError(String),
     RpcError(RpcError),
 }
@@ -1517,7 +1549,7 @@ async fn run_session(
     let mut preprocessor = ServerConfigPreprocessor::default();
     let mut environment_label: Option<String> = None;
     let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, subscribe_server_config_payload()).ok();
-    let options = initial_shell_options(
+    let options = match initial_shell_options(
         &mut server_config,
         active_route,
         routes,
@@ -1528,7 +1560,11 @@ async fn run_session(
         config_requested_at_ms,
         config_extras,
     )
-    .await;
+    .await
+    {
+        Ok(options) => options,
+        Err(reason) => return SessionEnd::Unsupported(reason),
+    };
     // Deltas never restore rows trimmed under other options (nor trim them), so the shell starts
     // over from an authoritative snapshot, as `shell.ts` does for every new session.
     if resume.shell_options.replace(options) != Some(options) {
@@ -1598,7 +1634,13 @@ async fn run_session(
                             }
                             let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
                         }
-                        Err(error) => report(events, "server config", error.to_string()).await,
+                        Err(error) => {
+                            let host = environment_label.as_deref().unwrap_or(&active_route.http_base);
+                            tracing::warn!(%error, "server configuration update failed to decode");
+                            break SessionEnd::Closed(format!(
+                                "{host} sent a server configuration update this client could not read."
+                            ));
+                        }
                     }
                 }
                 // The rest of the session works without it; the next session subscribes again.
@@ -1618,6 +1660,15 @@ async fn run_session(
                         }
                         let _ = events.send(ClientEvent::Thread { thread_id, item }).await;
                     }
+                    ThreadDelivery::Batch(items) => {
+                        if let Some(sequence) = items.iter().rev().find_map(thread_sequence) {
+                            resume.threads.insert(thread_id.clone(), Some(sequence));
+                        }
+                        let _ = events.send(ClientEvent::ThreadBatch { thread_id, items }).await;
+                    }
+                    ThreadDelivery::Synchronizing => {
+                        let _ = events.send(ClientEvent::ThreadSynchronizing { thread_id }).await;
+                    }
                     ThreadDelivery::DecodeError(message) => {
                         report(events, &format!("thread {thread_id}"), message).await;
                     }
@@ -1626,7 +1677,12 @@ async fn run_session(
                 }
             }
             probe_result = next_wake_probe(&mut wake_probe) => match probe_result {
-                WakeProbeResult::Alive(reason) => {
+                WakeProbeResult::Alive { reason, clock_sample } => {
+                    if let Some((server_time_ms, requested_at_ms, received_at_ms)) = clock_sample {
+                        let _ = events
+                            .send(ClientEvent::ServerClock { server_time_ms, requested_at_ms, received_at_ms })
+                            .await;
+                    }
                     if should_resubscribe_after_wakeup(reason) {
                         fetch.start();
                         match session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell, options)) {
@@ -1679,7 +1735,13 @@ async fn run_session(
                     .as_ref()
                     .is_none_or(|running| running.reason == ConnectionWakeup::ApplicationActiveProbe && reason != ConnectionWakeup::ApplicationActiveProbe);
                 if supersede
-                    && let Some(next_probe) = spawn_wake_probe(session.clone(), active_route.http_base.clone(), reason, nearby)
+                    && let Some(next_probe) = spawn_wake_probe(
+                        session.clone(),
+                        active_route.http_base.clone(),
+                        expected_environment_id.clone(),
+                        reason,
+                        nearby,
+                    )
                     && let Some(prev) = wake_probe.replace(next_probe)
                 {
                     prev.abort();
@@ -1718,7 +1780,13 @@ async fn run_session(
                             .as_ref()
                             .is_none_or(|running| running.reason == ConnectionWakeup::ApplicationActiveProbe && reason != ConnectionWakeup::ApplicationActiveProbe);
                         if supersede
-                            && let Some(next_probe) = spawn_wake_probe(session.clone(), active_route.http_base.clone(), reason, nearby)
+                            && let Some(next_probe) = spawn_wake_probe(
+                                session.clone(),
+                                active_route.http_base.clone(),
+                                expected_environment_id.clone(),
+                                reason,
+                                nearby,
+                            )
                             && let Some(prev) = wake_probe.replace(next_probe)
                         {
                             prev.abort();
@@ -1787,7 +1855,7 @@ async fn initial_shell_options(
     preprocessor: &mut ServerConfigPreprocessor,
     config_requested_at_ms: i64,
     config_extras: &watch::Sender<ServerConfigExtras>,
-) -> ShellOptions {
+) -> Result<ShellOptions, String> {
     let wait = async {
         loop {
             match next_config(stream).await {
@@ -1810,21 +1878,29 @@ async fn initial_shell_options(
                             };
                             let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
                             if let Some(options) = options {
-                                return options;
+                                return Ok(options);
                             }
                         }
-                        Err(error) => report(events, "server config", error.to_string()).await,
+                        Err(error) => {
+                            let host = environment_label.as_deref().unwrap_or(&active_route.http_base);
+                            tracing::warn!(%error, "initial server configuration failed to decode");
+                            return Err(format!(
+                                "{host} sent an incompatible server configuration. Update the client and server to compatible versions."
+                            ));
+                        }
                     }
                 }
                 Some(Err(error)) => {
                     report(events, "server config", error.to_string()).await;
-                    return ShellOptions::default();
+                    return Ok(ShellOptions::default());
                 }
-                None => return ShellOptions::default(),
+                None => return Ok(ShellOptions::default()),
             }
         }
     };
-    tokio::time::timeout(CONFIG_WAIT, wait).await.unwrap_or_default()
+    tokio::time::timeout(CONFIG_WAIT, wait)
+        .await
+        .unwrap_or_else(|_| Ok(ShellOptions::default()))
 }
 
 #[derive(Clone, Copy)]
@@ -1940,15 +2016,25 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
     let thread_id = thread_id.to_owned();
     ThreadForwarder(tokio::spawn(async move {
         let mut sequence = sequence;
+        let mut force_snapshot = false;
         let mut retry_attempt = 0u32;
         loop {
-            let mut stream = match session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, sequence)) {
+            let req_sequence = (!force_snapshot).then_some(sequence).flatten();
+            let mut resuming = req_sequence.is_some();
+            let mut catch_up: Vec<ThreadStreamItem> = Vec::new();
+            let mut marked_syncing = false;
+            let mut immediate_retry = false;
+            let mut stream = match session.stream(method::SUBSCRIBE_THREAD, commands::subscribe_thread(&thread_id, req_sequence)) {
                 Ok(stream) => stream,
                 Err(RpcError::Closed) => return,
                 Err(error) => {
                     let stop = is_thread_auth_failure(&error);
                     if tx.send((thread_id.clone(), ThreadDelivery::RpcError(error))).await.is_err() || stop {
                         return;
+                    }
+                    if resuming {
+                        force_snapshot = true;
+                        continue;
                     }
                     tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
                     retry_attempt = retry_attempt.saturating_add(1);
@@ -1961,11 +2047,41 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
                         Ok(item) => {
                             retry_attempt = 0;
                             sequence = thread_sequence(&item).or(sequence);
-                            if tx.send((thread_id.clone(), ThreadDelivery::Item(Box::new(item)))).await.is_err() {
+                            if matches!(item, ThreadStreamItem::Snapshot { .. }) {
+                                force_snapshot = false;
+                                resuming = false;
+                                catch_up.clear();
+                                marked_syncing = false;
+                                if tx.send((thread_id.clone(), ThreadDelivery::Item(Box::new(item)))).await.is_err() {
+                                    return;
+                                }
+                            } else if resuming {
+                                let completes = matches!(item, ThreadStreamItem::Synchronized);
+                                catch_up.push(item);
+                                if completes {
+                                    resuming = false;
+                                    marked_syncing = false;
+                                    let items = std::mem::take(&mut catch_up);
+                                    if tx.send((thread_id.clone(), ThreadDelivery::Batch(items))).await.is_err() {
+                                        return;
+                                    }
+                                } else if !marked_syncing {
+                                    marked_syncing = true;
+                                    if tx.send((thread_id.clone(), ThreadDelivery::Synchronizing)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            } else if tx.send((thread_id.clone(), ThreadDelivery::Item(Box::new(item)))).await.is_err() {
                                 return;
                             }
                         }
                         Err(error) => {
+                            force_snapshot = true;
+                            catch_up.clear();
+                            if std::mem::replace(&mut resuming, false) {
+                                immediate_retry = true;
+                                break;
+                            }
                             if tx.send((thread_id.clone(), ThreadDelivery::DecodeError(error.to_string()))).await.is_err() {
                                 return;
                             }
@@ -1978,12 +2094,18 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
                         if tx.send((thread_id.clone(), ThreadDelivery::RpcError(error))).await.is_err() || stop {
                             return;
                         }
+                        if std::mem::replace(&mut resuming, false) {
+                            force_snapshot = true;
+                            immediate_retry = true;
+                        }
                         break;
                     }
                 }
             }
-            tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
-            retry_attempt = retry_attempt.saturating_add(1);
+            if !immediate_retry {
+                tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
+                retry_attempt = retry_attempt.saturating_add(1);
+            }
         }
     }))
 }

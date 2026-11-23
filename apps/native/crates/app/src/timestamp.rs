@@ -161,6 +161,25 @@ impl TimestampLocale for SystemTimestampLocale {
     }
 }
 
+/// Formats `ms` as local medium date + short time respecting `format` (for one-shot schedules and deliveries).
+pub(crate) fn once_label(ms: i64, format: TimestampFormat) -> String {
+    use chrono::{Datelike, Local, TimeZone, Timelike};
+    let Some(time) = Local.timestamp_millis_opt(ms).single() else {
+        return String::new();
+    };
+    let local = LocalTime {
+        year: i64::from(time.year()),
+        month: i64::from(time.month()),
+        day: i64::from(time.day()),
+        hour: i64::from(time.hour()),
+        minute: i64::from(time.minute()),
+        second: i64::from(time.second()),
+        millis: i64::from(time.nanosecond() / 1_000_000),
+        weekday: i64::from(time.weekday().num_days_from_sunday()),
+    };
+    format!("{}, {}", time.format("%b %-d, %Y"), SystemTimestampLocale.time(local, format))
+}
+
 #[cfg(test)]
 mod zone_tests {
     use super::*;

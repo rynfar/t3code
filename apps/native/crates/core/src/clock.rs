@@ -39,6 +39,21 @@ pub fn record_server_clock(
     map.insert(environment_id.to_owned(), offset);
 }
 
+/// Raises a stale negative offset (for example when a VM or WSL clock catches up
+/// after host sleep) without shifting a clock that already agrees (`observeServerTime`).
+pub fn observe_server_time(environment_id: &str, server_time_ms: i64, received_at_ms: i64) {
+    let Ok(mut map) = offsets().write() else {
+        return;
+    };
+    let Some(&current_offset) = map.get(environment_id) else {
+        return;
+    };
+    if received_at_ms.saturating_add(current_offset) >= server_time_ms {
+        return;
+    }
+    map.insert(environment_id.to_owned(), server_time_ms.saturating_sub(received_at_ms));
+}
+
 /// Converts client epoch milliseconds to the environment's clock.
 pub fn to_server_clock(environment_id: &str, client_ms: i64) -> i64 {
     let offset = offsets()
@@ -79,5 +94,20 @@ mod tests {
         assert_eq!(to_server_clock("test-clear", 2_050), HOUR + 2_000);
         record_server_clock("test-clear", None, 2_000, 2_050);
         assert_eq!(to_server_clock("test-clear", 2_050), 2_050);
+    }
+
+    #[test]
+    fn observe_server_time_raises_stale_negative_offset_only() {
+        record_server_clock("test-wake", Some(1_000), 10_000, 10_050);
+        assert_eq!(to_server_clock("test-wake", 20_000), 11_000);
+        // Earlier or matching timestamps leave synced offset alone.
+        observe_server_time("test-wake", 11_000, 20_000);
+        assert_eq!(to_server_clock("test-wake", 20_000), 11_000);
+        // Host clock jumped forward after sleep: raises negative offset to match.
+        observe_server_time("test-wake", 19_500, 20_000);
+        assert_eq!(to_server_clock("test-wake", 20_000), 19_500);
+        // Unknown environment is ignored.
+        observe_server_time("test-unknown", 50_000, 20_000);
+        assert_eq!(to_server_clock("test-unknown", 20_000), 20_000);
     }
 }

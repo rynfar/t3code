@@ -47,7 +47,7 @@ use super::controls::{
     dialog_footer, icon, muted_text, r, section,
 };
 use super::threads::{model_trait_controls, parse_selection, selection_value};
-use super::{Block, SettingsView, features, store};
+use super::{Block, SettingsView, store};
 use crate::components::secret_source::SecretSourceInput;
 use crate::i18n::t;
 use crate::icons::Icon;
@@ -3533,7 +3533,7 @@ impl SettingsView {
                         let config = app.fleet.environments.iter().filter_map(|entry| entry.config.config.as_ref())
                             .chain(app.server_config.config.as_ref())
                             .find(|config| config.environment.environment_id == dialog.environment_id);
-                        let secret_sources = if features(cx).secrets {
+                        let secret_sources = if config.is_some_and(|c| c.has_secret_providers_feature() && c.secret_references) {
                             config.map_or(&[][..], |config| config.settings.secret_providers.0.as_slice())
                         } else {
                             &[]

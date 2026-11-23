@@ -182,7 +182,7 @@ pub fn required_scopes_for_server_settings_payload(payload: &Value) -> Vec<&'sta
     {
         for (key, value) in patch {
             match key.as_str() {
-                "requireConnectDeviceApproval" => changes_access = true,
+                "requireConnectDeviceApproval" | "enablePreviewTunnel" => changes_access = true,
                 "providers" | "providerInstances" | "usageLimitSources" | "textGenerators" => {
                     changes_providers = true;
                 }
@@ -374,6 +374,10 @@ mod tests {
         );
         assert_eq!(
             required_scopes_for_server_settings_payload(&json!({ "patch": { "requireConnectDeviceApproval": true } })),
+            vec!["access:write"]
+        );
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({ "patch": { "enablePreviewTunnel": false } })),
             vec!["access:write"]
         );
         assert_eq!(

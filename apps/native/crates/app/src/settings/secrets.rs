@@ -440,7 +440,6 @@ mod parity_tests {
             crate::keymap::init(cx);
             crate::settings::init(state.clone(), cx);
             crate::updates::init(cx);
-            cx.global_mut::<super::super::Host>().features.secrets = true;
             state.update(cx, |state, cx| {
                 state.server_config.config = Some(
                     serde_json::from_value(json!({
@@ -449,6 +448,7 @@ mod parity_tests {
                             "label": "Studio Mac",
                             "capabilities": { "secretProviderSettings": true, "secretSourceCheck": true }
                         },
+                        "featureFlags": { "secretProviders": true },
                         "secretProviderSettings": true,
                         "secretReferences": true,
                         "settings": {

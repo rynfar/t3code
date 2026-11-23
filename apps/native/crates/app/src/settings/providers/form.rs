@@ -959,7 +959,7 @@ impl SettingsView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let config = self.state.read(cx).server_config.config.as_ref()?;
-        let mut sources = if config.secret_references {
+        let mut sources = if config.secret_references && config.has_secret_providers_feature() {
             config
                 .settings
                 .secret_providers

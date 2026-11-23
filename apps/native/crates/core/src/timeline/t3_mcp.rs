@@ -218,6 +218,7 @@ const T3_MCP_TOOLS: &[T3McpToolDefinition] = &[
     t3_tool("run_scheduled_task_now", "Run", "Running", "Requested a run of", "a scheduled task", T3McpSummaryAction::ScheduleRun),
     t3_tool("t3_queue", "Manage", "Managing", "Managed", "queued messages", T3McpSummaryAction::QueueEdit),
     t3_tool("t3_pending_request", "Handle", "Handling", "Handled", "pending questions", T3McpSummaryAction::QuestionRespond),
+    t3_tool("t3_submit_output", "Submit", "Submitting", "Submitted", "the result", T3McpSummaryAction::ThreadSend),
     t3_tool("t3_queue_list", "List", "Listing", "Listed", "queued messages", T3McpSummaryAction::QueueList),
     t3_tool("t3_queue_read", "Read", "Reading", "Read", "a queued message", T3McpSummaryAction::QueueRead),
     t3_tool("t3_queue_edit", "Edit", "Editing", "Edited", "a queued message", T3McpSummaryAction::QueueEdit),

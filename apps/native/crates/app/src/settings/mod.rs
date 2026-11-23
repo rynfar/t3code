@@ -76,8 +76,6 @@ struct Host {
     pending_provider: Option<providers::ProviderSettingsTarget>,
     /// What had focus when the modal opened, focused again when it closes.
     previous_focus: Option<FocusHandle>,
-    /// Features the web build reads from its environment, read once at launch.
-    features: Features,
     _provider_navigation: Subscription,
 }
 
@@ -88,7 +86,6 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     controls::init(cx);
     typography::init(cx);
     providers::init(cx);
-    let features = Features::from_secrets_flag(std::env::var("T3CODE_FEATURE_SECRETS").ok().as_deref());
     let provider_navigation = cx.subscribe(&state, |state, event: &AppEvent, cx| {
         if matches!(event, AppEvent::Phase | AppEvent::ServerConfig)
             && cx
@@ -111,7 +108,6 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
         pending_scheduled_task: None,
         pending_provider: None,
         previous_focus: None,
-        features,
     });
     cx.on_action(|_: &OpenSettings, cx| open(Section::General, cx));
     cx.bind_keys([
@@ -357,8 +353,21 @@ pub(crate) fn test_setup_target_lifetime(
     finish_close(window, cx);
 }
 
+fn has_secret_providers_environment(state: &AppState) -> bool {
+    if state.fleet.environments.is_empty() {
+        state.server_config.config.as_ref().is_some_and(|config| config.has_secret_providers_feature())
+    } else {
+        state
+            .fleet
+            .environments
+            .iter()
+            .any(|entry| entry.config.config.as_ref().is_some_and(|config| config.has_secret_providers_feature()))
+    }
+}
+
 fn features(cx: &App) -> Features {
-    cx.global::<Host>().features
+    let state = cx.global::<Host>().state.read(cx);
+    Features { secrets: has_secret_providers_environment(state) }
 }
 
 /// Opens settings at the row a settings search result names, as the palette's results do.
@@ -968,7 +977,7 @@ impl SettingsView {
             search,
             active_result: 0,
             scroll: ScrollHandle::new(),
-            section_focus: search::nav_groups(features(cx))
+            section_focus: search::nav_groups(Features { secrets: true })
                 .into_iter()
                 .flat_map(|(_, sections)| sections)
                 .map(|section| (section, cx.focus_handle().tab_stop(true)))
@@ -1205,8 +1214,18 @@ impl SettingsView {
         if modifiers.alt || modifiers.control || modifiers.platform {
             return;
         }
-        let Some(index) = self.section_focus.iter().position(|(_, handle)| handle.is_focused(window)) else { return };
-        let last = self.section_focus.len() - 1;
+        let visible_sections: Vec<(Section, FocusHandle)> = search::nav_groups(features(cx))
+            .into_iter()
+            .flat_map(|(_, sections)| sections)
+            .filter_map(|section| {
+                self.section_focus
+                    .iter()
+                    .find(|(candidate, _)| *candidate == section)
+                    .cloned()
+            })
+            .collect();
+        let Some(index) = visible_sections.iter().position(|(_, handle)| handle.is_focused(window)) else { return };
+        let last = visible_sections.len().saturating_sub(1);
         let next = match event.keystroke.key.as_str() {
             "down" => (index + 1).min(last),
             "up" => index.saturating_sub(1),
@@ -1216,7 +1235,7 @@ impl SettingsView {
             _ => return,
         };
         cx.stop_propagation();
-        let (section, handle) = self.section_focus[next].clone();
+        let (section, handle) = visible_sections[next].clone();
         self.focused_section = Some((section, self.section));
         handle.focus(window, cx);
         cx.notify();

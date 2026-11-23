@@ -368,6 +368,18 @@ impl Drop for PendingRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeClockOutcome {
+    pub alive: bool,
+    pub clock_sample: Option<(i64, i64, i64)>,
+}
+
+fn epoch_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
+}
+
 impl Session {
     pub async fn connect(url: &str) -> Result<Session, OpenError> {
         Self::connect_with(url, TIMING).await
@@ -505,6 +517,44 @@ impl Session {
             }
         };
         tokio::time::timeout(timeout, wait).await.unwrap_or(false)
+    }
+
+    /// Probes liveness and refreshes host clock skew when `server.probe` answers with `serverTime`
+    /// (`pingdotgg/t3code#41037`).
+    pub async fn probe_with_clock(
+        &self,
+        timeout: Duration,
+        environment_id: Option<String>,
+    ) -> ProbeClockOutcome {
+        let requested_at_ms = epoch_now_ms();
+        let rpc = self.send_request(t3_core::commands::method::SERVER_PROBE, serde_json::json!({}));
+        let probe_rpc = async {
+            let reply = tokio::time::timeout(timeout, rpc).await.ok()?.ok()?;
+            let received_at_ms = epoch_now_ms();
+            let server_time_ms = reply
+                .get("serverTime")
+                .and_then(Value::as_str)
+                .and_then(t3_core::sidebar::time::parse_iso);
+            if let Some(server_time_ms) = server_time_ms
+                && let Some(env_id) = environment_id.as_deref().filter(|id| !id.is_empty())
+            {
+                t3_core::clock::record_server_clock(
+                    env_id,
+                    Some(server_time_ms),
+                    requested_at_ms,
+                    received_at_ms,
+                );
+            }
+            Some(ProbeClockOutcome {
+                alive: true,
+                clock_sample: server_time_ms.map(|st| (st, requested_at_ms, received_at_ms)),
+            })
+        };
+        let ping = self.probe(timeout);
+        tokio::select! {
+            Some(outcome) = probe_rpc => outcome,
+            alive = ping => ProbeClockOutcome { alive, clock_sample: None },
+        }
     }
 
     fn start(&self, tag: &str, payload: Value, entry: Pending) -> Result<RequestId, RpcError> {

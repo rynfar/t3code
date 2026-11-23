@@ -33,6 +33,8 @@ pub struct ProjectShell {
     /// `ProjectScript[]`, kept raw: the thread details decode them (`project_scripts`).
     #[serde(default)]
     pub scripts: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked_folders: Vec<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }

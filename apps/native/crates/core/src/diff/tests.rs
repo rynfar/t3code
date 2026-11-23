@@ -376,6 +376,16 @@ fn turn_one_uses_the_full_thread_diff() {
     assert_eq!(method, "orchestration.getTurnDiff");
     assert_eq!(payload, json!({ "threadId": "t1", "fromTurnCount": 3, "toTurnCount": 4, "ignoreWhitespace": false }));
     assert_eq!(decode_turn_diff(&json!({ "diff": "x" })), Ok("x".to_owned()));
+    assert_eq!(
+        decode_turn_diff(&json!({
+            "diff": "",
+            "repositories": [
+                { "name": "a", "repositoryPath": "/a", "relativePath": "a", "diff": "diff --git a/f b/f" },
+                { "name": "b", "repositoryPath": "/b", "relativePath": "b", "diff": "diff --git a/g b/g" }
+            ]
+        })),
+        Ok("diff --git a/f b/f\ndiff --git a/g b/g".to_owned())
+    );
     assert!(decode_turn_diff(&json!({})).is_err());
 }
 

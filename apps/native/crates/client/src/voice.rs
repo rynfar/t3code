@@ -30,6 +30,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOUD_TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(130);
 const LONG_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+fn internal_error_display(reason: &str, detail: Option<&str>) -> String {
+    if let Some(detail) = detail.map(str::trim).filter(|s| !s.is_empty()) {
+        detail.to_owned()
+    } else {
+        format!("Environment failed the voice request ({reason}).")
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VoiceClientError {
     #[error("This environment session is no longer valid. Pair again.")]
@@ -40,6 +48,8 @@ pub enum VoiceClientError {
     CloudSpeech(CloudSpeechError),
     #[error("Environment rejected the voice request ({reason}).")]
     InvalidRequest { reason: String, trace_id: Option<String> },
+    #[error("{}", internal_error_display(.reason, .detail.as_deref()))]
+    Internal { reason: String, detail: Option<String>, trace_id: Option<String> },
     #[error("Unexpected response from voice endpoint ({status}): {body}")]
     UnexpectedStatus { status: u16, body: String },
     #[error("Invalid voice endpoint URL: {0}")]
@@ -443,6 +453,18 @@ fn classify_http_error(status: u16, bytes: &[u8], value: &Value) -> VoiceClientE
     {
         let trace_id = value.get("traceId").and_then(Value::as_str).map(str::to_owned);
         return VoiceClientError::InvalidRequest { reason: reason.to_owned(), trace_id };
+    }
+    if value.get("_tag").and_then(Value::as_str) == Some("EnvironmentInternalError")
+        && let Some(reason) = value.get("reason").and_then(Value::as_str)
+    {
+        let detail = value
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let trace_id = value.get("traceId").and_then(Value::as_str).map(str::to_owned);
+        return VoiceClientError::Internal { reason: reason.to_owned(), detail, trace_id };
     }
     VoiceClientError::UnexpectedStatus {
         status,
@@ -973,5 +995,32 @@ mod tests {
         let final_text = session.finish().await.unwrap();
         assert_eq!(final_text, "hello world");
         assert!(updates.recv().await.is_none());
+    }
+
+    #[test]
+    fn classify_http_error_decodes_environment_internal_error_detail() {
+        let with_detail = json!({
+            "_tag": "EnvironmentInternalError",
+            "code": "internal_error",
+            "reason": "voice_post_processing_failed",
+            "detail": "Claude CLI timed out.",
+            "traceId": "trace-1"
+        });
+        let err = classify_http_error(500, b"{}", &with_detail);
+        assert!(matches!(
+            &err,
+            VoiceClientError::Internal { detail: Some(detail), .. } if detail == "Claude CLI timed out."
+        ));
+        assert_eq!(err.to_string(), "Claude CLI timed out.");
+
+        let without_detail = json!({
+            "_tag": "EnvironmentInternalError",
+            "code": "internal_error",
+            "reason": "voice_post_processing_failed",
+            "detail": "   ",
+            "traceId": "trace-2"
+        });
+        let err = classify_http_error(500, b"{}", &without_detail);
+        assert!(matches!(&err, VoiceClientError::Internal { detail: None, .. }));
     }
 }

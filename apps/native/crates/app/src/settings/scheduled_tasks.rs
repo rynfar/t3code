@@ -26,7 +26,8 @@ use t3_core::sidebar::{grouping::EnvironmentOwner, tag_filter::ThreadKey};
 use t3_core::settings::scheduled_tasks::{
     self, DAY_TOGGLES, Draft, Invalid, MAX_WEBHOOK_FILTERS, RunStatus, ScheduleMode, ScheduledTask, SignatureEncoding, ThreadMode,
     WebhookDelivery, WebhookDeliverySummary, WebhookFilterOp, WorkspaceMode, decode_webhook_deliveries, decode_webhook_delivery,
-    destination_threads, get_delivery_payload, list_deliveries_payload, method, schedule_time_zone_label, webhook_address, webhook_delivery_label,
+    destination_threads, get_delivery_payload, list_deliveries_payload, method, schedule_time_zone_label,
+    scheduled_task_worktree_base_ref, webhook_address, webhook_delivery_label,
 };
 
 use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, muted_text, r, section_title};
@@ -42,10 +43,7 @@ use crate::theme::{ThemeSlot, ThemeSlotExt, hsla, palette, theme_slot_clipped_ba
 const READ_SCOPE: &str = "orchestration:read";
 const LOCAL_FORMAT: &str = "%Y-%m-%d %H:%M";
 
-/// `Intl.DateTimeFormat` medium date, short time.
-fn once_label(ms: i64) -> String {
-    Local.timestamp_millis_opt(ms).single().map(|time| time.format("%b %-d, %Y, %-I:%M %p").to_string()).unwrap_or_default()
-}
+use crate::timestamp::once_label;
 
 fn local_field(iso: &str) -> Option<String> {
     let ms = t3_core::sidebar::time::parse_iso(iso)?;
@@ -126,6 +124,8 @@ impl Drop for TaskStream {
     }
 }
 
+type BranchRefsCache = ((String, bool), Result<Vec<t3_core::vcs::VcsRef>, String>);
+
 pub(crate) struct ScheduledTasksState {
     tasks: Option<Result<Vec<ScheduledTask>, String>>,
     time_zone: Option<String>,
@@ -136,8 +136,8 @@ pub(crate) struct ScheduledTasksState {
     previous_focus: Option<FocusHandle>,
     calendar: Entity<CalendarState>,
     calendar_open: bool,
-    branch_refs: Option<Result<Vec<SelectOption>, String>>,
-    branch_request: Option<Task<()>>,
+    branch_refs: Option<BranchRefsCache>,
+    branch_request: Option<(String, bool, Task<()>)>,
     delivery_revision: u64,
     busy: HashSet<(String, String)>,
     menu: Option<String>,
@@ -205,13 +205,20 @@ impl ScheduledTasksState {
                 }
             });
         }));
+        let base_ref = input("main", window, cx);
+        let sig_secret = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Signing secret"));
+        subscriptions.push(cx.subscribe(&base_ref, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.ensure_auto_base_branches(cx);
+            }
+        }));
         let inputs = EditorInputs {
             title: input("e.g. Check for Sentry issues", window, cx),
             prompt: cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 10).placeholder("What should the agent do each time this runs?")),
             time_of_day: input("09:00", window, cx),
             run_at: input("YYYY-MM-DD HH:MM", window, cx),
             interval: input("15", window, cx),
-            base_ref: input("main", window, cx),
+            base_ref,
             checkout: input("/path/to/checkout", window, cx),
             thread_search,
             max_age: input("No limit (1–1440)", window, cx),
@@ -220,7 +227,7 @@ impl ScheduledTasksState {
             coalesce_window: input("120 (10–3600)", window, cx),
             sig_header: input("x-hub-signature-256", window, cx),
             sig_prefix: input("sha256=", window, cx),
-            sig_secret: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Signing secret")),
+            sig_secret,
         };
         ScheduledTasksState {
             tasks: None,
@@ -604,6 +611,7 @@ impl SettingsView {
         self.scheduled.inputs.title.focus_handle(cx).focus(window, cx);
         self.scheduled.branch_refs = None;
         self.scheduled.branch_request = None;
+        self.ensure_auto_base_branches(cx);
         cx.notify();
     }
 
@@ -683,6 +691,7 @@ impl SettingsView {
         if let Some(draft) = self.scheduled.editor.as_mut() {
             edit(draft);
         }
+        self.ensure_auto_base_branches(cx);
         cx.notify();
     }
 
@@ -695,11 +704,18 @@ impl SettingsView {
         let once = config.environment.capabilities.one_time_schedules == Some(true);
         let thread_modes = config.environment.capabilities.scheduled_task_thread_modes == Some(true);
         let ceiling = scheduled_tasks::max_runtime_mode(config.managed_policy.as_ref()).map(str::to_owned);
-        let Some(draft) = self.scheduled.editor.clone() else { return };
+        let Some(mut draft) = self.scheduled.editor.clone() else { return };
         let projects = self.shell_projects(cx);
         if !projects.iter().any(|project| project.id == draft.project_id) {
             self.scheduled.save_error = Some(t(cx, "Select a project").to_owned());
             return cx.notify();
+        }
+        let (resolved_base_ref, automatic_loading) = self.auto_base_ref_state(&draft, &projects, cx);
+        if automatic_loading {
+            return;
+        }
+        if draft.workspace_mode == WorkspaceMode::Worktree && draft.base_ref.trim().is_empty() {
+            draft.base_ref = resolved_base_ref;
         }
         if draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some() {
             return;
@@ -854,10 +870,11 @@ impl SettingsView {
              "Run a prompt automatically on an interval, at a fixed time, once at a set date, or when a webhook is called.", body, footer)
         };
         let view = cx.entity().downgrade();
+        let dismiss_on_backdrop = self.scheduled.deliveries.is_some();
         Some(DialogFrame {
             id, title: title.into(), description: description.into(), max_width: 640.,
             body, footer, focus: self.scheduled.dialog_focus.clone(),
-        }.render_modal(window, 1, move |window, cx| {
+        }.render_modal_guarded(window, 1, dismiss_on_backdrop, move |window, cx| {
             let _ = view.update(cx, |view, cx| view.close_task_dialog(window, cx));
         }, cx))
     }
@@ -882,11 +899,14 @@ impl SettingsView {
         let p = palette(cx);
         let busy = self.scheduled.environment.as_ref()
             .is_some_and(|id| self.scheduled.busy.contains(&(id.clone(), task.id.clone())));
-        let schedule_text = task.schedule.label_with_timezone(
+        let ts_format = store::client(cx).timestamp_format();
+        let schedule_text = task.schedule.label_with_format(
+            ts_format,
+            &crate::timestamp::SystemTimestampLocale,
             self.scheduled.time_zone.as_deref(),
             task.next_run_at.as_deref(),
             now,
-            once_label,
+            |ms| once_label(ms, ts_format),
         );
         let status = format!("{schedule_text} \u{00b7} {}", task.state_label(now));
         let badge = task.last_run_status.badge().map(|text| {
@@ -1057,8 +1077,9 @@ impl SettingsView {
                             let deliv_id = item.id.clone();
                             let label = webhook_delivery_label(&item.outcome, item.pending_window);
                             let tone = delivery_outcome_tone(&item.outcome);
+                            let ts_format = store::client(cx).timestamp_format();
                             let when = t3_core::sidebar::time::parse_iso(&item.received_at)
-                                .map(once_label)
+                                .map(|ms| once_label(ms, ts_format))
                                 .unwrap_or_else(|| item.received_at.clone());
                             let meta = format!("{} · {} B · {}", item.method, item.body_bytes, when);
                             h_flex()
@@ -1545,13 +1566,14 @@ impl SettingsView {
             }))
             .when(!connected, |this| this.child(div().px(r(16.)).child(muted_text("Reconnect this environment before saving.", cx))))
             .into_any_element();
+        let (_, automatic_loading) = self.auto_base_ref_state(&draft, &projects, cx);
         let cancel = Button::new("scheduled-task-cancel", ButtonVariant::Outline, ButtonSize::Sm)
             .label("Cancel")
             .disabled(self.scheduled.saving || self.scheduled.rotating_url)
             .on_click(cx.listener(|view, _, window, cx| view.close_task_dialog(window, cx)));
         let save = Button::new("scheduled-task-save", ButtonVariant::Default, ButtonSize::Sm)
             .label(if editing { "Save task" } else { "Create task" })
-            .disabled(self.scheduled.saving || self.scheduled.rotating_url || !connected
+            .disabled(self.scheduled.saving || self.scheduled.rotating_url || automatic_loading || !connected
                 || (draft.enabled && draft.schedule_mode == ScheduleMode::Webhook && self.webhook_denial(cx).is_some()))
             .on_click(cx.listener(|view, _, window, cx| view.save_task(window, cx)));
         (body, dialog_footer(false, vec![cancel.into_any_element(), save.into_any_element()], cx).into_any_element())
@@ -1596,18 +1618,72 @@ impl SettingsView {
             .into_any_element()
     }
 
+    fn auto_base_ref_state(
+        &self,
+        draft: &Draft,
+        projects: &[t3_core::shell::ProjectShell],
+        cx: &App,
+    ) -> (String, bool) {
+        let base_ref_input = self.scheduled.inputs.base_ref.read(cx).value().to_string();
+        let key = (draft.project_id.clone(), draft.start_from_origin);
+        let matching_result = self
+            .scheduled
+            .branch_refs
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, result)| result);
+        let refs = matching_result
+            .and_then(|result| result.as_ref().ok())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let resolved = scheduled_task_worktree_base_ref(&base_ref_input, refs);
+        let automatic = draft.workspace_mode == WorkspaceMode::Worktree
+            && base_ref_input.trim().is_empty()
+            && projects.iter().any(|project| project.id == draft.project_id);
+        let loading = automatic && matching_result.is_none();
+        (resolved, loading)
+    }
+
+    fn ensure_auto_base_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.scheduled.editor.as_ref() else { return };
+        if draft.workspace_mode != WorkspaceMode::Worktree
+            || draft.project_id.is_empty()
+            || !self.scheduled.inputs.base_ref.read(cx).value().trim().is_empty()
+        {
+            return;
+        }
+        let key = (draft.project_id.clone(), draft.start_from_origin);
+        if self.scheduled.branch_refs.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.scheduled.branch_request.as_ref().is_some_and(|(pid, rem, _)| pid == &key.0 && *rem == key.1)
+        {
+            return;
+        }
+        self.load_task_branches(&key.0, cx);
+    }
+
     fn base_branch_picker(&self, draft: &Draft, cx: &Context<Self>) -> AnyElement {
-        let loading = self.scheduled.branch_request.is_some();
+        let key = (draft.project_id.clone(), draft.start_from_origin);
+        let loading = self
+            .scheduled
+            .branch_request
+            .as_ref()
+            .is_some_and(|(pid, rem, _)| pid == &key.0 && *rem == key.1);
         let input = self.scheduled.inputs.base_ref.clone();
-        match &self.scheduled.branch_refs {
-            Some(Ok(options)) if !options.is_empty() => Select::new("scheduled-task-branch-select", options.clone())
-                .label("Choose a branch")
-                .selected(input.read(cx).value())
-                .show_check()
-                .on_change(move |value, window, cx| {
-                    input.update(cx, |input, cx| input.set_value(value, window, cx));
-                })
-                .into_any_element(),
+        match self.scheduled.branch_refs.as_ref().filter(|(k, _)| *k == key).map(|(_, result)| result) {
+            Some(Ok(refs)) if !refs.is_empty() => {
+                let options = refs
+                    .iter()
+                    .map(|branch| SelectOption::new(branch.name.clone(), branch.name.clone()))
+                    .collect();
+                Select::new("scheduled-task-branch-select", options)
+                    .label("Choose a branch")
+                    .selected(input.read(cx).value())
+                    .show_check()
+                    .on_change(move |value, window, cx| {
+                        input.update(cx, |input, cx| input.set_value(value, window, cx));
+                    })
+                    .into_any_element()
+            }
             result => {
                 let project_id = draft.project_id.clone();
                 Button::new("scheduled-task-branch-fetch", ButtonVariant::Outline, ButtonSize::Xs)
@@ -1630,18 +1706,21 @@ impl SettingsView {
         let kind = if remote { t3_core::diff::BaseRefKind::Remote } else { t3_core::diff::BaseRefKind::Local };
         let payload = t3_core::diff::list_base_refs_request(&project.workspace_root, kind, None);
         let request = self.task_request(READ_SCOPE, t3_core::vcs::method::VCS_LIST_REFS, payload, cx);
-        self.scheduled.branch_request = Some(cx.spawn(async move |view, cx| {
+        let pid = project_id.to_owned();
+        let pid_task = pid.clone();
+        let task = cx.spawn(async move |view, cx| {
             let result = request.await.map_err(|error| failure_text(&error, "Could not load branches"))
                 .and_then(t3_core::diff::decode_list_refs_result)
-                .map(|reply| reply.refs.into_iter().map(|branch| {
-                    SelectOption::new(branch.name.clone(), branch.name)
-                }).collect());
+                .map(|reply| reply.refs);
             let _ = view.update(cx, |view, cx| {
-                view.scheduled.branch_refs = Some(result);
-                view.scheduled.branch_request = None;
-                cx.notify();
+                if view.scheduled.branch_request.as_ref().is_some_and(|(p, r, _)| p == &pid_task && *r == remote) {
+                    view.scheduled.branch_refs = Some(((pid_task, remote), result));
+                    view.scheduled.branch_request = None;
+                    cx.notify();
+                }
             });
-        }));
+        });
+        self.scheduled.branch_request = Some((pid, remote, task));
         cx.notify();
     }
 

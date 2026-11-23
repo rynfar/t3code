@@ -798,6 +798,60 @@ impl AppState {
         }
     }
 
+    fn with_active_clock_keys(&self, mut f: impl FnMut(&str)) {
+        let active = self.environments.active.as_deref().filter(|id| !id.is_empty());
+        let http_base = self.environment().filter(|id| !id.is_empty());
+        let canonical = self
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty());
+        if let Some(id) = active {
+            f(id);
+        }
+        if let Some(base) = http_base
+            && active != Some(base)
+        {
+            f(base);
+        }
+        if let Some(cid) = canonical
+            && active != Some(cid)
+            && http_base != Some(cid)
+        {
+            f(cid);
+        }
+    }
+
+    fn observe_active_server_time(&self, iso: &str) {
+        let Some(server_time_ms) = t3_core::sidebar::time::parse_iso(iso) else {
+            return;
+        };
+        let received_at_ms = chrono::Utc::now().timestamp_millis();
+        self.with_active_clock_keys(|key| {
+            t3_core::clock::observe_server_time(key, server_time_ms, received_at_ms);
+        });
+    }
+
+    fn apply_thread_stream_item(
+        &mut self,
+        thread_id: &str,
+        item: t3_core::thread::ThreadStreamItem,
+        thread_structure_changed: &mut bool,
+        thread_delta_changed: &mut bool,
+        side_changed: &mut bool,
+    ) {
+        if self.selected_thread.as_deref() == Some(thread_id) {
+            match self.thread.apply_classified(item) {
+                ThreadApplyKind::Unchanged => {}
+                ThreadApplyKind::StreamingDelta => *thread_delta_changed = true,
+                ThreadApplyKind::Structure => *thread_structure_changed = true,
+            }
+        } else {
+            *side_changed |= self.apply_side_thread(thread_id, item);
+        }
+    }
+
     pub(crate) fn apply_batch(&mut self, batch: Vec<ClientEvent>, cx: &mut Context<Self>) {
         let (mut shell_changed, mut sidebar_changed, mut error_changed, mut config_changed) = (false, false, false, false);
         let (mut thread_structure_changed, mut thread_delta_changed) = (false, false);
@@ -811,6 +865,11 @@ impl AppState {
                 ClientEvent::Status(status) => self.set_phase(Phase::Online(status), cx),
                 ClientEvent::Shell(item) => {
                     error_changed |= self.clear_stream_error("shell");
+                    if self.shell.synchronized
+                        && let ShellStreamItem::ThreadUpdated { thread, .. } = &item
+                    {
+                        self.observe_active_server_time(&thread.updated_at);
+                    }
                     resynchronized |= matches!(item, ShellStreamItem::Synchronized);
                     if let ShellStreamItem::ThreadRemoved { thread_id, .. } = &item {
                         self.collect_side_chats_for_deleted_thread(thread_id, &mut removed_draft_threads);
@@ -826,14 +885,41 @@ impl AppState {
                 }
                 ClientEvent::Thread { thread_id, item } => {
                     error_changed |= self.clear_stream_error(&format!("thread {thread_id}"));
+                    if self.selected_thread.as_deref() == Some(thread_id.as_str())
+                        && self.thread.synchronized
+                        && let t3_core::thread::ThreadStreamItem::Event { event, .. } = item.as_ref()
+                    {
+                        self.observe_active_server_time(&event.occurred_at);
+                    }
+                    self.apply_thread_stream_item(
+                        &thread_id,
+                        *item,
+                        &mut thread_structure_changed,
+                        &mut thread_delta_changed,
+                        &mut side_changed,
+                    );
+                }
+                ClientEvent::ThreadBatch { thread_id, items } => {
+                    error_changed |= self.clear_stream_error(&format!("thread {thread_id}"));
+                    for item in items {
+                        self.apply_thread_stream_item(
+                            &thread_id,
+                            item,
+                            &mut thread_structure_changed,
+                            &mut thread_delta_changed,
+                            &mut side_changed,
+                        );
+                    }
+                }
+                ClientEvent::ThreadSynchronizing { thread_id } => {
                     if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
-                        match self.thread.apply_classified(*item) {
-                            ThreadApplyKind::Unchanged => {}
-                            ThreadApplyKind::StreamingDelta => thread_delta_changed = true,
-                            ThreadApplyKind::Structure => thread_structure_changed = true,
+                        if self.thread.synchronized || self.thread.error.is_some() {
+                            self.thread.synchronized = false;
+                            self.thread.error = None;
+                            thread_structure_changed = true;
                         }
                     } else {
-                        side_changed |= self.apply_side_thread(&thread_id, *item);
+                        side_changed |= self.mark_side_thread_synchronizing(&thread_id);
                     }
                 }
                 ClientEvent::ServerConfig(event) => {
@@ -843,8 +929,18 @@ impl AppState {
                         self.server_config_revision = self.server_config_revision.wrapping_add(1);
                     }
                 }
+                ClientEvent::ServerClock { server_time_ms, requested_at_ms, received_at_ms } => {
+                    self.with_active_clock_keys(|key| {
+                        t3_core::clock::record_server_clock(key, Some(server_time_ms), requested_at_ms, received_at_ms);
+                    });
+                }
                 ClientEvent::StreamError { context, message } => {
                     self.last_error = Some(format!("Could not read {context}: {message}"));
+                    if self.selected_thread.as_deref().is_some_and(|id| context == format!("thread {id}")) {
+                        self.thread.error = Some(message);
+                    } else if let Some(thread_id) = context.strip_prefix("thread ") {
+                        self.set_side_thread_error(thread_id, message);
+                    }
                     error_changed = true;
                 }
                 ClientEvent::Moved { http_base } => { if let Some(id) = self.environments.active.clone() { self.environment_route_moved(&id, http_base, cx); } },
@@ -2548,6 +2644,100 @@ mod stream_and_stop_tests {
             cx.shutdown();
             cx.clear_globals();
         });
+        runtime.shutdown_background();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn thread_batch_synchronizing_and_stream_error_update_thread_state(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let make_snap = |id: &str, seq: u64| -> t3_core::thread::ThreadStreamItem {
+            serde_json::from_value(serde_json::json!({
+                "kind": "snapshot",
+                "snapshotSequence": seq,
+                "hasMoreHistory": false,
+                "historyCursor": null,
+                "projection": {
+                    "thread": {
+                        "id": id, "projectId": "checkout-a", "title": "T",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:00.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": { "instanceId": "replay", "model": "replay" },
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": { "rootThreadId": id }
+                    },
+                    "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                    "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                    "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }))
+            .unwrap()
+        };
+        let sync_item: t3_core::thread::ThreadStreamItem = serde_json::from_value(serde_json::json!({ "kind": "synchronized" })).unwrap();
+
+        state.update(cx, |s, cx| {
+            s.select_thread("t1", cx);
+            s.apply_batch(
+                vec![ClientEvent::ThreadBatch {
+                    thread_id: "t1".into(),
+                    items: vec![make_snap("t1", 5), sync_item.clone()],
+                }],
+                cx,
+            );
+        });
+        state.read_with(cx, |s, _| {
+            assert!(s.thread.synchronized);
+            assert!(s.thread.error.is_none());
+            assert_eq!(s.thread.sequence, Some(5));
+        });
+
+        state.update(cx, |s, cx| {
+            s.apply_batch(vec![ClientEvent::ThreadSynchronizing { thread_id: "t1".into() }], cx);
+        });
+        state.read_with(cx, |s, _| {
+            assert!(!s.thread.synchronized);
+        });
+
+        state.update(cx, |s, cx| {
+            s.apply_batch(
+                vec![ClientEvent::StreamError {
+                    context: "thread t1".into(),
+                    message: "socket closed".into(),
+                }],
+                cx,
+            );
+        });
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.thread.error.as_deref(), Some("socket closed"));
+        });
+
+        state.update(cx, |s, cx| {
+            s.apply_batch(
+                vec![ClientEvent::ThreadBatch {
+                    thread_id: "t1".into(),
+                    items: vec![make_snap("t1", 6), sync_item],
+                }],
+                cx,
+            );
+        });
+        state.read_with(cx, |s, _| {
+            assert!(s.thread.synchronized);
+            assert!(s.thread.error.is_none());
+            assert_eq!(s.thread.sequence, Some(6));
+        });
+
+        state.update(cx, |s, _| s.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(_guard);
         runtime.shutdown_background();
         cx.run_until_parked();
     }

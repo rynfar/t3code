@@ -668,6 +668,9 @@ pub struct EnvironmentCapabilities {
     pub voice_transcription: Option<bool>,
     #[serde(default)]
     pub cloud_voice_transcription: Option<bool>,
+    /// Honors `enablePreviewTunnel`; hide the switch where absent, since the tunnel stays on there.
+    #[serde(default)]
+    pub preview_tunnel_setting: Option<bool>,
     /// Server answers `server.prepareTriage`.
     #[serde(default)]
     pub triage: Option<bool>,
@@ -837,6 +840,8 @@ pub struct ServerSettings {
     pub environment_icon: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub enable_agent_browser_access: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub enable_preview_tunnel: Option<bool>,
     #[serde(default, deserialize_with = "lenient")]
     pub prompt_suggestions_enabled: bool,
     /// Missing on older hosts; the Maintenance UI default does not prove restart continuation.
@@ -989,6 +994,14 @@ pub struct RemoteOpenTarget {
     pub username: Option<String>,
 }
 
+/// The boolean `T3CODE_FEATURE_FLAGS` a server started with (`ServerFeatureFlags`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ServerFeatureFlags {
+    pub secret_providers: Option<bool>,
+    pub tanstack_source: Option<bool>,
+}
+
 /// `ServerConfigIssue` in `packages/contracts/src/server.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1045,6 +1058,9 @@ pub struct ServerConfig {
     /// Override for the reveal label (`finder`, `file-explorer`, `files`), e.g. WSL on Linux.
     #[serde(default)]
     pub shell_reveal_in_file_manager_kind: Option<String>,
+    /// The boolean `T3CODE_FEATURE_FLAGS` the server started with.
+    #[serde(default)]
+    pub feature_flags: Option<ServerFeatureFlags>,
     /// Advertised remote open targets (e.g. Tailscale, mDNS, SSH) from `ServerConfig.remoteOpenTargets`.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub remote_open_targets: Vec<RemoteOpenTarget>,
@@ -1078,6 +1094,14 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Whether `T3CODE_FEATURE_FLAGS` enabled `secretProviders` on this server.
+    pub fn has_secret_providers_feature(&self) -> bool {
+        self.feature_flags
+            .as_ref()
+            .and_then(|flags| flags.secret_providers)
+            == Some(true)
+    }
+
     pub fn provider(&self, instance_id: &str) -> Option<&ServerProvider> {
         self.providers.iter().find(|provider| provider.instance_id == instance_id)
     }

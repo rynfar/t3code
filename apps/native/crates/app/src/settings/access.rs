@@ -215,6 +215,7 @@ pub(crate) struct AccessPageState {
     connect_device_busy: Option<String>,
     revoke_device_confirm: Option<RevokeConnectDeviceConfirm>,
     approval_saving: bool,
+    preview_tunnel_saving: bool,
     permissions_open: bool,
     /// Cached dismissal state per environment key so `render()` reads disk at most once per key.
     dismissed_legacy_notice: HashMap<String, bool>,
@@ -275,6 +276,7 @@ impl AccessPageState {
             connect_device_busy: None,
             revoke_device_confirm: None,
             approval_saving: false,
+            preview_tunnel_saving: false,
             permissions_open: false,
             dismissed_legacy_notice: HashMap::new(),
             qr: RefCell::new(None),
@@ -326,6 +328,7 @@ impl AccessPageState {
         self.connect_device_busy = None;
         self.revoke_device_confirm = None;
         self.approval_saving = false;
+        self.preview_tunnel_saving = false;
         self.qr.borrow_mut().take();
     }
 
@@ -978,6 +981,31 @@ impl SettingsView {
                 match result {
                     Ok(_) => client.set_require_connect_device_approval(next),
                     Err(error) => store::show_error(format!("Could not update device approval setting: {error}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_preview_tunnel(&mut self, client: Option<ClientHandle>, target_id: String, next: bool, cx: &mut Context<Self>) {
+        let Some(client) = client else {
+            return store::show_error("Reconnect to this environment first.".to_owned(), cx);
+        };
+        self.access.preview_tunnel_saving = true;
+        let runtime = self.state.read(cx).runtime().clone();
+        let update = client.request(method::SERVER_UPDATE_SETTINGS, json!({ "patch": { "enablePreviewTunnel": next } }));
+        let task = runtime.spawn(update);
+        cx.spawn(async move |this, cx| {
+            let result = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.access.active_target.as_deref() != Some(target_id.as_str()) {
+                    return;
+                }
+                this.access.preview_tunnel_saving = false;
+                if let Err(error) = result {
+                    store::show_error(format!("Could not update preview tunnel setting: {error}"), cx);
                 }
                 cx.notify();
             });
@@ -1734,6 +1762,39 @@ impl SettingsView {
                                 let target = toggle_target.clone();
                                 let _ = toggle_entity.update(cx, |this, cx| {
                                     this.toggle_connect_device_approval(client, target, next, cx);
+                                });
+                            }),
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(config) = target
+            .config
+            .as_ref()
+            .filter(|c| c.environment.capabilities.preview_tunnel_setting == Some(true))
+        {
+            let policy = config.managed_policy.as_ref();
+            let preview_tunnel_locked = t3_core::managed_policy::capability_denial(
+                policy,
+                t3_core::managed_policy::Capability::PreviewTunnel,
+            )
+            .or_else(|| t3_core::managed_policy::setting_lock_reason(policy, "enablePreviewTunnel"));
+            let toggle_client = target.client.clone();
+            let toggle_target = target.saved_id.clone();
+            let toggle_entity = cx.entity().downgrade();
+            machine_rows.push(
+                Row::new("preview-tunnel", "Preview tunnel")
+                    .description("Lets other devices open this machine's local servers: browser tabs loaded on the device, Open on this device, and port forwarding. Off: browser tabs stream from this machine.")
+                    .control(crate::components::managed::ManagedControl::new(
+                        "managed-preview-tunnel",
+                        preview_tunnel_locked,
+                        Switch::new("preview-tunnel-switch", t3_core::managed_policy::allows_preview_tunnel(config))
+                            .disabled(!can_write || self.access.preview_tunnel_saving)
+                            .on_change(move |next, _, cx| {
+                                let client = toggle_client.clone();
+                                let target = toggle_target.clone();
+                                let _ = toggle_entity.update(cx, |this, cx| {
+                                    this.toggle_preview_tunnel(client, target, next, cx);
                                 });
                             }),
                     ))

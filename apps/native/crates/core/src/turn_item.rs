@@ -140,6 +140,17 @@ pub struct FileChangeDetail {
     pub mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRequestField {
+    pub name: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum TurnItemKind {
@@ -332,6 +343,8 @@ pub enum TurnItemKind {
         placeholder: Option<String>,
         #[serde(default)]
         delivery: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fields: Option<Vec<SecretRequestField>>,
     },
     LinkRequest {
         reason: String,

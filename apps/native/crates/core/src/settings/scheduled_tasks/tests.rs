@@ -307,3 +307,74 @@ fn webhook_settings_validation_filters_and_deliveries_match_web() {
     let err = fixed_draft.upsert_input_with_thread_modes(true, true, None, |_| None).unwrap_err();
     assert_eq!(err.description, "Pick a time.");
 }
+
+#[test]
+fn unbind_thread_automatic_base_ref_and_time_format_match_web() {
+    use crate::client_settings::TimestampFormat;
+    use crate::sidebar::time::LocalTime;
+    use crate::timeline::{IntlTimestampClock, TimestampLocale};
+    use crate::vcs::VcsRef;
+
+    // 1. Clearing an already-bound task emits `unbindThread: true`, while a new unbound task does not.
+    let mut raw = task(json!({ "type": "interval", "everyMs": 60_000 }));
+    raw["threadId"] = json!("thread-1");
+    let mut bound = Draft::from_task(&decode_task(&raw).unwrap(), |_| None);
+    bound.title = "T".into();
+    bound.prompt = "P".into();
+    bound.project_id = "p1".into();
+    bound.unbind_from_thread();
+    let cleared = bound.upsert_input_with_thread_modes(true, true, None, |_| None).unwrap();
+    assert_eq!(cleared["threadId"], Value::Null);
+    assert_eq!(cleared["unbindThread"], true);
+
+    let fresh = Draft {
+        title: "T".into(),
+        prompt: "P".into(),
+        project_id: "p1".into(),
+        model: bound.model.clone(),
+        ..Default::default()
+    };
+    assert_eq!(fresh.base_ref, "");
+    let fresh_input = fresh.upsert_input_with_thread_modes(true, true, None, |_| None).unwrap();
+    assert_eq!(fresh_input.get("unbindThread"), None);
+
+    // 2. Switching from root leaves automatic baseRef empty.
+    let mut root_raw = task(json!({ "type": "interval", "everyMs": 60_000 }));
+    root_raw["workspaceStrategy"] = json!({ "type": "root" });
+    let root_draft = Draft::from_task(&decode_task(&root_raw).unwrap(), |_| None);
+    assert_eq!(root_draft.base_ref, "");
+
+    // 3. `scheduled_task_worktree_base_ref` prefers explicit > default ref > main/master fallback.
+    let mk_ref = |name: &str, is_default: bool| VcsRef {
+        name: name.to_owned(),
+        is_remote: Some(name.starts_with("origin/")),
+        remote_name: name.starts_with("origin/").then(|| "origin".to_owned()),
+        current: false,
+        is_default,
+        worktree_path: None,
+    };
+    assert_eq!(scheduled_task_worktree_base_ref(" release ", &[mk_ref("master", true)]), "release");
+    assert_eq!(scheduled_task_worktree_base_ref("", &[mk_ref("feature", false), mk_ref("master", true)]), "master");
+    assert_eq!(scheduled_task_worktree_base_ref(" ", &[mk_ref("origin/develop", true)]), "origin/develop");
+    assert_eq!(scheduled_task_worktree_base_ref("", &[mk_ref("feature", false), mk_ref("master", false)]), "master");
+    assert_eq!(scheduled_task_worktree_base_ref("", &[mk_ref("origin/master", false)]), "origin/master");
+    assert_eq!(scheduled_task_worktree_base_ref("", &[mk_ref("master", false), mk_ref("main", false)]), "main");
+    assert_eq!(scheduled_task_worktree_base_ref("", &[]), "main");
+
+    // 4. `label_with_format` follows `TimestampFormat`.
+    let en = IntlTimestampClock::new("en-US").unwrap();
+    struct Clock<'a>(&'a IntlTimestampClock);
+    impl TimestampLocale for Clock<'_> {
+        fn time(&self, local: LocalTime, format: TimestampFormat) -> String { self.0.time(local, format) }
+        fn numeric_date(&self, local: LocalTime, include_year: bool) -> String { self.0.numeric_date(local, include_year) }
+    }
+    let fixed = Schedule::decode(&json!({ "type": "fixed_time", "timeOfDay": "18:30" }));
+    assert_eq!(
+        fixed.label_with_format(TimestampFormat::TwelveHour, &Clock(&en), Some("Etc/UTC"), None, NOW, |_| String::new()),
+        "Daily at 6:30 PM UTC"
+    );
+    assert_eq!(
+        fixed.label_with_format(TimestampFormat::TwentyFourHour, &Clock(&en), Some("Etc/UTC"), None, NOW, |_| String::new()),
+        "Daily at 18:30 UTC"
+    );
+}

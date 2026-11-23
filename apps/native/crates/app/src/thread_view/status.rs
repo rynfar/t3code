@@ -29,6 +29,13 @@ use crate::theme::{hsla, metrics, palette, rem};
 use crate::toast::{Toast, ToastKind};
 use crate::transcript::{InlineTone, TimerKind, WorkingTimer, ghost_icon_button, inline_button};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncPhase {
+    Loading,
+    Syncing,
+    Failed,
+}
+
 /// The lines after the last row, in the web's order.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FooterLines {
@@ -41,8 +48,8 @@ struct FooterLines {
     /// True when the active run or connection prevents background Stop.
     run_is_live: bool,
     can_operate: bool,
-    /// Loading or resubscribing detail ("Loading messages..." / "Syncing messages...").
-    syncing: Option<&'static str>,
+    /// Loading, resubscribing, or failed sync detail.
+    syncing: Option<SyncPhase>,
     goal: Option<GoalLine>,
     status: Option<StatusLine>,
 }
@@ -245,17 +252,21 @@ impl ThreadView {
             _ => None,
         };
         let thread = self.thread_state(state);
-        let sync_label = match (self.thread_id.is_some() && shell.is_some(), thread.projection.is_some(), thread.synchronized) {
-            (true, false, false) => Some("Loading messages..."),
-            (_, true, false) => Some("Syncing messages..."),
-            _ => None,
+        let sync_phase = if self.thread_id.is_none() || shell.is_none() || thread.synchronized || thread.deleted {
+            None
+        } else if thread.projection.is_none() {
+            Some(SyncPhase::Loading)
+        } else if thread.error.is_some() {
+            Some(SyncPhase::Failed)
+        } else {
+            Some(SyncPhase::Syncing)
         };
-        let syncing = match (sync_label, self.footer.unsynced_since) {
+        let syncing = match (sync_phase, self.footer.unsynced_since) {
             (None, _) => {
                 self.footer.unsynced_since = None;
                 None
             }
-            (Some(label), Some(since)) if since.elapsed() >= SYNC_LINE_DELAY => Some(label),
+            (Some(phase), Some(since)) if since.elapsed() >= SYNC_LINE_DELAY => Some(phase),
             (Some(_), Some(_)) => None,
             (Some(_), None) => {
                 self.footer.unsynced_since = Some(std::time::Instant::now());
@@ -586,8 +597,13 @@ impl ThreadView {
         });
         lines.extend(attention);
         lines.extend(work);
-        if let Some(sync_label) = self.footer.lines.syncing {
-            lines.push(line().child(div().flex_none().child(Icon::RefreshCw.render(px(14.), muted))).child(div().min_w_0().truncate().child(sync_label)).into_any_element());
+        if let Some(sync_phase) = self.footer.lines.syncing {
+            let (icon, label) = match sync_phase {
+                SyncPhase::Loading => (Icon::RefreshCw, "Loading messages..."),
+                SyncPhase::Syncing => (Icon::RefreshCw, "Syncing messages..."),
+                SyncPhase::Failed => (Icon::CircleAlert, "Could not sync messages"),
+            };
+            lines.push(line().child(div().flex_none().child(icon.render(px(14.), muted))).child(div().min_w_0().truncate().child(label)).into_any_element());
         }
         if let Some(goal) = &self.footer.lines.goal {
             let pending = self.footer.goal_pending;

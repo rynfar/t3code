@@ -5,6 +5,7 @@
 //! (`SecretRequestCard.tsx`, `LinkRequestCard.tsx`) in their answered and waiting states.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use t3_core::timeline::{
     sanitize_secret_request_error, secret_request_display, secret_request_link,
     secret_request_privacy_note, secret_request_reference, secret_request_sources,
 };
-use t3_core::turn_item::{TurnItem, TurnItemKind};
+use t3_core::turn_item::{SecretRequestField, TurnItem, TurnItemKind};
 
 use super::parts::{
     ROW_GROUP, DividerTone, focusable, ghost_button, icon_slot, system_divider,
@@ -614,11 +615,51 @@ fn link_access_full_description(access: &str) -> String {
 
 struct SecretCardState {
     input: Entity<InputState>,
+    field_inputs: Vec<(String, Entity<InputState>)>,
     source_id: Option<String>,
     secret_draft: String,
     reference_draft: String,
     submitting: bool,
     error: Option<String>,
+}
+
+fn submit_secret_answer(
+    card_state: Entity<SecretCardState>,
+    app: Entity<AppState>,
+    payload: Value,
+    restore: Option<Vec<(Entity<InputState>, String)>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    card_state.update(cx, |s, cx| {
+        s.submitting = true;
+        s.error = None;
+        cx.notify();
+    });
+    let task = app.update(cx, |app, _| {
+        app.rpc(t3_core::commands::method::SECRETS_ANSWER_REQUEST, payload)
+    });
+    let weak = card_state.downgrade();
+    window
+        .spawn(cx, async move |cx| {
+            let res = task.await;
+            let _ = cx.update(|window, cx| {
+                let _ = weak.update(cx, |s, cx| {
+                    s.submitting = false;
+                    if let Err(err) = res {
+                        if let Some(previous) = restore {
+                            for (field_input, value) in previous {
+                                field_input.update(cx, |inp, cx| inp.set_value(value, window, cx));
+                            }
+                        }
+                        let (tag, msg) = rpc_error_tag_and_message(&err);
+                        s.error = Some(sanitize_secret_request_error(tag, msg));
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
 }
 
 #[derive(IntoElement)]
@@ -631,6 +672,7 @@ struct SecretRequestCard {
     url: Option<String>,
     placeholder: Option<String>,
     delivery: Option<String>,
+    fields: Option<Vec<SecretRequestField>>,
     state: Entity<AppState>,
 }
 
@@ -639,30 +681,52 @@ impl RenderOnce for SecretRequestCard {
         let p = palette(cx);
         let default_placeholder = self.placeholder.clone().unwrap_or_else(|| "Paste the secret".to_owned());
         let init_placeholder = default_placeholder.clone();
-        let card_state = window.use_keyed_state(SharedString::from(format!("secret-ui:{}", self.id)), cx, |window, cx| SecretCardState {
-            input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(init_placeholder)),
-            source_id: None,
-            secret_draft: String::new(),
-            reference_draft: String::new(),
-            submitting: false,
-            error: None,
+        let multiple = self.fields.is_some();
+        let fields_for_state = self.fields.clone();
+        let card_state = window.use_keyed_state(SharedString::from(format!("secret-ui:{}", self.id)), cx, |window, cx| {
+            let field_inputs = fields_for_state
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|field| {
+                    let masked = field.secret.unwrap_or(true);
+                    let ph = field.placeholder.clone().unwrap_or_default();
+                    (
+                        field.name.clone(),
+                        cx.new(|cx| InputState::new(window, cx).masked(masked).placeholder(ph)),
+                    )
+                })
+                .collect();
+            SecretCardState {
+                input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(init_placeholder)),
+                field_inputs,
+                source_id: None,
+                secret_draft: String::new(),
+                reference_draft: String::new(),
+                submitting: false,
+                error: None,
+            }
         });
-        let sources: Vec<SecretRequestSource> = self
-            .state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()
-            .map(|c| secret_request_sources(c.secret_request_references, &c.settings.secret_providers))
-            .unwrap_or_default();
-        let (input, source_id, submitting, error) = {
+        let sources: Vec<SecretRequestSource> = if multiple {
+            Vec::new()
+        } else {
+            self.state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .filter(|c| c.has_secret_providers_feature())
+                .map(|c| secret_request_sources(c.secret_request_references, &c.settings.secret_providers))
+                .unwrap_or_default()
+        };
+        let (input, field_inputs, source_id, submitting, error) = {
             let s = card_state.read(cx);
-            (s.input.clone(), s.source_id.clone(), s.submitting, s.error.clone())
+            (s.input.clone(), s.field_inputs.clone(), s.source_id.clone(), s.submitting, s.error.clone())
         };
         let active_source = source_id.as_deref().and_then(|id| sources.iter().find(|s| s.id == id)).cloned();
         let link = secret_request_link(self.url.as_deref(), &self.reason);
         let url_caption = self.url.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_owned);
-        let privacy_note = secret_request_privacy_note(self.delivery.as_deref());
+        let privacy_note = secret_request_privacy_note(self.delivery.as_deref(), multiple);
 
         let source_select = (!sources.is_empty()).then(|| {
             let options = std::iter::once(SelectOption::new("__stored__", "Value").icon(Icon::FileText))
@@ -705,17 +769,187 @@ impl RenderOnce for SecretRequestCard {
                 })
         });
 
-        let save_state = card_state.clone();
-        let save_input = input.clone();
-        let save_source = active_source.clone();
-        let save_app = self.state.clone();
-        let save_thread = self.thread_id.clone();
-        let save_item = self.turn_item_id.clone();
-
         let decline_state = card_state.clone();
         let decline_app = self.state.clone();
         let decline_thread = self.thread_id.clone();
         let decline_item = self.turn_item_id.clone();
+        let decline_debug_id = format!("secret-decline:{}", self.id);
+        let decline_button = div().debug_selector(move || decline_debug_id.clone()).child(ghost_button(
+            SharedString::from(format!("secret-decline:{}", self.id)),
+            "Decline",
+            submitting,
+            move |_, window, cx| {
+                if submitting {
+                    return;
+                }
+                let payload = t3_core::commands::secret_request_answer_decline(&decline_thread, &decline_item);
+                submit_secret_answer(decline_state.clone(), decline_app.clone(), payload, None, window, cx);
+            },
+            cx,
+        ));
+
+        let save_id = self.id.clone();
+        let save_thread = self.thread_id.clone();
+        let save_item = self.turn_item_id.clone();
+        let save_app = self.state.clone();
+        let form_body = if let Some(fields) = self.fields {
+            let mut fields_col = v_flex().w_full().gap(px(10.));
+            for field in &fields {
+                let Some(field_input) = field_inputs
+                    .iter()
+                    .find(|(name, _)| name == &field.name)
+                    .map(|(_, entity)| entity.clone())
+                else {
+                    continue;
+                };
+                let is_secret = field.secret.unwrap_or(true);
+                let field_debug_id = format!("secret-field:{}:{}", self.id, field.name);
+                fields_col = fields_col.child(
+                    v_flex()
+                        .w_full()
+                        .gap(px(4.))
+                        .debug_selector(move || field_debug_id.clone())
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(hsla(p.foreground))
+                                .child(field.label.clone()),
+                        )
+                        .child(
+                            Input::new(&field_input)
+                                .disabled(submitting)
+                                .when(is_secret, |el| el.mask_toggle()),
+                        ),
+                );
+            }
+
+            let save_state = card_state.clone();
+            let save_inputs = field_inputs;
+            let save_debug_id = format!("secret-save:{save_id}");
+            let save_button = div().debug_selector(move || save_debug_id.clone()).child(
+                Button::new(SharedString::from(format!("secret-save:{save_id}")), ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(if submitting { "Saving..." } else { "Save securely" })
+                    .disabled(submitting)
+                    .on_click(move |_, window, cx| {
+                        if submitting {
+                            return;
+                        }
+                        let mut values = BTreeMap::new();
+                        let mut snapshot = Vec::with_capacity(save_inputs.len());
+                        for (name, entity) in &save_inputs {
+                            let raw = entity.read(cx).value().to_string();
+                            let trimmed = raw.trim().to_owned();
+                            if trimmed.is_empty() {
+                                save_state.update(cx, |s, cx| {
+                                    s.error = Some("Enter a value for every field first.".to_owned());
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            values.insert(name.clone(), trimmed);
+                            snapshot.push((entity.clone(), raw));
+                        }
+                        for (entity, _) in &snapshot {
+                            entity.update(cx, |inp, cx| inp.set_value(String::new(), window, cx));
+                        }
+                        let payload = t3_core::commands::secret_request_answer_save_values(&save_thread, &save_item, &values);
+                        submit_secret_answer(save_state.clone(), save_app.clone(), payload, Some(snapshot), window, cx);
+                    }),
+            );
+
+            v_flex()
+                .w_full()
+                .gap(px(8.))
+                .child(fields_col)
+                .when_some(error, |this, err| this.child(div().text_xs().text_color(hsla(p.destructive)).child(err)))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap(px(6.))
+                                .text_xs()
+                                .text_color(hsla(p.muted_foreground))
+                                .child(Icon::Shield.render(px(14.), hsla(p.muted_foreground)))
+                                .child(privacy_note),
+                        )
+                        .child(h_flex().flex_none().gap(px(8.)).child(decline_button).child(save_button)),
+                )
+                .into_any_element()
+        } else {
+            let save_state = card_state.clone();
+            let save_input = input.clone();
+            let save_source = active_source.clone();
+            let save_debug_id = format!("secret-save:{save_id}");
+            let save_button = div().debug_selector(move || save_debug_id.clone()).child(
+                Button::new(SharedString::from(format!("secret-save:{save_id}")), ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(if submitting { "Saving..." } else { "Save securely" })
+                    .disabled(submitting)
+                    .on_click(move |_, window, cx| {
+                        if submitting {
+                            return;
+                        }
+                        let draft = save_input.read(cx).value().to_string();
+                        let payload = if let Some(source) = save_source.as_ref() {
+                            let Some((provider, reference)) = secret_request_reference(source, &draft) else {
+                                save_state.update(cx, |s, cx| {
+                                    s.error = Some(source.invalid_reference_message.to_owned());
+                                    cx.notify();
+                                });
+                                return;
+                            };
+                            t3_core::commands::secret_request_answer_reference(&save_thread, &save_item, provider, &reference)
+                        } else {
+                            let trimmed = draft.trim();
+                            if trimmed.is_empty() {
+                                save_state.update(cx, |s, cx| {
+                                    s.error = Some("Enter a secret value first.".to_owned());
+                                    cx.notify();
+                                });
+                                return;
+                            }
+                            t3_core::commands::secret_request_answer_save(&save_thread, &save_item, trimmed)
+                        };
+                        submit_secret_answer(save_state.clone(), save_app.clone(), payload, None, window, cx);
+                    }),
+            );
+
+            v_flex()
+                .w_full()
+                .gap(px(8.))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .when_some(source_select, |row, select| {
+                            let source_debug_id = format!("secret-source:{}", self.id);
+                            row.child(div().debug_selector(move || source_debug_id.clone()).child(select))
+                        })
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&input)
+                                    .disabled(submitting)
+                                    .when(active_source.is_none(), |el| el.mask_toggle()),
+                            ),
+                        )
+                        .child(save_button)
+                        .child(decline_button),
+                )
+                .when_some(error, |this, err| this.child(div().text_xs().text_color(hsla(p.destructive)).child(err)))
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(Icon::Shield.render(px(14.), hsla(p.muted_foreground)))
+                        .child(privacy_note),
+                )
+                .into_any_element()
+        };
 
         v_flex()
             .w_full()
@@ -754,117 +988,7 @@ impl RenderOnce for SecretRequestCard {
                         }),
                 )
             })
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .when_some(source_select, |row, select| {
-                        let source_debug_id = format!("secret-source:{}", self.id);
-                        row.child(div().debug_selector(move || source_debug_id.clone()).child(select))
-                    })
-                    .child(div().flex_1().min_w_0().child(Input::new(&input).disabled(submitting)))
-                    .child({
-                        let save_debug_id = format!("secret-save:{}", self.id);
-                        div().debug_selector(move || save_debug_id.clone()).child(
-                            Button::new(SharedString::from(format!("secret-save:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
-                                .label(if submitting { "Saving..." } else { "Save securely" })
-                                .disabled(submitting)
-                                .on_click(move |_, _, cx| {
-                                    if submitting {
-                                        return;
-                                    }
-                                    let draft = save_input.read(cx).value().to_string();
-                                    let payload = if let Some(source) = save_source.as_ref() {
-                                        let Some((provider, reference)) = secret_request_reference(source, &draft) else {
-                                            save_state.update(cx, |s, cx| {
-                                                s.error = Some(source.invalid_reference_message.to_owned());
-                                                cx.notify();
-                                            });
-                                            return;
-                                        };
-                                        t3_core::commands::secret_request_answer_reference(&save_thread, &save_item, provider, &reference)
-                                    } else {
-                                        let trimmed = draft.trim();
-                                        if trimmed.is_empty() {
-                                            save_state.update(cx, |s, cx| {
-                                                s.error = Some("Enter a secret value first.".to_owned());
-                                                cx.notify();
-                                            });
-                                            return;
-                                        }
-                                        t3_core::commands::secret_request_answer_save(&save_thread, &save_item, trimmed)
-                                    };
-                                    save_state.update(cx, |s, cx| {
-                                        s.submitting = true;
-                                        s.error = None;
-                                        cx.notify();
-                                    });
-                                    let task = save_app.update(cx, |app, _| {
-                                        app.rpc(t3_core::commands::method::SECRETS_ANSWER_REQUEST, payload)
-                                    });
-                                    let weak = save_state.downgrade();
-                                    cx.spawn(async move |cx| {
-                                        let res = task.await;
-                                        let _ = weak.update(cx, |s, cx| {
-                                            s.submitting = false;
-                                            if let Err(err) = res {
-                                                let (tag, msg) = rpc_error_tag_and_message(&err);
-                                                s.error = Some(sanitize_secret_request_error(tag, msg));
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                }),
-                        )
-                    })
-                    .child({
-                        let decline_debug_id = format!("secret-decline:{}", self.id);
-                        div().debug_selector(move || decline_debug_id.clone()).child(ghost_button(
-                            SharedString::from(format!("secret-decline:{}", self.id)),
-                            "Decline",
-                            submitting,
-                            move |_, _, cx| {
-                                if submitting {
-                                    return;
-                                }
-                                decline_state.update(cx, |s, cx| {
-                                    s.submitting = true;
-                                    s.error = None;
-                                    cx.notify();
-                                });
-                                let task = decline_app.update(cx, |app, _| {
-                                    app.rpc(
-                                        t3_core::commands::method::SECRETS_ANSWER_REQUEST,
-                                        t3_core::commands::secret_request_answer_decline(&decline_thread, &decline_item),
-                                    )
-                                });
-                                let weak = decline_state.downgrade();
-                                cx.spawn(async move |cx| {
-                                    let res = task.await;
-                                    let _ = weak.update(cx, |s, cx| {
-                                        s.submitting = false;
-                                        if let Err(err) = res {
-                                            let (tag, msg) = rpc_error_tag_and_message(&err);
-                                            s.error = Some(sanitize_secret_request_error(tag, msg));
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .detach();
-                            },
-                            cx,
-                        ))
-                    }),
-            )
-            .when_some(error, |this, err| this.child(div().text_xs().text_color(hsla(p.destructive)).child(err)))
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .text_xs()
-                    .text_color(hsla(p.muted_foreground))
-                    .child(Icon::Shield.render(px(14.), hsla(p.muted_foreground)))
-                    .child(privacy_note),
-            )
+            .child(form_body)
     }
 }
 
@@ -1712,7 +1836,7 @@ pub fn event_row(
     match &item.kind {
         TurnItemKind::Subagent { .. } if subagents.len() > 1 => subagent_group(id, subagents, &marks, env, cx),
         TurnItemKind::Subagent { .. } => subagent_row(item, &marks, env, cx),
-        TurnItemKind::SecretRequest { label, reason, url, placeholder, delivery, secret_status } => {
+        TurnItemKind::SecretRequest { label, reason, url, placeholder, delivery, fields, secret_status } => {
             if secret_status == "pending"
                 && can_answer_here
                 && let Some(thread_id) = env.thread_id
@@ -1726,6 +1850,7 @@ pub fn event_row(
                     url: url.clone(),
                     placeholder: placeholder.clone(),
                     delivery: delivery.clone(),
+                    fields: fields.clone(),
                     state: env.state.clone(),
                 }
                 .into_any_element();
@@ -2101,6 +2226,10 @@ mod tests {
         state.update(cx, |state, _| {
             let mut config = state.server_config.config.take().unwrap_or_default();
             config.secret_request_references = true;
+            config.feature_flags = Some(t3_core::server_config::ServerFeatureFlags {
+                secret_providers: Some(true),
+                tanstack_source: None,
+            });
             config.settings.secret_providers = serde_json::from_value(serde_json::json!({
                 "op-work": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "work.1password.com" } }
             }))
@@ -2123,6 +2252,7 @@ mod tests {
                         url: Some("https://platform.openai.com/api-keys".into()),
                         placeholder: None,
                         delivery: None,
+                        fields: None,
                         state: self.state.clone(),
                     })
             }
@@ -2133,5 +2263,70 @@ mod tests {
         assert!(vcx.debug_bounds("secret-source:secret-test-1").is_some());
         assert!(vcx.debug_bounds("secret-save:secret-test-1").is_some());
         assert!(vcx.debug_bounds("secret-decline:secret-test-1").is_some());
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_multi_field_secret_request_renders_fields_without_source_select(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, _| {
+            let mut config = state.server_config.config.take().unwrap_or_default();
+            config.secret_request_references = true;
+            config.feature_flags = Some(t3_core::server_config::ServerFeatureFlags {
+                secret_providers: Some(true),
+                tanstack_source: None,
+            });
+            config.settings.secret_providers = serde_json::from_value(serde_json::json!({
+                "op-work": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "work.1password.com" } }
+            }))
+            .unwrap();
+            state.server_config.config = Some(config);
+        });
+        struct MultiSecretHost {
+            state: Entity<AppState>,
+        }
+        impl gpui::Render for MultiSecretHost {
+            fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                gpui::div()
+                    .size_full()
+                    .child(SecretRequestCard {
+                        id: "secret-multi-1".into(),
+                        thread_id: "t1".into(),
+                        turn_item_id: "item-sec-2".into(),
+                        label: "Cloudflare R2 credentials".into(),
+                        reason: "Needed to upload artifacts.".into(),
+                        url: None,
+                        placeholder: None,
+                        delivery: None,
+                        fields: Some(vec![
+                            SecretRequestField {
+                                name: "accessKeyId".into(),
+                                label: "Access key ID".into(),
+                                placeholder: Some("AKIA...".into()),
+                                secret: Some(false),
+                            },
+                            SecretRequestField {
+                                name: "secretAccessKey".into(),
+                                label: "Secret access key".into(),
+                                placeholder: None,
+                                secret: Some(true),
+                            },
+                        ]),
+                        state: self.state.clone(),
+                    })
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_, _| MultiSecretHost { state: state.clone() });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("secret-field:secret-multi-1:accessKeyId").is_some());
+        assert!(vcx.debug_bounds("secret-field:secret-multi-1:secretAccessKey").is_some());
+        assert!(vcx.debug_bounds("secret-source:secret-multi-1").is_none());
+        assert!(vcx.debug_bounds("secret-save:secret-multi-1").is_some());
+        assert!(vcx.debug_bounds("secret-decline:secret-multi-1").is_some());
     }
 }

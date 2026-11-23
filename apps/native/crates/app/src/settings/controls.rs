@@ -1497,14 +1497,33 @@ pub struct DialogFrame {
 
 impl DialogFrame {
     pub fn render(self, window: &Window, on_dismiss: impl Fn(&mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
-        self.render_inner(window, DIALOG_MODAL_PRIORITY, false, on_dismiss, cx)
+        self.render_inner(window, DIALOG_MODAL_PRIORITY, false, true, on_dismiss, cx)
     }
 
-    pub fn render_modal(self,window:&Window,priority:usize,on_dismiss:impl Fn(&mut Window,&mut App)+'static,cx:&App)->AnyElement {
-        self.render_inner(window,priority,true,on_dismiss,cx)
+    pub fn render_modal(self, window: &Window, priority: usize, on_dismiss: impl Fn(&mut Window, &mut App) + 'static, cx: &App) -> AnyElement {
+        self.render_inner(window, priority, true, true, on_dismiss, cx)
     }
 
-    fn render_inner(self,window:&Window,priority:usize,close:bool,on_dismiss:impl Fn(&mut Window,&mut App)+'static,cx:&App)->AnyElement {
+    pub fn render_modal_guarded(
+        self,
+        window: &Window,
+        priority: usize,
+        dismiss_on_backdrop: bool,
+        on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> AnyElement {
+        self.render_inner(window, priority, true, dismiss_on_backdrop, on_dismiss, cx)
+    }
+
+    fn render_inner(
+        self,
+        window: &Window,
+        priority: usize,
+        close: bool,
+        dismiss_on_backdrop: bool,
+        on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> AnyElement {
         let on_dismiss=std::rc::Rc::new(on_dismiss);
         let dismiss_button=on_dismiss.clone();
         let p = palette(cx);
@@ -1562,7 +1581,9 @@ impl DialogFrame {
                     .justify_center()
                     .p(px(16.))
                     .bg(hsla(p.dialog_backdrop))
-                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| on_dismiss(window, cx))
+                    .when(dismiss_on_backdrop, |this| {
+                        this.on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| on_dismiss(window, cx))
+                    })
                     .child(dialog),
             ),
         )

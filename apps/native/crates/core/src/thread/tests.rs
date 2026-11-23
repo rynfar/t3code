@@ -362,3 +362,45 @@ fn apply_classified_distinguishes_streaming_deltas_from_structural_updates() {
     asst_done["status"] = json!("completed");
     assert_eq!(state.apply_classified(upsert_event(14, asst_done)), ThreadApplyKind::Structure);
 }
+
+#[test]
+fn run_output_submitted_sets_output_and_later_run_updated_without_output_preserves_it() {
+    let mut proj = projection(Vec::new(), vec![run("r1", "running")]);
+    let submitted: DomainEvent = serde_json::from_value(json!({
+        "id": "ev-1",
+        "threadId": "t1",
+        "occurredAt": "2026-04-02T00:00:05.000Z",
+        "type": "run.output-submitted",
+        "payload": {
+            "runId": "r1",
+            "output": {
+                "value": { "summary": "all green" },
+                "submittedAt": "2026-04-02T00:00:05.000Z"
+            }
+        }
+    }))
+    .unwrap();
+    assert!(apply_event(&mut proj, submitted, ApplyOptions::default()));
+    assert_eq!(proj.updated_at, "2026-04-02T00:00:05.000Z");
+    assert_eq!(
+        proj.runs[0].output,
+        Some(json!({ "value": { "summary": "all green" }, "submittedAt": "2026-04-02T00:00:05.000Z" }))
+    );
+
+    let mut next_run = run("r1", "completed");
+    next_run["completedAt"] = json!("2026-04-02T00:00:06.000Z");
+    let updated: DomainEvent = serde_json::from_value(json!({
+        "id": "ev-2",
+        "threadId": "t1",
+        "occurredAt": "2026-04-02T00:00:06.000Z",
+        "type": "run.updated",
+        "payload": next_run
+    }))
+    .unwrap();
+    assert!(apply_event(&mut proj, updated, ApplyOptions::default()));
+    assert_eq!(proj.runs[0].status, "completed");
+    assert_eq!(
+        proj.runs[0].output,
+        Some(json!({ "value": { "summary": "all green" }, "submittedAt": "2026-04-02T00:00:05.000Z" }))
+    );
+}

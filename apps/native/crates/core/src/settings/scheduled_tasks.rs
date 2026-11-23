@@ -8,10 +8,12 @@ use chrono::{Offset, TimeZone};
 use chrono_tz::{OffsetName, Tz};
 use serde_json::{Map, Value, json};
 
+use crate::client_settings::TimestampFormat;
 use crate::model::ModelSelection;
 use crate::settings::archive::relative_label;
 use crate::shell::Lineage;
-use crate::sidebar::time::parse_iso;
+use crate::sidebar::time::{LocalTime, parse_iso};
+use crate::timeline::TimestampLocale;
 
 pub mod method {
     pub const SUBSCRIBE: &str = "scheduledTasks.subscribe";
@@ -342,6 +344,54 @@ pub fn schedule_time_zone_label(time_zone: Option<&str>, reference_iso: Option<&
     }
 }
 
+/// `formatTimeOfDay` (`apps/web/src/timestampFormat.ts`): formats `H:MM` / `HH:MM` wall clock.
+pub fn format_time_of_day(
+    time_of_day: &str,
+    format: TimestampFormat,
+    locale: &dyn TimestampLocale,
+) -> String {
+    let trimmed = time_of_day.trim();
+    let Some((h_str, m_str)) = trimmed.split_once(':') else {
+        return time_of_day.to_owned();
+    };
+    if m_str.len() != 2
+        || !(1..=2).contains(&h_str.len())
+        || !h_str.bytes().all(|b| b.is_ascii_digit())
+        || !m_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return time_of_day.to_owned();
+    }
+    let (Ok(hour), Ok(minute)) = (h_str.parse::<i64>(), m_str.parse::<i64>()) else {
+        return time_of_day.to_owned();
+    };
+    if hour > 23 || minute > 59 {
+        return time_of_day.to_owned();
+    }
+    locale.time(
+        LocalTime { year: 2000, month: 1, day: 1, hour, minute, second: 0, millis: 0, weekday: 6 },
+        format,
+    )
+}
+
+/// An empty base is automatic: the project's default branch, else `main` or `master`
+/// (`scheduledTaskWorktreeBaseRef` in `packages/client-runtime/src/scheduledTaskWorktree.ts`).
+pub fn scheduled_task_worktree_base_ref(base_ref: &str, refs: &[crate::vcs::VcsRef]) -> String {
+    let picked = base_ref.trim();
+    if !picked.is_empty() {
+        return picked.to_owned();
+    }
+    if let Some(default_ref) = refs.iter().find(|r| r.is_default) {
+        return default_ref.name.clone();
+    }
+    for name in ["main", "master"] {
+        let origin_name = format!("origin/{name}");
+        if let Some(found) = refs.iter().find(|r| r.name == name || r.name == origin_name) {
+            return found.name.clone();
+        }
+    }
+    "main".to_owned()
+}
+
 /// `ScheduledTaskSchedule`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Schedule {
@@ -379,9 +429,33 @@ impl Schedule {
         self.label_with_timezone(None, None, 0, once_label)
     }
 
-    /// `scheduleLabel` with optional server IANA time zone suffix for fixed-time schedules.
+    /// `scheduleLabel` with optional server IANA time zone suffix and user `TimestampFormat`.
     pub fn label_with_timezone(
         &self,
+        time_zone: Option<&str>,
+        next_run_at: Option<&str>,
+        now_ms: i64,
+        once_label: impl Fn(i64) -> String,
+    ) -> String {
+        self.format_label(None, time_zone, next_run_at, now_ms, once_label)
+    }
+
+    /// `scheduleLabel` following `TimestampFormat` (`pingdotgg/t3code#37314`).
+    pub fn label_with_format(
+        &self,
+        format: TimestampFormat,
+        locale: &dyn TimestampLocale,
+        time_zone: Option<&str>,
+        next_run_at: Option<&str>,
+        now_ms: i64,
+        once_label: impl Fn(i64) -> String,
+    ) -> String {
+        self.format_label(Some((format, locale)), time_zone, next_run_at, now_ms, once_label)
+    }
+
+    fn format_label(
+        &self,
+        clock: Option<(TimestampFormat, &dyn TimestampLocale)>,
         time_zone: Option<&str>,
         next_run_at: Option<&str>,
         now_ms: i64,
@@ -400,9 +474,13 @@ impl Schedule {
                 } else {
                     weekdays.iter().map(|day| WEEKDAY_LABELS[usize::from(*day)]).collect::<Vec<_>>().join(", ")
                 };
+                let time = match clock {
+                    Some((format, locale)) => format_time_of_day(time_of_day, format, locale),
+                    None => time_of_day.clone(),
+                };
                 match schedule_time_zone_label(time_zone, next_run_at, now_ms) {
-                    Some(zone) => format!("{days} at {time_of_day} {zone}"),
-                    None => format!("{days} at {time_of_day}"),
+                    Some(zone) => format!("{days} at {time} {zone}"),
+                    None => format!("{days} at {time}"),
                 }
             }
             Schedule::Unknown => "Unknown schedule".to_owned(),
@@ -795,6 +873,8 @@ pub struct Draft {
     pub weekdays: Vec<u8>,
     pub project_id: String,
     pub thread_id: Option<String>,
+    /// The thread the editor opened with, so saving after clearing it emits `unbindThread: true`.
+    pub saved_thread_id: Option<String>,
     pub thread_mode: ThreadMode,
     pub workspace_mode: WorkspaceMode,
     pub base_ref: String,
@@ -834,9 +914,10 @@ impl Default for Draft {
             weekdays: vec![1, 2, 3, 4, 5],
             project_id: String::new(),
             thread_id: None,
+            saved_thread_id: None,
             thread_mode: ThreadMode::NewThread,
             workspace_mode: WorkspaceMode::default(),
-            base_ref: "main".to_owned(),
+            base_ref: String::new(),
             start_from_origin: true,
             existing_worktree_path: String::new(),
             model: None,
@@ -910,6 +991,7 @@ impl Draft {
             enabled: task.enabled,
             project_id: task.project_id.clone(),
             thread_id: task.thread_id.clone(),
+            saved_thread_id: task.thread_id.clone(),
             thread_mode: task.effective_thread_mode(),
             model: Some(task.model_selection.clone()),
             runtime_mode: task.runtime_mode.clone(),
@@ -970,7 +1052,7 @@ impl Draft {
                 draft.existing_worktree_path = text(strategy, "worktreePath").unwrap_or_default();
             }
             _ => {
-                draft.base_ref = text(strategy, "baseRef").unwrap_or_else(|| "main".to_owned());
+                draft.base_ref = text(strategy, "baseRef").unwrap_or_default();
                 draft.start_from_origin = strategy.get("startFromOrigin").and_then(Value::as_bool).unwrap_or(false);
             }
         }
@@ -1199,6 +1281,9 @@ impl Draft {
         input.insert("schedule".into(), schedule);
         input.insert("projectId".into(), json!(self.project_id));
         input.insert("threadId".into(), json!(self.thread_id));
+        if self.thread_id.is_none() && self.saved_thread_id.is_some() {
+            input.insert("unbindThread".into(), json!(true));
+        }
         if thread_modes_supported {
             input.insert("threadMode".into(), json!(self.thread_mode.as_str()));
         }

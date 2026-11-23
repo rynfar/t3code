@@ -788,6 +788,7 @@ mod tests {
             actor: None,
             created_at: "2026-01-02T00:00:00Z".into(),
             detail: Some("not_planned".into()),
+            reference: None,
         };
         assert_eq!(issue_event_sentence(&closed_evt), "closed this as not planned");
         let moved_evt = IssueEvent {
@@ -796,6 +797,7 @@ mod tests {
             actor: None,
             created_at: "2026-01-01T12:00:00Z".into(),
             detail: Some("In Review".into()),
+            reference: None,
         };
         assert_eq!(issue_event_sentence(&moved_evt), "moved this to In Review");
 

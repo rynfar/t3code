@@ -1083,8 +1083,8 @@ impl VoiceSpeechController {
                     self.app.update(cx, |app, cx| {
                         app.show_toast(
                             crate::toast::Toast::new(
-                                crate::toast::ToastKind::Error,
-                                "Voice cleanup failed",
+                                crate::toast::ToastKind::Warning,
+                                "Transcript cleanup failed",
                             )
                             .description(msg),
                             cx,
@@ -1205,13 +1205,14 @@ impl VoiceSpeechController {
             let options = SpeechTranscriptionOptions {
                 speech_language: intent_lang,
                 speech_translate_to_english: translate,
-                speech_custom_words: vocabulary.clone(),
+                speech_custom_words: vocabulary.speech_custom_words.clone(),
+                speech_hints: vocabulary.speech_hints.clone(),
                 speech_remove_filler_words: remove_fillers,
                 speech_correction_word: correction_word.clone(),
                 speech_silence_filtering: silence_filter,
             };
             let cleanup_options = SpeechPostProcessingOptions {
-                speech_custom_words: vocabulary,
+                speech_custom_words: vocabulary.speech_custom_words,
                 speech_post_processing_prompt: post_prompt,
                 speech_correction_word: correction_word,
             };
@@ -1395,13 +1396,14 @@ impl VoiceSpeechController {
                         let options = SpeechTranscriptionOptions {
                             speech_language: effective_lang,
                             speech_translate_to_english: translate,
-                            speech_custom_words: vocabulary.clone(),
+                            speech_custom_words: vocabulary.speech_custom_words.clone(),
+                            speech_hints: vocabulary.speech_hints.clone(),
                             speech_remove_filler_words: remove_fillers,
                             speech_correction_word: correction_word.clone(),
                             speech_silence_filtering: silence_filter,
                         };
                         let cleanup_options = SpeechPostProcessingOptions {
-                            speech_custom_words: vocabulary,
+                            speech_custom_words: vocabulary.speech_custom_words,
                             speech_post_processing_prompt: post_prompt,
                             speech_correction_word: correction_word,
                         };
@@ -2005,8 +2007,11 @@ impl VoiceSpeechController {
                 }
                 let outcome = match res {
                     Ok(Ok(out)) => Ok(out.text),
-                    Ok(Err(err)) => Err(err.to_string()),
-                    Err(err) => Err(err.to_string()),
+                    Ok(Err(t3_client::voice::VoiceClientError::Internal {
+                        detail: Some(detail),
+                        ..
+                    })) => Err(format!("{detail} The original transcript was added.")),
+                    Ok(Err(_)) | Err(_) => Err("The original transcript was added.".to_owned()),
                 };
                 let effects = this
                     .machine

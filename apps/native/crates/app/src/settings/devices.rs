@@ -1728,8 +1728,13 @@ impl SettingsView {
                 let has_token_or_ref = ed.token_editor.configured() || !ed.token_editor.field_value().is_empty() || ed.source != STORED_SECRET;
 
                 let view_source = cx.entity().downgrade();
+                let secret_providers = if config.has_secret_providers_feature() && config.secret_references {
+                    config.settings.secret_providers.0.as_slice()
+                } else {
+                    &[]
+                };
                 let token_input = SecretSourceInput::new(
-                    "eas-token-source", "Expo access token", &ed.token, &config.settings.secret_providers.0,
+                    "eas-token-source", "Expo access token", &ed.token, secret_providers,
                     (ed.source != STORED_SECRET).then_some(ed.source.as_str()),
                 ).disabled(ed.saving || !writable).on_source_change(move |next, window, cx| {
                     let _ = view_source.update(cx, |this, cx| {
@@ -1887,8 +1892,13 @@ impl SettingsView {
                 let has_token_or_ref = ed.token_editor.configured() || !ed.token_editor.field_value().is_empty() || ed.source != STORED_SECRET;
 
                 let view_source = cx.entity().downgrade();
+                let secret_providers = if config.has_secret_providers_feature() && config.secret_references {
+                    config.settings.secret_providers.0.as_slice()
+                } else {
+                    &[]
+                };
                 let token_input = SecretSourceInput::new(
-                    "simlock-token-source", "Simlock agent token", &ed.token, &config.settings.secret_providers.0,
+                    "simlock-token-source", "Simlock agent token", &ed.token, secret_providers,
                     (ed.source != STORED_SECRET).then_some(ed.source.as_str()),
                 ).disabled(ed.saving || !writable).on_source_change(move |next, window, cx| {
                     let _ = view_source.update(cx, |this, cx| {

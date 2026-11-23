@@ -421,6 +421,19 @@ pub fn secret_request_answer_save(thread_id: &str, turn_item_id: &str, secret: &
     })
 }
 
+/// `secrets.answerRequest` multi-field payload (`type: "save"` with `values`).
+pub fn secret_request_answer_save_values(
+    thread_id: &str,
+    turn_item_id: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": { "type": "save", "values": values },
+    })
+}
+
 /// `secrets.answerRequest` reference payload (`type: "reference"`).
 pub fn secret_request_answer_reference(thread_id: &str, turn_item_id: &str, provider: &str, reference: &str) -> Value {
     json!({

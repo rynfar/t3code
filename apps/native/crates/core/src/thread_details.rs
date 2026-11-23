@@ -382,6 +382,30 @@ pub fn automation_schedule_line_in(
     } else {
         base
     };
+    finish_automation_schedule_line(schedule, task, now_ms)
+}
+
+/// `taskScheduleLine` formatted per user `TimestampFormat` (`pingdotgg/t3code#37314`).
+pub fn automation_schedule_line_with_format(
+    task: &ScheduledTask,
+    once_label: impl Fn(i64) -> String,
+    time_zone: Option<&str>,
+    now_ms: i64,
+    format: crate::client_settings::TimestampFormat,
+    locale: &dyn crate::timeline::TimestampLocale,
+) -> String {
+    let schedule = task.schedule.label_with_format(
+        format,
+        locale,
+        time_zone,
+        task.next_run_at.as_deref(),
+        now_ms,
+        once_label,
+    );
+    finish_automation_schedule_line(schedule, task, now_ms)
+}
+
+fn finish_automation_schedule_line(schedule: String, task: &ScheduledTask, now_ms: i64) -> String {
     if let Some(reason) = &task.blocked_by_policy {
         format!("{schedule} \u{00b7} {reason}")
     } else if !task.enabled {

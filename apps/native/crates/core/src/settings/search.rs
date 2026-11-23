@@ -1,8 +1,8 @@
 //! Settings sections, their sidebar order, and settings search: `SETTINGS_SECTION_LABELS`,
 //! `SETTINGS_NAV_GROUPS`, `SETTINGS_SEARCH_ITEMS` and `searchSettings` from
 //! `web/src/components/settings/settingsSearch.ts`. Only the entries for rows the native app
-//! renders are listed, so a result never lands on a page without its row. Secrets ships behind
-//! `T3CODE_FEATURE_SECRETS`, as `isSecretsFeatureEnabled` gates it on the web.
+//! renders are listed, so a result never lands on a page without its row. Secrets shows when any
+//! connected server advertises `featureFlags.secretProviders`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
@@ -481,6 +481,7 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("review-guide-model", "Review guide model", SourceControl, &["pull request pr guided review guide brief maintainer"]).target("review-guides").scope(ProjectDefaults).environment_only(),
         SearchItem::new("review-guide-instructions", "Review guide instructions", SourceControl, &["pull request pr guided review guide preferences taste prompt custom"]).target("review-guides").scope(ProjectDefaults).environment_only(),
         SearchItem::new("project-actions", "Actions", Projects, &["commands scripts setup run dev server checkout worktree t3.json import"]).scope(Project),
+        SearchItem::new("preview-tunnel", "Preview tunnel", Access, &["localhost loopback port forwarding open on this device browser tabs stream security"]).target("connections-environment"),
         SearchItem::new("connections-environment", "This machine", Access, &["connections server backend local remote access administrative permissions scope pairing links qr code authorized clients sessions revoke endpoint"]).scope(SearchScope::Connections),
         SearchItem::new("linked-environments", "Linked environments", Connections, &["link peer another machine vps agents work there handoff pairing code"]).scope(SearchScope::Connections).peer_links_only(),
         SearchItem::new("remote-environments", "Environments", Connections, &["add pair backend host code ssh config agent tunnel saved t3 connect"]).scope(SearchScope::Connections),

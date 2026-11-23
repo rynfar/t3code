@@ -166,6 +166,7 @@ pub enum ServerSettingChange {
     PromptSuggestionsEnabled(bool),
     SimlockDeviceHostsEnabled(bool),
     FastWorktreeCheckout(bool),
+    EnablePreviewTunnel(bool),
     /// A whole `server.updateSettings` payload a panel built itself: provider instance mutations
     /// and model preferences (`settings::providers`).
     Prepared(Value),
@@ -204,6 +205,7 @@ impl ServerSettingChange {
             ServerSettingChange::PromptSuggestionsEnabled(_) => "promptSuggestionsEnabled",
             ServerSettingChange::SimlockDeviceHostsEnabled(_) => "simlockDeviceHostsEnabled",
             ServerSettingChange::FastWorktreeCheckout(_) => "fastWorktreeCheckout",
+            ServerSettingChange::EnablePreviewTunnel(_) => "enablePreviewTunnel",
             ServerSettingChange::Prepared(_)
             | ServerSettingChange::ProviderInstance { .. }
             | ServerSettingChange::ProjectOverride { .. }
@@ -235,7 +237,8 @@ impl ServerSettingChange {
             | ServerSettingChange::LinkedEnvironmentsEnabled(on)
             | ServerSettingChange::PromptSuggestionsEnabled(on)
             | ServerSettingChange::SimlockDeviceHostsEnabled(on)
-            | ServerSettingChange::FastWorktreeCheckout(on) => json!(on),
+            | ServerSettingChange::FastWorktreeCheckout(on)
+            | ServerSettingChange::EnablePreviewTunnel(on) => json!(on),
             ServerSettingChange::SnoozePresets(presets) => json!(presets),
             ServerSettingChange::AddProjectBaseDirectory(path)
             | ServerSettingChange::ThreadTitleInstructions(path) => json!(path.trim()),
@@ -1304,6 +1307,13 @@ pub fn peer_link_unlink_payload(environment_id: &str) -> Value {
     json!({ "environmentId": environment_id })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PeerLinkRemoveResult {
+    pub removed: bool,
+    pub ended_there: Option<bool>,
+}
+
 /// `LoadPreference` (`LoadBalancingSettings.tsx`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum LoadPreference {
@@ -1626,6 +1636,16 @@ mod panel_tests {
         assert_eq!(
             ServerSettingChange::SimlockDeviceHostsEnabled(true).payload(),
             json!({ "patch": { "simlockDeviceHostsEnabled": true } })
+        );
+        assert_eq!(
+            ServerSettingChange::EnablePreviewTunnel(false).payload(),
+            json!({ "patch": { "enablePreviewTunnel": false } })
+        );
+        let unlinked: PeerLinkRemoveResult =
+            serde_json::from_value(json!({ "removed": true, "endedThere": false })).unwrap();
+        assert_eq!(
+            unlinked,
+            PeerLinkRemoveResult { removed: true, ended_there: Some(false) }
         );
     }
 
