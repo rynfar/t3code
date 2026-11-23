@@ -6,6 +6,7 @@
 //! (`audio.rs`), fonts (`font.rs`), video, folders, or read errors.
 
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -42,6 +43,63 @@ use super::pdf::{self, PdfReady, PdfState};
 use super::table::TableView;
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
+
+/// Workspace asset fetch outcome allowing unchanged files (`fileRevision` or byte hash match) to
+/// keep their already-decoded preview state across agent commands (`pingdotgg/t3code#39736`).
+pub(super) enum AssetFetchOutcome {
+    Unchanged,
+    Loaded {
+        bytes: Vec<u8>,
+        file_revision: Option<String>,
+        content_hash: u64,
+    },
+}
+
+pub(super) struct KnownAsset {
+    pub file_revision: Option<String>,
+    pub content_hash: Option<u64>,
+}
+
+pub(super) fn load_workspace_asset(
+    state: &AppState,
+    request: serde_json::Value,
+    max_bytes: usize,
+    known: KnownAsset,
+    mutation: Option<&str>,
+    error_message: &'static str,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
+    let client = state.client_handle()?;
+    let mutation = mutation.map(str::to_owned);
+    Some(state.runtime().spawn(async move {
+        let value = client
+            .request(t3_core::files::CREATE_ASSET_URL, request)
+            .await
+            .map_err(|_| error_message.to_owned())?;
+        let asset = t3_core::files::decode_workspace_asset(&value)
+            .map_err(|_| error_message.to_owned())?;
+        if known.file_revision.is_some() && asset.file_revision == known.file_revision {
+            return Ok(AssetFetchOutcome::Unchanged);
+        }
+        let bytes = client
+            .asset_bytes(
+                &t3_core::files::workspace_asset_fetch_url(&asset, mutation.as_deref()),
+                max_bytes,
+            )
+            .await?;
+        let mut hasher = std::hash::DefaultHasher::new();
+        bytes.len().hash(&mut hasher);
+        bytes.hash(&mut hasher);
+        let content_hash = hasher.finish();
+        if known.content_hash == Some(content_hash) {
+            return Ok(AssetFetchOutcome::Unchanged);
+        }
+        Ok(AssetFetchOutcome::Loaded {
+            bytes,
+            file_revision: asset.file_revision,
+            content_hash,
+        })
+    }))
+}
 
 /// Text files kept after leaving them, so tabbing back shows them at once.
 const CACHE_LIMIT: usize = 6;
@@ -141,6 +199,9 @@ pub struct Preview {
     markdown: Option<(Key, Entity<TextViewState>)>,
     markdown_scroll: ScrollHandle,
     mutation: Option<String>,
+    /// Last loaded server `fileRevision` & content hash for the active asset (`pingdotgg/t3code#39736`).
+    asset_revision: Option<String>,
+    asset_content_hash: Option<u64>,
     media_scope: Option<std::sync::Arc<std::sync::Mutex<crate::media::MediaScope>>>,
     media_document: Option<crate::transcript::MediaDocument>,
     media_extensions: Option<gpui_component::text::MarkdownExtensions>,
@@ -181,6 +242,8 @@ impl Preview {
             markdown: None,
             markdown_scroll: ScrollHandle::new(),
             mutation: None,
+            asset_revision: None,
+            asset_content_hash: None,
             media_scope: None,
             media_document: None,
             media_extensions: None,
@@ -219,6 +282,8 @@ impl Preview {
             self.key = key.clone();
             self.generation += 1;
             self._fetch = None;
+            self.asset_revision = None;
+            self.asset_content_hash = None;
             crate::media::video::retire_owner(cx.entity_id(), cx);
             self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
             let cached = key.as_ref().and_then(|key| self.cache.iter().position(|file| file.key == *key));
@@ -253,6 +318,8 @@ impl Preview {
         self._fetch = None;
         self.generation += 1;
         self.key = None;
+        self.asset_revision = None;
+        self.asset_content_hash = None;
         self.viewer.update(cx, |viewer, cx| viewer.dismiss(cx));
         self.replace_content(Content::Empty, cx);
         self.fetch_attachment(cx);
@@ -333,8 +400,32 @@ impl Preview {
         }
     }
 
+    fn known_asset_fingerprint(&self, ready: bool) -> KnownAsset {
+        if ready {
+            KnownAsset {
+                file_revision: self.asset_revision.clone(),
+                content_hash: self.asset_content_hash,
+            }
+        } else {
+            KnownAsset { file_revision: None, content_hash: None }
+        }
+    }
+
+    fn record_asset_fingerprint(&mut self, file_revision: Option<String>, content_hash: u64) {
+        self.asset_revision = file_revision;
+        self.asset_content_hash = Some(content_hash);
+    }
+
+    fn clear_asset_fingerprint(&mut self) {
+        self.asset_revision = None;
+        self.asset_content_hash = None;
+    }
+
     fn replace_content(&mut self, content: Content, cx: &mut Context<Self>) {
         self.html = None;
+        if matches!(content, Content::Empty | Content::Folder | Content::Failed(_)) {
+            self.clear_asset_fingerprint();
+        }
         let previous = std::mem::replace(&mut self.content, content);
         match previous {
             Content::Image(image) => image.release(cx),
@@ -371,6 +462,15 @@ impl Preview {
     pub(super) fn current_text_contents(&self) -> Option<String> {
         match &self.content {
             Content::Text(file) => Some(file.contents.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns copyable full text contents for non-truncated, non-empty text files (raw or rendered,
+    /// including HTML and text attachments, `pingdotgg/t3code#34769`).
+    pub(super) fn copyable_contents(&self) -> Option<String> {
+        match &self.content {
+            Content::Text(file) if !file.truncated && !file.contents.is_empty() => Some(file.contents.clone()),
             _ => None,
         }
     }
@@ -431,30 +531,42 @@ impl Preview {
     }
 
     fn fetch_binary(&mut self, target: Target, generation: u64, cx: &mut Context<Self>) {
+        let ready = matches!(self.content, Content::Binary(BinaryState::Ready(_)));
         if !matches!(self.content, Content::Binary(_)) {
             self.replace_content(Content::Binary(BinaryState::Loading), cx);
         }
+        let known = self.known_asset_fingerprint(ready);
         let state = self.state.read(cx);
         let path = target.path.clone();
-        let task = binary::load(state, &target.root, &path, self.mutation.as_deref());
+        let task = binary::load(state, &target.root, &path, self.mutation.as_deref(), known);
         self._fetch = Some(cx.spawn(async move |this, cx| {
             let result = match task {
                 Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                 None => Err("Not connected to the server.".to_owned()),
             };
-            let decoded = match result {
-                Ok(bytes) => {
+            match result {
+                Ok(AssetFetchOutcome::Unchanged) => {}
+                Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
                     let decode_path = path.clone();
-                    Ok(cx.background_executor().spawn(async move { binary::decode(&decode_path, bytes) }).await)
+                    let decoded = cx.background_executor().spawn(async move { binary::decode(&decode_path, bytes) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.generation == generation {
+                            this.record_asset_fingerprint(file_revision, content_hash);
+                            this.replace_content(Content::Binary(BinaryState::from(Ok(decoded))), cx);
+                            cx.notify();
+                        }
+                    });
                 }
-                Err(error) => Err(error),
-            };
-            let _ = this.update(cx, |this, cx| {
-                if this.generation == generation {
-                    this.replace_content(Content::Binary(BinaryState::from(decoded)), cx);
-                    cx.notify();
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.generation == generation {
+                            this.clear_asset_fingerprint();
+                            this.replace_content(Content::Binary(BinaryState::from(Err(error))), cx);
+                            cx.notify();
+                        }
+                    });
                 }
-            });
+            }
         }));
     }
 
@@ -518,125 +630,207 @@ impl Preview {
         }
 
         if is_audio(&key.path) {
+            let ready = matches!(self.content, Content::Audio(AudioState::Ready { .. }));
             if !matches!(self.content, Content::Audio(_)) {
                 self.replace_content(Content::Audio(AudioState::Loading), cx);
             }
+            let known = self.known_asset_fingerprint(ready);
+            let abs = t3_core::files::absolute_path(&key.path, &target.root.workspace.cwd);
+            let thread_id = target.root.workspace.thread_id.clone();
+            let path_owned = key.path.clone();
             let state = self.state.read(cx);
-            let task = audio::load(state, &target.root, &key.path, self.mutation.as_deref());
+            let task = audio::load(state, &target.root, &key.path, self.mutation.as_deref(), known);
             self._fetch = Some(cx.spawn(async move |this, cx| {
                 let result = match task {
                     Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                     None => Err("Not connected to the server.".to_owned()),
                 };
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.replace_content(Content::Audio(AudioState::from_decoded(result)), cx);
-                        cx.notify();
+                match result {
+                    Ok(AssetFetchOutcome::Unchanged) => {}
+                    Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
+                        let decoded = cx
+                            .background_executor()
+                            .spawn(async move { audio::decode(&path_owned, abs, thread_id, bytes) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.record_asset_fingerprint(file_revision, content_hash);
+                                this.replace_content(Content::Audio(AudioState::from_decoded(Ok(decoded))), cx);
+                                cx.notify();
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.clear_asset_fingerprint();
+                                this.replace_content(Content::Audio(AudioState::from_decoded(Err(error))), cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
             }));
             return;
         }
 
         if is_font(&key.path) {
+            let ready = matches!(self.content, Content::Font(FontState::Ready { .. }));
             if !matches!(self.content, Content::Font(_)) {
                 self.replace_content(Content::Font(FontState::Loading), cx);
             }
+            let known = self.known_asset_fingerprint(ready);
             let state = self.state.read(cx);
-            let task = font::load(state, &target.root, &key.path, self.mutation.as_deref());
+            let task = font::load(state, &target.root, &key.path, self.mutation.as_deref(), known);
             self._fetch = Some(cx.spawn(async move |this, cx| {
                 let result = match task {
                     Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                     None => Err("Not connected to the server.".to_owned()),
                 };
-                let decoded = match result {
-                    Ok(bytes) => cx.background_executor().spawn(async move { font::decode(bytes) }).await,
-                    Err(error) => Err(error),
-                };
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        let font_state = FontState::from_decoded(decoded, cx);
-                        this.replace_content(Content::Font(font_state), cx);
-                        cx.notify();
+                match result {
+                    Ok(AssetFetchOutcome::Unchanged) => {}
+                    Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
+                        let decoded = cx.background_executor().spawn(async move { font::decode(bytes) }).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.record_asset_fingerprint(file_revision, content_hash);
+                                let font_state = FontState::from_decoded(decoded, cx);
+                                this.replace_content(Content::Font(font_state), cx);
+                                cx.notify();
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.clear_asset_fingerprint();
+                                let font_state = FontState::from_decoded(Err(error), cx);
+                                this.replace_content(Content::Font(font_state), cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
             }));
             return;
         }
 
         if let Some(kind) = image_kind(&key.path) {
+            let ready = matches!(self.content, Content::Image(ImageState::Raster { .. } | ImageState::Svg(_)));
             if !matches!(self.content, Content::Image(_)) {
                 self.replace_content(Content::Image(ImageState::Loading), cx);
             }
+            let known = self.known_asset_fingerprint(ready);
             let state = self.state.read(cx);
-            let task = image::load(state, &target.root, &key.path, kind, self.mutation.as_deref());
+            let task = image::load(state, &target.root, &key.path, kind, self.mutation.as_deref(), known);
             self._fetch = Some(cx.spawn(async move |this, cx| {
                 let result = match task {
                     Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                     None => Err("Not connected to the server.".to_owned()),
                 };
-                let decoded = match result {
-                    Ok(bytes) => cx.background_executor().spawn(async move { image::decode(bytes, kind == ImageKind::Svg) }).await,
-                    Err(error) => Err(error),
-                };
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.replace_content(Content::Image(ImageState::from(decoded)), cx);
-                        cx.notify();
+                match result {
+                    Ok(AssetFetchOutcome::Unchanged) => {}
+                    Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
+                        let decoded = cx.background_executor().spawn(async move { image::decode(bytes, kind == ImageKind::Svg) }).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.record_asset_fingerprint(file_revision, content_hash);
+                                this.replace_content(Content::Image(ImageState::from(decoded)), cx);
+                                cx.notify();
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.clear_asset_fingerprint();
+                                this.replace_content(Content::Image(ImageState::from(Err(error))), cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
             }));
             return;
         }
 
         if is_pdf(&key.path) {
+            let ready = matches!(self.content, Content::Pdf(PdfState::Ready(_)));
             if !matches!(self.content, Content::Pdf(_)) {
                 self.replace_content(Content::Pdf(PdfState::Loading), cx);
             }
+            let known = self.known_asset_fingerprint(ready);
             let state = self.state.read(cx);
             let doc_key = format!("{}:{}:{}", key.environment, key.cwd, key.path);
-            let task = pdf::load(state, &target.root, &key.path, self.mutation.as_deref());
+            let task = pdf::load(state, &target.root, &key.path, self.mutation.as_deref(), known);
             self._fetch = Some(cx.spawn(async move |this, cx| {
                 let result = match task {
                     Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                     None => Err("Not connected to the server.".to_owned()),
                 };
-                let decoded = match result {
-                    Ok(bytes) => cx.background_executor().spawn(async move { pdf::decode(bytes) }).await,
-                    Err(error) => Err(error),
-                };
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        let pdf_state = PdfState::from_decoded(doc_key, decoded, &this.pdf_positions);
-                        this.replace_content(Content::Pdf(pdf_state), cx);
-                        cx.notify();
+                match result {
+                    Ok(AssetFetchOutcome::Unchanged) => {}
+                    Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
+                        let decoded = cx.background_executor().spawn(async move { pdf::decode(bytes) }).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.record_asset_fingerprint(file_revision, content_hash);
+                                let pdf_state = PdfState::from_decoded(doc_key, decoded, &this.pdf_positions);
+                                this.replace_content(Content::Pdf(pdf_state), cx);
+                                cx.notify();
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.clear_asset_fingerprint();
+                                let pdf_state = PdfState::from_decoded(doc_key, Err(error), &this.pdf_positions);
+                                this.replace_content(Content::Pdf(pdf_state), cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
             }));
             return;
         }
 
         if let Some(kind) = office_kind(&key.path) {
+            let ready = matches!(self.content, Content::Office(OfficeState::Ready(_)));
             if !matches!(self.content, Content::Office(_)) {
                 self.replace_content(Content::Office(OfficeState::Loading), cx);
             }
+            let known = self.known_asset_fingerprint(ready);
             let state = self.state.read(cx);
-            let task = office::load(state, &target.root, &key.path, self.mutation.as_deref());
+            let task = office::load(state, &target.root, &key.path, self.mutation.as_deref(), known);
             self._fetch = Some(cx.spawn(async move |this, cx| {
                 let result = match task {
                     Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
                     None => Err("Not connected to the server.".to_owned()),
                 };
-                let decoded = match result {
-                    Ok(bytes) => cx.background_executor().spawn(async move { office::decode(kind, bytes) }).await,
-                    Err(error) => Err(error),
-                };
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.replace_content(Content::Office(OfficeState::from_decoded(decoded)), cx);
-                        cx.notify();
+                match result {
+                    Ok(AssetFetchOutcome::Unchanged) => {}
+                    Ok(AssetFetchOutcome::Loaded { bytes, file_revision, content_hash }) => {
+                        let decoded = cx.background_executor().spawn(async move { office::decode(kind, bytes) }).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.record_asset_fingerprint(file_revision, content_hash);
+                                this.replace_content(Content::Office(OfficeState::from_decoded(decoded)), cx);
+                                cx.notify();
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation {
+                                this.clear_asset_fingerprint();
+                                this.replace_content(Content::Office(OfficeState::from_decoded(Err(error))), cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
             }));
             return;
         }
@@ -1326,7 +1520,7 @@ impl Render for Preview {
             Content::Font(font) => font.render(cx),
             Content::Audio(_) => self.render_audio(cx),
             Content::Pdf(_) => self.render_pdf(window, cx),
-            Content::Office(_) => self.render_office(cx),
+            Content::Office(_) => self.render_office(window, cx),
             Content::Binary(_) => self.render_binary(cx),
             Content::Video { player, .. } => div()
                 .size_full()
@@ -1436,12 +1630,13 @@ mod tests {
         });
         let (preview, vcx) = cx.add_window_view(|_, cx| Preview::new(state.clone(), cx));
 
-        // 1. Delimited CSV table preview
+        // 1. Delimited CSV table preview & copyable_contents (`#34769`)
         vcx.update(|window, cx| {
             preview.update(cx, |p, cx| {
                 p.load_text_for_test(test_target("data.csv"), "name,val\nalpha,10\nbeta,2\n", cx);
                 assert_eq!(p.rendered_mode(), Some(RenderedMode::Table));
                 assert!(p.is_rendered_active());
+                assert_eq!(p.copyable_contents().as_deref(), Some("name,val\nalpha,10\nbeta,2\n"));
             });
             window.draw(cx).clear();
         });
@@ -1484,10 +1679,11 @@ mod tests {
             window.draw(cx).clear();
         });
 
-        // 4. Binary / Hex preview
+        // 4. Binary / Hex preview (never exposes raw copyable_contents)
         vcx.update(|window, cx| {
             preview.update(cx, |p, cx| {
                 p.load_binary_for_test("blob.bin", b"\x89PNG\r\n\x1a\nhello binary!".to_vec(), cx);
+                assert_eq!(p.copyable_contents(), None);
             });
             window.draw(cx).clear();
         });

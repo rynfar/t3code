@@ -41,7 +41,7 @@ use t3_core::files::{breadcrumbs, group_thousands, is_host_path};
 use t3_core::right_panel::{FileAttachment, SurfaceKind, breadcrumb_path_of, retained_breadcrumb_trail};
 
 pub use actions::FileWorkspace;
-pub(crate) use explorer_rows::file_icon;
+pub(crate) use explorer_rows::{file_icon, is_label_clipped};
 
 pub fn init(cx: &mut App) {
     explorer::init(cx);
@@ -155,6 +155,9 @@ pub struct FilesPanel {
     reconnected: bool,
     /// The files body's width at the last paint, which bounds the explorer.
     body_width: Rc<Cell<f32>>,
+    copied_contents: bool,
+    copied_contents_gen: u64,
+    _copied_reset: Option<Task<()>>,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -208,6 +211,9 @@ impl FilesPanel {
             stale: false,
             reconnected: false,
             body_width: Rc::new(Cell::new(0.)),
+            copied_contents: false,
+            copied_contents_gen: 0,
+            _copied_reset: None,
             _save_width: None,
             _subscription: subscription,
         };
@@ -284,6 +290,8 @@ impl FilesPanel {
         let shown_changed = shown != self.shown || root_changed;
         if shown_changed {
             self.shown = shown.clone();
+            self.copied_contents = false;
+            self._copied_reset = None;
         }
         // Hidden files do no work: they catch up when they show.
         if visible {
@@ -321,6 +329,26 @@ impl FilesPanel {
         if shown_changed {
             cx.notify();
         }
+    }
+
+    fn copy_preview_contents(&mut self, cx: &mut Context<Self>) {
+        let Some(contents) = self.preview.read(cx).copyable_contents() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(contents));
+        self.copied_contents = true;
+        self.copied_contents_gen = self.copied_contents_gen.wrapping_add(1);
+        let generation = self.copied_contents_gen;
+        self._copied_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_contents_gen == generation {
+                    this.copied_contents = false;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
     }
 
     fn set_prefs(&mut self, change: impl FnOnce(&mut Prefs), cx: &mut Context<Self>) {
@@ -403,6 +431,7 @@ impl FilesPanel {
         let editing = previewing && preview_ref.is_editing();
         let dirty = previewing && preview_ref.is_dirty();
         let can_edit = previewing && preview_ref.can_edit_current(cx);
+        let can_copy = previewing && preview_ref.copyable_contents().is_some();
         let host = is_host_path(path);
         let entity = cx.entity().downgrade();
         let toggle = move |run: fn(&mut FilesPanel, &mut Context<FilesPanel>)| {
@@ -464,6 +493,16 @@ impl FilesPanel {
                             this.preview.update(cx, |preview, cx| preview.set_wrap(wrap, cx));
                             cx.notify();
                         })),
+                )
+            })
+            .when(can_copy, |this| {
+                this.child(
+                    Button::new("file-copy-contents")
+                        .variant(Variant::Toggle)
+                        .icon(if self.copied_contents { Icon::Check } else { Icon::Copy })
+                        .icon_size(14.)
+                        .tooltip(crate::i18n::t(cx, if self.copied_contents { "Copied" } else { "Copy contents" }))
+                        .on_click(toggle(Self::copy_preview_contents)),
                 )
             })
             .when(!host && previewing, |this| {
@@ -636,6 +675,8 @@ impl FilesPanel {
         let preview = self.preview.read(cx);
         let mode = preview.rendered_mode();
         let rendered = preview.is_rendered_active();
+        let can_copy = preview.copyable_contents().is_some();
+        let copy_entity = cx.entity().downgrade();
         v_flex()
             .size_full()
             .min_h_0()
@@ -653,6 +694,20 @@ impl FilesPanel {
                         .text_color(hsla(p.foreground)).child(attachment.name.clone()))
                     .child(div().truncate().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(metadata)))
                 .when_some(mode, |this, mode| this.child(self.render_mode_toggle(mode, rendered, cx)))
+                .when(can_copy, |this| {
+                    this.child(
+                        Button::new("attachment-copy-contents")
+                            .variant(Variant::Toggle)
+                            .icon(if self.copied_contents { Icon::Check } else { Icon::Copy })
+                            .icon_size(14.)
+                            .tooltip(crate::i18n::t(cx, if self.copied_contents { "Copied" } else { "Copy contents" }))
+                            .on_click(move |_, _, cx| {
+                                if let Some(entity) = copy_entity.upgrade() {
+                                    entity.update(cx, Self::copy_preview_contents);
+                                }
+                            }),
+                    )
+                })
                 .when_some(open_target, |this, target| {
                     this.child(div().debug_selector(|| "attachment-open-url".into())
                         .child(Button::new("attachment-open-url")

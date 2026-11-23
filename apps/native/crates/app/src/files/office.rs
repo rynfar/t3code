@@ -7,9 +7,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, DragMoveEvent, EmptyView, FontWeight, IntoElement, ListAlignment,
-    ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, ScrollHandle, ScrollWheelEvent,
-    SharedString, Styled, Window, canvas, div, list, prelude::*, px,
+    AnyElement, Context, DragMoveEvent, EmptyView, FocusHandle, FontWeight, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, ScrollHandle,
+    ScrollWheelEvent, SharedString, Styled, Window, canvas, div, list, prelude::*, px,
 };
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex};
@@ -17,12 +17,10 @@ use t3_core::files::office::{
     DEFAULT_ROW_HEIGHT, DocumentBlock, OFFICE_PREVIEW_MAX_BYTES, OfficeKind, OfficePreview,
     ResizeAxis, column_name, parse_office_preview,
 };
-use t3_core::files::{
-    CREATE_ASSET_URL, absolute_path, decode_asset_url, workspace_asset_request,
-};
+use t3_core::files::{absolute_path, workspace_asset_request};
 
 use super::Root;
-use super::preview::Preview;
+use super::preview::{AssetFetchOutcome, KnownAsset, Preview, load_workspace_asset};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
@@ -38,33 +36,26 @@ struct SheetTrackResize {
     start_size: f32,
 }
 
-pub fn load(
+pub(super) fn load(
     state: &AppState,
     root: &Root,
     path: &str,
     mutation: Option<&str>,
-) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
-    let client = state.client_handle()?;
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
     let request = workspace_asset_request(
         &root.workspace.thread_id,
         &root.workspace.cwd,
         &absolute_path(path, &root.workspace.cwd),
     );
-    let mutation = mutation.map(str::to_owned);
-    Some(state.runtime().spawn(async move {
-        let value = client
-            .request(CREATE_ASSET_URL, request)
-            .await
-            .map_err(|_| "The file could not be loaded. Close it and try again.".to_owned())?;
-        let url = decode_asset_url(&value)
-            .map_err(|_| "The file could not be loaded. Close it and try again.".to_owned())?;
-        client
-            .asset_bytes(
-                &format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())),
-                OFFICE_PREVIEW_MAX_BYTES,
-            )
-            .await
-    }))
+    load_workspace_asset(
+        state,
+        request,
+        OFFICE_PREVIEW_MAX_BYTES,
+        known,
+        mutation,
+        "The file could not be loaded. Close it and try again.",
+    )
 }
 
 pub fn decode(kind: OfficeKind, bytes: Vec<u8>) -> Result<OfficePreview, String> {
@@ -86,6 +77,7 @@ pub struct OfficeReady {
     pub doc_scroll: ScrollHandle,
     pub resize_anchor: f32,
     pub viewport_width: Rc<Cell<f32>>,
+    pub sheet_tab_focuses: Vec<FocusHandle>,
 }
 
 impl OfficeReady {
@@ -102,6 +94,7 @@ impl OfficeReady {
             doc_scroll: ScrollHandle::new(),
             resize_anchor: 0.0,
             viewport_width: Rc::new(Cell::new(0.0)),
+            sheet_tab_focuses: Vec::new(),
         }
     }
 
@@ -137,7 +130,7 @@ impl OfficeState {
 }
 
 impl Preview {
-    pub(super) fn render_office(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_office(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         match self.office_state() {
             None | Some(OfficeState::Loading) => v_flex()
@@ -165,10 +158,15 @@ impl Preview {
             Some(OfficeState::Ready(ready)) => {
                 let details = ready.preview.details_label();
                 let truncated = ready.preview.truncated();
-                let body = match &ready.preview {
-                    OfficePreview::Workbook(_) => self.render_office_workbook(cx),
-                    OfficePreview::Document(_) => self.render_office_document(cx),
-                    OfficePreview::Presentation(_) => self.render_office_presentation(cx),
+                let kind_body = match &ready.preview {
+                    OfficePreview::Workbook(_) => 0,
+                    OfficePreview::Document(_) => 1,
+                    OfficePreview::Presentation(_) => 2,
+                };
+                let body = match kind_body {
+                    0 => self.render_office_workbook(window, cx),
+                    1 => self.render_office_document(cx),
+                    _ => self.render_office_presentation(cx),
                 };
                 v_flex()
                     .id("file-office-viewer")
@@ -208,8 +206,25 @@ impl Preview {
         }
     }
 
-    fn render_office_workbook(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_office_workbook(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let sheet_count = match self.office_state() {
+            Some(OfficeState::Ready(ready)) => match &ready.preview {
+                OfficePreview::Workbook(wb) => wb.sheets.len(),
+                _ => return div().into_any_element(),
+            },
+            _ => return div().into_any_element(),
+        };
+        if let Some(ready) = self.office_ready_mut() {
+            while ready.sheet_tab_focuses.len() < sheet_count {
+                ready.sheet_tab_focuses.push(cx.focus_handle());
+            }
+            ready.sheet_tab_focuses.truncate(sheet_count);
+            let active = ready.active_index.min(sheet_count.saturating_sub(1));
+            for (idx, slot) in ready.sheet_tab_focuses.iter_mut().enumerate() {
+                *slot = slot.clone().tab_stop(idx == active);
+            }
+        }
         let Some(OfficeState::Ready(ready)) = self.office_state() else {
             return div().into_any_element();
         };
@@ -224,6 +239,7 @@ impl Preview {
         let show_gridlines = sheet.show_gridlines;
         let row_list = ready.row_list.clone();
         let viewport_width = ready.viewport_width.clone();
+        let tab_focuses = ready.sheet_tab_focuses.clone();
 
         let header_cells = (0..sheet.column_count).map(|col| {
             let width = sheet.col_width(col);
@@ -266,19 +282,28 @@ impl Preview {
 
         let sheet_tabs = wb.sheets.iter().enumerate().map(|(index, tab)| {
             let selected = index == active_idx;
+            let focus_handle = tab_focuses.get(index).cloned();
+            let focused = focus_handle.as_ref().is_some_and(|handle| handle.is_focused(window));
+            let focus_on_click = focus_handle.clone();
             div()
                 .id(("office-sheet-tab", index))
+                .when_some(focus_handle, |this, handle| this.track_focus(&handle))
                 .flex_none()
                 .h(px(28.))
                 .px(px(10.))
                 .rounded(px(6.))
+                .border_1()
+                .border_color(if focused { hsla(p.ring) } else { gpui::transparent_black() })
                 .flex()
                 .items_center()
                 .text_xs()
                 .cursor_pointer()
                 .when(selected, |this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)).font_weight(FontWeight::MEDIUM))
                 .when(!selected, |this| this.text_color(hsla(p.muted_foreground)).hover(|s| s.bg(hsla(p.accent))))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(handle) = &focus_on_click {
+                        window.focus(handle, cx);
+                    }
                     if let Some(ready) = this.office_ready_mut() {
                         ready.select_index(index);
                         cx.notify();
@@ -353,6 +378,35 @@ impl Preview {
                     .border_t_1()
                     .border_color(hsla(p.border))
                     .bg(hsla(p.background))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.platform
+                            || event.keystroke.modifiers.control
+                            || event.keystroke.modifiers.alt
+                        {
+                            return;
+                        }
+                        let Some(ready) = this.office_ready_mut() else { return };
+                        let count = ready.sheet_tab_focuses.len();
+                        let Some(current) = ready.sheet_tab_focuses.iter().position(|h| h.is_focused(window)) else {
+                            return;
+                        };
+                        let Some(next) = t3_core::files::office::next_sheet_tab_index(
+                            current,
+                            count,
+                            event.keystroke.key.as_str(),
+                        ) else {
+                            return;
+                        };
+                        ready.select_index(next);
+                        for (idx, slot) in ready.sheet_tab_focuses.iter_mut().enumerate() {
+                            *slot = slot.clone().tab_stop(idx == next);
+                        }
+                        if let Some(target_focus) = ready.sheet_tab_focuses.get(next).cloned() {
+                            window.focus(&target_focus, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
                     .children(sheet_tabs),
             )
             .into_any_element()

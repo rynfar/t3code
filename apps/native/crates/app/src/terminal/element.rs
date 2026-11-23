@@ -11,8 +11,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Context, EntityInputHandler, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
+    App, Bounds, Context, ElementInputHandler, ContentMask, EntityInputHandler, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, PathBuilder, Pixels, Point,
     ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
     px, relative, size,
 };
@@ -126,12 +126,133 @@ impl<T: TerminalSurface> TerminalElement<T> {
 pub struct Prepainted {
     quads: Vec<PaintQuad>,
     cursor_block: Option<PaintQuad>,
+    powerline: Vec<PowerlineCell>,
     lines: Vec<(Pixels, ShapedRow)>,
     origin_x: Pixels,
     cell_width: Pixels,
     overlays: Vec<PaintQuad>,
     marked: Option<(Point<Pixels>, ShapedLine)>,
     line_height: Pixels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PowerlineShape {
+    Fill(&'static [(f32, f32)]),
+    Stroke(&'static [(f32, f32)]),
+    Cap { flat_left: bool, filled: bool },
+}
+
+#[derive(Clone, Copy)]
+struct PowerlineCell {
+    bounds: Bounds<Pixels>,
+    shape: PowerlineShape,
+    color: Hsla,
+}
+
+/// Maps Powerline private-use glyphs (`U+E0B0..=U+E0BF`) to exact cell-edge geometry so dividers,
+/// triangles, slants, and rounded caps never show font-inset gaps (`pingdotgg/t3code#24888`).
+fn powerline_shape(ch: char) -> Option<PowerlineShape> {
+    Some(match ch {
+        '\u{e0b0}' => PowerlineShape::Fill(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)]),
+        '\u{e0b1}' => PowerlineShape::Stroke(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)]),
+        '\u{e0b2}' => PowerlineShape::Fill(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)]),
+        '\u{e0b3}' => PowerlineShape::Stroke(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)]),
+        '\u{e0b4}' => PowerlineShape::Cap { flat_left: true, filled: true },
+        '\u{e0b5}' => PowerlineShape::Cap { flat_left: true, filled: false },
+        '\u{e0b6}' => PowerlineShape::Cap { flat_left: false, filled: true },
+        '\u{e0b7}' => PowerlineShape::Cap { flat_left: false, filled: false },
+        '\u{e0b8}' => PowerlineShape::Fill(&[(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)]),
+        '\u{e0b9}' => PowerlineShape::Stroke(&[(0.0, 0.0), (1.0, 1.0)]),
+        '\u{e0ba}' => PowerlineShape::Fill(&[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]),
+        '\u{e0bb}' => PowerlineShape::Stroke(&[(1.0, 0.0), (0.0, 1.0)]),
+        '\u{e0bc}' => PowerlineShape::Fill(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]),
+        '\u{e0bd}' => PowerlineShape::Stroke(&[(1.0, 0.0), (0.0, 1.0)]),
+        '\u{e0be}' => PowerlineShape::Fill(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]),
+        '\u{e0bf}' => PowerlineShape::Stroke(&[(0.0, 0.0), (1.0, 1.0)]),
+        _ => return None,
+    })
+}
+
+fn paint_powerline_cell(cell: PowerlineCell, clip_bounds: Bounds<Pixels>, window: &mut Window) {
+    let left = f32::from(cell.bounds.left());
+    let top = f32::from(cell.bounds.top());
+    let width = f32::from(cell.bounds.size.width);
+    let height = f32::from(cell.bounds.size.height);
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    match cell.shape {
+        PowerlineShape::Fill(points) => {
+            if let Some((&first, rest)) = points.split_first() {
+                let mut builder = PathBuilder::fill();
+                builder.move_to(point(px(left + first.0 * width), px(top + first.1 * height)));
+                for &(x, y) in rest {
+                    builder.line_to(point(px(left + x * width), px(top + y * height)));
+                }
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, cell.color);
+                }
+            }
+        }
+        PowerlineShape::Stroke(points) => {
+            if let Some((&first, rest)) = points.split_first() {
+                let mut builder = PathBuilder::stroke(px(1.));
+                builder.move_to(point(px(left + first.0 * width), px(top + first.1 * height)));
+                for &(x, y) in rest {
+                    builder.line_to(point(px(left + x * width), px(top + y * height)));
+                }
+                if let Ok(path) = builder.build() {
+                    let cell_clip = cell.bounds.intersect(&clip_bounds);
+                    window.with_content_mask(Some(ContentMask { bounds: cell_clip }), |window| {
+                        window.paint_path(path, cell.color);
+                    });
+                }
+            }
+        }
+        PowerlineShape::Cap { flat_left, filled } => {
+            const STEPS: usize = 16;
+            let inset = if filled { 0.0 } else { 0.5 };
+            let rx = (width - inset).max(0.5);
+            let ry = (height / 2.0 - inset).max(0.5);
+            let cy = top + height / 2.0;
+            let base_x = if flat_left { left } else { left + width };
+            let start_angle = if flat_left { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+            let arc_point = |step: usize| {
+                let theta = start_angle + std::f32::consts::PI * (step as f32 / STEPS as f32);
+                point(px(base_x + rx * theta.cos()), px(cy + ry * theta.sin()))
+            };
+            if filled {
+                let mut builder = PathBuilder::fill();
+                builder.move_to(arc_point(0));
+                for step in 1..=STEPS {
+                    builder.line_to(arc_point(step));
+                }
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, cell.color);
+                }
+                // Overlap the neighbor segment boundary so fractional cell widths avoid a hairline seam.
+                let seam_x = if flat_left { left - 0.5 } else { left + width };
+                window.paint_quad(fill(
+                    Bounds::new(point(px(seam_x), px(top)), size(px(0.5), px(height))),
+                    cell.color,
+                ));
+            } else {
+                let mut builder = PathBuilder::stroke(px(1.));
+                builder.move_to(arc_point(0));
+                for step in 1..=STEPS {
+                    builder.line_to(arc_point(step));
+                }
+                if let Ok(path) = builder.build() {
+                    let cell_clip = cell.bounds.intersect(&clip_bounds);
+                    window.with_content_mask(Some(ContentMask { bounds: cell_clip }), |window| {
+                        window.paint_path(path, cell.color);
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl<T: TerminalSurface> IntoElement for TerminalElement<T> {
@@ -245,6 +366,27 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
         }
         let cursor_glyph = block.map(|c| (c.row, c.col));
 
+        let mut powerline = Vec::new();
+        for row in 0..frame.rows {
+            let cells = frame.row(row);
+            for (col, cell_view) in cells.iter().enumerate() {
+                if cell_view.spacer || cell_view.hidden || cell_view.combining {
+                    continue;
+                }
+                if let Some(shape) = powerline_shape(cell_view.c) {
+                    let mut color = if cursor_glyph == Some((row, col)) { pane_bg } else { to_hsla(cell_view.fg) };
+                    if cell_view.dim {
+                        color.a *= 0.5;
+                    }
+                    powerline.push(PowerlineCell {
+                        bounds: cell(row, col, if cell_view.wide { 2 } else { 1 }),
+                        shape,
+                        color,
+                    });
+                }
+            }
+        }
+
         let style_key = {
             let mut hasher = DefaultHasher::new();
             font.family.hash(&mut hasher);
@@ -300,7 +442,7 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
         });
 
         self.pane.update(cx, |pane, _| pane.set_geometry(geometry));
-        Prepainted { quads, cursor_block, lines, origin_x: origin.x, cell_width, overlays, marked, line_height }
+        Prepainted { quads, cursor_block, powerline, lines, origin_x: origin.x, cell_width, overlays, marked, line_height }
     }
 
     fn paint(
@@ -321,6 +463,9 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
             }
             if let Some(cursor) = prepainted.cursor_block.take() {
                 window.paint_quad(cursor);
+            }
+            for cell in prepainted.powerline.drain(..) {
+                paint_powerline_cell(cell, bounds, window);
             }
             for (y, segments) in &prepainted.lines {
                 for (col, line) in segments.iter() {
@@ -448,8 +593,17 @@ fn shape_row(
         let underline = (!cell.hidden && (cell.underline || hovered_cols.is_some_and(|(start, end)| col >= start && col <= end)))
             .then_some(UnderlineStyle { thickness: px(1.), color: Some(color), wavy: false });
         let strikethrough = (!cell.hidden && cell.strikeout).then_some(StrikethroughStyle { thickness: px(1.), color: Some(color) });
+        let is_powerline = !cell.hidden && !cell.combining && powerline_shape(cell.c).is_some();
+        if is_powerline && underline.is_none() && strikethrough.is_none() {
+            flush(&mut text, &mut runs, start);
+            continue;
+        }
         let before = text.len();
-        text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        if is_powerline {
+            text.push(' ');
+        } else {
+            text.push(if cell.c == '\0' { ' ' } else { cell.c });
+        }
         if cell.combining {
             text.extend(frame.combining(row * frame.cols + col));
         }
@@ -467,4 +621,25 @@ fn shape_row(
         }
     }
     flush(&mut text, &mut runs, start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powerline_shapes_cover_full_e0b0_to_e0bf_range() {
+        for code in 0xE0B0u32..=0xE0BF {
+            let ch = char::from_u32(code).unwrap();
+            assert!(powerline_shape(ch).is_some(), "expected Powerline shape for U+{code:04X}");
+        }
+        assert!(matches!(powerline_shape('\u{e0b0}'), Some(PowerlineShape::Fill(_))));
+        assert!(matches!(powerline_shape('\u{e0b1}'), Some(PowerlineShape::Stroke(_))));
+        assert_eq!(powerline_shape('\u{e0b4}'), Some(PowerlineShape::Cap { flat_left: true, filled: true }));
+        assert_eq!(powerline_shape('\u{e0b5}'), Some(PowerlineShape::Cap { flat_left: true, filled: false }));
+        assert_eq!(powerline_shape('\u{e0b6}'), Some(PowerlineShape::Cap { flat_left: false, filled: true }));
+        assert_eq!(powerline_shape('\u{e0b7}'), Some(PowerlineShape::Cap { flat_left: false, filled: false }));
+        assert_eq!(powerline_shape('A'), None);
+        assert_eq!(powerline_shape('─'), None);
+    }
 }

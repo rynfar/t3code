@@ -572,6 +572,7 @@ impl AppState {
     fn reopen_browser(&mut self, view: ClosedView, cx: &mut Context<Self>) {
         let ClosedTarget::Browser { snapshot } = &view.target else { return };
         let connection = self.connection_id();
+        let nav_before = self.navigation_snapshot();
         let previews = crate::preview::previews(cx).filter(|previews| previews.read(cx).availability() == crate::preview::Availability::Available);
         let defaults = previews.as_ref().map(|previews| previews.read(cx).browser_defaults(cx)).unwrap_or_default();
         let task = previews
@@ -593,6 +594,14 @@ impl AppState {
                 match result {
                     Ok(opened) => {
                         let thread = view.thread_id.clone();
+                        // Preserve newer user navigation if the user moved elsewhere while
+                        // `preview.open` was pending (`pingdotgg/t3code#40516`).
+                        if state.navigation_snapshot() != nav_before {
+                            if state.panels.panels.open_browser(&thread, Some(&opened.tab_id)) {
+                                state.save_panels(cx);
+                            }
+                            return;
+                        }
                         state.select_thread(&thread, cx);
                         // Let `AppEvent::Selection` flush (`Previews::threads.show` + `list_selected`)
                         // before opening the tab, so `show`'s initial reconcile does not drop it.
@@ -668,6 +677,28 @@ impl AppState {
             self.panels.diff_file_tree_open = open;
             self.save_panels(cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use gpui::AppContext as _;
+
+    #[gpui::test]
+    fn navigation_snapshot_detects_thread_and_page_transitions(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx)));
+        state.update(cx, |state, _| {
+            let initial = state.navigation_snapshot();
+            state.selected_thread = Some("t-next".into());
+            let after_thread = state.navigation_snapshot();
+            assert_ne!(initial, after_thread);
+            state.pull_requests_open = true;
+            assert_ne!(after_thread, state.navigation_snapshot());
+            state.pull_requests_open = false;
+            state.issues_open = true;
+            assert_ne!(after_thread, state.navigation_snapshot());
+        });
     }
 }
 

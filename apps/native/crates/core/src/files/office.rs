@@ -63,6 +63,22 @@ impl OfficeKind {
     }
 }
 
+/// Next sheet tab index for keyboard navigation (`ArrowRight` / `ArrowLeft` / `Home` / `End`)
+/// on a workbook tablist (`pingdotgg/t3code#41008`).
+pub fn next_sheet_tab_index(current: usize, count: usize, key: &str) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let current = current.min(count - 1);
+    match key {
+        "right" => Some((current + 1) % count),
+        "left" => Some((current + count - 1) % count),
+        "home" => Some(0),
+        "end" => Some(count - 1),
+        _ => None,
+    }
+}
+
 /// `columnName` (`office/sheet-cells.ts`): 0 -> `"A"`, 25 -> `"Z"`, 26 -> `"AA"`.
 pub fn column_name(mut col: usize) -> String {
     let mut name = String::new();
@@ -903,37 +919,191 @@ fn parse_docx_table(tbl_xml: &str) -> Vec<Vec<String>> {
     rows
 }
 
+const ODF_SKIPPED_ELEMENTS: &[&str] = &[
+    "office:annotation",
+    "presentation:notes",
+    "text:tracked-changes",
+    "office:scripts",
+    "draw:object",
+    "draw:object-ole",
+    "text:table-of-content-source",
+    "text:illustration-index-source",
+    "text:table-index-source",
+    "text:object-index-source",
+    "text:user-index-source",
+    "text:alphabetical-index-source",
+    "text:bibliography-source",
+];
+
+fn find_xml_tag_end(xml: &str, start: usize) -> Option<usize> {
+    let bytes = xml.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn xml_tag_name(raw: &str) -> &str {
+    let trimmed = raw.trim_start_matches('/').trim_end_matches('/').trim_start();
+    trimmed
+        .split([' ', '\t', '\r', '\n', '/'])
+        .next()
+        .unwrap_or("")
+}
+
+/// Removes ODF skipped subtrees (index/TOC/bibliography sources, scripts, embedded objects,
+/// annotations, tracked changes) while leaving visible bodies intact (`pingdotgg/t3code#40509`).
+fn strip_odf_skipped_elements(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut skip_stack: Vec<&'static str> = Vec::new();
+    let mut cursor = 0;
+    while cursor < xml.len() {
+        let Some(rel) = xml[cursor..].find('<') else {
+            if skip_stack.is_empty() {
+                out.push_str(&xml[cursor..]);
+            }
+            break;
+        };
+        let lt = cursor + rel;
+        if skip_stack.is_empty() {
+            out.push_str(&xml[cursor..lt]);
+        }
+        if xml[lt..].starts_with("<!--") {
+            let end = xml[lt + 4..].find("-->").map_or(xml.len(), |p| lt + 4 + p + 3);
+            if skip_stack.is_empty() {
+                out.push_str(&xml[lt..end]);
+            }
+            cursor = end;
+            continue;
+        }
+        if xml[lt..].starts_with("<![CDATA[") {
+            let end = xml[lt + 9..].find("]]>").map_or(xml.len(), |p| lt + 9 + p + 3);
+            if skip_stack.is_empty() {
+                out.push_str(&xml[lt..end]);
+            }
+            cursor = end;
+            continue;
+        }
+        let Some(gt) = find_xml_tag_end(xml, lt + 1) else {
+            if skip_stack.is_empty() {
+                out.push_str(&xml[lt..]);
+            }
+            break;
+        };
+        let inner = &xml[lt + 1..gt];
+        cursor = gt + 1;
+        if let Some(closing) = inner.strip_prefix('/') {
+            let name = xml_tag_name(closing);
+            if skip_stack.last().copied() == Some(name) {
+                skip_stack.pop();
+            } else if skip_stack.is_empty() {
+                out.push_str(&xml[lt..cursor]);
+            }
+            continue;
+        }
+        let self_closing = inner.trim_end().ends_with('/');
+        let name = xml_tag_name(inner);
+        if let Some(&matched) = ODF_SKIPPED_ELEMENTS.iter().find(|&&tag| tag == name) {
+            if !self_closing {
+                skip_stack.push(matched);
+            }
+            continue;
+        }
+        if skip_stack.is_empty() {
+            out.push_str(&xml[lt..cursor]);
+        }
+    }
+    out
+}
+
+fn find_next_odf_text_block(xml: &str, mut cursor: usize) -> Option<(bool, usize)> {
+    while cursor < xml.len() {
+        let next_h = xml[cursor..].find("<text:h").map(|rel| (true, cursor + rel));
+        let next_p = xml[cursor..].find("<text:p").map(|rel| (false, cursor + rel));
+        let (is_heading, start) = match (next_h, next_p) {
+            (None, None) => return None,
+            (Some(h), Some(p)) if h.1 < p.1 => h,
+            (Some(h), None) => h,
+            (_, Some(p)) => p,
+        };
+        let after = start + "<text:p".len();
+        if matches!(xml[after..].chars().next(), Some('>' | ' ' | '\t' | '\n' | '\r' | '/')) {
+            return Some((is_heading, start));
+        }
+        cursor = after;
+    }
+    None
+}
+
+fn odf_inline_text(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut cursor = 0;
+    while cursor < xml.len() {
+        let Some(rel) = xml[cursor..].find('<') else {
+            out.push_str(&decode_xml_entities(&xml[cursor..]));
+            break;
+        };
+        let lt = cursor + rel;
+        if lt > cursor {
+            out.push_str(&decode_xml_entities(&xml[cursor..lt]));
+        }
+        let Some(gt) = find_xml_tag_end(xml, lt + 1) else {
+            break;
+        };
+        let tag = &xml[lt..=gt];
+        let name = xml_tag_name(&xml[lt + 1..gt]);
+        match name {
+            "text:s" => {
+                let count = xml_attr(tag, "text:c")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 100);
+                for _ in 0..count {
+                    out.push(' ');
+                }
+            }
+            "text:tab" => out.push('\t'),
+            "text:line-break" => out.push('\n'),
+            _ => {}
+        }
+        cursor = gt + 1;
+    }
+    out
+}
+
 fn parse_odt(bytes: &[u8]) -> Result<OfficeDocument, String> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|_| "Could not open this OpenDocument file.".to_owned())?;
-    let Some(xml) = read_zip_text(&mut archive, "content.xml")? else {
+    let Some(raw_xml) = read_zip_text(&mut archive, "content.xml")? else {
         return Err("This document has no content.xml.".to_owned());
     };
+    let xml = strip_odf_skipped_elements(&raw_xml);
     let mut blocks = Vec::new();
     let mut truncated = false;
     let mut cursor = 0;
-    while cursor < xml.len() {
-        let next_h = xml[cursor..].find("<text:h");
-        let next_p = xml[cursor..].find("<text:p");
-        let (is_heading, rel) = match (next_h, next_p) {
-            (None, None) => break,
-            (Some(h), Some(p)) if h < p => (true, h),
-            (Some(h), None) => (true, h),
-            (_, Some(p)) => (false, p),
-        };
-        let start = cursor + rel;
+    while let Some((is_heading, start)) = find_next_odf_text_block(&xml, cursor) {
         let close = if is_heading { "</text:h>" } else { "</text:p>" };
-        let Some(gt) = xml[start..].find('>') else { break };
-        let tag = &xml[start..start + gt + 1];
+        let Some(gt) = find_xml_tag_end(&xml, start + 1) else { break };
+        let tag = &xml[start..=gt];
         if tag.ends_with("/>") {
-            cursor = start + gt + 1;
+            cursor = gt + 1;
             continue;
         }
-        let body_start = start + gt + 1;
+        let body_start = gt + 1;
         let Some(end) = xml[body_start..].find(close) else { break };
         let inner = &xml[body_start..body_start + end];
         cursor = body_start + end + close.len();
-        let text = strip_xml_tags(inner).trim().to_owned();
+        let text = odf_inline_text(inner).trim().to_owned();
         if text.is_empty() {
             continue;
         }
@@ -957,100 +1127,409 @@ fn parse_odt(bytes: &[u8]) -> Result<OfficeDocument, String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RtfEncoding {
+    Windows1252,
+    MacRoman,
+    Utf8,
+}
+
+/// WHATWG / IANA `windows-1252` upper table (`0x80..=0x9F`); `0xA0..=0xFF` map directly.
+const WIN1252_HIGH: [char; 32] = [
+    '€', '\u{FFFD}', '‚', 'ƒ', '„', '…', '†', '‡',
+    'ˆ', '‰', 'Š', '‹', 'Œ', '\u{FFFD}', 'Ž', '\u{FFFD}',
+    '\u{FFFD}', '‘', '’', '“', '”', '•', '–', '—',
+    '˜', '™', 'š', '›', 'œ', '\u{FFFD}', 'ž', 'Ÿ',
+];
+
+/// WHATWG / IANA `macintosh` (Mac Roman) upper table (`0x80..=0xFF`, `pingdotgg/t3code#39846`).
+const MAC_ROMAN_HIGH: [char; 128] = [
+    'Ä', 'Å', 'Ç', 'É', 'Ñ', 'Ö', 'Ü', 'á',
+    'à', 'â', 'ä', 'ã', 'å', 'ç', 'é', 'è',
+    'ê', 'ë', 'í', 'ì', 'î', 'ï', 'ñ', 'ó',
+    'ò', 'ô', 'ö', 'õ', 'ú', 'ù', 'û', 'ü',
+    '†', '°', '¢', '£', '§', '•', '¶', 'ß',
+    '®', '©', '™', '´', '¨', '≠', 'Æ', 'Ø',
+    '∞', '±', '≤', '≥', '¥', 'µ', '∂', '∑',
+    '∏', 'π', '∫', 'ª', 'º', 'Ω', 'æ', 'ø',
+    '¿', '¡', '¬', '√', 'ƒ', '≈', '∆', '«',
+    '»', '…', '\u{00A0}', 'À', 'Ã', 'Õ', 'Œ', 'œ',
+    '–', '—', '“', '”', '‘', '’', '÷', '◊',
+    'ÿ', 'Ÿ', '⁄', '€', '‹', '›', 'ﬁ', 'ﬂ',
+    '‡', '·', '‚', '„', '‰', 'Â', 'Ê', 'Á',
+    'Ë', 'È', 'Í', 'Î', 'Ï', 'Ì', 'Ó', 'Ô',
+    '\u{F8FF}', 'Ò', 'Ú', 'Û', 'Ù', 'ı', 'ˆ', '˜',
+    '¯', '˘', '˙', '˚', '¸', '˝', '˛', 'ˇ',
+];
+
+fn decode_rtf_bytes(bytes: &[u8], encoding: RtfEncoding) -> String {
+    if encoding == RtfEncoding::Utf8 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    bytes
+        .iter()
+        .map(|&b| match encoding {
+            RtfEncoding::Windows1252 => match b {
+                0x80..=0x9F => WIN1252_HIGH[(b - 0x80) as usize],
+                other => other as char,
+            },
+            RtfEncoding::MacRoman => match b {
+                0x80..=0xFF => MAC_ROMAN_HIGH[(b - 0x80) as usize],
+                other => other as char,
+            },
+            RtfEncoding::Utf8 => unreachable!(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct RtfState {
+    skip: bool,
+    deleted: bool,
+    hidden_text: bool,
+    uc: usize,
+    font: i32,
+    font_table: bool,
+    encoding: RtfEncoding,
+}
+
+impl RtfState {
+    fn is_hidden(self) -> bool {
+        self.skip || self.deleted || self.hidden_text
+    }
+}
+
+fn rtf_special_char(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "tab" => "\t",
+        "endash" => "–",
+        "emdash" => "—",
+        "bullet" => "•",
+        "lquote" => "‘",
+        "rquote" => "’",
+        "ldblquote" => "“",
+        "rdblquote" => "”",
+        "enspace" => "\u{2002}",
+        "emspace" => "\u{2003}",
+        "qmspace" => "\u{2005}",
+        "zwbo" => "\u{200B}",
+        "zwnj" => "\u{200C}",
+        "zwj" => "\u{200D}",
+        "ltrmark" => "\u{200E}",
+        "rtlmark" => "\u{200F}",
+        _ => return None,
+    })
+}
+
+fn is_rtf_skipped_destination(word: &str) -> bool {
+    matches!(
+        word,
+        "colortbl"
+            | "stylesheet"
+            | "info"
+            | "pict"
+            | "object"
+            | "fldinst"
+            | "header"
+            | "headerl"
+            | "headerr"
+            | "headerf"
+            | "footer"
+            | "footerl"
+            | "footerr"
+            | "footerf"
+            | "filetbl"
+            | "datastore"
+            | "themedata"
+    )
+}
+
 fn parse_rtf(bytes: &[u8]) -> Result<OfficeDocument, String> {
-    let raw = String::from_utf8_lossy(bytes);
-    if !raw.trim_start().starts_with("{\\rtf") {
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("This RTF document is too large to preview.".to_owned());
+    }
+    let trimmed_start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    if !bytes[trimmed_start..].starts_with(b"{\\rtf") {
         return Err("Not a valid RTF document.".to_owned());
     }
+
+    let mut state = RtfState {
+        skip: false,
+        deleted: false,
+        hidden_text: false,
+        uc: 1,
+        font: 0,
+        font_table: false,
+        encoding: RtfEncoding::Windows1252,
+    };
+    let mut fonts: HashMap<i32, RtfEncoding> = HashMap::new();
+    let mut default_font = 0i32;
+    let mut stack: Vec<RtfState> = Vec::new();
     let mut blocks = Vec::new();
     let mut current = String::new();
-    let mut chars = raw.chars().peekable();
-    let mut skip_depth = 0usize;
-    let mut depth = 0usize;
+    let mut encoded: Vec<u8> = Vec::new();
+    let mut fallback = 0usize;
+    let mut pending_high_surrogate: Option<u16> = None;
+    let mut truncated = false;
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' => {
-                depth += 1;
-                if chars.peek() == Some(&'\\') {
-                    let clone = chars.clone();
-                    let lookahead: String = clone.take(16).collect();
-                    if skip_depth == 0
-                        && (lookahead.starts_with("\\*")
-                            || lookahead.starts_with("\\fonttbl")
-                            || lookahead.starts_with("\\colortbl")
-                            || lookahead.starts_with("\\stylesheet")
-                            || lookahead.starts_with("\\info"))
-                    {
-                        skip_depth = depth;
+    let flush_encoded = |encoded: &mut Vec<u8>, state: RtfState, fonts: &HashMap<i32, RtfEncoding>, current: &mut String| {
+        if encoded.is_empty() {
+            return;
+        }
+        let enc = fonts.get(&state.font).copied().unwrap_or(state.encoding);
+        current.push_str(&decode_rtf_bytes(encoded, enc));
+        encoded.clear();
+    };
+    let push_paragraph = |blocks: &mut Vec<DocumentBlock>, current: &mut String, truncated: &mut bool| {
+        let trimmed = current.trim().to_owned();
+        if !trimmed.is_empty() {
+            if blocks.len() >= MAX_PARAGRAPHS {
+                *truncated = true;
+            } else {
+                blocks.push(DocumentBlock::Paragraph(trimmed));
+            }
+        }
+        current.clear();
+    };
+
+    let mut i = trimmed_start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        match b {
+            b'{' => {
+                flush_encoded(&mut encoded, state, &fonts, &mut current);
+                fallback = 0;
+                pending_high_surrogate = None;
+                if stack.len() > 100 {
+                    return Err("This RTF document is too deeply nested.".to_owned());
+                }
+                stack.push(state);
+            }
+            b'}' => {
+                flush_encoded(&mut encoded, state, &fonts, &mut current);
+                fallback = 0;
+                pending_high_surrogate = None;
+                let Some(parent) = stack.pop() else {
+                    return Err("Not a valid RTF document.".to_owned());
+                };
+                state = parent;
+            }
+            b'\\' => {
+                let Some(&next) = bytes.get(i) else {
+                    break;
+                };
+                if next == b'\'' {
+                    let Some(hex) = bytes.get(i + 1..i + 3).and_then(|s| std::str::from_utf8(s).ok()) else {
+                        return Err("Not a valid RTF document.".to_owned());
+                    };
+                    let Ok(byte) = u8::from_str_radix(hex, 16) else {
+                        return Err("Not a valid RTF document.".to_owned());
+                    };
+                    i += 3;
+                    if fallback > 0 {
+                        fallback -= 1;
+                    } else if !state.is_hidden() {
+                        pending_high_surrogate = None;
+                        encoded.push(byte);
                     }
+                    continue;
                 }
-            }
-            '}' => {
-                if skip_depth == depth {
-                    skip_depth = 0;
+                flush_encoded(&mut encoded, state, &fonts, &mut current);
+                if matches!(next, b'\\' | b'{' | b'}') {
+                    i += 1;
+                    if fallback > 0 {
+                        fallback -= 1;
+                    } else if !state.is_hidden() {
+                        pending_high_surrogate = None;
+                        current.push(next as char);
+                    }
+                    continue;
                 }
-                depth = depth.saturating_sub(1);
-            }
-            '\\' if skip_depth == 0 => {
-                if let Some(&next) = chars.peek() {
-                    if matches!(next, '\\' | '{' | '}') {
-                        current.push(chars.next().unwrap());
-                    } else if next == '\'' {
-                        chars.next();
-                        let h1 = chars.next();
-                        let h2 = chars.next();
-                        if let (Some(a), Some(b)) = (h1, h2) {
-                            let hex = format!("{a}{b}");
-                            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                current.push(byte as char);
+                if next == b'*' {
+                    state.skip = true;
+                    i += 1;
+                    continue;
+                }
+                if next.is_ascii_alphabetic() {
+                    let word_start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    let word = std::str::from_utf8(&bytes[word_start..i]).unwrap_or("");
+                    let arg = if i < bytes.len() && (bytes[i] == b'-' || bytes[i].is_ascii_digit()) {
+                        let arg_start = i;
+                        if bytes[i] == b'-' {
+                            i += 1;
+                        }
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        std::str::from_utf8(&bytes[arg_start..i])
+                            .ok()
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    };
+                    if i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    if word == "bin" {
+                        if arg < 0 || (arg as usize) > bytes.len().saturating_sub(i) {
+                            return Err("Not a valid RTF document.".to_owned());
+                        }
+                        i += arg as usize;
+                    }
+                    if fallback > 0 {
+                        fallback -= 1;
+                        continue;
+                    }
+                    match word {
+                        "fonttbl" => {
+                            state.font_table = true;
+                            state.skip = true;
+                        }
+                        "deff" => {
+                            default_font = arg;
+                            state.font = arg;
+                        }
+                        "f" => state.font = arg,
+                        "fcharset" if state.font_table => {
+                            let enc = match arg {
+                                0 | 1 => Some(state.encoding),
+                                77 => Some(RtfEncoding::MacRoman),
+                                _ => None,
+                            };
+                            if let Some(enc) = enc {
+                                fonts.insert(state.font, enc);
                             }
                         }
-                    } else if next.is_ascii_alphabetic() {
-                        let mut word = String::new();
-                        while let Some(&c) = chars.peek() {
-                            if c.is_ascii_alphabetic() {
-                                word.push(chars.next().unwrap());
+                        w if is_rtf_skipped_destination(w) => state.skip = true,
+                        "mac" => state.encoding = RtfEncoding::MacRoman,
+                        "ansicpg" => {
+                            state.encoding = match arg {
+                                10000 => RtfEncoding::MacRoman,
+                                65001 => RtfEncoding::Utf8,
+                                _ => RtfEncoding::Windows1252,
+                            };
+                        }
+                        "deleted" => state.deleted = arg != 0,
+                        "v" => state.hidden_text = arg != 0,
+                        "plain" => {
+                            state.deleted = false;
+                            state.hidden_text = false;
+                            state.font = default_font;
+                        }
+                        "uc" => state.uc = arg.clamp(0, 10) as usize,
+                        "u" => {
+                            let code = if arg < 0 {
+                                (arg + 65536) as u32
                             } else {
-                                break;
-                            }
-                        }
-                        while let Some(&c) = chars.peek() {
-                            if c.is_ascii_digit() || c == '-' {
-                                chars.next();
+                                arg as u32
+                            };
+                            if code == 0x2028 {
+                                pending_high_surrogate = None;
+                                if !state.is_hidden() {
+                                    push_paragraph(&mut blocks, &mut current, &mut truncated);
+                                }
+                            } else if (0xD800..=0xDBFF).contains(&code) {
+                                pending_high_surrogate = Some(code as u16);
+                            } else if (0xDC00..=0xDFFF).contains(&code)
+                                && let Some(hi) = pending_high_surrogate.take()
+                            {
+                                let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + (code - 0xDC00);
+                                if !state.is_hidden()
+                                    && let Some(ch) = char::from_u32(cp)
+                                {
+                                    current.push(ch);
+                                }
                             } else {
-                                break;
+                                pending_high_surrogate = None;
+                                if !state.is_hidden()
+                                    && let Some(ch) = char::from_u32(code)
+                                {
+                                    current.push(ch);
+                                }
                             }
+                            fallback = state.uc;
                         }
-                        if chars.peek() == Some(&' ') {
-                            chars.next();
+                        "page" | "par" | "line" if !state.is_hidden() => {
+                            pending_high_surrogate = None;
+                            push_paragraph(&mut blocks, &mut current, &mut truncated);
                         }
-                        if matches!(word.as_str(), "par" | "line") {
-                            let trimmed = current.trim().to_owned();
-                            if !trimmed.is_empty() {
-                                blocks.push(DocumentBlock::Paragraph(trimmed));
-                            }
-                            current.clear();
-                        } else if word == "tab" {
+                        "row" if !state.skip => {
+                            pending_high_surrogate = None;
+                            push_paragraph(&mut blocks, &mut current, &mut truncated);
+                        }
+                        "cell" if !state.skip => {
+                            pending_high_surrogate = None;
                             current.push('\t');
                         }
-                    } else {
-                        chars.next();
+                        "sect" | "column" if !state.is_hidden() => {
+                            pending_high_surrogate = None;
+                            if !current.trim().is_empty() {
+                                push_paragraph(&mut blocks, &mut current, &mut truncated);
+                            }
+                        }
+                        other => {
+                            if let Some(ch) = rtf_special_char(other)
+                                && !state.is_hidden()
+                            {
+                                pending_high_surrogate = None;
+                                current.push_str(ch);
+                            }
+                        }
+                    }
+                } else {
+                    i += 1;
+                    let symbol = match next {
+                        b'~' => Some('\u{00A0}'),
+                        b'_' => Some('\u{2011}'),
+                        b'-' => Some('\u{00AD}'),
+                        _ => None,
+                    };
+                    if fallback > 0 {
+                        fallback -= 1;
+                    } else if let Some(ch) = symbol {
+                        if !state.is_hidden() {
+                            pending_high_surrogate = None;
+                            current.push(ch);
+                        }
+                    } else if matches!(next, b'\n' | b'\r') && !state.is_hidden() {
+                        if next == b'\r' && bytes.get(i) == Some(&b'\n') {
+                            i += 1;
+                        }
+                        pending_high_surrogate = None;
+                        push_paragraph(&mut blocks, &mut current, &mut truncated);
                     }
                 }
             }
-            '\r' | '\n' => {}
-            other if skip_depth == 0 => current.push(other),
-            _ => {}
+            b'\r' | b'\n' => {}
+            other => {
+                if fallback > 0 {
+                    fallback -= 1;
+                } else if !state.is_hidden() {
+                    pending_high_surrogate = None;
+                    encoded.push(other);
+                }
+            }
+        }
+        if truncated {
+            break;
         }
     }
-    let trimmed = current.trim().to_owned();
-    if !trimmed.is_empty() {
-        blocks.push(DocumentBlock::Paragraph(trimmed));
+    if !truncated && !stack.is_empty() {
+        return Err("Not a valid RTF document.".to_owned());
     }
+    flush_encoded(&mut encoded, state, &fonts, &mut current);
+    push_paragraph(&mut blocks, &mut current, &mut truncated);
     Ok(OfficeDocument {
         chapters: vec![DocumentChapter { title: None, blocks }],
-        truncated: false,
+        truncated,
     })
 }
 
@@ -1158,9 +1637,10 @@ fn parse_pptx(bytes: &[u8]) -> Result<OfficePresentation, String> {
 fn parse_odp(bytes: &[u8]) -> Result<OfficePresentation, String> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|_| "Could not open this presentation archive.".to_owned())?;
-    let Some(xml) = read_zip_text(&mut archive, "content.xml")? else {
+    let Some(raw_xml) = read_zip_text(&mut archive, "content.xml")? else {
         return Err("This presentation has no content.xml.".to_owned());
     };
+    let xml = strip_odf_skipped_elements(&raw_xml);
     let mut slides = Vec::new();
     let mut truncated = false;
     let mut cursor = 0;

@@ -859,3 +859,164 @@ fn office_parsers_and_spreadsheet_row_col_resize_match_web() {
     };
     assert_eq!(rtf.chapters[0].blocks, vec![DocumentBlock::Paragraph("Hello".into()), DocumentBlock::Paragraph("World".into())]);
 }
+
+#[test]
+fn workspace_asset_revision_and_pdf_link_helpers() {
+    let asset = decode_workspace_asset(&json!({
+        "relativeUrl": "/api/assets/signed?token=1",
+        "fileRevision": "  rev-42  ",
+        "expiresAt": 12345.0,
+    }))
+    .unwrap();
+    assert_eq!(asset.relative_url, "/api/assets/signed?token=1");
+    assert_eq!(asset.file_revision.as_deref(), Some("rev-42"));
+    assert_eq!(
+        workspace_asset_fetch_url(&asset, Some("mut-99")),
+        "/api/assets/signed?token=1&file-revision=rev-42"
+    );
+
+    let legacy = decode_workspace_asset(&json!({ "relativeUrl": "/api/assets/signed" })).unwrap();
+    assert_eq!(legacy.file_revision, None);
+    assert_eq!(
+        workspace_asset_fetch_url(&legacy, Some("mut-99")),
+        "/api/assets/signed?workspace-revision=mut-99"
+    );
+    assert_eq!(workspace_asset_fetch_url(&legacy, None), "/api/assets/signed");
+
+    // `#40507`: PDF link URL validation and normalized bounding boxes across all page rotations.
+    assert!(pdf::is_safe_pdf_external_url("HTTPS://example.com/docs"));
+    assert!(pdf::is_safe_pdf_external_url("  http://localhost:3000/a "));
+    assert!(!pdf::is_safe_pdf_external_url("javascript:alert(1)"));
+    assert!(!pdf::is_safe_pdf_external_url("file:///etc/passwd"));
+    assert!(!pdf::is_safe_pdf_external_url("mailto:test@example.com"));
+
+    let box_0 = pdf::pdf_rect_to_normalized_box([61.2, 633.6, 183.6, 712.8], [0.0, 0.0, 612.0, 792.0], 0).unwrap();
+    assert!((box_0[0] - 0.1).abs() < 1e-4 && (box_0[1] - 0.1).abs() < 1e-4);
+    assert!((box_0[2] - 0.2).abs() < 1e-4 && (box_0[3] - 0.1).abs() < 1e-4);
+
+    let box_90 = pdf::pdf_rect_to_normalized_box([0.0, 0.0, 100.0, 200.0], [0.0, 0.0, 1000.0, 1000.0], 90).unwrap();
+    assert_eq!(box_90, [0.0, 0.0, 0.2, 0.1]);
+    let box_180 = pdf::pdf_rect_to_normalized_box([0.0, 0.0, 100.0, 200.0], [0.0, 0.0, 1000.0, 1000.0], 180).unwrap();
+    assert!((box_180[0] - 0.9).abs() < 1e-4 && box_180[1].abs() < 1e-4);
+    let box_270 = pdf::pdf_rect_to_normalized_box([-50.0, 0.0, 100.0, 200.0], [0.0, 0.0, 1000.0, 1000.0], 270).unwrap();
+    assert!((box_270[0] - 0.8).abs() < 1e-4 && (box_270[1] - 0.9).abs() < 1e-4 && (box_270[3] - 0.1).abs() < 1e-4);
+    assert_eq!(pdf::pdf_rect_to_normalized_box([0.0, 0.0, 10.0, 10.0], [0.0, 0.0, 0.0, 100.0], 0), None);
+}
+
+#[test]
+fn odt_rtf_and_sheet_tab_navigation_match_upstream() {
+    use std::io::Write;
+    use super::office::*;
+
+    let make_zip = |files: &[(&str, &str)]| -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in files {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    };
+
+    // `#40509`: ODT skips index/TOC/bibliography sources, scripts, and embedded objects while
+    // preserving index body and normal headings/paragraphs.
+    let odt = make_zip(&[(
+        "content.xml",
+        concat!(
+            "<office:document-content><office:scripts><text:p>SCRIPT</text:p></office:scripts>",
+            "<office:body><office:text>",
+            "<text:table-of-content>",
+            "<text:table-of-content-source><text:index-title-template>TOC</text:index-title-template><text:p>Skipped source</text:p></text:table-of-content-source>",
+            "<text:index-body><text:p>1. Intro</text:p></text:index-body>",
+            "</text:table-of-content>",
+            "<text:bibliography-source><text:p>Bib field</text:p></text:bibliography-source>",
+            "<text:illustration-index-source><text:p>Illus</text:p></text:illustration-index-source>",
+            "<draw:object><text:p>Formula</text:p></draw:object>",
+            "<text:h text:outline-level=\"1\">Title</text:h>",
+            "<text:p>Hello<text:s text:c=\"2\"/>world<text:tab/>next</text:p>",
+            "</office:text></office:body></office:document-content>",
+        ),
+    )]);
+    let OfficePreview::Document(odt_doc) = parse_office_preview(OfficeKind::Odt, &odt).unwrap() else {
+        panic!("expected odt document");
+    };
+    assert_eq!(
+        odt_doc.chapters[0].blocks,
+        vec![
+            DocumentBlock::Paragraph("1. Intro".into()),
+            DocumentBlock::Heading { level: 1, text: "Title".into() },
+            DocumentBlock::Paragraph("Hello  world\tnext".into()),
+        ]
+    );
+
+    // `#39846`: Mac Roman via `\mac`, `\ansicpg10000`, and `\fcharset77`.
+    let OfficePreview::Document(mac) =
+        parse_office_preview(OfficeKind::Rtf, br"{\rtf1\mac\deff0 Caf\'8e \'d2Hi\'d3\'d1\'db}").unwrap()
+    else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(mac.chapters[0].blocks, vec![DocumentBlock::Paragraph("Café “Hi”—€".into())]);
+
+    let OfficePreview::Document(mac_cpg) = parse_office_preview(
+        OfficeKind::Rtf,
+        br"{\rtf1\ansi\ansicpg10000{\fonttbl{\f0\fnil\fcharset77 Helvetica;}}\f0 \'8e\'d4s\'d5}",
+    )
+    .unwrap()
+    else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(mac_cpg.chapters[0].blocks, vec![DocumentBlock::Paragraph("é‘s’".into())]);
+
+    // `#40264` & `#40783`: `\deleted`, `\v`, group restore, `*0` toggle off, and `\plain` reset.
+    let OfficePreview::Document(rev) = parse_office_preview(
+        OfficeKind::Rtf,
+        br"{\rtf1\ansi Keep{\deleted drop} \deleted gone\deleted0 back \v hidden\plain shown}",
+    )
+    .unwrap()
+    else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(rev.chapters[0].blocks, vec![DocumentBlock::Paragraph("Keep back shown".into())]);
+
+    // `#40437`: `\sect` & `\column` break paragraphs without duplicating `\par\sect`.
+    let OfficePreview::Document(sects) =
+        parse_office_preview(OfficeKind::Rtf, br"{\rtf1\ansi One\sect Two\column Three\par\sect Four}").unwrap()
+    else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(
+        sects.chapters[0].blocks,
+        vec![
+            DocumentBlock::Paragraph("One".into()),
+            DocumentBlock::Paragraph("Two".into()),
+            DocumentBlock::Paragraph("Three".into()),
+            DocumentBlock::Paragraph("Four".into()),
+        ]
+    );
+
+    // `#40468`: `\uN`, `\ucN` fallback skipping, UTF-16 surrogates, and TextEdit `\u8232` line break.
+    let OfficePreview::Document(unicode) = parse_office_preview(
+        OfficeKind::Rtf,
+        br"{\rtf1\ansi\uc1 Line\u8232\'e2Hi \u-10179?\u-8704? \uc2\u233\'65\'78 end}",
+    )
+    .unwrap()
+    else {
+        panic!("expected rtf document");
+    };
+    assert_eq!(
+        unicode.chapters[0].blocks,
+        vec![DocumentBlock::Paragraph("Line".into()), DocumentBlock::Paragraph("Hi 😀 é end".into())]
+    );
+
+    // `#41008`: Workbook sheet tab Left/Right/Home/End navigation.
+    assert_eq!(next_sheet_tab_index(0, 3, "left"), Some(2));
+    assert_eq!(next_sheet_tab_index(2, 3, "right"), Some(0));
+    assert_eq!(next_sheet_tab_index(1, 3, "home"), Some(0));
+    assert_eq!(next_sheet_tab_index(1, 3, "end"), Some(2));
+    assert_eq!(next_sheet_tab_index(0, 3, "up"), None);
+    assert_eq!(next_sheet_tab_index(0, 0, "right"), None);
+}

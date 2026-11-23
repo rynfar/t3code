@@ -1,12 +1,14 @@
 //! The changed-files tree beside the code view (`components/diffs/DiffFileTree.tsx` in Pierre's
 //! compact density): selecting a file reveals it in the list. Rows are a `uniform_list`.
 
-use gpui::{AnyElement, Context, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px, relative, uniform_list};
+use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, canvas, div, prelude::*, px, relative, uniform_list};
 use gpui_component::{h_flex, v_flex};
 use t3_core::diff::{ChangeKind, FileViewedState, TreeRowKind};
 
 use super::DiffPanel;
+use crate::files::is_label_clipped;
 use crate::icons::Icon;
+use crate::right_panel::tooltip_view;
 use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 24.;
@@ -15,6 +17,7 @@ pub fn render(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> impl IntoEl
     let p = palette(cx);
     let count = panel.view.as_ref().map_or(0, |view| view.parsed.files().len());
     let rows = panel.view.as_ref().map_or(0, |view| view.tree.len());
+    let tree_width = panel.tree_width.clone();
     v_flex()
         .flex_none()
         .w(relative(0.4))
@@ -32,20 +35,31 @@ pub fn render(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> impl IntoEl
                 .gap(px(4.))
                 .text_xs()
                 .text_color(hsla(p.muted_foreground))
-                .child(div().px(px(4.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Files")))
+                .child(div().px(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Files")))
                 .child(div().ml_auto().child(count.to_string())),
         )
         .child(
-            uniform_list("diff-file-tree", rows, cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                range.map(|ix| this.render_tree_row(ix, cx)).collect::<Vec<_>>()
-            }))
-            .flex_1()
-            .track_scroll(&panel.tree_scroll),
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    uniform_list("diff-file-tree", rows, cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        range.map(|ix| this.render_tree_row(ix, window, cx)).collect::<Vec<_>>()
+                    }))
+                    .size_full()
+                    .track_scroll(&panel.tree_scroll),
+                )
+                .child(
+                    canvas(move |bounds, _, _| tree_width.set(f32::from(bounds.size.width)), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                ),
         )
 }
 
 impl DiffPanel {
-    fn render_tree_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_tree_row(&self, ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.view.as_ref().and_then(|view| view.tree.get(ix)) else { return div().into_any_element() };
         let p = palette(cx);
         let base = h_flex()
@@ -60,10 +74,18 @@ impl DiffPanel {
             .cursor_pointer()
             .hover(|style| style.bg(hsla(p.foreground).opacity(0.07)));
         let label: SharedString = row.label.clone().into();
+        let tree_width = self.tree_width.get();
+        let row_inset = 8. + (8. + 12. * row.depth as f32) + 8.;
         match &row.kind {
             TreeRowKind::Directory { path, expanded } => {
                 let path = path.clone();
+                let available = tree_width - (row_inset + 12. + 4.);
+                let clipped = is_label_clipped(&row.label, available, px(12.), FontWeight::NORMAL, window);
                 base.text_color(hsla(p.muted_foreground))
+                    .when(clipped, |this| {
+                        let tip = label.clone();
+                        this.tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_directory(&path, cx)))
                     .child(
                         (if *expanded { Icon::ChevronDown } else { Icon::ChevronRight })
@@ -99,9 +121,21 @@ impl DiffPanel {
                     ChangeKind::RenamePure | ChangeKind::RenameChanged => ("R", p.diff_modified_icon),
                     ChangeKind::Modified => ("M", p.diff_modified_icon),
                 };
+                let review_extra = if open_review_count > 0 { 24. } else { 0. };
+                let viewed_extra = match viewed_state {
+                    Some(FileViewedState::Viewed) => 15.,
+                    Some(FileViewedState::Stale) => 10.,
+                    _ => 0.,
+                };
+                let non_label = row_inset + 12. + 4. + 4. + 12. + review_extra + viewed_extra;
+                let clipped = is_label_clipped(&row.label, tree_width - non_label, px(12.), FontWeight::NORMAL, window);
                 let alpha = if viewed_state == Some(FileViewedState::Viewed) { 0.55 } else { 0.85 };
                 base.text_color(hsla(p.foreground).opacity(alpha))
                     .when(selected, |this| this.bg(hsla(p.foreground).opacity(0.12)))
+                    .when(clipped, |this| {
+                        let tip = label.clone();
+                        this.tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.reveal_file(file, cx)))
                     .child(file_path.map_or(Icon::File, crate::files::file_icon)
                         .render(px(12.), hsla(p.icon_muted).opacity(alpha)))

@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, App, ImageFormat, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, div, img, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
-use t3_core::files::{CREATE_ASSET_URL, ImageKind, absolute_path, decode_asset_url, image_asset_request};
+use t3_core::files::{ImageKind, absolute_path, image_asset_request};
 
 use super::Root;
+use super::preview::{AssetFetchOutcome, KnownAsset, load_workspace_asset};
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
 
@@ -46,18 +47,19 @@ impl From<Result<Decoded, String>> for ImageState {
 }
 
 /// Mints the URL and downloads the bytes on the network runtime.
-pub fn load(state: &AppState, root: &Root, path: &str, kind: ImageKind, mutation: Option<&str>) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
-    let client = state.client_handle()?;
+pub(super) fn load(
+    state: &AppState,
+    root: &Root,
+    path: &str,
+    kind: ImageKind,
+    mutation: Option<&str>,
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
+    if kind == ImageKind::Unsupported {
+        return Some(state.runtime().spawn(async move { Err(UNSUPPORTED.to_owned()) }));
+    }
     let request = image_asset_request(&root.workspace.thread_id, &root.workspace.cwd, &absolute_path(path, &root.workspace.cwd));
-    let mutation = mutation.map(str::to_owned);
-    Some(state.runtime().spawn(async move {
-        if kind == ImageKind::Unsupported {
-            return Err(UNSUPPORTED.to_owned());
-        }
-        let value = client.request(CREATE_ASSET_URL, request).await.map_err(|_| UNSUPPORTED.to_owned())?;
-        let url = decode_asset_url(&value)?;
-        client.asset_bytes(&format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())), MAX_IMAGE_BYTES).await
-    }))
+    load_workspace_asset(state, request, MAX_IMAGE_BYTES, known, mutation, UNSUPPORTED)
 }
 
 /// Runs on the background executor.

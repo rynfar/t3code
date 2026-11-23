@@ -3,7 +3,9 @@
 //! `projects.searchEntries` results (`useProjectPathSearch`, debounced 200ms), refresh of what
 //! was listed, reveal of the open file, and the keyboard model of Pierre's tree.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -69,10 +71,13 @@ pub struct Explorer {
     tree_selection: Option<String>,
     handled_reveal: Option<(String, u64)>,
     pending_scroll: Option<String>,
+    /// Keeps an externally revealed item centered while restored parent folders continue loading (`pingdotgg/t3code#39470`).
+    followed_reveal: Option<String>,
     expanded_folder: Option<String>,
     /// A reveal closed the search; the field clears on the next render, which has the window.
     pub(super) pending_reset_input: bool,
     pub(super) scroll: UniformListScrollHandle,
+    pub(super) tree_width: Rc<Cell<f32>>,
     pub(super) focus: FocusHandle,
     /// Whether the tree had focus at the last render: the cursor row shows only then.
     pub(super) tree_focused: bool,
@@ -113,9 +118,11 @@ impl Explorer {
             tree_selection: None,
             handled_reveal: None,
             pending_scroll: None,
+            followed_reveal: None,
             expanded_folder: None,
             pending_reset_input: false,
             scroll: UniformListScrollHandle::new(),
+            tree_width: Rc::new(Cell::new(0.0)),
             focus: cx.focus_handle().tab_stop(true),
             tree_focused: false,
             drag_mention: DragMentionController::default(),
@@ -153,6 +160,8 @@ impl Explorer {
         self.in_flight = 0;
         self.search = Search { query: self.search.query.clone(), ..Search::default() };
         self.handled_reveal = None;
+        self.pending_scroll = None;
+        self.followed_reveal = None;
         self.expanded_folder = None;
         self.cursor = None;
         self.mark_dirty();
@@ -186,7 +195,15 @@ impl Explorer {
         {
             self.pending_scroll = None;
             self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+        } else if let Some(path) = self.followed_reveal.as_deref()
+            && let Some(index) = self.rows.iter().position(|row| row.path == path)
+        {
+            self.scroll.scroll_to_item(index, ScrollStrategy::Center);
         }
+    }
+
+    pub(super) fn stop_following_reveal(&mut self) {
+        self.followed_reveal = None;
     }
 
     fn load(&mut self, directory: String, refresh: bool, cx: &mut Context<Self>) {
@@ -280,6 +297,7 @@ impl Explorer {
         if query == self.search.query {
             return;
         }
+        self.stop_following_reveal();
         self.search.query = query;
         self.mark_dirty();
         if self.search.query.trim().is_empty() {
@@ -337,6 +355,8 @@ impl Explorer {
         self.selected = path.clone();
         let Some(path) = path else {
             self.handled_reveal = None;
+            self.pending_scroll = None;
+            self.followed_reveal = None;
             if changed {
                 cx.notify();
             }
@@ -356,7 +376,10 @@ impl Explorer {
                 self.search = Search::default();
                 self.pending_reset_input = true;
             }
-            self.pending_scroll = Some(path);
+            self.pending_scroll = Some(path.clone());
+            self.followed_reveal = Some(path);
+        } else {
+            self.followed_reveal = None;
         }
         self.mark_dirty();
         cx.notify();
@@ -396,6 +419,7 @@ impl Explorer {
     /// When `focus_content` is true (unmodified click/Enter on a file), notifies `FilesPanel` to
     /// move focus into the opened file's editor/preview (`pingdotgg/t3code#34360`).
     pub(super) fn activate_row(&mut self, index: usize, focus_content: bool, cx: &mut Context<Self>) {
+        self.stop_following_reveal();
         let Some(row) = self.rows.get(index).cloned() else { return };
         self.cursor = Some(row.path.clone());
         match row.kind {
@@ -423,6 +447,7 @@ impl Explorer {
     }
 
     fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
+        self.stop_following_reveal();
         if self.rows.is_empty() {
             return;
         }
@@ -461,6 +486,7 @@ impl Explorer {
 
     /// Left: closes an open folder, or steps out to the parent.
     pub(super) fn collapse_selected(&mut self, _: &CollapseSelected, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_following_reveal();
         let Some(index) = self.row_index(self.cursor.as_deref()) else { return };
         let row = self.rows[index].clone();
         if row.kind == EntryKind::Directory && row.expanded && self.search.query.trim().is_empty() {
@@ -484,14 +510,78 @@ impl Explorer {
 
     /// Expand all opens every non-ignored folder, listing as it goes; collapse all closes all.
     pub(super) fn toggle_all(&mut self, cx: &mut Context<Self>) {
+        self.stop_following_reveal();
         if self.tree.expanding_all() || self.tree.all_expanded() {
             self.tree.collapse_all();
         } else {
-            for directory in self.tree.expand_all() {
+        for directory in self.tree.expand_all() {
                 self.load(directory, false, cx);
             }
         }
         self.mark_dirty();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn external_reveal_keeps_target_followed_until_stopped(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (explorer, vcx) = cx.add_window_view(|window, cx| Explorer::new(state.clone(), window, cx));
+
+        explorer.update(vcx, |explorer, cx| {
+            let root_gen = explorer.tree.begin_load("", true).unwrap();
+            explorer.tree.finish_load(
+                "",
+                root_gen,
+                vec![
+                    Entry { path: "a".into(), kind: EntryKind::Directory, ignored: false },
+                    Entry { path: "z".into(), kind: EntryKind::Directory, ignored: false },
+                ],
+            );
+            let z_gen = explorer.tree.begin_load("z", true).unwrap();
+            explorer.tree.finish_load(
+                "z",
+                z_gen,
+                vec![Entry { path: "z/target.rs".into(), kind: EntryKind::File, ignored: false }],
+            );
+            explorer.set_selected(Some("z/target.rs".into()), 1, cx);
+            assert_eq!(explorer.followed_reveal.as_deref(), Some("z/target.rs"));
+            assert_eq!(explorer.pending_scroll.as_deref(), Some("z/target.rs"));
+
+            explorer.sync_rows();
+            assert_eq!(explorer.pending_scroll, None);
+            assert_eq!(explorer.followed_reveal.as_deref(), Some("z/target.rs"));
+            let before_idx = explorer.row_index(Some("z/target.rs")).unwrap();
+
+            // Simulate restored expanded directory `"a"` finishing async load above the revealed item.
+            let a_gen = explorer.tree.begin_load("a", true).unwrap();
+            let _ = explorer.tree.expand("a");
+            explorer.tree.finish_load(
+                "a",
+                a_gen,
+                vec![
+                    Entry { path: "a/one.rs".into(), kind: EntryKind::File, ignored: false },
+                    Entry { path: "a/two.rs".into(), kind: EntryKind::File, ignored: false },
+                ],
+            );
+            explorer.mark_dirty();
+            explorer.sync_rows();
+            let after_idx = explorer.row_index(Some("z/target.rs")).unwrap();
+            assert!(after_idx > before_idx);
+            assert_eq!(explorer.followed_reveal.as_deref(), Some("z/target.rs"));
+
+            explorer.stop_following_reveal();
+            assert_eq!(explorer.followed_reveal, None);
+        });
     }
 }

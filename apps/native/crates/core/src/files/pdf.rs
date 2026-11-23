@@ -14,6 +14,61 @@ pub const PDF_MAX_FIND_TEXT: usize = 4 * 1024 * 1024;
 pub const PDF_MAX_BYTES: usize = 50 * 1024 * 1024;
 pub const PDF_MAX_POSITIONS: usize = 50;
 
+/// Link destination inside a PDF page (`PdfViewer.tsx::PdfLink`, `pingdotgg/t3code#40507`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdfLinkTarget {
+    External(String),
+    Page(usize),
+}
+
+/// Clickable link annotation rectangle in `[0..=1]` top-left normalized page coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfPageLink {
+    pub box_norm: [f32; 4],
+    pub target: PdfLinkTarget,
+}
+
+/// Only external `http(s)://` URLs are clickable in the PDF overlay (`pingdotgg/t3code#40507`).
+pub fn is_safe_pdf_external_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || trimmed
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+/// Converts a PDF page-space rectangle `[x1, y1, x2, y2]` relative to `crop_box`
+/// `[origin_x, origin_y, width, height]` and page `rotation` into top-left normalized
+/// `[left, top, width, height]` coordinates in `0.0..=1.0`.
+pub fn pdf_rect_to_normalized_box(rect: [f32; 4], crop_box: [f32; 4], rotation: i32) -> Option<[f32; 4]> {
+    let [bx, by, bw, bh] = crop_box;
+    if !bw.is_finite() || !bh.is_finite() || bw <= 0.0 || bh <= 0.0 {
+        return None;
+    }
+    let rot = rotation.rem_euclid(360);
+    let convert = |x: f32, y: f32| -> (f32, f32) {
+        let nx = (x - bx) / bw;
+        let ny = (y - by) / bh;
+        match rot {
+            90 => (ny, nx),
+            180 => (1.0 - nx, ny),
+            270 => (1.0 - ny, 1.0 - nx),
+            _ => (nx, 1.0 - ny),
+        }
+    };
+    let (vx1, vy1) = convert(rect[0], rect[1]);
+    let (vx2, vy2) = convert(rect[2], rect[3]);
+    let left = vx1.min(vx2).clamp(0.0, 1.0);
+    let top = vy1.min(vy2).clamp(0.0, 1.0);
+    let right = vx1.max(vx2).clamp(0.0, 1.0);
+    let bottom = vy1.max(vy2).clamp(0.0, 1.0);
+    let width = right - left;
+    let height = bottom - top;
+    (width > 0.0 && height > 0.0).then_some([left, top, width, height])
+}
+
 /// Saved viewport position for one PDF document (`PdfViewState` + measured ratios).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PdfViewState {

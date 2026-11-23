@@ -146,6 +146,19 @@ pub fn add_browser_surface(state: &mut AppState, cx: &mut Context<AppState>) {
     });
 }
 
+/// Duplicates an existing browser tab next to the source tab (`pingdotgg/t3code#29681`).
+pub fn duplicate_browser_surface(state: &mut AppState, tab_id: String, cx: &mut Context<AppState>) {
+    let Some(thread_id) = state.panel_thread() else { return };
+    if AppState::is_utility_panel_key(&thread_id) {
+        return;
+    }
+    cx.defer(move |cx| {
+        if let Some(previews) = previews(cx) {
+            previews.update(cx, |previews, cx| previews.duplicate_session(thread_id, tab_id, cx));
+        }
+    });
+}
+
 /// `preview.toggle` (`togglePreviewPanel`): hides a showing browser, else shows the active
 /// session's tab or starts one.
 pub fn toggle_preview(state: &mut AppState, cx: &mut Context<AppState>) {
@@ -553,6 +566,23 @@ impl Previews {
         self.open_session_with(thread_id, OpenPreviewOverrides { url: Some(url), ..Default::default() }, true, cx);
     }
 
+    pub fn duplicate_session(&mut self, thread_id: String, source_tab_id: String, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.session(&thread_id, &source_tab_id).cloned() else {
+            return;
+        };
+        let overrides = OpenPreviewOverrides {
+            url: snapshot.nav_status.url().map(str::to_owned),
+            viewport: snapshot.viewport.as_ref().map(ViewportSetting::from_value),
+            profile_id: snapshot.profile_id.clone(),
+            zoom_factor: snapshot.zoom_factor,
+            color_scheme: snapshot
+                .color_scheme
+                .as_deref()
+                .and_then(t3_core::preview::viewport::AppearancePreference::parse),
+        };
+        self.open_session_inner(thread_id, overrides, false, Some(source_tab_id), cx);
+    }
+
     /// Opens a server browser tab with default zoom, appearance, viewport, and profile
     /// (`pingdotgg/t3code#34943` & `pingdotgg/t3code#25874`), honoring explicit `overrides` (e.g.
     /// when reopening a closed tab).
@@ -561,6 +591,17 @@ impl Previews {
         thread_id: String,
         overrides: OpenPreviewOverrides,
         external_fallback: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_session_inner(thread_id, overrides, external_fallback, None, cx);
+    }
+
+    fn open_session_inner(
+        &mut self,
+        thread_id: String,
+        overrides: OpenPreviewOverrides,
+        external_fallback: bool,
+        insert_after_tab: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if AppState::is_utility_panel_key(&thread_id) {
@@ -606,7 +647,23 @@ impl Previews {
                             this.save_history();
                         }
                         cx.emit(PreviewsEvent::Thread(thread_id.clone()));
-                        this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab] }), cx);
+                        this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab.clone()] }), cx);
+                        if let Some(after_tab) = insert_after_tab.as_deref() {
+                            this.state.update(cx, |state, cx| {
+                                state.mutate_panels(cx, |panels, thread| {
+                                    if thread != thread_id {
+                                        return false;
+                                    }
+                                    let surfaces = &panels.panels.panel(thread).surfaces;
+                                    let source_idx = surfaces.iter().position(|s| s.preview_tab() == Some(after_tab));
+                                    let dup_id = surfaces.iter().find(|s| s.preview_tab() == Some(tab.as_str())).map(|s| s.id.clone());
+                                    match (source_idx, dup_id) {
+                                        (Some(idx), Some(dup_id)) => panels.panels.move_surface(thread, &dup_id, idx + 1),
+                                        _ => false,
+                                    }
+                                });
+                            });
+                        }
                     }
                     Err(error) => {
                         if external_fallback && let Some(url) = &url {

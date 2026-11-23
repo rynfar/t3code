@@ -118,6 +118,29 @@ pub(crate) struct ActiveRewind {
     pub _timeout: Option<Task<()>>,
 }
 
+/// Snapshot of user navigation state used to avoid clobbering newer navigation after async RPCs
+/// such as `reopen_browser` settle (`pingdotgg/t3code#40516`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigationSnapshot {
+    pub(crate) connection: u64,
+    pub(crate) selected_thread: Option<String>,
+    pub(crate) draft_route: Option<DraftRef>,
+    pub(crate) pull_requests_open: bool,
+    pub(crate) issues_open: bool,
+}
+
+impl AppState {
+    pub(crate) fn navigation_snapshot(&self) -> NavigationSnapshot {
+        NavigationSnapshot {
+            connection: self.connection,
+            selected_thread: self.selected_thread.clone(),
+            draft_route: self.draft_route.clone(),
+            pull_requests_open: self.pull_requests_open,
+            issues_open: self.issues_open,
+        }
+    }
+}
+
 pub(crate) enum ThreadRewindPhase {
     Preparing { generation: u64 },
     Active(Box<ActiveRewind>),

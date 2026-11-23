@@ -429,21 +429,27 @@ impl Session {
                             Some(Err(error)) => break describe_ws_error(error).into(),
                         };
                         last_frame = Instant::now();
-                        task_frames.fetch_add(1, Ordering::Release);
-                        task_notify.notify_waiters();
                         let text = match frame_parts.push(text) {
                             Ok(Some(whole)) => whole,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                task_frames.fetch_add(1, Ordering::Release);
+                                task_notify.notify_waiters();
+                                continue;
+                            }
                             Err(error) => break error.into(),
                         };
-                        match decode_server_frame(&text) {
-                            Ok(messages) => {
-                                if let Some(end) = messages.into_iter().find_map(|m| route(m, &task_pending)) {
-                                    break end;
-                                }
+                        let end = match decode_server_frame(&text) {
+                            Ok(messages) => messages.into_iter().find_map(|m| route(m, &task_pending)),
+                            Err(error) => {
+                                tracing::warn!(%error, "undecodable server frame");
+                                None
                             }
-                            Err(error) => tracing::warn!(%error, "undecodable server frame"),
+                        };
+                        if let Some(end) = end {
+                            break end;
                         }
+                        task_frames.fetch_add(1, Ordering::Release);
+                        task_notify.notify_waiters();
                     }
                     outgoing = outbound_rx.recv() => {
                         let Some(message) = outgoing else { break "Session dropped.".into() };
@@ -526,34 +532,78 @@ impl Session {
         timeout: Duration,
         environment_id: Option<String>,
     ) -> ProbeClockOutcome {
+        let before = self.inbound_frames.load(Ordering::Acquire);
+        let started = std::time::Instant::now();
         let requested_at_ms = epoch_now_ms();
         let rpc = self.send_request(t3_core::commands::method::SERVER_PROBE, serde_json::json!({}));
-        let probe_rpc = async {
-            let reply = tokio::time::timeout(timeout, rpc).await.ok()?.ok()?;
-            let received_at_ms = epoch_now_ms();
-            let server_time_ms = reply
-                .get("serverTime")
-                .and_then(Value::as_str)
-                .and_then(t3_core::sidebar::time::parse_iso);
-            if let Some(server_time_ms) = server_time_ms
-                && let Some(env_id) = environment_id.as_deref().filter(|id| !id.is_empty())
-            {
-                t3_core::clock::record_server_clock(
-                    env_id,
-                    Some(server_time_ms),
-                    requested_at_ms,
-                    received_at_ms,
-                );
+        tokio::pin!(rpc);
+
+        let wait_inbound = async {
+            loop {
+                let notified = self.frame_notify.notified();
+                if self.inbound_frames.load(Ordering::Acquire) > before {
+                    return true;
+                }
+                tokio::select! {
+                    _ = notified => {
+                        if self.inbound_frames.load(Ordering::Acquire) > before {
+                            return true;
+                        }
+                    }
+                    _ = self.closed() => return false,
+                }
             }
-            Some(ProbeClockOutcome {
-                alive: true,
-                clock_sample: server_time_ms.map(|st| (st, requested_at_ms, received_at_ms)),
-            })
         };
-        let ping = self.probe(timeout);
-        tokio::select! {
-            Some(outcome) = probe_rpc => outcome,
-            alive = ping => ProbeClockOutcome { alive, clock_sample: None },
+
+        let result = tokio::time::timeout(timeout, async {
+            tokio::select! {
+                biased;
+                reply = &mut rpc => Ok(reply),
+                alive = wait_inbound => Err(alive),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(Ok(reply))) => {
+                let received_at_ms = epoch_now_ms();
+                let server_time_ms = reply
+                    .get("serverTime")
+                    .and_then(Value::as_str)
+                    .and_then(t3_core::sidebar::time::parse_iso);
+                if let Some(server_time_ms) = server_time_ms
+                    && let Some(env_id) = environment_id.as_deref().filter(|id| !id.is_empty())
+                {
+                    t3_core::clock::record_server_clock(
+                        env_id,
+                        Some(server_time_ms),
+                        requested_at_ms,
+                        received_at_ms,
+                    );
+                }
+                ProbeClockOutcome {
+                    alive: true,
+                    clock_sample: server_time_ms.map(|st| (st, requested_at_ms, received_at_ms)),
+                }
+            }
+            Ok(Ok(Err(RpcError::Failure(_)))) => {
+                // Older servers without `server.probe` reject the RPC; fall back to WebSocket ping.
+                let remaining = timeout
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_millis(50));
+                ProbeClockOutcome {
+                    alive: self.probe(remaining).await,
+                    clock_sample: None,
+                }
+            }
+            Ok(Ok(Err(RpcError::Closed))) | Err(_) => ProbeClockOutcome {
+                alive: false,
+                clock_sample: None,
+            },
+            Ok(Err(alive)) => ProbeClockOutcome {
+                alive,
+                clock_sample: None,
+            },
         }
     }
 

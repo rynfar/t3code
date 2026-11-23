@@ -110,14 +110,51 @@ pub fn image_asset_request(thread_id: &str, workspace_root: &str, absolute_path:
     json!({ "resource": { "_tag": tag, "threadId": thread_id, "path": absolute_path } })
 }
 
-/// `AssetCreateUrlResult.relativeUrl`.
-pub fn decode_asset_url(value: &Value) -> Result<String, String> {
-    value
+/// Decoded result of `assets.createUrl` for a workspace or media file (`pingdotgg/t3code#39736`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceAsset {
+    pub relative_url: String,
+    pub file_revision: Option<String>,
+    pub expires_at: f64,
+}
+
+/// Decodes `AssetCreateUrlResult` including optional `fileRevision` and `expiresAt`.
+pub fn decode_workspace_asset(value: &Value) -> Result<WorkspaceAsset, String> {
+    let relative_url = value
         .get("relativeUrl")
         .and_then(Value::as_str)
         .filter(|url| url.starts_with('/'))
         .map(str::to_owned)
-        .ok_or_else(|| "Unable to load workspace image.".to_owned())
+        .ok_or_else(|| "Unable to load workspace image.".to_owned())?;
+    let file_revision = value
+        .get("fileRevision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty() && revision.encode_utf16().count() <= 256)
+        .map(str::to_owned);
+    let expires_at = value.get("expiresAt").and_then(Value::as_f64).unwrap_or_default();
+    Ok(WorkspaceAsset { relative_url, file_revision, expires_at })
+}
+
+/// Formats the fetch URL for a workspace asset, preferring server-reported `fileRevision` so
+/// unchanged files keep their cache identity across agent turns (`pingdotgg/t3code#39736`).
+pub fn workspace_asset_fetch_url(asset: &WorkspaceAsset, mutation: Option<&str>) -> String {
+    if let Some(rev) = asset.file_revision.as_deref() {
+        let encoded: String = url::form_urlencoded::byte_serialize(rev.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
+        let sep = if asset.relative_url.contains('?') { '&' } else { '?' };
+        format!("{}{sep}file-revision={encoded}", asset.relative_url)
+    } else if let Some(mutation) = mutation {
+        format!("{}{}", asset.relative_url, crate::media::workspace_image_suffix(&asset.relative_url, Some(mutation)))
+    } else {
+        asset.relative_url.clone()
+    }
+}
+
+/// `AssetCreateUrlResult.relativeUrl`.
+pub fn decode_asset_url(value: &Value) -> Result<String, String> {
+    decode_workspace_asset(value).map(|asset| asset.relative_url)
 }
 
 fn decode_entry(value: &Value) -> Option<Entry> {

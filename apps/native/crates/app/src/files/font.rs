@@ -14,9 +14,10 @@ use t3_core::files::media_preview::{
     FONT_SPECIMEN_LOWER, FONT_SPECIMEN_PANGRAM, FONT_SPECIMEN_SIZES, FONT_SPECIMEN_SYMBOLS,
     FONT_SPECIMEN_UPPER, FontInfo, MAX_FONT_BYTES, parse_font_info,
 };
-use t3_core::files::{CREATE_ASSET_URL, absolute_path, decode_asset_url, group_thousands, workspace_asset_request};
+use t3_core::files::{absolute_path, group_thousands, workspace_asset_request};
 
 use super::Root;
+use super::preview::{AssetFetchOutcome, KnownAsset, load_workspace_asset};
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
 
@@ -35,32 +36,19 @@ pub enum FontState {
     Failed(String),
 }
 
-pub fn load(
+pub(super) fn load(
     state: &AppState,
     root: &Root,
     path: &str,
     mutation: Option<&str>,
-) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
-    let client = state.client_handle()?;
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
     let request = workspace_asset_request(
         &root.workspace.thread_id,
         &root.workspace.cwd,
         &absolute_path(path, &root.workspace.cwd),
     );
-    let mutation = mutation.map(str::to_owned);
-    Some(state.runtime().spawn(async move {
-        let value = client
-            .request(CREATE_ASSET_URL, request)
-            .await
-            .map_err(|_| "The font could not be loaded.".to_owned())?;
-        let url = decode_asset_url(&value).map_err(|_| "The font could not be loaded.".to_owned())?;
-        client
-            .asset_bytes(
-                &format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())),
-                MAX_FONT_BYTES,
-            )
-            .await
-    }))
+    load_workspace_asset(state, request, MAX_FONT_BYTES, known, mutation, "The font could not be loaded.")
 }
 
 pub fn decode(bytes: Vec<u8>) -> Result<DecodedFont, String> {

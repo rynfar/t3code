@@ -4,8 +4,8 @@
 //! text color, radius 6. The row menu offers the mention actions.
 
 use gpui::{
-    AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::*, px, uniform_list,
+    AnyElement, Context, ElementId, Font, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, TextRun, Window, canvas, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -22,6 +22,35 @@ use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 12.;
+
+/// Returns true when `text` overflows `available_width` so clipped tree rows can surface a
+/// hover tooltip (`pingdotgg/t3code#40308`).
+pub(crate) fn is_label_clipped(
+    text: &str,
+    available_width: f32,
+    font_size: Pixels,
+    weight: FontWeight,
+    window: &Window,
+) -> bool {
+    if available_width <= 0.0 || text.is_empty() {
+        return false;
+    }
+    let mut font: Font = window.text_style().font();
+    font.weight = weight;
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let measured = window
+        .text_system()
+        .shape_line(SharedString::from(text.to_owned()), font_size, &[run], None)
+        .width;
+    f32::from(measured) > available_width
+}
 
 pub(crate) fn file_icon(path: &str) -> Icon {
     use t3_core::files::{binary_container_kind, delimited_separator, image_kind, is_audio, is_font, is_markdown, is_mermaid, is_notebook, is_pdf, office_kind, syntax_language};
@@ -107,12 +136,22 @@ impl Explorer {
             })
     }
 
-    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(index) else { return div().into_any_element() };
         let p = palette(cx);
         let selected = self.selected.as_deref() == Some(row.path.as_str());
         let cursor = self.cursor.as_deref() == Some(row.path.as_str()) && self.tree_focused;
         let label: SharedString = row.label.clone().into();
+        let icon_size = if row.kind == EntryKind::File { 14. } else { 12. };
+        let non_label_width = 8. + (8. + INDENT * row.depth as f32) + 8. + 6. + icon_size;
+        let available_width = self.tree_width.get() - non_label_width;
+        let clipped = is_label_clipped(
+            &row.label,
+            available_width,
+            px(12.),
+            if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL },
+            window,
+        );
         let text = if row.ignored { hsla(p.muted_foreground).opacity(0.7) } else { hsla(p.foreground) };
         let icon = match (row.kind, row.expanded) {
             (EntryKind::Directory, true) => Icon::ChevronDown,
@@ -145,6 +184,10 @@ impl Explorer {
             .when(selected, |this| this.bg(hsla(p.foreground).opacity(0.12)))
             .when(!selected && cursor, |this| this.bg(hsla(p.foreground).opacity(0.07)))
             .when(!selected, |this| this.hover(|style| style.bg(hsla(p.foreground).opacity(0.07))))
+            .when(clipped, |this| {
+                let tip = label.clone();
+                this.tooltip(move |window, cx| crate::right_panel::tooltip_view(tip.clone(), window, cx))
+            })
             .on_drag(drag_payload, move |dragged, _, _, cx| {
                 if let Some(explorer) = explorer_entity.upgrade() {
                     explorer.update(cx, |this, _| {
@@ -246,6 +289,7 @@ impl Render for Explorer {
             .when(loading && count == 0, |this| this.child(self.render_status(crate::i18n::t(cx, "Loading files…").to_owned(), false, cx)))
             .when(no_matches, |this| this.child(self.render_status(crate::i18n::t(cx, "No matching files.").to_owned(), true, cx)))
             .when(!no_matches, |this| {
+                let tree_width = self.tree_width.clone();
                 this.child(
                     div()
                         .id("file-tree")
@@ -254,20 +298,28 @@ impl Render for Explorer {
                         .relative()
                         .flex_1()
                         .min_h_0()
+                        .capture_any_mouse_down(cx.listener(|this, _, _, _| this.stop_following_reveal()))
+                        .capture_key_down(cx.listener(|this, _, _, _| this.stop_following_reveal()))
+                        .on_scroll_wheel(cx.listener(|this, _, _, _| this.stop_following_reveal()))
                         .on_action(cx.listener(Self::select_previous))
                         .on_action(cx.listener(Self::select_next))
                         .on_action(cx.listener(Self::expand_selected))
                         .on_action(cx.listener(Self::collapse_selected))
                         .on_action(cx.listener(Self::open_selected))
                         .child(
-                            uniform_list("file-tree-rows", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                range.map(|index| this.render_row(index, cx)).collect::<Vec<_>>()
+                            uniform_list("file-tree-rows", count, cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                                range.map(|index| this.render_row(index, window, cx)).collect::<Vec<_>>()
                             }))
                             .size_full()
                             .pb(px(8.))
                             .track_scroll(&self.scroll),
                         )
-                        .vertical_scrollbar(&self.scroll),
+                        .vertical_scrollbar(&self.scroll)
+                        .child(
+                            canvas(move |bounds, _, _| tree_width.set(f32::from(bounds.size.width)), |_, _, _, _| {})
+                                .absolute()
+                                .size_full(),
+                        ),
                 )
             })
             .when(cx.has_active_drag() && self.drag_mention.is_drag_in_progress(), |this| {

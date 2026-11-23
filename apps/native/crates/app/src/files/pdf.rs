@@ -16,16 +16,15 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::files::pdf::{
     PDF_MAX_BYTES, PDF_MAX_PAGES, PDF_MAX_ZOOM, PDF_MIN_ZOOM, PDF_PAGE_GAP, PdfFindState,
-    PdfFindStep, PdfPositionStore, PdfViewState, SavedPdfPosition, current_pdf_page,
-    parse_basic_pdf, pdf_page_offsets, pdf_page_scroll_top, pdf_page_width,
-    pdf_restored_scroll_top, step_pdf_zoom, visible_pdf_pages,
+    PdfFindStep, PdfLinkTarget, PdfPageLink, PdfPositionStore, PdfViewState, SavedPdfPosition,
+    current_pdf_page, is_safe_pdf_external_url, parse_basic_pdf, pdf_page_offsets,
+    pdf_page_scroll_top, pdf_page_width, pdf_rect_to_normalized_box, pdf_restored_scroll_top,
+    step_pdf_zoom, visible_pdf_pages,
 };
-use t3_core::files::{
-    CREATE_ASSET_URL, absolute_path, decode_asset_url, workspace_asset_request,
-};
+use t3_core::files::{absolute_path, workspace_asset_request};
 
 use super::Root;
-use super::preview::Preview;
+use super::preview::{AssetFetchOutcome, KnownAsset, Preview, load_workspace_asset};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
@@ -40,10 +39,10 @@ mod native_pdf {
     use std::sync::Arc;
 
     use gpui::RenderImage;
-    use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2_foundation::{NSData, NSString};
+    use objc2::{msg_send, sel};
+    use objc2_foundation::{NSData, NSRect, NSString, NSURL};
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -256,6 +255,117 @@ mod native_pdf {
         doc.render_page(page_index, width)
     }
 
+    pub fn extract_page_links(
+        bytes: &Arc<Vec<u8>>,
+        page_index: usize,
+    ) -> Vec<super::PdfPageLink> {
+        objc2::rc::autoreleasepool(|_| {
+            let Some(cls) = AnyClass::get(c"PDFDocument") else {
+                return Vec::new();
+            };
+            let data = NSData::with_bytes(bytes);
+            let doc: Option<Retained<AnyObject>> = unsafe {
+                let alloc: *mut AnyObject = msg_send![cls, alloc];
+                let init: *mut AnyObject = msg_send![alloc, initWithData: &*data];
+                Retained::from_raw(init)
+            };
+            let Some(doc) = doc else {
+                return Vec::new();
+            };
+            let page_count: usize = unsafe { msg_send![&*doc, pageCount] };
+            if page_index >= page_count {
+                return Vec::new();
+            }
+            let page: *mut AnyObject = unsafe { msg_send![&*doc, pageAtIndex: page_index] };
+            if page.is_null() {
+                return Vec::new();
+            }
+            // kPDFDisplayBoxCropBox = 1
+            let crop_box: NSRect = unsafe { msg_send![page, boundsForBox: 1isize] };
+            let rotation: isize = unsafe { msg_send![page, rotation] };
+            let annots: *mut AnyObject = unsafe { msg_send![page, annotations] };
+            if annots.is_null() {
+                return Vec::new();
+            }
+            let count: usize = unsafe { msg_send![annots, count] };
+            let crop = [
+                crop_box.origin.x as f32,
+                crop_box.origin.y as f32,
+                crop_box.size.width as f32,
+                crop_box.size.height as f32,
+            ];
+            let mut links = Vec::new();
+            for i in 0..count {
+                let annot: *mut AnyObject = unsafe { msg_send![annots, objectAtIndex: i] };
+                if annot.is_null() {
+                    continue;
+                }
+                let kind: *mut NSString = unsafe { msg_send![annot, type] };
+                if kind.is_null() {
+                    continue;
+                }
+                let kind_str = unsafe { &*kind }.to_string();
+                if kind_str != "Link" && kind_str != "/Link" {
+                    continue;
+                }
+                let bounds: NSRect = unsafe { msg_send![annot, bounds] };
+                let Some(box_norm) = super::pdf_rect_to_normalized_box(
+                    [
+                        bounds.origin.x as f32,
+                        bounds.origin.y as f32,
+                        (bounds.origin.x + bounds.size.width) as f32,
+                        (bounds.origin.y + bounds.size.height) as f32,
+                    ],
+                    crop,
+                    rotation as i32,
+                ) else {
+                    continue;
+                };
+                let mut url_obj: *mut NSURL = unsafe { msg_send![annot, URL] };
+                let action: *mut AnyObject = unsafe { msg_send![annot, action] };
+                if url_obj.is_null() && !action.is_null() {
+                    let responds_url: bool = unsafe { msg_send![action, respondsToSelector: sel!(URL)] };
+                    if responds_url {
+                        url_obj = unsafe { msg_send![action, URL] };
+                    }
+                }
+                if !url_obj.is_null() {
+                    let abs: *mut NSString = unsafe { msg_send![url_obj, absoluteString] };
+                    if !abs.is_null() {
+                        let url_str = unsafe { &*abs }.to_string();
+                        if super::is_safe_pdf_external_url(&url_str) {
+                            links.push(super::PdfPageLink {
+                                box_norm,
+                                target: super::PdfLinkTarget::External(url_str),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                let mut dest: *mut AnyObject = unsafe { msg_send![annot, destination] };
+                if dest.is_null() && !action.is_null() {
+                    let responds_dest: bool = unsafe { msg_send![action, respondsToSelector: sel!(destination)] };
+                    if responds_dest {
+                        dest = unsafe { msg_send![action, destination] };
+                    }
+                }
+                if !dest.is_null() {
+                    let target_page: *mut AnyObject = unsafe { msg_send![dest, page] };
+                    if !target_page.is_null() {
+                        let target_idx: usize = unsafe { msg_send![&*doc, indexForPage: target_page] };
+                        if target_idx < page_count {
+                            links.push(super::PdfPageLink {
+                                box_norm,
+                                target: super::PdfLinkTarget::Page(target_idx),
+                            });
+                        }
+                    }
+                }
+            }
+            links
+        })
+    }
+
     /// Single-parse PDF scan handle reused across every page of a progressive Find pass.
     /// Wraps ObjC allocations (`NSData`, `PDFDocument`, `PDFPage`, `NSString`) in explicit
     /// autorelease pools so background executor threads never accumulate autoreleased objects.
@@ -328,6 +438,10 @@ mod native_pdf {
         None
     }
 
+    pub fn extract_page_links(_bytes: &Arc<Vec<u8>>, _page_index: usize) -> Vec<super::PdfPageLink> {
+        Vec::new()
+    }
+
     pub struct PdfScanSession {
         parsed: Option<t3_core::files::pdf::BasicPdfDocument>,
     }
@@ -355,32 +469,19 @@ pub struct DecodedPdf {
     pub fallback_text: Vec<String>,
 }
 
-pub fn load(
+pub(super) fn load(
     state: &AppState,
     root: &Root,
     path: &str,
     mutation: Option<&str>,
-) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
-    let client = state.client_handle()?;
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
     let request = workspace_asset_request(
         &root.workspace.thread_id,
         &root.workspace.cwd,
         &absolute_path(path, &root.workspace.cwd),
     );
-    let mutation = mutation.map(str::to_owned);
-    Some(state.runtime().spawn(async move {
-        let value = client
-            .request(CREATE_ASSET_URL, request)
-            .await
-            .map_err(|_| "Unable to open PDF.".to_owned())?;
-        let url = decode_asset_url(&value).map_err(|_| "Unable to open PDF.".to_owned())?;
-        client
-            .asset_bytes(
-                &format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())),
-                PDF_MAX_BYTES,
-            )
-            .await
-    }))
+    load_workspace_asset(state, request, PDF_MAX_BYTES, known, mutation, "Unable to open PDF.")
 }
 
 pub fn decode(bytes: Vec<u8>) -> Result<DecodedPdf, String> {
@@ -439,6 +540,7 @@ pub struct PdfReady {
     rendered_pages: HashMap<usize, CachedPage>,
     render_lru: VecDeque<usize>,
     in_flight_renders: HashMap<(usize, u32), Task<()>>,
+    page_links: HashMap<usize, Vec<PdfPageLink>>,
     restored: bool,
 }
 
@@ -469,6 +571,7 @@ impl PdfReady {
             rendered_pages: HashMap::new(),
             render_lru: VecDeque::new(),
             in_flight_renders: HashMap::new(),
+            page_links: HashMap::new(),
             restored: false,
         }
     }
@@ -645,7 +748,9 @@ impl Preview {
     fn ensure_pdf_page_rendered(&mut self, index: usize, width: f32, cx: &mut Context<Self>) {
         let width_bucket = (width.round() as u32).max(32);
         let Some(ready) = self.pdf_ready_mut() else { return };
-        if ready.rendered_pages.get(&index).is_some_and(|c| c.width_bucket == width_bucket) {
+        let image_cached = ready.rendered_pages.get(&index).is_some_and(|c| c.width_bucket == width_bucket);
+        let need_links = !ready.page_links.contains_key(&index);
+        if image_cached && !need_links {
             return;
         }
         if ready.in_flight_renders.contains_key(&(index, width_bucket)) {
@@ -654,19 +759,34 @@ impl Preview {
         let bytes = Arc::clone(&ready.bytes);
         let doc_key = ready.doc_key.clone();
         let task = cx.spawn(async move |this, cx| {
-            let rendered = cx
+            let (rendered, links) = cx
                 .background_executor()
-                .spawn(async move { native_pdf::render_page_image(&bytes, index, width) })
+                .spawn(async move {
+                    let rendered = if image_cached {
+                        None
+                    } else {
+                        native_pdf::render_page_image(&bytes, index, width)
+                    };
+                    let links = if need_links {
+                        Some(native_pdf::extract_page_links(&bytes, index))
+                    } else {
+                        None
+                    };
+                    (rendered, links)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(ready) = this.pdf_ready_mut()
                     && ready.doc_key == doc_key
                 {
                     ready.in_flight_renders.remove(&(index, width_bucket));
+                    if let Some(links) = links {
+                        ready.page_links.insert(index, links);
+                    }
                     if let Some(image) = rendered {
                         ready.store_rendered_page(index, width_bucket, image, cx);
-                        cx.notify();
                     }
+                    cx.notify();
                 }
             });
         });
@@ -803,6 +923,57 @@ impl Preview {
                         .child(format!("Page {}", index + 1))
                         .into_any_element()
                 };
+                let links: Vec<AnyElement> = ready
+                    .page_links
+                    .get(&index)
+                    .map(|page_links| {
+                        page_links
+                            .iter()
+                            .enumerate()
+                            .map(|(link_idx, link)| {
+                                let [nx, ny, nw, nh] = link.box_norm;
+                                let target = link.target.clone();
+                                let tip: SharedString = match &target {
+                                    PdfLinkTarget::External(url) => url.clone().into(),
+                                    PdfLinkTarget::Page(p) => format!("Page {}", p + 1).into(),
+                                };
+                                div()
+                                    .id(("pdf-page-link", index * 4096 + link_idx))
+                                    .absolute()
+                                    .left(px(nx * width))
+                                    .top(px(ny * page_h))
+                                    .w(px((nw * width).max(4.0)))
+                                    .h(px((nh * page_h).max(4.0)))
+                                    .rounded(px(2.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(hsla(p.primary).opacity(0.12)))
+                                    .tooltip(move |window, cx| crate::right_panel::tooltip_view(tip.clone(), window, cx))
+                                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        match &target {
+                                            PdfLinkTarget::External(url) => {
+                                                let thread_id = this.target.as_ref().map(|t| t.root.workspace.thread_id.clone());
+                                                crate::transcript::markdown::links::open_browser_link(
+                                                    url,
+                                                    event.modifiers(),
+                                                    Some(&this.state),
+                                                    thread_id,
+                                                    cx,
+                                                );
+                                            }
+                                            PdfLinkTarget::Page(target_page) => {
+                                                if let Some(ready) = this.pdf_ready_mut() {
+                                                    ready.jump_to_page(*target_page);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }
+                                    }))
+                                    .into_any_element()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 div()
                     .id(("pdf-page", index))
                     .absolute()
@@ -814,6 +985,9 @@ impl Preview {
                     .shadow_sm()
                     .when(is_match, |this| this.border_2().border_color(hsla(p.primary)))
                     .child(body)
+                    .when(!links.is_empty(), |this| {
+                        this.child(div().absolute().inset_0().children(links))
+                    })
                     .into_any_element()
             })
             .collect();

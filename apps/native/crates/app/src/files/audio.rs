@@ -10,10 +10,10 @@ use gpui::{
 };
 use gpui_component::{h_flex, v_flex};
 use t3_core::files::media_preview::{AudioInfo, MAX_AUDIO_BYTES, format_audio_time, inspect_audio_bytes};
-use t3_core::files::{CREATE_ASSET_URL, absolute_path, decode_asset_url, group_thousands, workspace_asset_request};
+use t3_core::files::{absolute_path, group_thousands, workspace_asset_request};
 
 use super::Root;
-use super::preview::Preview;
+use super::preview::{AssetFetchOutcome, KnownAsset, Preview, load_workspace_asset};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
@@ -131,34 +131,22 @@ pub enum AudioState {
     Failed(String),
 }
 
-pub fn load(
+pub(super) fn load(
     state: &AppState,
     root: &Root,
     path: &str,
     mutation: Option<&str>,
-) -> Option<tokio::task::JoinHandle<Result<DecodedAudio, String>>> {
-    let client = state.client_handle()?;
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
     let abs = absolute_path(path, &root.workspace.cwd);
     let request = workspace_asset_request(&root.workspace.thread_id, &root.workspace.cwd, &abs);
-    let mutation = mutation.map(str::to_owned);
-    let path_owned = path.to_owned();
-    let thread_id = root.workspace.thread_id.clone();
-    Some(state.runtime().spawn(async move {
-        let value = client
-            .request(CREATE_ASSET_URL, request)
-            .await
-            .map_err(|_| "Unable to load workspace audio.".to_owned())?;
-        let url = decode_asset_url(&value).map_err(|_| "Unable to load workspace audio.".to_owned())?;
-        let bytes = client
-            .asset_bytes(
-                &format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())),
-                MAX_AUDIO_BYTES,
-            )
-            .await?;
-        let info = inspect_audio_bytes(&path_owned, &bytes);
-        let name = t3_core::files::basename(&path_owned).to_owned();
-        Ok(DecodedAudio { name, path: abs, thread_id, info, bytes })
-    }))
+    load_workspace_asset(state, request, MAX_AUDIO_BYTES, known, mutation, "Unable to load workspace audio.")
+}
+
+pub fn decode(path: &str, abs: String, thread_id: String, bytes: Vec<u8>) -> DecodedAudio {
+    let info = inspect_audio_bytes(path, &bytes);
+    let name = t3_core::files::basename(path).to_owned();
+    DecodedAudio { name, path: abs, thread_id, info, bytes }
 }
 
 impl AudioState {

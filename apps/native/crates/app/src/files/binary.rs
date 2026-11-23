@@ -25,13 +25,13 @@ use t3_core::files::sqlite::{
     estimate_sqlite_column_width, sqlite_page_range,
 };
 use t3_core::files::{
-    BinaryContainerKind, CREATE_ASSET_URL, absolute_path, binary_container_kind, decode_asset_url,
-    group_thousands, workspace_asset_request,
+    BinaryContainerKind, absolute_path, binary_container_kind, group_thousands,
+    workspace_asset_request,
 };
 use t3_core::i18n::IcuArg;
 
 use super::Root;
-use super::preview::Preview;
+use super::preview::{AssetFetchOutcome, KnownAsset, Preview, load_workspace_asset};
 use super::sqlite::SqliteDatabaseHandle;
 use crate::app_state::AppState;
 use crate::i18n::{t, t_fmt};
@@ -203,32 +203,19 @@ pub struct DecodedBinary {
 }
 
 /// Downloads binary bytes via signed asset URL on the network runtime.
-pub fn load(
+pub(super) fn load(
     state: &AppState,
     root: &Root,
     path: &str,
     mutation: Option<&str>,
-) -> Option<tokio::task::JoinHandle<Result<Vec<u8>, String>>> {
-    let client = state.client_handle()?;
+    known: KnownAsset,
+) -> Option<tokio::task::JoinHandle<Result<AssetFetchOutcome, String>>> {
     let request = workspace_asset_request(
         &root.workspace.thread_id,
         &root.workspace.cwd,
         &absolute_path(path, &root.workspace.cwd),
     );
-    let mutation = mutation.map(str::to_owned);
-    Some(state.runtime().spawn(async move {
-        let value = client
-            .request(CREATE_ASSET_URL, request)
-            .await
-            .map_err(|_| "Could not read this binary file.".to_owned())?;
-        let url = decode_asset_url(&value).map_err(|_| "Could not read this binary file.".to_owned())?;
-        client
-            .asset_bytes(
-                &format!("{url}{}", t3_core::media::workspace_image_suffix(&url, mutation.as_deref())),
-                BINARY_PREVIEW_MAX_BYTES,
-            )
-            .await
-    }))
+    load_workspace_asset(state, request, BINARY_PREVIEW_MAX_BYTES, known, mutation, "Could not read this binary file.")
 }
 
 /// Builds bounded hex + optional archive index or read-only SQLite handle off the UI thread.

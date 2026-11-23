@@ -860,6 +860,7 @@ fn tab(
         _ => surface.title().into(),
     };
     let is_device = matches!(surface.kind, SurfaceKind::Device { .. });
+    let preview_tab = surface.preview_tab().map(str::to_owned);
     // Static dot: a side chat tab can stay open for a whole run.
     let dot = side_chat.and_then(t3_core::side_chat::TabState::of).map(|tab_state| match tab_state {
         t3_core::side_chat::TabState::Running => hsla(p.muted_foreground),
@@ -1010,6 +1011,17 @@ fn tab(
                 let rename_title = rename_title_menu.clone();
                 menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Rename")).on_click(move |_, window, cx| {
                     on_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                }))
+            } else {
+                menu
+            };
+            let menu = if let Some(tab_id) = preview_tab.clone()
+                && crate::preview::previews(cx).is_some_and(|p| p.read(cx).availability() == crate::preview::Availability::Available)
+            {
+                let state = state.clone();
+                menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Duplicate")).on_click(move |_, _, cx| {
+                    let tab_id = tab_id.clone();
+                    state.update(cx, |state, cx| crate::preview::duplicate_browser_surface(state, tab_id, cx));
                 }))
             } else {
                 menu
