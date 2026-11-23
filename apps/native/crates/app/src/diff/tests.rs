@@ -699,3 +699,27 @@ index 1111111..2222222 100644
         Some("old_line();\nshared_line();".to_owned())
     );
 }
+
+#[test]
+fn thread_switch_does_not_bump_git_revision_on_initial_projection_load() {
+    let mut loaded = false;
+    let mut previous = None;
+    assert!(!super::advance_workspace_mutation(&mut loaded, &mut previous, true, Some("m1".into()), true));
+    assert!(loaded);
+    assert_eq!(previous.as_deref(), Some("m1"));
+
+    // Thread switch clears `loaded` and `previous`, passes through `projection_present = false`,
+    // then lands on the next thread's projection `"m2"` without restarting Changes reads.
+    loaded = false;
+    previous = None;
+    assert!(!super::advance_workspace_mutation(&mut loaded, &mut previous, false, None, true));
+    assert!(!loaded);
+    assert!(!super::advance_workspace_mutation(&mut loaded, &mut previous, true, Some("m2".into()), true));
+    assert!(loaded);
+    assert_eq!(previous.as_deref(), Some("m2"));
+
+    // Subsequent in-thread mutation still bumps `git_revision`.
+    assert!(super::advance_workspace_mutation(&mut loaded, &mut previous, true, Some("m3".into()), true));
+    assert_eq!(previous.as_deref(), Some("m3"));
+    assert!(!super::advance_workspace_mutation(&mut loaded, &mut previous, true, Some("m3".into()), true));
+}

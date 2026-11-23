@@ -862,7 +862,14 @@ fn lazy_review_tracks_paths_across_complete_metadata_and_bounds_revision_reads()
     assert_eq!(review.take_requests().len(), 1, "on-demand file uses the released permit");
     review.accept_preview(&metadata(&["a","b","c","d","e","f","g","h","i","j"], "complete", false));
     assert!(review.has_complete_preview());
-    assert!(!review.accept_patch(&initial[1], Err("late failure".into())));
+    assert_eq!(review.revision, 1, "tracked-to-complete completion preserves in-flight tracked reads");
+    assert!(review.accept_patch(&initial[1], Err("late failure".into())));
+    let after_completion = review.take_requests();
+    assert_eq!(after_completion.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["a"]);
+
+    review.accept_preview(&metadata(&["a","b","c","d","e","f","g","h","i","j"], "refreshed", false));
+    assert_eq!(review.revision, 2);
+    assert!(!review.accept_patch(&initial[2], Err("late failure".into())));
     let first = review.take_requests();
     assert_eq!(first.iter().map(|t| t.file.path.as_str()).collect::<Vec<_>>(), ["a","b","c","d"]);
     for ticket in &first { review.accept_patch(ticket, Err("failed".into())); }
@@ -1014,4 +1021,155 @@ fn review_model_preserves_pre_patch_added_and_deleted_change_types_in_file_tree(
             ("removed.rs", ChangeKind::Deleted),
         ]
     );
+}
+
+#[test]
+fn tool_call_diff_rewrites_posix_and_windows_headers_relative_to_workspace() {
+    let posix = [
+        r#"diff --git "a//Users/dev/my repo/src/dir with space/app.ts" "b//Users/dev/my repo/src/dir with space/app.ts""#,
+        r#"--- "a//Users/dev/my repo/src/dir with space/app.ts""#,
+        r#"+++ "b//Users/dev/my repo/src/dir with space/app.ts""#,
+        "@@ -1,3 +1,3 @@",
+        "--- unchanged context marker inside hunk",
+        "-old line",
+        "+new line",
+        "+++ unchanged addition-like hunk line",
+        "",
+    ]
+    .join("\n");
+    let kind = file_change("/Users/dev/my repo/src/dir with space/app.ts", Some(&posix), &[]);
+    let rewritten = tool_call_diff_in_workspace(&kind, Some("/Users/dev/my repo/")).expect("diff").patch.expect("patch");
+    assert_eq!(
+        rewritten,
+        [
+            r#"diff --git "a/src/dir with space/app.ts" "b/src/dir with space/app.ts""#,
+            r#"--- "a/src/dir with space/app.ts""#,
+            r#"+++ "b/src/dir with space/app.ts""#,
+            "@@ -1,3 +1,3 @@",
+            "--- unchanged context marker inside hunk",
+            "-old line",
+            "+new line",
+            "+++ unchanged addition-like hunk line",
+            "",
+        ]
+        .join("\n")
+    );
+
+    let outside = [
+        "diff --git a//tmp/other/file.rs b//tmp/other/file.rs",
+        "--- a//tmp/other/file.rs",
+        "+++ b//tmp/other/file.rs",
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+    ]
+    .join("\n");
+    assert_eq!(
+        tool_call_diff_in_workspace(&file_change("/tmp/other/file.rs", Some(&outside), &[]), Some("/Users/dev/my repo"))
+            .unwrap()
+            .patch
+            .unwrap(),
+        outside
+    );
+
+    let win = [
+        r#"diff --git "a/c:\\Users\\Dev\\repo\\src\\main.ts" "b/C:\\Users\\Dev\\repo\\src\\main.ts""#,
+        r#"--- a/c:\Users\Dev\repo\src\main.ts"#,
+        r#"+++ b/C:/Users/Dev/repo/src/main.ts"#,
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+    ]
+    .join("\n");
+    let win_out = tool_call_diff_in_workspace(&file_change(r"C:\Users\Dev\repo\src\main.ts", Some(&win), &[]), Some(r"C:\Users\Dev\repo"))
+        .unwrap()
+        .patch
+        .unwrap();
+    assert_eq!(
+        win_out,
+        [
+            r#"diff --git "a/src\\main.ts" "b/src\\main.ts""#,
+            r#"--- a/src\main.ts"#,
+            "+++ b/src/main.ts",
+            "@@ -1 +1 @@",
+            "-a",
+            "+b",
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
+fn review_model_forwards_completion_token_merge_base_change_type_and_preserves_in_flight_tracked_patches() {
+    let scope = ReviewScope {
+        environment: "smoke".into(),
+        connection: 1,
+        cwd: "/repo".into(),
+        kind: PreviewSourceKind::BranchRange,
+        base_ref: Some("main".into()),
+        ignore_whitespace: true,
+    };
+    let mut review = ReviewModel::new(scope);
+    let tracked = json!({
+        "cwd": "/repo",
+        "generatedAt": "t1",
+        "incomplete": true,
+        "completionToken": "tok-123",
+        "sources": [{
+            "id": "branch-range",
+            "kind": "branch-range",
+            "baseRef": "main",
+            "headRef": "feat/x",
+            "mergeBase": "abc1234",
+            "diff": "",
+            "patchesDeferred": true,
+            "truncated": false,
+            "files": [
+                { "path": "src/changed.rs", "previousPath": null, "changeType": "change", "additions": 2, "deletions": 1 },
+                { "path": "src/modified.rs", "previousPath": null, "changeType": "change", "additions": 1, "deletions": 0 }
+            ]
+        }]
+    });
+    review.accept_preview(&tracked);
+    assert_eq!(review.completion_token.as_deref(), Some("tok-123"));
+    let (_, follow_up) = review.request(false);
+    assert_eq!(follow_up["completionToken"], "tok-123");
+
+    let tickets = review.take_requests();
+    assert_eq!(tickets.len(), 2);
+    let (_, file_payload) = tickets[0].request();
+    assert_eq!(file_payload["mergeBase"], "abc1234");
+    assert_eq!(file_payload["file"]["changeType"], "change");
+
+    let complete = json!({
+        "cwd": "/repo",
+        "generatedAt": "t2",
+        "incomplete": false,
+        "sources": [{
+            "id": "branch-range",
+            "kind": "branch-range",
+            "baseRef": "main",
+            "headRef": "feat/x",
+            "mergeBase": "abc1234",
+            "diff": "",
+            "patchesDeferred": true,
+            "truncated": false,
+            "files": [
+                { "path": "src/changed.rs", "previousPath": null, "changeType": "change", "additions": 2, "deletions": 1 },
+                { "path": "src/modified.rs", "previousPath": null, "changeType": "change", "additions": 5, "deletions": 0 },
+                { "path": "src/untracked.rs", "previousPath": null, "changeType": "new", "additions": 4, "deletions": 0 }
+            ]
+        }]
+    });
+    review.accept_preview(&complete);
+    assert_eq!(review.revision, 1, "tracked -> complete with same refs keeps revision so unchanged tracked reads survive");
+    assert!(review.states.get(&review.files()[0].identity()).is_some_and(|s| s.pending));
+    assert!(!review.states.contains_key(&review.files()[1].identity()), "files whose stats changed reset");
+
+    let mut patch_reply = complete.clone();
+    patch_reply["sources"][0]["diff"] = json!("diff --git a/src/changed.rs b/src/changed.rs\n--- a/src/changed.rs\n+++ b/src/changed.rs\n@@ -1 +1 @@\n-old\n+new\n");
+    patch_reply["sources"][0]["files"] = json!([{ "path": "src/changed.rs", "previousPath": null, "changeType": "change", "additions": 2, "deletions": 1 }]);
+    let source = decode_diff_preview(&patch_reply, PreviewSourceKind::BranchRange).unwrap();
+    assert!(review.accept_patch(&tickets[0], Ok(source.clone())), "unchanged in-flight tracked patch must still apply");
+    assert!(!review.accept_patch(&tickets[1], Ok(source)), "file whose additions changed rejects pre-change ticket");
 }

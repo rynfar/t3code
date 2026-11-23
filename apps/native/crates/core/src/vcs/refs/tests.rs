@@ -327,3 +327,23 @@ fn offline_ref_snapshot_seeds_empty_listing_and_pr_choice_sits_at_index_zero() {
         Some(RefChoice::CheckoutPullRequest("https://github.com/org/repo/pull/42".into()))
     );
 }
+
+#[test]
+fn refresh_status_skips_ref_invalidation_when_refs_digest_matches() {
+    let mut cache = RefCache::default();
+    assert!(cache.settle_refresh_status("/repo-a", Some("digest-1")));
+    assert_eq!(cache.revision(), 1);
+    assert!(!cache.settle_refresh_status("/repo-a", Some("digest-1")), "unchanged refsDigest skips invalidation");
+    assert_eq!(cache.revision(), 1);
+
+    assert!(cache.settle_refresh_status("/repo-b", Some("digest-1")), "other cwds stay independent");
+    assert_eq!(cache.revision(), 2);
+
+    assert!(cache.settle_refresh_status("/repo-a", Some("digest-2")), "changed refsDigest invalidates");
+    assert_eq!(cache.revision(), 3);
+
+    assert!(cache.settle_refresh_status("/repo-a", None), "missing refsDigest clears tracked digest and invalidates");
+    assert_eq!(cache.revision(), 4);
+    assert!(cache.settle_refresh_status("/repo-a", Some("digest-2")), "after missing digest, prior digest re-seeds and invalidates");
+    assert_eq!(cache.revision(), 5);
+}

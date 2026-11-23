@@ -265,3 +265,34 @@ fn preferred_editor_keeps_the_last_one_while_available() {
     assert_eq!(editor_label("idea", true), "IntelliJ IDEA");
     assert_eq!(editor_label("nope", true), "Editor");
 }
+
+#[test]
+fn branch_action_errors_surface_git_command_detail_and_reason() {
+    let with_reason = crate::rpc::RpcFailure {
+        tag: Some("GitCommandError".into()),
+        message: "Git command failed in /repo: git checkout main".into(),
+        error: json!({
+            "_tag": "GitCommandError",
+            "detail": "Your local changes would be overwritten by checkout.",
+            "reason": "local-changes"
+        }),
+    };
+    assert_eq!(
+        format_branch_action_error(&with_reason),
+        "Your local changes would be overwritten by checkout. (local-changes)"
+    );
+
+    let detail_only = crate::rpc::RpcFailure {
+        tag: Some("GitCommandError".into()),
+        message: "Git command failed".into(),
+        error: json!({ "_tag": "GitCommandError", "detail": "Branch already exists.", "reason": "  " }),
+    };
+    assert_eq!(format_branch_action_error(&detail_only), "Branch already exists.");
+
+    let other = crate::rpc::RpcFailure {
+        tag: Some("PermissionDenied".into()),
+        message: "Not permitted".into(),
+        error: json!({ "_tag": "PermissionDenied" }),
+    };
+    assert_eq!(format_branch_action_error(&other), "Not permitted");
+}

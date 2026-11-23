@@ -88,7 +88,7 @@ pub use scope::{
     is_checkpoint_diff_truncated, preview_is_repository, project_commit_url, turn_diff_summaries,
     workspace_mutation_id,
 };
-pub use tool_call::{RecordedContent, ToolCallDiff, ToolCallTarget, tool_call_diff};
+pub use tool_call::{RecordedContent, ToolCallDiff, ToolCallTarget, tool_call_diff, tool_call_diff_in_workspace};
 pub use tree::{TreeRow, TreeRowKind, file_tree_rows, file_tree_rows_shown};
 pub use whitespace::hide_whitespace_changes;
 

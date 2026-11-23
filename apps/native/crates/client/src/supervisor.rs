@@ -440,7 +440,8 @@ impl ClientHandle {
     /// depends on it).
     pub fn request(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let queued = self.commands.send(Command::Request { method, payload, reply, settled: self.refs.on_settled(method) }).is_ok();
+        let settled = self.refs.on_settled(method, &payload);
+        let queued = self.commands.send(Command::Request { method, payload, reply, settled }).is_ok();
         async move {
             if !queued {
                 return Err(RpcError::Closed);
@@ -453,7 +454,8 @@ impl ClientHandle {
     /// drops, and callers resubscribe. Dropping the handle interrupts it on the server.
     pub fn stream(&self, method: &'static str, payload: Value) -> impl Future<Output = Result<StreamHandle, RpcError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let queued = self.commands.send(Command::Stream { method, payload, reply, settled: self.refs.on_settled(method) }).is_ok();
+        let settled = self.refs.on_settled(method, &payload);
+        let queued = self.commands.send(Command::Stream { method, payload, reply, settled }).is_ok();
         async move {
             if !queued {
                 return Err(RpcError::Closed);
@@ -1808,7 +1810,12 @@ async fn run_session(
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = reply.closed() => {},
-                                result = response => { drop(settled); let _ = reply.send(result); }
+                                result = response => {
+                                    if let Some(settled) = settled {
+                                        settled.settle_with(result.as_ref().ok());
+                                    }
+                                    let _ = reply.send(result);
+                                }
                             }
                         });
                     }

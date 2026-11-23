@@ -78,6 +78,7 @@ pub struct DiffPanel {
     git_fetched_at: Option<Instant>,
     /// `deriveWorkspaceMutationId` as last seen: a change refetches git diffs mid-turn.
     workspace_mutation: Option<String>,
+    workspace_mutation_loaded: bool,
     /// Whether each cwd is a repository, learned from git previews (`isGitRepo`).
     repositories: HashMap<String, bool>,
     connected: bool,
@@ -275,6 +276,7 @@ impl DiffPanel {
             git_revision: 0,
             git_fetched_at: None,
             workspace_mutation: None,
+            workspace_mutation_loaded: false,
             repositories: HashMap::new(),
             connected: false,
             visible: false,
@@ -388,6 +390,8 @@ impl DiffPanel {
             self.cache.clear();
             self.repositories.clear();
             self.git_fetched_at = None;
+            self.workspace_mutation = None;
+            self.workspace_mutation_loaded = false;
             self.connected = false;
             self.branch_commits = None;
             self.branch_commits_error = None;
@@ -425,6 +429,7 @@ impl DiffPanel {
             self.fingerprint = (0, None);
             self.summaries = Arc::new(Vec::new());
             self.workspace_mutation = None;
+            self.workspace_mutation_loaded = false;
             self.selected_file = None;
             self.file_reveal.reset();
             self.revealed_path = None;
@@ -463,6 +468,7 @@ impl DiffPanel {
             self.summaries = Arc::new(projection.map(|projection| turn_diff_summaries(&projection.checkpoints)).unwrap_or_default());
             self.fingerprint = fingerprint;
         }
+        let projection_present = projection.is_some();
         let mutation = projection.and_then(|projection| {
             let latest_checkpoint = self.summaries.first().map(|summary| summary.completed_at.as_str());
             workspace_mutation_id(projection.visible_turn_items.iter().map(|row| row.item.as_ref()), latest_checkpoint)
@@ -488,10 +494,16 @@ impl DiffPanel {
         let repository = cwd.as_ref().and_then(|cwd| self.repositories.get(cwd)).copied();
         // The agent may have changed files; showing the panel revalidates a stale git diff.
         let git_stale = self.git_fetched_at.is_some_and(|at| at.elapsed() >= GIT_REFRESH_FLOOR);
-        if (mutation != self.workspace_mutation && self.git_fetched_at.is_some()) || (visible && !self.visible && git_stale) {
+        let mutation_changed = advance_workspace_mutation(
+            &mut self.workspace_mutation_loaded,
+            &mut self.workspace_mutation,
+            projection_present,
+            mutation,
+            self.git_fetched_at.is_some(),
+        );
+        if mutation_changed || (visible && !self.visible && git_stale) {
             self.git_revision += 1;
         }
-        self.workspace_mutation = mutation;
         self.visible = visible;
         let can_read = state.can_read_threads();
         let source_exists = match &scope {
@@ -2124,6 +2136,28 @@ impl DiffPanel {
         cx.notify();
         true
     }
+}
+
+/// Seeds the selected thread's initial `workspace_mutation` once its projection arrives so switching
+/// threads never bumps `git_revision` when transitioning through an unloaded state (`#40215`).
+fn advance_workspace_mutation(
+    loaded: &mut bool,
+    previous: &mut Option<String>,
+    projection_present: bool,
+    next: Option<String>,
+    has_git_fetch: bool,
+) -> bool {
+    if !projection_present {
+        return false;
+    }
+    if !*loaded {
+        *loaded = true;
+        *previous = next;
+        return false;
+    }
+    let changed = next != *previous;
+    *previous = next;
+    changed && has_git_fetch
 }
 
 impl Render for DiffPanel {

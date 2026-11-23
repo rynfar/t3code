@@ -64,7 +64,7 @@ enum AfterSave {
     /// Close the editor this open started, or show its error there.
     Editor(u64),
     /// An import that failed opens the editor on it with the error (`importFileScript`).
-    Import(ScriptInput),
+    Import(u64, ScriptInput),
 }
 
 pub(crate) struct ActionsState {
@@ -143,6 +143,7 @@ impl SettingsView {
         let actions = &mut self.projects.actions;
         actions.import_open = false;
         actions.generation += 1;
+        crate::git::bump_script_editor_request_id();
         let initial = request.initial.clone();
         let (name, command, preview) = (initial.name.clone(), initial.command.clone(), initial.preview_url.clone().unwrap_or_default());
         actions.name.update(cx, |input, cx| input.set_value(name, window, cx));
@@ -289,9 +290,13 @@ impl SettingsView {
                     }
                 }
             }
-            AfterSave::Import(input) => {
+            AfterSave::Import(generation, input) => {
                 if let Some(message) = failure {
-                    actions.pending = Some(EditorRequest { script_id: None, initial: input, error: Some(message) });
+                    if actions.generation == generation && actions.editor.is_none() {
+                        actions.pending = Some(EditorRequest { script_id: None, initial: input, error: Some(message) });
+                    } else {
+                        store::show_error(format!("Failed to import {}.", input.name), cx);
+                    }
                 }
             }
         }
@@ -350,8 +355,11 @@ impl SettingsView {
             return;
         }
         self.projects.actions.import_open = false;
+        self.projects.actions.generation += 1;
+        let generation = self.projects.actions.generation;
+        crate::git::bump_script_editor_request_id();
         let input = file.import_input();
-        self.submit_action(None, input.clone(), AfterSave::Import(input), cx);
+        self.submit_action(None, input.clone(), AfterSave::Import(generation, input), cx);
     }
 
     fn delete_action(&mut self, id: String, cx: &mut Context<Self>) {
@@ -715,7 +723,6 @@ impl SettingsView {
                         .justify_center()
                         .p(px(16.))
                         .bg(hsla(p.dialog_backdrop))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_action_editor(window, cx)))
                         .child(dialog),
                 ),
             )

@@ -95,6 +95,7 @@ struct CheckoutPrDraft {
 
 pub struct GitDialogs {
     git: Entity<GitStore>,
+    checkout_key: Option<(u64, String)>,
     commit: Option<CommitDraft>,
     pending: Option<PendingDefault>,
     publish: Option<PublishDraft>,
@@ -114,7 +115,19 @@ impl GitDialogs {
         let publish_remote = cx.new(|cx| InputState::new(window, cx).placeholder("origin"));
         let pr_input = cx.new(|cx| InputState::new(window, cx).placeholder("PR URL, checkout command, or #42"));
         let subscriptions = vec![
-            cx.subscribe(&git, |this, _, _: &GitEvent, cx| {
+            cx.subscribe(&git, |this, git, _: &GitEvent, cx| {
+                let next_key = git.read(cx).checkout_key();
+                if next_key != this.checkout_key {
+                    this.checkout_key = next_key;
+                    let had_open = this.commit.take().is_some()
+                        | this.pending.take().is_some()
+                        | this.publish.take().is_some()
+                        | this.checkout_pr.take().is_some();
+                    if had_open {
+                        cx.notify();
+                        return;
+                    }
+                }
                 if this.commit.is_some() || this.pending.is_some() || this.publish.is_some() || this.checkout_pr.is_some() {
                     cx.notify();
                 }
@@ -151,8 +164,10 @@ impl GitDialogs {
                 _ => {}
             }),
         ];
+        let checkout_key = git.read(cx).checkout_key();
         GitDialogs {
             git,
+            checkout_key,
             commit: None,
             pending: None,
             publish: None,

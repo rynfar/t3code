@@ -337,6 +337,31 @@ pub fn refresh_status(cwd: &str, local_only: bool) -> Value {
     payload
 }
 
+/// Formats branch-action errors (`toBranchActionErrorMessage` in `BranchToolbar.logic.ts`):
+/// extracts sanitized `GitCommandError.detail` (+ optional `reason`) instead of noisy command/cwd prefixes.
+pub fn format_branch_action_error(failure: &crate::rpc::RpcFailure) -> String {
+    if failure.tag.as_deref() == Some("GitCommandError")
+        && let Some(detail) = failure
+            .error
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return match failure
+            .error
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(reason) => format!("{detail} ({reason})"),
+            None => detail.to_owned(),
+        };
+    }
+    failure.message.clone()
+}
+
 pub fn pull(cwd: &str) -> Value {
     json!({ "cwd": cwd })
 }

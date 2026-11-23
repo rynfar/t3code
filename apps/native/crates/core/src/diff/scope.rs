@@ -309,6 +309,7 @@ pub struct DiffPreviewSource {
     pub truncated: bool,
     pub base_ref: Option<String>,
     pub head_ref: Option<String>,
+    pub merge_base: Option<String>,
     /// Totals over every changed file; set when `diff` holds only some of them.
     pub totals: Option<(u64, u64)>,
 }
@@ -419,6 +420,7 @@ pub fn decode_diff_preview(value: &Value, kind: PreviewSourceKind) -> Option<Dif
         truncated: source.get("truncated").and_then(Value::as_bool).unwrap_or(false),
         base_ref: text("baseRef"),
         head_ref: text("headRef"),
+        merge_base: text("mergeBase"),
         totals,
     })
 }

@@ -86,6 +86,12 @@ fn recorded_text(value: Option<&str>) -> (Option<&str>, bool) {
 
 /// `toolCallDiff`. `None` for anything but a file change.
 pub fn tool_call_diff(kind: &TurnItemKind) -> Option<ToolCallDiff> {
+    tool_call_diff_in_workspace(kind, None)
+}
+
+/// `toolCallDiff(item, workspaceRoot)`: rewrites absolute workspace paths in patch headers to
+/// workspace-relative paths (`apps/web/src/lib/toolCallDiff.ts`).
+pub fn tool_call_diff_in_workspace(kind: &TurnItemKind, workspace_root: Option<&str>) -> Option<ToolCallDiff> {
     let TurnItemKind::FileChange { file_name, diff_str, old_str, new_str, changes, .. } = kind else { return None };
     let changes = changes.as_deref().unwrap_or_default();
     let (diff, diff_truncated) = recorded_text(diff_str.as_deref());
@@ -102,11 +108,96 @@ pub fn tool_call_diff(kind: &TurnItemKind) -> Option<ToolCallDiff> {
             .collect()
     };
     Some(ToolCallDiff {
-        patch: diff.map(|diff| tool_call_patch(file_name, diff, changes)),
+        patch: diff.map(|diff| {
+            let patch = tool_call_patch(file_name, diff, changes);
+            relative_header_paths(&patch, workspace_root)
+        }),
         content,
         truncated: diff_truncated || before_truncated || after_truncated,
         recorded_files: changes.len(),
     })
+}
+
+fn is_windows_workspace_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\'))
+        || root.starts_with(r"\\")
+}
+
+/// Strips `workspace_root` from `diff --git`, `---`, and `+++` header lines up to the first hunk
+/// (`relativeHeaderPaths` in `apps/web/src/lib/toolCallDiff.ts`).
+fn relative_header_paths(patch: &str, workspace_root: Option<&str>) -> String {
+    let Some(workspace_root) = workspace_root.filter(|root| !root.is_empty()) else {
+        return patch.to_owned();
+    };
+    if patch.is_empty() {
+        return String::new();
+    }
+    let windows = is_windows_workspace_root(workspace_root);
+    let raw_segments: Vec<&str> = if windows {
+        workspace_root.split(['/', '\\']).collect()
+    } else {
+        workspace_root.split('/').collect()
+    };
+    let mut segments: Vec<&str> = Vec::with_capacity(raw_segments.len());
+    for (idx, seg) in raw_segments.into_iter().enumerate() {
+        if idx == 0 || !seg.is_empty() {
+            segments.push(seg);
+        }
+    }
+    while segments.last().is_some_and(|seg| seg.is_empty()) {
+        segments.pop();
+    }
+    if !segments.iter().any(|seg| !seg.is_empty()) {
+        return patch.to_owned();
+    }
+    let separator = if windows { r"[\\/]+" } else { r"/+" };
+    let root_pattern = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .split('\\')
+                .map(regex::escape)
+                .collect::<Vec<_>>()
+                .join(r"\\\\?")
+        })
+        .collect::<Vec<_>>()
+        .join(separator);
+    let prefix_pattern = format!(
+        r#"{}^("?(?:[ab]/)?){root_pattern}{separator}"#,
+        if windows { "(?i)" } else { "" }
+    );
+    let Ok(prefix_re) = regex::Regex::new(&prefix_pattern) else {
+        return patch.to_owned();
+    };
+    let Ok(diff_git_re) = regex::Regex::new(r#"^diff --git ("a/(?:[^"\\]|\\.)*"|a/.+?) ("b/(?:[^"\\]|\\.)*"|b/.+?)$"#) else {
+        return patch.to_owned();
+    };
+    let Ok(header_line_re) = regex::Regex::new(r"^(---|\+\+\+)(\s+)(.*)$") else {
+        return patch.to_owned();
+    };
+    let relative = |name: &str| prefix_re.replace(name, "$1").into_owned();
+    let mut in_header = true;
+    patch
+        .split('\n')
+        .map(|line| {
+            if line.starts_with("diff --git ") {
+                in_header = true;
+                return match diff_git_re.captures(line) {
+                    Some(caps) => format!("diff --git {} {}", relative(&caps[1]), relative(&caps[2])),
+                    None => line.to_owned(),
+                };
+            }
+            if line.starts_with("@@") {
+                in_header = false;
+            }
+            if in_header && let Some(caps) = header_line_re.captures(line) {
+                return format!("{}{}{}", &caps[1], &caps[2], relative(&caps[3]));
+            }
+            line.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `toolCallPatch`: a complete patch stays as recorded; a bare hunk gets file headers; an added

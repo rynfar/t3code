@@ -711,6 +711,19 @@ impl Composer {
         self.workspace.branch_open = true;
         self.workspace.open = false;
         self.workspace.host_open = false;
+        if let Some(scope) = self.workspace.scope.as_ref()
+            && let Some(client) = self.state.read(cx).client_handle()
+        {
+            let cwd = scope.root.clone();
+            let runtime = self.state.read(cx).runtime().clone();
+            runtime.spawn(async move {
+                drop(
+                    client
+                        .request(t3_core::vcs::method::VCS_REFRESH_STATUS, t3_core::vcs::refresh_status(&cwd, true))
+                        .await,
+                );
+            });
+        }
         let search = self.ensure_base_search(window, cx);
         search.update(cx, |input, cx| {
             if !input.value().is_empty() {

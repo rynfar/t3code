@@ -118,19 +118,48 @@ impl RefState {
         self.persisted_env.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    pub(crate) fn on_settled(&self, method: &'static str) -> Option<OnSettled> {
-        t3_core::vcs::refs::invalidates_refs(method).then(|| OnSettled { state: self.clone(), method })
+    pub(crate) fn on_settled(&self, method: &'static str, payload: &Value) -> Option<OnSettled> {
+        let cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        t3_core::vcs::refs::invalidates_refs(method).then(|| OnSettled {
+            state: self.clone(),
+            method,
+            cwd,
+            settled: false,
+        })
     }
 }
 
 pub(crate) struct OnSettled {
     state: RefState,
     method: &'static str,
+    cwd: Option<String>,
+    settled: bool,
 }
 
-impl Drop for OnSettled {
-    fn drop(&mut self) {
+impl OnSettled {
+    pub(crate) fn settle_with(mut self, response: Option<&Value>) {
+        self.settled = true;
+        self.apply_settlement(response);
+    }
+
+    fn apply_settlement(&self, response: Option<&Value>) {
         let _persist_guard = self.state.persistence_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.method == method::VCS_REFRESH_STATUS {
+            let digest = response.and_then(|value| value.get("refsDigest")).and_then(Value::as_str);
+            let cwd = self.cwd.as_deref().unwrap_or_default();
+            if !self.state.lock().settle_refresh_status(cwd, digest) {
+                return;
+            }
+            let env_key = self.state.environment_key();
+            let readable = match env_key.as_deref() {
+                Some(key) => clear_disk_cache(key).is_ok(),
+                None => true,
+            };
+            let mut cache = self.state.lock();
+            cache.set_persisted_cache_readable(readable);
+            self.state.revision.send_replace(cache.revision());
+            return;
+        }
         let env_key = self.state.environment_key();
         let readable = match env_key.as_deref() {
             Some(key) => clear_disk_cache(key).is_ok(),
@@ -140,6 +169,14 @@ impl Drop for OnSettled {
         if cache.settle(self.method) {
             cache.set_persisted_cache_readable(readable);
             self.state.revision.send_replace(cache.revision());
+        }
+    }
+}
+
+impl Drop for OnSettled {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.apply_settlement(None);
         }
     }
 }
@@ -430,5 +467,33 @@ mod tests {
         super::clear_disk_cache_at(&path).unwrap();
         assert!(super::read_disk_cache_at(&path).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use serde_json::json;
+    use t3_core::vcs::method;
+
+    #[test]
+    fn refresh_status_settlement_reuses_matching_refs_digest_and_invalidates_on_change_or_drop() {
+        let refs = super::RefState::default();
+        let mut rx = refs.revision.subscribe();
+
+        let s1 = refs.on_settled(method::VCS_REFRESH_STATUS, &json!({ "cwd": "/repo" })).unwrap();
+        s1.settle_with(Some(&json!({ "refsDigest": "rev-1" })));
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        let s2 = refs.on_settled(method::VCS_REFRESH_STATUS, &json!({ "cwd": "/repo" })).unwrap();
+        s2.settle_with(Some(&json!({ "refsDigest": "rev-1" })));
+        assert_eq!(*rx.borrow(), 1, "matching refsDigest skips revision bump");
+
+        let s3 = refs.on_settled(method::VCS_REFRESH_STATUS, &json!({ "cwd": "/repo" })).unwrap();
+        s3.settle_with(Some(&json!({ "refsDigest": "rev-2" })));
+        assert_eq!(*rx.borrow_and_update(), 2);
+
+        let s4 = refs.on_settled(method::VCS_REFRESH_STATUS, &json!({ "cwd": "/repo" })).unwrap();
+        drop(s4);
+        assert_eq!(*rx.borrow_and_update(), 3, "dropped/failed refresh still invalidates");
     }
 }

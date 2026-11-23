@@ -38,6 +38,7 @@ pub fn can_use_offline_refs_cache(input: &Value) -> bool {
 pub struct RefCache {
     revision: u64,
     server_revisions: BTreeMap<String, u64>,
+    refs_digests: BTreeMap<String, String>,
     persisted_cache_readable: bool,
 }
 
@@ -46,6 +47,7 @@ impl Default for RefCache {
         Self {
             revision: 0,
             server_revisions: BTreeMap::new(),
+            refs_digests: BTreeMap::new(),
             persisted_cache_readable: true,
         }
     }
@@ -79,6 +81,29 @@ impl RefCache {
     pub fn settle(&mut self, method: &str) -> bool {
         if !invalidates_refs(method) {
             return false;
+        }
+        self.revision += 1;
+        true
+    }
+
+    /// Invalidates refs on `vcs.refreshStatus` only when `refs_digest` is absent or changed
+    /// (`invalidateCachedVcsRefsIfChanged` in `vcsRefInvalidation.ts`).
+    pub fn settle_refresh_status(&mut self, cwd: &str, refs_digest: Option<&str>) -> bool {
+        if let Some(digest) = refs_digest
+            && !cwd.is_empty()
+            && self.refs_digests.get(cwd).map(String::as_str) == Some(digest)
+        {
+            return false;
+        }
+        if !cwd.is_empty() {
+            if let Some(digest) = refs_digest {
+                if !self.refs_digests.contains_key(cwd) && self.refs_digests.len() >= 256 {
+                    self.refs_digests.pop_first();
+                }
+                self.refs_digests.insert(cwd.to_owned(), digest.to_owned());
+            } else {
+                self.refs_digests.remove(cwd);
+            }
         }
         self.revision += 1;
         true

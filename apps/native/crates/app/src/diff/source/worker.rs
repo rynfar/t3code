@@ -237,4 +237,123 @@ mod tests {
         drop(send);
         task.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn tracked_to_complete_preview_forwards_completion_token_and_keeps_in_flight_patch_reads() {
+        let scope = ReviewScope {
+            environment: "smoke".into(),
+            connection: 1,
+            cwd: "/repo".into(),
+            kind: PreviewSourceKind::BranchRange,
+            base_ref: Some("main".into()),
+            ignore_whitespace: true,
+        };
+        let (send, commands) = mpsc::channel(16);
+        let (updates, mut receive) = mpsc::channel(4);
+        let file_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_completion_token = Arc::new(std::sync::Mutex::new(None::<String>));
+        let (allow_complete, wait_complete) = tokio::sync::oneshot::channel::<()>();
+        let wait_complete = Arc::new(std::sync::Mutex::new(Some(wait_complete)));
+        let (allow_patch, wait_patch) = tokio::sync::oneshot::channel::<()>();
+        let wait_patch = Arc::new(std::sync::Mutex::new(Some(wait_patch)));
+        let file_reads_req = file_reads.clone();
+        let token_req = seen_completion_token.clone();
+
+        let task = tokio::spawn(run_with(
+            move |_, input| {
+                let file_reads = file_reads_req.clone();
+                let seen_token = token_req.clone();
+                let wait_complete = wait_complete.clone();
+                let wait_patch = wait_patch.clone();
+                async move {
+                    if let Some(file) = input.get("file") {
+                        let path = file["path"].as_str().unwrap_or_default();
+                        if path == "tracked.rs" {
+                            file_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let rx = wait_patch.lock().unwrap().take();
+                            if let Some(rx) = rx {
+                                let _ = rx.await;
+                            }
+                            return Ok(json!({
+                                "cwd": "/repo",
+                                "generatedAt": "patch",
+                                "incomplete": false,
+                                "sources": [{
+                                    "kind": "branch-range",
+                                    "diff": "diff --git a/tracked.rs b/tracked.rs\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                                    "files": [{ "path": "tracked.rs", "previousPath": null, "changeType": "change", "additions": 1, "deletions": 1 }]
+                                }]
+                            }));
+                        }
+                        return Ok(json!({
+                            "cwd": "/repo",
+                            "generatedAt": "patch-u",
+                            "incomplete": false,
+                            "sources": [{
+                                "kind": "branch-range",
+                                "diff": "diff --git a/untracked.rs b/untracked.rs\n--- /dev/null\n+++ b/untracked.rs\n@@ -0,0 +1 @@\n+hi\n",
+                                "files": [{ "path": "untracked.rs", "previousPath": null, "changeType": "new", "additions": 1, "deletions": 0 }]
+                            }]
+                        }));
+                    }
+                    if input["trackedOnly"] == true {
+                        return Ok(json!({
+                            "cwd": "/repo",
+                            "generatedAt": "tracked",
+                            "incomplete": true,
+                            "completionToken": "tok-worker",
+                            "sources": [{
+                                "kind": "branch-range",
+                                "baseRef": "main",
+                                "headRef": "feat",
+                                "mergeBase": "m1",
+                                "patchesDeferred": true,
+                                "files": [{ "path": "tracked.rs", "previousPath": null, "changeType": "change", "additions": 1, "deletions": 1 }]
+                            }]
+                        }));
+                    }
+                    *seen_token.lock().unwrap() = input.get("completionToken").and_then(|v| v.as_str()).map(str::to_owned);
+                    let rx = wait_complete.lock().unwrap().take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                    Ok(json!({
+                        "cwd": "/repo",
+                        "generatedAt": "complete",
+                        "incomplete": false,
+                        "sources": [{
+                            "kind": "branch-range",
+                            "baseRef": "main",
+                            "headRef": "feat",
+                            "mergeBase": "m1",
+                            "patchesDeferred": true,
+                            "files": [
+                                { "path": "tracked.rs", "previousPath": null, "changeType": "change", "additions": 1, "deletions": 1 },
+                                { "path": "untracked.rs", "previousPath": null, "changeType": "new", "additions": 1, "deletions": 0 }
+                            ]
+                        }]
+                    }))
+                }
+            },
+            scope,
+            None,
+            None,
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            commands,
+            updates,
+        ));
+
+        let Loaded::Git { review: initial, .. } = receive.recv().await.unwrap().unwrap() else { panic!("tracked") };
+        assert!(initial.incomplete);
+        allow_complete.send(()).unwrap();
+        let Loaded::Git { review: after_complete, .. } = receive.recv().await.unwrap().unwrap() else { panic!("complete") };
+        assert!(!after_complete.incomplete);
+        assert_eq!(seen_completion_token.lock().unwrap().as_deref(), Some("tok-worker"));
+        allow_patch.send(()).unwrap();
+        let Loaded::Git { review: settled, .. } = receive.recv().await.unwrap().unwrap() else { panic!("settled") };
+        assert_eq!(settled.files().len(), 2);
+        assert_eq!(file_reads.load(std::sync::atomic::Ordering::SeqCst), 1, "tracked.rs patch must not be aborted and re-fetched when complete preview arrives");
+        drop(send);
+        task.await.unwrap();
+    }
 }

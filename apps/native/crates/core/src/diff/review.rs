@@ -80,6 +80,7 @@ pub struct PatchTicket {
     pub file: ReviewFile,
     pub cwd: String,
     pub base_ref: Option<String>,
+    pub merge_base: Option<String>,
 }
 
 impl PatchTicket {
@@ -88,7 +89,17 @@ impl PatchTicket {
         if let Some(sha) = &self.commit_sha {
             input["commitSha"] = json!(sha);
         }
-        input["file"] = json!({"path": self.file.path, "previousPath": self.file.previous_path, "sourceKind": self.scope.kind.wire()});
+        if let Some(merge_base) = &self.merge_base {
+            input["mergeBase"] = json!(merge_base);
+        }
+        let mut file = serde_json::Map::new();
+        file.insert("path".into(), json!(self.file.path));
+        file.insert("previousPath".into(), json!(self.file.previous_path));
+        if let Some(change_type) = self.file.change_type {
+            file.insert("changeType".into(), json!(change_type.as_str()));
+        }
+        file.insert("sourceKind".into(), json!(self.scope.kind.wire()));
+        input["file"] = Value::Object(file);
         (method, input)
     }
 }
@@ -99,6 +110,7 @@ pub struct ReviewModel {
     pub commit_sha: Option<String>,
     pub source: Option<Arc<DiffPreviewSource>>,
     pub incomplete: bool,
+    pub completion_token: Option<String>,
     pub repository: bool,
     pub revision: u64,
     pub states: HashMap<String, FilePatchState>,
@@ -114,6 +126,7 @@ impl ReviewModel {
             commit_sha: None,
             source: None,
             incomplete: false,
+            completion_token: None,
             repository: true,
             revision: 0,
             states: HashMap::new(),
@@ -135,7 +148,11 @@ impl ReviewModel {
             payload["metadataOnly"] = json!(true);
             return (method, payload);
         }
-        self.scope.request(tracked_only)
+        let (method, mut payload) = self.scope.request(tracked_only);
+        if !tracked_only && self.incomplete && let Some(token) = &self.completion_token {
+            payload["completionToken"] = json!(token);
+        }
+        (method, payload)
     }
 
     pub fn has_complete_preview(&self) -> bool {
@@ -154,30 +171,66 @@ impl ReviewModel {
     }
 
     pub fn accept_preview(&mut self, value: &Value) {
+        let was_incomplete = self.incomplete;
+        let prev_files: HashMap<String, ReviewFile> = self
+            .files()
+            .iter()
+            .map(|file| (file.identity(), file.clone()))
+            .collect();
         let source = decode_diff_preview(value, self.scope.kind).map(Arc::new);
         self.repository = super::preview_is_repository(value);
         self.incomplete = value["incomplete"].as_bool().unwrap_or(false);
+        self.completion_token = value.get("completionToken").and_then(Value::as_str).map(str::to_owned);
         let same_refs = self
             .source
             .as_ref()
             .zip(source.as_ref())
-            .is_some_and(|(a, b)| a.kind == b.kind && a.base_ref == b.base_ref && a.head_ref == b.head_ref);
+            .is_some_and(|(a, b)| a.kind == b.kind && a.base_ref == b.base_ref && a.head_ref == b.head_ref && a.merge_base == b.merge_base);
         if !same_refs {
             Arc::make_mut(&mut self.requested).clear();
         }
         let changed = self.source != source;
-        if changed {
+        let preserve_patches = changed && was_incomplete && same_refs;
+        if changed && !preserve_patches {
             self.revision += 1;
             self.states.clear();
         }
         self.source = source;
+        if preserve_patches {
+            let new_files: HashMap<String, &ReviewFile> = self
+                .source
+                .as_ref()
+                .map_or(&[][..], |source| source.files.as_slice())
+                .iter()
+                .map(|file| (file.identity(), file))
+                .collect();
+            self.states.retain(|id, state| {
+                (state.pending || state.files.is_some())
+                    && matches!(
+                        (prev_files.get(id), new_files.get(id)),
+                        (Some(prev), Some(next)) if prev == *next
+                    )
+            });
+        }
         let identities: HashSet<_> = self.files().iter().map(ReviewFile::identity).collect();
         Arc::make_mut(&mut self.requested).retain(|id| identities.contains(id));
         let automatic = self.files().iter().take(4).map(ReviewFile::identity).collect::<Vec<_>>();
         Arc::make_mut(&mut self.requested).extend(automatic);
         if changed {
             self.rendered = Arc::new(if self.lazy() {
-                ParsedPatch::Files(self.files().iter().map(ReviewFile::placeholder).collect())
+                if preserve_patches {
+                    let mut list = Vec::with_capacity(self.files().len());
+                    for file in self.files() {
+                        if let Some(loaded) = self.states.get(&file.identity()).and_then(|s| s.files.as_ref()) {
+                            list.extend(loaded.iter().cloned());
+                        } else {
+                            list.push(file.placeholder());
+                        }
+                    }
+                    ParsedPatch::Files(list)
+                } else {
+                    ParsedPatch::Files(self.files().iter().map(ReviewFile::placeholder).collect())
+                }
             } else {
                 self.source.as_ref().map_or(ParsedPatch::Empty, |s| parse_patch(&s.diff))
             });
@@ -254,6 +307,7 @@ impl ReviewModel {
                         .as_ref()
                         .and_then(|s| s.base_ref.clone())
                         .or_else(|| self.scope.base_ref.clone()),
+                    merge_base: self.source.as_ref().and_then(|s| s.merge_base.clone()),
                 }
             })
             .collect()
@@ -263,7 +317,7 @@ impl ReviewModel {
         if ticket.scope != self.scope
             || ticket.commit_sha != (self.source.as_ref().filter(|s| s.kind == PreviewSourceKind::Commit).and_then(|s| s.id.clone()).or_else(|| self.commit_sha.clone()))
             || ticket.revision != self.revision
-            || !self.files().iter().any(|f| f.identity() == ticket.file.identity())
+            || !self.files().iter().any(|f| f == &ticket.file)
         {
             return false;
         }

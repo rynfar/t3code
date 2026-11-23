@@ -10,6 +10,7 @@ mod actions;
 mod branch_picker;
 mod dialogs;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Subscription, Task};
@@ -78,6 +79,8 @@ pub struct GitStore {
     pub success: Option<InlineSuccess>,
     /// The branch shown while a switch or create is in flight (`useOptimistic`).
     pub optimistic_branch: Option<Option<String>>,
+    /// Picker-initiated checkouts by `cwd` (`pickerCheckouts` in `BranchToolbarBranchSelector.tsx`).
+    picker_checkouts: HashMap<String, Option<String>>,
     pub branch_pending: bool,
     pub initializing: bool,
     pub refs: vcs::refs::RefListing,
@@ -155,6 +158,7 @@ impl GitStore {
             progress: None,
             success: None,
             optimistic_branch: None,
+            picker_checkouts: HashMap::new(),
             branch_pending: false,
             initializing: false,
             refs: Default::default(),
@@ -234,6 +238,7 @@ impl GitStore {
             self.status = None;
             self.status_error = None;
             self.failed_commit_message = None;
+            self.picker_checkouts.clear();
             self.project_file = None;
             self.project_file_task = None;
             self.importing_script = false;
@@ -382,6 +387,12 @@ impl GitStore {
                         Ok(event) => {
                             store.status = apply_status_event(store.status.take(), event);
                             store.status_error = None;
+                            if let Some(ref_name) = store.status.as_ref().and_then(|s| s.local.ref_name.as_deref())
+                                && let Some(Some(expected)) = store.picker_checkouts.get(&target.cwd).map(Option::as_deref)
+                                && expected != ref_name
+                            {
+                                store.picker_checkouts.remove(&target.cwd);
+                            }
                         }
                         Err(error) => store.status_error = Some(error),
                     }
@@ -412,6 +423,10 @@ impl GitStore {
             }
         });
         self.terminal_feed = Some(Feed { net, _ui: ui });
+    }
+
+    pub(super) fn checkout_key(&self) -> Option<(u64, String)> {
+        Some((self.connection?, self.target.as_ref()?.cwd.clone()))
     }
 
     pub fn is_running(&self) -> bool {
@@ -869,10 +884,23 @@ impl GitStore {
         cx: &mut Context<Self>,
         resolve: impl FnOnce(RefNameResult, String) -> (String, Option<String>) + 'static,
     ) {
-        let Some(task) = self.state.read(cx).request(rpc, payload, decode::<RefNameResult>) else { return };
+        let Some((client, runtime)) = self.client(cx) else { return };
+        let checkout_cwd = payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| origin.cwd.clone());
+        self.picker_checkouts.insert(checkout_cwd.clone(), None);
         self.branch_pending = true;
         self.optimistic_branch = Some(Some(optimistic.clone()));
         cx.emit(GitEvent::Changed);
+        let task = runtime.spawn(async move {
+            match client.request(rpc, payload).await {
+                Ok(value) => decode::<RefNameResult>(value),
+                Err(RpcError::Failure(rpc_failure)) => Err(vcs::format_branch_action_error(&rpc_failure)),
+                Err(error) => Err(error.to_string()),
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err(failure.into()));
             let _ = this.update(cx, |store, cx| {
@@ -883,22 +911,22 @@ impl GitStore {
                 match result {
                     Ok(result) => {
                         let (branch, worktree) = resolve(result, optimistic);
+                        store.picker_checkouts.insert(checkout_cwd, Some(branch.clone()));
                         if shown {
                             store.optimistic_branch = Some(Some(branch.clone()));
                         }
                         store.set_thread_branch(&origin, Some(&branch), worktree.as_deref(), cx);
                     }
                     Err(message) => {
+                        store.picker_checkouts.remove(&checkout_cwd);
                         if shown {
                             store.optimistic_branch = None;
                         }
                         store.toast(Toast::new(ToastKind::Error, failure).description(message), cx);
+                        if shown {
+                            store.refresh_status(true, cx);
+                        }
                     }
-                }
-                if shown {
-                    store.refresh_status(true, cx);
-                    let query = store.refs.query.clone();
-                    store.load_refs(&query, false, cx);
                 }
                 cx.emit(GitEvent::Changed);
             });
@@ -1026,6 +1054,8 @@ impl GitStore {
         let writes = project_action_rules::plan_writes(&config.settings, &keybindings, &projects, &members, &edit);
         let project_id = project_id.to_owned();
         let connection = self.connection;
+        let request_id = bump_script_editor_request_id();
+        let script_name = input.name.clone();
         self.importing_script = true;
         cx.emit(GitEvent::Changed);
         let task = runtime.spawn(async move {
@@ -1042,9 +1072,11 @@ impl GitStore {
                     && store.connection == connection
                 {
                     let message = error.to_string();
-                    let request = EditorRequest { script_id: None, initial: input, error: Some(message.clone()) };
-                    open_script_editor_request(&project_id, request, cx);
-                    store.toast(Toast::new(ToastKind::Error, "Failed to import action.").description(message), cx);
+                    if current_script_editor_request_id() == request_id {
+                        let request = EditorRequest { script_id: None, initial: input, error: Some(message.clone()) };
+                        open_script_editor_request(&project_id, request, cx);
+                    }
+                    store.toast(Toast::new(ToastKind::Error, format!("Failed to import {script_name}.")).description(message), cx);
                 }
                 cx.emit(GitEvent::Changed);
             });
@@ -1130,8 +1162,19 @@ pub struct PendingScriptEditor(pub Option<ScriptEditorRequest>);
 
 impl gpui::Global for PendingScriptEditor {}
 
+static SCRIPT_EDITOR_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn bump_script_editor_request_id() -> u64 {
+    SCRIPT_EDITOR_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+pub(crate) fn current_script_editor_request_id() -> u64 {
+    SCRIPT_EDITOR_REQUEST_ID.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Opens the action editor on `project_id`'s actions: Add, or Edit on `script_id`.
 pub fn open_script_editor(project_id: &str, script_id: Option<&str>, cx: &mut App) {
+    bump_script_editor_request_id();
     cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest { project_id: project_id.to_owned(), script_id: script_id.map(str::to_owned), request: None })));
     crate::settings::open_project(project_id, cx);
 }

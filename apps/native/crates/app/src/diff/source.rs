@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use t3_core::diff::{
     PreviewSourceKind, ToolCallDiff, ToolCallTarget, checkpoint_diff_request, decode_turn_diff,
-    hide_whitespace_changes, is_checkpoint_diff_truncated, tool_call_diff, ReviewModel,
+    hide_whitespace_changes, is_checkpoint_diff_truncated, tool_call_diff_in_workspace, ReviewModel,
 };
 use t3_core::timeline::{GET_TURN_ITEM, decode_detail};
 
@@ -95,14 +95,24 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
             })
         }
         RequestKey::ToolCall { target, .. } if !target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)) => None,
-        RequestKey::ToolCall { target, .. } => state.request(GET_TURN_ITEM, target.request(), |value| {
-            let item = decode_detail(value).map_err(|error| error.to_string())?;
-            let mut diff = item.and_then(|item| tool_call_diff(&item.kind)).unwrap_or_default();
-            let exact = diff.patch.take().map(|patch| Parsed::new(&patch, diff.truncated, None, None, None));
-            let ignoring_whitespace =
-                exact.as_ref().map(|exact| Parsed::from_patch(hide_whitespace_changes(&exact.patch), exact.truncated, None, None, None));
-            Ok(Loaded::ToolCall(Arc::new(ToolCall { exact, ignoring_whitespace, diff })))
-        }),
+        RequestKey::ToolCall { target, .. } => {
+            let workspace_root = state.thread_shell(&target.thread_id).and_then(|thread| {
+                thread
+                    .worktree_path
+                    .clone()
+                    .or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()))
+            });
+            state.request(GET_TURN_ITEM, target.request(), move |value| {
+                let item = decode_detail(value).map_err(|error| error.to_string())?;
+                let mut diff = item
+                    .and_then(|item| tool_call_diff_in_workspace(&item.kind, workspace_root.as_deref()))
+                    .unwrap_or_default();
+                let exact = diff.patch.take().map(|patch| Parsed::new(&patch, diff.truncated, None, None, None));
+                let ignoring_whitespace =
+                    exact.as_ref().map(|exact| Parsed::from_patch(hide_whitespace_changes(&exact.patch), exact.truncated, None, None, None));
+                Ok(Loaded::ToolCall(Arc::new(ToolCall { exact, ignoring_whitespace, diff })))
+            })
+        }
     }
 }
 
